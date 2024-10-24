@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, default};
 
 use anyhow::Context;
 use id_arena::{Arena, Id};
@@ -17,8 +17,9 @@ pub struct Block {
     pub catch: Catch,
     pub term: Term,
 }
-#[derive(Clone)]
+#[derive(Clone,Default)]
 pub enum Catch {
+    #[default]
     Throw,
     Jump { pat: Pat, k: Id<Block> },
 }
@@ -45,7 +46,7 @@ pub struct Loop {
     pub r#break: Id<Block>,
     pub r#continue: Id<Block>,
 }
-#[derive(Clone)]
+#[derive(Clone,Default)]
 pub struct Ctx {
     pub catch: Catch,
     pub cur_loop: Option<Loop>,

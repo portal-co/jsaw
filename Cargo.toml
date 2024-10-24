@@ -1,0 +1,24 @@
+[workspace]
+members=[ "js-runtime-lib","swc-cfg", "swc-emit-rust", "swc-ssa", "swc-tac"]
+resolver="2"
+
+[workspace.dependencies]
+anyhow = "1.0.87"
+arena-traits = {version="0.1.4",features=["id-arena"]}
+bimap = "0.6.3"
+id-arena = "2.2.1"
+ssa-impls = "0.1.4"
+ssa-traits = "0.1.4"
+swc_atoms = "1.0.0"
+swc_common = "0.40.0"
+swc_ecma_ast = "0.121.0"
+swc_ecma_compat_es2015 = "0.16.0"
+swc_ecma_minifier = "0.208.0"
+swc_ecma_transforms_base = "0.149.0"
+swc_ecma_utils = "0.137.0"
+swc_ecma_visit = "0.107.0"
+
+proc-macro2 = "1.0.88"
+quasiquote = "0.1.1"
+quote = "1.0.37"
+syn = "2.0.82"

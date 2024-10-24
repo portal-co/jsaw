@@ -1,0 +1,8 @@
+[package]
+name = "js-runtime-lib"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow.workspace = true
+boxing = "0.1.2"

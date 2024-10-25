@@ -15,11 +15,19 @@ use swc_ecma_ast::{
     LabeledStmt, Lit, MemberExpr, Pat, ReturnStmt, Stmt, Str, SwitchCase, SwitchStmt, ThrowStmt,
     TryStmt, WhileStmt,
 };
-
+pub mod recfg;
+#[derive(Clone, Default)]
 pub struct Cfg {
     pub blocks: Arena<Block>,
 }
 impl Cfg {
+    pub fn recfg(&self, entry: Id<Block>) -> (Cfg, Id<Block>) {
+        let mut res = Cfg::default();
+        let Ok(entry) = recfg::Recfg::default().go(self, &mut res, entry) else {
+            return (self.clone(), entry);
+        };
+        return (res, entry);
+    }
     pub fn reloop_block(&self, entry: Id<Block>) -> ShapedBlock<Id<Block>> {
         return *relooper::reloop(
             self.blocks
@@ -302,6 +310,7 @@ impl Cfg {
         }
     }
 }
+#[derive(Default, Clone)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
     pub catch: Catch,
@@ -316,7 +325,7 @@ pub enum Catch {
         k: Id<Block>,
     },
 }
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub enum Term {
     Return(Option<Expr>),
     Throw(Expr),

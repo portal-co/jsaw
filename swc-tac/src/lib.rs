@@ -1,31 +1,157 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::convert::Infallible;
+use std::default;
+use std::iter::{empty, once};
 
 use arena_traits::Arena as TArena;
 use id_arena::{Arena, Id};
 use lam::LAM;
-use swc_cfg::{Block, Catch, Cfg};
+use swc_cfg::{Block, Catch, Cfg, Func};
+use swc_common::pass::Either;
 use swc_ecma_ast::{
-    AssignOp, BinaryOp, Expr, Function, Ident, Lit, MemberExpr, Pat, SimpleAssignTarget, Stmt,
-    UnaryOp,
+    AssignOp, BinaryOp, Expr, Function, Lit, MemberExpr, Pat, SimpleAssignTarget, Stmt, UnaryOp,
 };
 
-pub mod lam;
+use swc_ecma_ast::Id as Ident;
 
+pub mod lam;
+pub mod rew;
+#[derive(Clone)]
+pub struct TFunc {
+    pub cfg: TCfg,
+    pub entry: Id<TBlock>,
+    pub params: Vec<Ident>,
+    pub is_generator: bool,
+    pub is_async: bool,
+}
+
+impl TryFrom<Func> for TFunc {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Func) -> Result<Self, Self::Error> {
+        let mut cfg = TCfg::default();
+        let entry = Trans {
+            map: BTreeMap::new(),
+        }
+        .trans(&value.cfg, &mut cfg, value.entry)?;
+        let params = value
+            .params
+            .iter()
+            .filter_map(|x| match &x.pat {
+                Pat::Ident(i) => Some(i.id.clone().into()),
+                _ => None,
+            })
+            .collect::<Vec<Ident>>();
+        Ok(Self {
+            cfg,
+            entry,
+            params,
+            is_generator: value.is_generator,
+            is_async: value.is_async,
+        })
+    }
+}
+impl TryFrom<Function> for TFunc {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Function) -> Result<Self, Self::Error> {
+        let a: Func = value.try_into()?;
+        return a.try_into();
+    }
+}
+#[derive(Default, Clone)]
 pub struct TCfg {
     pub blocks: Arena<TBlock>,
     pub regs: LAM<()>,
+    pub decls: BTreeSet<Ident>,
 }
+impl TCfg {
+    pub fn refs<'a>(&'a self) -> impl Iterator<Item = Ident> + 'a {
+        let a = self.blocks.iter().flat_map(|k| {
+            let i: Box<dyn Iterator<Item = Ident> + '_> = match &k.1.term {
+                TTerm::Return(a) => Box::new(a.iter().cloned()),
+                TTerm::Throw(b) => Box::new(Some(b.clone()).into_iter()),
+                TTerm::Jmp(id) => Box::new(std::iter::empty()),
+                TTerm::CondJmp {
+                    cond,
+                    if_true,
+                    if_false,
+                } => Box::new(once(cond.clone())),
+                TTerm::Switch { x, blocks, default } => {
+                    Box::new(once(x.clone()).chain(blocks.iter().map(|a| a.0.clone())))
+                }
+                TTerm::Default => Box::new(std::iter::empty()),
+            };
+            i.chain(k.1.stmts.iter().flat_map(|(a, b)| {
+                let a: Box<dyn Iterator<Item = Ident> + '_> = match a {
+                    LId::Id { id } => Box::new(once(id.clone())),
+                    LId::Member { obj, mem } => {
+                        Box::new(once(obj.clone()).chain(once(mem.clone())))
+                    }
+                };
+                let b: Box<dyn Iterator<Item = Ident> + '_> = match b {
+                    Item::Just { id } => Box::new(once(id.clone())),
+                    Item::Bin { left, right, op } => {
+                        Box::new(vec![left.clone(), right.clone()].into_iter())
+                    }
+                    Item::Un { arg, op } => Box::new(once(arg.clone())),
+                    Item::Mem { obj, mem } => Box::new(once(obj.clone()).chain(once(mem.clone()))),
+                    Item::Func { func } => Box::new(func.cfg.externs()),
+                    Item::Lit { lit } => Box::new(empty()),
+                    Item::Call { r#fn, args } => {
+                        Box::new(once(r#fn.clone()).chain(args.iter().cloned()))
+                    }
+                    Item::Obj { members } => Box::new(members.iter().flat_map(|(a, b)| {
+                        once(b.clone()).chain(
+                            match a {
+                                PropKey::Lit(i) => None,
+                                PropKey::Computed(i) => Some(i.clone()),
+                            }
+                            .into_iter(),
+                        )
+                    })),
+                    Item::Arr { members } => Box::new(members.iter().cloned()),
+                    Item::Yield { value, delegate } => Box::new(value.iter().cloned()),
+                    Item::Await { value } => Box::new(once(value.clone())),
+                    Item::Undef => Box::new(empty()),
+                };
+                a.chain(b)
+            }))
+        });
+        return a;
+    }
+    pub fn externs<'a>(&'a self) -> impl Iterator<Item = Ident> + 'a {
+        self.refs().filter(|a| !self.decls.contains(a))
+    }
+    pub fn update(&mut self) {
+        for x in self.blocks.iter() {
+            for k in x.1.stmts.iter() {
+                k.0.clone()
+                    .map(&mut |a| {
+                        self.regs[a] = ();
+                        Ok::<(), Infallible>(())
+                    })
+                    .unwrap();
+            }
+        }
+    }
+}
+#[derive(Clone, Default)]
 pub struct TBlock {
     pub stmts: Vec<(LId, Item)>,
     pub catch: TCatch,
     pub term: TTerm,
 }
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum TCatch {
+    #[default]
     Throw,
-    Jump { pat: Ident, k: Id<TBlock> },
+    Jump {
+        pat: Ident,
+        k: Id<TBlock>,
+    },
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub enum TTerm {
     Return(Option<Ident>),
     Throw(Ident),
@@ -43,18 +169,36 @@ pub enum TTerm {
     #[default]
     Default,
 }
+#[derive(Clone, Ord, PartialEq, PartialOrd, Eq)]
+pub enum PropKey<I = Ident> {
+    Lit(Ident),
+    Computed(I),
+}
+impl<I> PropKey<I> {
+    pub fn map<J: Ord, E>(self, f: &mut impl FnMut(I) -> Result<J, E>) -> Result<PropKey<J>, E> {
+        Ok(match self {
+            PropKey::Lit(l) => PropKey::Lit(l),
+            PropKey::Computed(x) => PropKey::Computed(f(x)?),
+        })
+    }
+}
 #[derive(Clone)]
 pub enum Item<I = Ident> {
     Just { id: I },
     Bin { left: I, right: I, op: BinaryOp },
     Un { arg: I, op: UnaryOp },
     Mem { obj: I, mem: I },
-    Func { func: Function },
+    Func { func: TFunc },
     Lit { lit: Lit },
     Call { r#fn: I, args: Vec<I> },
+    Obj { members: BTreeMap<PropKey<I>, I> },
+    Arr { members: Vec<I> },
+    Yield { value: Option<I>, delegate: bool },
+    Await { value: I },
+    Undef,
 }
 impl<I> Item<I> {
-    pub fn map<J, E>(self, f: &mut impl FnMut(I) -> Result<J, E>) -> Result<Item<J>, E> {
+    pub fn map<J: Ord, E>(self, f: &mut impl FnMut(I) -> Result<J, E>) -> Result<Item<J>, E> {
         Ok(match self {
             Item::Just { id } => Item::Just { id: f(id)? },
             Item::Bin { left, right, op } => Item::Bin {
@@ -73,6 +217,24 @@ impl<I> Item<I> {
                 r#fn: f(r#fn)?,
                 args: args.into_iter().map(f).collect::<Result<Vec<J>, E>>()?,
             },
+            Item::Obj { members } => Item::Obj {
+                members: members
+                    .into_iter()
+                    .map(|(a, b)| Ok((a.map(f)?, f(b)?)))
+                    .collect::<Result<_, E>>()?,
+            },
+            Item::Arr { members } => Item::Arr {
+                members: members.into_iter().map(f).collect::<Result<_, E>>()?,
+            },
+            Item::Yield { value, delegate } => Item::Yield {
+                value: match value {
+                    None => None,
+                    Some(a) => Some(f(a)?),
+                },
+                delegate: delegate,
+            },
+            Item::Await { value } => Item::Await { value: f(value)? },
+            Item::Undef => Item::Undef,
         })
     }
 }
@@ -112,7 +274,7 @@ impl Trans {
                     Pat::Ident(id) => {
                         let k = self.trans(i, o, *k)?;
                         o.blocks[t].catch = TCatch::Jump {
-                            pat: id.id.clone(),
+                            pat: id.id.clone().into(),
                             k,
                         };
                     }
@@ -191,12 +353,13 @@ impl Trans {
                 swc_ecma_ast::Decl::Fn(f) => {
                     o.blocks[t].stmts.push((
                         LId::Id {
-                            id: f.ident.clone(),
+                            id: f.ident.clone().into(),
                         },
                         Item::Func {
-                            func: f.function.as_ref().clone(),
+                            func: f.function.as_ref().clone().try_into()?,
                         },
                     ));
+                    o.decls.insert(f.ident.clone().into());
                     return Ok(t);
                 }
                 swc_ecma_ast::Decl::Var(var_decl) => {
@@ -207,9 +370,12 @@ impl Trans {
                                     let f;
                                     (f, t) = self.expr(i, o, b, t, e)?;
                                     o.blocks[t].stmts.push((
-                                        LId::Id { id: i2.id.clone() },
+                                        LId::Id {
+                                            id: i2.id.clone().into(),
+                                        },
                                         Item::Just { id: f },
                                     ));
+                                    o.decls.insert(i2.id.clone().into());
                                 }
                                 _ => anyhow::bail!("todo: {}:{}", file!(), line!()),
                             }
@@ -245,7 +411,7 @@ impl Trans {
             t,
             match &s.prop {
                 swc_ecma_ast::MemberProp::Ident(ident_name) => {
-                    e = Expr::Ident(Ident::new(
+                    e = Expr::Ident(swc_ecma_ast::Ident::new(
                         ident_name.sym.clone(),
                         ident_name.span,
                         Default::default(),
@@ -262,6 +428,7 @@ impl Trans {
         o.blocks[t]
             .stmts
             .push((LId::Id { id: v.clone() }, Item::Mem { obj, mem }));
+        o.decls.insert(v.clone());
         Ok((v, t))
     }
     pub fn expr(
@@ -273,7 +440,7 @@ impl Trans {
         s: &Expr,
     ) -> anyhow::Result<(Ident, Id<TBlock>)> {
         match s {
-            Expr::Ident(i) => Ok((i.clone(), t)),
+            Expr::Ident(i) => Ok((i.clone().into(), t)),
             Expr::Assign(a) => {
                 let mut right;
                 (right, t) = self.expr(i, o, b, t, &a.right)?;
@@ -285,12 +452,17 @@ impl Trans {
                                     None => Item::Just { id: right },
                                     Some(a) => Item::Bin {
                                         left: right,
-                                        right: i.id.clone(),
+                                        right: i.id.clone().into(),
                                         op: a,
                                     },
                                 };
-                                o.blocks[t].stmts.push((LId::Id { id: i.id.clone() }, item));
-                                right = i.id.clone();
+                                o.blocks[t].stmts.push((
+                                    LId::Id {
+                                        id: i.id.clone().into(),
+                                    },
+                                    item,
+                                ));
+                                right = i.id.clone().into();
                             }
                             SimpleAssignTarget::Member(m) => {
                                 let obj;
@@ -304,7 +476,7 @@ impl Trans {
                                     t,
                                     match &m.prop {
                                         swc_ecma_ast::MemberProp::Ident(ident_name) => {
-                                            e = Expr::Ident(Ident::new(
+                                            e = Expr::Ident(swc_ecma_ast::Ident::new(
                                                 ident_name.sym.clone(),
                                                 ident_name.span,
                                                 Default::default(),
@@ -348,6 +520,7 @@ impl Trans {
                                 o.blocks[t]
                                     .stmts
                                     .push((LId::Id { id: right.clone() }, Item::Mem { obj, mem }));
+                                o.decls.insert(right.clone());
                             }
                             _ => anyhow::bail!("todo: {}:{}", file!(), line!()),
                         }
@@ -374,9 +547,18 @@ impl Trans {
                         op: bin.op.clone(),
                     },
                 ));
+                o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
             }
             Expr::Unary(un) => {
+                if un.op == UnaryOp::Void {
+                    let tmp = o.regs.alloc(());
+                    o.blocks[t]
+                        .stmts
+                        .push((LId::Id { id: tmp.clone() }, Item::Undef));
+                    o.decls.insert(tmp.clone());
+                    return Ok((tmp, t));
+                }
                 let arg;
                 // let right;
                 (arg, t) = self.expr(i, o, b, t, &un.arg)?;
@@ -389,6 +571,7 @@ impl Trans {
                         op: un.op.clone(),
                     },
                 ));
+                o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
             }
             Expr::Member(m) => return self.member_expr(i, o, b, t, m),
@@ -397,19 +580,137 @@ impl Trans {
                 o.blocks[t]
                     .stmts
                     .push((LId::Id { id: tmp.clone() }, Item::Lit { lit: l.clone() }));
+                o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
             }
             Expr::Fn(f) => {
                 let tmp = match &f.ident {
-                    Some(a) => a.clone(),
+                    Some(a) => a.clone().into(),
                     None => o.regs.alloc(()),
                 };
                 o.blocks[t].stmts.push((
                     LId::Id { id: tmp.clone() },
                     Item::Func {
-                        func: f.function.as_ref().clone(),
+                        func: f.function.as_ref().clone().try_into()?,
                     },
                 ));
+                o.decls.insert(tmp.clone());
+                return Ok((tmp, t));
+            }
+            Expr::Array(arr) => {
+                let members = arr
+                    .elems
+                    .iter()
+                    .flat_map(|a| a.as_ref())
+                    .map(|x| {
+                        anyhow::Ok({
+                            let y;
+                            (y, t) = self.expr(i, o, b, t, &x.expr)?;
+                            y
+                        })
+                    })
+                    .collect::<anyhow::Result<_>>()?;
+                let tmp = o.regs.alloc(());
+                o.blocks[t]
+                    .stmts
+                    .push((LId::Id { id: tmp.clone() }, Item::Arr { members }));
+                o.decls.insert(tmp.clone());
+                return Ok((tmp, t));
+            }
+            Expr::Object(obj) => {
+                let members = obj
+                    .props
+                    .iter()
+                    .map(|a| {
+                        anyhow::Ok(match a {
+                            swc_ecma_ast::PropOrSpread::Spread(spread_element) => {
+                                anyhow::bail!("todo: {}:{}", file!(), line!())
+                            }
+                            swc_ecma_ast::PropOrSpread::Prop(prop) => match prop.as_ref() {
+                                swc_ecma_ast::Prop::Shorthand(ident) => {
+                                    Some((PropKey::Lit(ident.clone().into()), ident.clone().into()))
+                                }
+                                swc_ecma_ast::Prop::KeyValue(key_value_prop) => {
+                                    let v;
+                                    (v, t) = self.expr(i, o, b, t, &key_value_prop.value)?;
+                                    match &key_value_prop.key {
+                                        swc_ecma_ast::PropName::Ident(ident_name) => Some((
+                                            PropKey::Lit((
+                                                ident_name.sym.clone(),
+                                                Default::default(),
+                                            )),
+                                            v,
+                                        )),
+                                        swc_ecma_ast::PropName::Str(s) => Some((
+                                            PropKey::Lit((s.value.clone(), Default::default())),
+                                            v,
+                                        )),
+                                        swc_ecma_ast::PropName::Num(number) => {
+                                            anyhow::bail!("todo: {}:{}", file!(), line!())
+                                        }
+                                        swc_ecma_ast::PropName::Computed(computed_prop_name) => {
+                                            let w;
+                                            (w, t) = self.expr(i, o, b, t, s)?;
+                                            Some((PropKey::Computed(w), v))
+                                        }
+                                        swc_ecma_ast::PropName::BigInt(big_int) => {
+                                            anyhow::bail!("todo: {}:{}", file!(), line!())
+                                        }
+                                    }
+                                }
+                                swc_ecma_ast::Prop::Assign(assign_prop) => {
+                                    anyhow::bail!("todo: {}:{}", file!(), line!())
+                                }
+                                swc_ecma_ast::Prop::Getter(getter_prop) => {
+                                    anyhow::bail!("todo: {}:{}", file!(), line!())
+                                }
+                                swc_ecma_ast::Prop::Setter(setter_prop) => {
+                                    anyhow::bail!("todo: {}:{}", file!(), line!())
+                                }
+                                swc_ecma_ast::Prop::Method(method_prop) => {
+                                    anyhow::bail!("todo: {}:{}", file!(), line!())
+                                }
+                            },
+                        })
+                    })
+                    .filter_map(|a| match a {
+                        Ok(Some(a)) => Some(Ok(a)),
+                        Ok(None) => None,
+                        Err(e) => Some(Err(e)),
+                    })
+                    .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+                let tmp = o.regs.alloc(());
+                o.blocks[t]
+                    .stmts
+                    .push((LId::Id { id: tmp.clone() }, Item::Obj { members }));
+                o.decls.insert(tmp.clone());
+                return Ok((tmp, t));
+            }
+            Expr::Await(x) => {
+                let (a, t) = self.expr(i, o, b, t, &x.arg)?;
+                o.blocks[t]
+                    .stmts
+                    .push((LId::Id { id: a.clone() }, Item::Await { value: a.clone() }));
+                return Ok((a, t));
+            }
+            Expr::Yield(y) => {
+                let y2 = match &y.arg {
+                    None => None,
+                    Some(a) => {
+                        let b2;
+                        (b2, t) = self.expr(i, o, b, t, a.as_ref())?;
+                        Some(b2)
+                    }
+                };
+                let tmp = o.regs.alloc(());
+                o.blocks[t].stmts.push((
+                    LId::Id { id: tmp.clone() },
+                    Item::Yield {
+                        value: y2,
+                        delegate: y.delegate,
+                    },
+                ));
+                o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
             }
             _ => anyhow::bail!("todo: {}:{}", file!(), line!()),

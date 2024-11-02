@@ -1,6 +1,7 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
     convert::Infallible,
+    default,
     iter::once,
 };
 
@@ -8,13 +9,71 @@ use anyhow::Context;
 use id_arena::{Arena, Id};
 use ssa_traits::Value;
 use swc_cfg::Catch;
-use swc_ecma_ast::Ident;
-use swc_tac::{Item, LId, TBlock, TCfg};
+use swc_common::Span;
+use swc_ecma_ast::{Id as Ident, Lit, Null};
+use swc_tac::{Item, LId, TBlock, TCfg, TFunc};
+pub mod rew;
+pub struct SFunc {
+    pub cfg: SwcFunc,
+    pub entry: Id<SBlock>,
+    pub is_generator: bool,
+    pub is_async: bool,
+}
+impl TryFrom<TFunc> for SFunc {
+    type Error = anyhow::Error;
 
+    fn try_from(value: TFunc) -> Result<Self, Self::Error> {
+        let mut decls = value.cfg.decls.clone();
+        let mut d = BTreeSet::new();
+        for e in value.cfg.externs().collect::<BTreeSet<_>>() {
+            decls.remove(&e);
+            d.insert(e);
+        }
+        let mut cfg = SwcFunc {
+            blocks: Default::default(),
+            values: Default::default(),
+            decls: d,
+        };
+        let mut trans = Trans {
+            map: BTreeMap::new(),
+            all: decls.clone(),
+        };
+        let entry = trans.trans(&value.cfg, &mut cfg, value.entry)?;
+        let entry2 = cfg.blocks.alloc(Default::default());
+        let params = value
+            .params
+            .iter()
+            .cloned()
+            .map(|a| (a, cfg.add_blockparam(entry2)))
+            .collect::<BTreeMap<_, _>>();
+        let undef = cfg.values.alloc(SValue::Item(Item::Undef));
+        let target = STarget {
+            block: entry,
+            args: decls
+                .iter()
+                .cloned()
+                .map(|a| match params.get(&a) {
+                    Some(v) => *v,
+                    None => undef,
+                })
+                .collect(),
+        };
+        cfg.blocks[entry2].term = STerm::Jmp(target);
+
+        Ok(Self {
+            cfg,
+            entry: entry2,
+            is_generator: value.is_generator,
+            is_async: value.is_async,
+        })
+    }
+}
 pub struct SwcFunc {
     pub blocks: Arena<SBlock>,
     pub values: Arena<SValue>,
+    pub decls: BTreeSet<Ident>,
 }
+#[derive(Default)]
 pub struct SBlock {
     pub params: Vec<(Id<SValue>, ())>,
     pub stmts: Vec<Id<SValue>>,
@@ -38,10 +97,15 @@ pub enum SValue {
         val: Id<SValue>,
     },
 }
+#[derive(Default)]
 pub enum SCatch {
+    #[default]
     Throw,
-    Just { target: STarget },
+    Just {
+        target: STarget,
+    },
 }
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct STarget {
     pub block: Id<SBlock>,
     pub args: Vec<Id<SValue>>,
@@ -78,13 +142,13 @@ impl SwcFunc {
 }
 pub struct Trans {
     pub map: BTreeMap<Id<TBlock>, Id<SBlock>>,
-    pub all: HashSet<Ident>,
+    pub all: BTreeSet<Ident>,
 }
 impl Trans {
     pub fn apply_shim(
         &self,
         o: &mut SwcFunc,
-        state: &HashMap<Ident, Id<SValue>>,
+        state: &BTreeMap<Ident, Id<SValue>>,
         s: &Option<(Id<SBlock>, Vec<Ident>)>,
         x: Id<SBlock>,
     ) {
@@ -102,11 +166,15 @@ impl Trans {
     }
     pub fn load(
         &self,
-        state: &HashMap<Ident, Id<SValue>>,
+        state: &BTreeMap<Ident, Id<SValue>>,
         o: &mut SwcFunc,
         t: Id<SBlock>,
         a: Ident,
+        cache: &BTreeMap<Ident, Id<SValue>>,
     ) -> Id<SValue> {
+        if let Some(k) = cache.get(&a) {
+            return *k;
+        }
         match state.get(&a).cloned() {
             Some(b) => b,
             None => {
@@ -149,7 +217,7 @@ impl Trans {
                         .iter()
                         .cloned()
                         .map(|a2| (a2, o.add_blockparam(a)))
-                        .collect::<HashMap<_, _>>();
+                        .collect::<BTreeMap<_, _>>();
                     let p = self
                         .all
                         .iter()
@@ -168,12 +236,13 @@ impl Trans {
                 .all
                 .iter()
                 .map(|a| (a.clone(), o.add_blockparam(t)))
-                .collect::<HashMap<_, _>>();
+                .collect::<BTreeMap<_, _>>();
             self.apply_shim(o, &state, &shim, t);
+            let mut cache = BTreeMap::new();
             for (a, b) in i.blocks[k].stmts.iter() {
                 let b = b
                     .clone()
-                    .map::<_, Infallible>(&mut |a| Ok(self.load(&state, o, t, a)))
+                    .map::<_, Infallible>(&mut |a| Ok(self.load(&state, o, t, a, &cache)))
                     .unwrap();
                 let b = o.values.alloc(SValue::Item(b));
                 o.blocks[t].stmts.push(b);
@@ -195,6 +264,7 @@ impl Trans {
                             t = u;
                         }
                         None => {
+                            cache.insert(id.clone(), b);
                             let c = o.values.alloc(SValue::StoreId {
                                 target: id.clone(),
                                 val: b,
@@ -206,7 +276,7 @@ impl Trans {
                         // let obj = self.load(&state, o, t, obj.clone());
                         // let mem = self.load(&state, o, t, mem.clone());
                         let c = a
-                            .map::<_, Infallible>(&mut |a| Ok(self.load(&state, o, t, a)))
+                            .map::<_, Infallible>(&mut |a| Ok(self.load(&state, o, t, a, &cache)))
                             .unwrap();
                         let c = o.values.alloc(SValue::Assign { target: c, val: b });
                         o.blocks[t].stmts.push(c);
@@ -222,10 +292,10 @@ impl Trans {
             let term = match &i.blocks[k].term {
                 swc_tac::TTerm::Return(ident) => match ident.as_ref() {
                     None => STerm::Return(None),
-                    Some(a) => STerm::Return(Some(self.load(&state, o, t, a.clone()))),
+                    Some(a) => STerm::Return(Some(self.load(&state, o, t, a.clone(), &cache))),
                 },
                 swc_tac::TTerm::Throw(ident) => {
-                    STerm::Throw(self.load(&state, o, t, ident.clone()))
+                    STerm::Throw(self.load(&state, o, t, ident.clone(), &cache))
                 }
                 swc_tac::TTerm::Jmp(id) => {
                     let id = self.trans(i, o, *id)?;
@@ -249,7 +319,7 @@ impl Trans {
                         block: if_false,
                         args: params,
                     };
-                    let cond = self.load(&state, o, t, cond.clone());
+                    let cond = self.load(&state, o, t, cond.clone(), &cache);
                     STerm::CondJmp {
                         cond,
                         if_true,
@@ -257,12 +327,12 @@ impl Trans {
                     }
                 }
                 swc_tac::TTerm::Switch { x, blocks, default } => {
-                    let x = self.load(&state, o, t, x.clone());
+                    let x = self.load(&state, o, t, x.clone(), &cache);
                     let blocks = blocks
                         .iter()
                         .map(|(a, b)| {
                             let c = self.trans(i, o, *b)?;
-                            let d = self.load(&state, o, t, a.clone());
+                            let d = self.load(&state, o, t, a.clone(), &cache);
                             Ok((
                                 d,
                                 STarget {

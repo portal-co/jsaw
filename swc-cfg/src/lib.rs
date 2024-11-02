@@ -11,11 +11,59 @@ use swc_atoms::Atom;
 use swc_common::{Span, Spanned, SyntaxContext};
 use swc_ecma_ast::{
     ArrayLit, AssignExpr, BindingIdent, BlockStmt, Bool, BreakStmt, CallExpr, CatchClause,
-    ContinueStmt, Decl, DoWhileStmt, Expr, ExprOrSpread, ExprStmt, Ident, IdentName, IfStmt,
-    LabeledStmt, Lit, MemberExpr, Pat, ReturnStmt, Stmt, Str, SwitchCase, SwitchStmt, ThrowStmt,
-    TryStmt, WhileStmt,
+    ContinueStmt, Decl, DoWhileStmt, Expr, ExprOrSpread, ExprStmt, Function, Ident, IdentName,
+    IfStmt, LabeledStmt, Lit, MemberExpr, Param, Pat, ReturnStmt, Stmt, Str, SwitchCase,
+    SwitchStmt, ThrowStmt, TryStmt, WhileStmt,
 };
 pub mod recfg;
+#[derive(Clone)]
+pub struct Func {
+    pub cfg: Cfg,
+    pub entry: Id<Block>,
+    pub params: Vec<Param>,
+    pub is_generator: bool,
+    pub is_async: bool,
+}
+impl TryFrom<Function> for Func {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Function) -> Result<Self, Self::Error> {
+        let mut cfg = Cfg::default();
+        let entry = cfg.blocks.alloc(Default::default());
+        let exit = Ctx::default().transform_all(
+            &mut cfg,
+            value.body.map(|a| a.stmts).unwrap_or_else(Vec::new),
+            entry,
+        )?;
+        cfg.blocks[exit].term = Term::Return(None);
+
+        return Ok(Self {
+            cfg,
+            entry,
+            params: value.params,
+            is_generator: value.is_generator,
+            is_async: value.is_async,
+        });
+    }
+}
+impl Into<Function> for Func {
+    fn into(self) -> Function {
+        let k = Cfg::reloop_block(&self.cfg, self.entry);
+        let x = Cfg::process_block(&self.cfg, &k, Span::dummy_with_cmt(), Default::default());
+        return Function {
+            params: self.params,
+            decorators: vec![],
+            span: Span::dummy_with_cmt(),
+            ctxt: Default::default(),
+            body: Some(BlockStmt { span: Span::dummy_with_cmt(), ctxt: Default::default(), stmts: x }),
+            is_generator: self.is_generator,
+            is_async: self.is_async,
+            type_params: None,
+            return_type: None,
+        };
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Cfg {
     pub blocks: Arena<Block>,

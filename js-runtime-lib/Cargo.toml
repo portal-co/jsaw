@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 anyhow.workspace = true
 boxing = "0.1.2"
+dumpster = "1.0.0"

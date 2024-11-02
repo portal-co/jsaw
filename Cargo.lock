@@ -34,9 +34,9 @@ checksum = "86fdf8605db99b54d3cd748a44c6d04df638eb5dafb219b135d0149bd0db01f6"
 
 [[package]]
 name = "arena-traits"
-version = "0.1.4"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "158450757384a307a3c731ebab356e21314787505357a1287570da2352cf40bc"
+checksum = "324e412f1771dc6c84a2a53e5c19cf92bd7ea05b5eeddb3f80c18e3473374ab4"
 dependencies = [
  "id-arena",
 ]
@@ -97,6 +97,16 @@ name = "cfg-if"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
+
+[[package]]
+name = "cfg-traits"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a3dfb49182ea18b9cc93b5d43cf340b519af6ca40b90fd5548c46471e19e9fb"
+dependencies = [
+ "arena-traits",
+ "either",
+]
 
 [[package]]
 name = "dumpster"
@@ -583,12 +593,13 @@ checksum = "3b9b39299b249ad65f3b7e96443bad61c02ca5cd3589f46cb6d610a0fd6c0d6a"
 
 [[package]]
 name = "ssa-traits"
-version = "0.1.4"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39ff6549f5343c263987205cdf0cb5a0a6b567a0c66db6c53e3f19d1f6be0840"
+checksum = "36d84c7d6066cd100eb6c1d2c7790c9f67db0f41a7d36a4249379e06f11780f2"
 dependencies = [
  "anyhow",
  "arena-traits",
+ "cfg-traits",
  "either",
 ]
 
@@ -651,6 +662,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arena-traits",
+ "cfg-traits",
  "id-arena",
  "ssa-traits",
  "swc-cfg",

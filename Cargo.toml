@@ -4,11 +4,12 @@ resolver="2"
 
 [workspace.dependencies]
 anyhow = "1.0.87"
-arena-traits = {version="0.1.4",features=["id-arena"]}
 bimap = "0.6.3"
 id-arena = "2.2.1"
-ssa-impls = "0.1.4"
-ssa-traits = "0.1.4"
+arena-traits = {version="0.2.0",features=["id-arena"]}
+ssa-traits = "0.2.0"
+cfg-traits = "0.2.0"
+ssa-impls = "0.2.0"
 swc_atoms = "2.0.0"
 swc_common = "1.0.0"
 swc_ecma_ast = "1.0.0"

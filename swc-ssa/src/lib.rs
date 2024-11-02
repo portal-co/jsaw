@@ -13,6 +13,7 @@ use swc_common::Span;
 use swc_ecma_ast::{Id as Ident, Lit, Null};
 use swc_tac::{Item, LId, TBlock, TCfg, TFunc};
 pub mod rew;
+pub mod impls;
 pub struct SFunc {
     pub cfg: SwcFunc,
     pub entry: Id<SBlock>,
@@ -58,7 +59,7 @@ impl TryFrom<TFunc> for SFunc {
                 })
                 .collect(),
         };
-        cfg.blocks[entry2].term = STerm::Jmp(target);
+        cfg.blocks[entry2].postcedent.term = STerm::Jmp(target);
 
         Ok(Self {
             cfg,
@@ -77,6 +78,10 @@ pub struct SwcFunc {
 pub struct SBlock {
     pub params: Vec<(Id<SValue>, ())>,
     pub stmts: Vec<Id<SValue>>,
+    pub postcedent: SPostcedent,
+}
+#[derive(Default)]
+pub struct SPostcedent{
     pub term: STerm,
     pub catch: SCatch,
 }
@@ -122,7 +127,7 @@ pub enum STerm {
     },
     Switch {
         x: Id<SValue>,
-        blocks: BTreeMap<Id<SValue>, STarget>,
+        blocks: Vec<(Id<SValue>,STarget)>,
         default: STarget,
     },
     #[default]
@@ -153,7 +158,7 @@ impl Trans {
         x: Id<SBlock>,
     ) {
         let Some((a, b)) = s else {
-            o.blocks[x].catch = SCatch::Throw;
+            o.blocks[x].postcedent.catch = SCatch::Throw;
             return;
         };
         let k = SCatch::Just {
@@ -162,7 +167,7 @@ impl Trans {
                 args: b.iter().filter_map(|x| state.get(x)).cloned().collect(),
             },
         };
-        o.blocks[x].catch = k;
+        o.blocks[x].postcedent.catch = k;
     }
     pub fn load(
         &self,
@@ -197,8 +202,7 @@ impl Trans {
             let mut t = o.blocks.alloc(SBlock {
                 params: vec![],
                 stmts: vec![],
-                term: STerm::Default,
-                catch: SCatch::Throw,
+                postcedent: SPostcedent::default()
             });
             self.map.insert(k, t);
             let shim: Option<(Id<SBlock>, Vec<Ident>)> = match &i.blocks[k].catch {
@@ -207,8 +211,7 @@ impl Trans {
                     let a = o.blocks.alloc(SBlock {
                         params: vec![],
                         stmts: vec![],
-                        term: STerm::Default,
-                        catch: SCatch::Throw,
+                        postcedent: SPostcedent::default(),
                     });
                     let mut state2 = once(pat.clone())
                         .chain(self.all.iter().filter(|a| *a != pat).cloned())
@@ -228,7 +231,7 @@ impl Trans {
                         block: self.trans(i, o, *k)?,
                         args: p,
                     });
-                    o.blocks[a].term = t;
+                    o.blocks[a].postcedent.term = t;
                     Some((a, state2))
                 }
             };
@@ -253,11 +256,10 @@ impl Trans {
                             let u = o.blocks.alloc(SBlock {
                                 params: vec![],
                                 stmts: vec![],
-                                term: STerm::Default,
-                                catch: SCatch::Throw,
+                                postcedent: Default::default()
                             });
                             self.apply_shim(o, &state, &shim, u);
-                            o.blocks[t].term = STerm::Jmp(STarget {
+                            o.blocks[t].postcedent.term = STerm::Jmp(STarget {
                                 block: u,
                                 args: vec![],
                             });
@@ -341,7 +343,7 @@ impl Trans {
                                 },
                             ))
                         })
-                        .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+                        .collect::<anyhow::Result<Vec<_>>>()?;
                     let default = self.trans(i, o, *default)?;
                     let default = STarget {
                         block: default,
@@ -351,7 +353,7 @@ impl Trans {
                 }
                 swc_tac::TTerm::Default => STerm::Default,
             };
-            o.blocks[t].term = term;
+            o.blocks[t].postcedent.term = term;
         }
     }
 }

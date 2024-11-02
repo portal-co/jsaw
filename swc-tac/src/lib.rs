@@ -3,7 +3,7 @@ use std::convert::Infallible;
 use std::default;
 use std::iter::{empty, once};
 
-use arena_traits::Arena as TArena;
+use arena_traits::{Arena as TArena, IndexAlloc};
 use id_arena::{Arena, Id};
 use lam::LAM;
 use swc_cfg::{Block, Catch, Cfg, Func};
@@ -191,7 +191,7 @@ pub enum Item<I = Ident> {
     Func { func: TFunc },
     Lit { lit: Lit },
     Call { r#fn: I, args: Vec<I> },
-    Obj { members: BTreeMap<PropKey<I>, I> },
+    Obj { members: Vec<(PropKey<I>,I)> },
     Arr { members: Vec<I> },
     Yield { value: Option<I>, delegate: bool },
     Await { value: I },
@@ -678,7 +678,7 @@ impl Trans {
                         Ok(None) => None,
                         Err(e) => Some(Err(e)),
                     })
-                    .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+                    .collect::<anyhow::Result<Vec<_>>>()?;
                 let tmp = o.regs.alloc(());
                 o.blocks[t]
                     .stmts

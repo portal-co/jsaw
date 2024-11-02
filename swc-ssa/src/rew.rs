@@ -51,7 +51,7 @@ impl Rew {
             self.blocks.insert(k.clone(), k2);
             match &k {
                 BlockEntry::Block(id) => {
-                    let catch = match &a.cfg.blocks[*id].catch {
+                    let catch = match &a.cfg.blocks[*id].postcedent.catch {
                         crate::SCatch::Throw => TCatch::Throw,
                         crate::SCatch::Just { target } => {
                             let error = (Atom::new("$error"), Default::default());
@@ -113,7 +113,7 @@ impl Rew {
                             }
                         }
                     }
-                    let term = match &a.cfg.blocks[*id].term {
+                    let term = match &a.cfg.blocks[*id].postcedent.term {
                         crate::STerm::Throw(id) => swc_tac::TTerm::Throw(mangle_value(a, *id)),
                         crate::STerm::Return(id) => {
                             swc_tac::TTerm::Return(id.clone().map(|v| mangle_value(a, v)))

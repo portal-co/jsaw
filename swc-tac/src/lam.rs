@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use arena_traits::Arena;
+use arena_traits::{Arena, IndexAlloc, IndexIter};
 use swc_atoms::Atom;
 use swc_common::{Mark, Span, SyntaxContext};
 use swc_ecma_ast::{Id, Ident};
@@ -52,7 +52,13 @@ impl<T: Default> IndexMut<Id> for LAM<T> {
         self.map.entry(index).or_insert(T::default())
     }
 }
-impl<T: Default> Arena<Id> for LAM<T> {
+impl<T: Default> IndexIter<Id> for LAM<T> {
+
+    fn iter<'a>(&'a self) -> Box<(dyn Iterator<Item = Id> + 'a)> {
+        Box::new(self.map.keys().cloned())
+    }
+}
+impl<T: Default> IndexAlloc<Id> for LAM<T>{
     fn alloc(&mut self, a: Self::Output) -> Id {
         let len = self.map.len();
         let root = (
@@ -61,9 +67,5 @@ impl<T: Default> Arena<Id> for LAM<T> {
         );
         self[root.clone()] = a;
         return root;
-    }
-
-    fn iter(&self) -> impl Iterator<Item = Id> {
-        self.map.keys().cloned()
     }
 }

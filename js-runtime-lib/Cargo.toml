@@ -1,7 +1,10 @@
 [package]
-name = "js-runtime-lib"
+name = "portal-swc-js-runtime-lib"
 version = "0.1.0"
 edition = "2021"
+
+[lib]
+name = "js_runtime_lib"
 
 [dependencies]
 anyhow.workspace = true

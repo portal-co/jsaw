@@ -1,9 +1,10 @@
 [package]
-name = "swc-tac"
+name = "portal-jsc-swc-tac"
 version = "0.1.0"
 edition = "2021"
 
-
+[lib]
+name = "swc_tac"
 
 
 [dependencies]
@@ -11,7 +12,7 @@ anyhow.workspace = true
 arena-traits.workspace = true
 either = "1.13.0"
 id-arena.workspace = true
-swc-cfg = { version = "0.1.0", path = "../swc-cfg" }
+portal-jsc-swc-cfg = { version = "0.1.0", path = "../swc-cfg" }
 swc_atoms.workspace = true
 swc_common.workspace = true
 swc_ecma_ast.workspace = true

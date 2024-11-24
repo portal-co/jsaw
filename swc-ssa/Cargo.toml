@@ -1,7 +1,9 @@
 [package]
-name = "swc-ssa"
+name = "portal-jsc-swc-ssa"
 version = "0.1.0"
 edition = "2021"
+[lib]
+name = "swc_ssa"
 
 [dependencies]
 anyhow.workspace = true
@@ -9,8 +11,8 @@ arena-traits.workspace = true
 cfg-traits.workspace = true
 id-arena.workspace = true
 ssa-traits.workspace = true
-swc-cfg = { version = "0.1.0", path = "../swc-cfg" }
-swc-tac = { version = "0.1.0", path = "../swc-tac" }
+portal-jsc-swc-cfg = { version = "0.1.0", path = "../swc-cfg" }
+portal-jsc-swc-tac = { version = "0.1.0", path = "../swc-tac" }
 swc_atoms.workspace = true
 swc_common.workspace = true
 swc_ecma_ast.workspace = true

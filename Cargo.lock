@@ -273,15 +273,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "js-runtime-lib"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "boxing",
- "dumpster",
-]
-
-[[package]]
 name = "libc"
 version = "0.2.159"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -434,6 +425,87 @@ name = "pin-project-lite"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bda66fc9667c18cb2758a2ac84d1167245054bcf85d5d1aaa6923f45801bdd02"
+
+[[package]]
+name = "portal-jsc-swc-cfg"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cfg-traits",
+ "id-arena",
+ "relooper",
+ "ssa-impls",
+ "ssa-reloop",
+ "swc_atoms",
+ "swc_common 3.0.0",
+ "swc_ecma_ast 3.0.0",
+ "swc_ecma_utils",
+ "swc_ecma_visit 3.0.0",
+]
+
+[[package]]
+name = "portal-jsc-swc-emit-rust"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arena-traits",
+ "id-arena",
+ "portal-jsc-swc-cfg",
+ "portal-jsc-swc-tac",
+ "proc-macro2",
+ "quasiquote",
+ "quote",
+ "ssa-traits",
+ "swc_atoms",
+ "swc_common 3.0.0",
+ "swc_ecma_ast 3.0.0",
+ "swc_ecma_utils",
+ "swc_ecma_visit 3.0.0",
+ "syn 2.0.82",
+]
+
+[[package]]
+name = "portal-jsc-swc-ssa"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arena-traits",
+ "cfg-traits",
+ "id-arena",
+ "portal-jsc-swc-cfg",
+ "portal-jsc-swc-tac",
+ "ssa-traits",
+ "swc_atoms",
+ "swc_common 3.0.0",
+ "swc_ecma_ast 3.0.0",
+ "swc_ecma_utils",
+ "swc_ecma_visit 3.0.0",
+]
+
+[[package]]
+name = "portal-jsc-swc-tac"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arena-traits",
+ "either",
+ "id-arena",
+ "portal-jsc-swc-cfg",
+ "swc_atoms",
+ "swc_common 3.0.0",
+ "swc_ecma_ast 3.0.0",
+ "swc_ecma_utils",
+ "swc_ecma_visit 3.0.0",
+]
+
+[[package]]
+name = "portal-swc-js-runtime-lib"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boxing",
+ "dumpster",
+]
 
 [[package]]
 name = "proc-macro2"
@@ -643,78 +715,6 @@ dependencies = [
  "quote",
  "swc_macros_common",
  "syn 2.0.82",
-]
-
-[[package]]
-name = "swc-cfg"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cfg-traits",
- "id-arena",
- "relooper",
- "ssa-impls",
- "ssa-reloop",
- "swc_atoms",
- "swc_common 3.0.0",
- "swc_ecma_ast 3.0.0",
- "swc_ecma_utils",
- "swc_ecma_visit 3.0.0",
-]
-
-[[package]]
-name = "swc-emit-rust"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arena-traits",
- "id-arena",
- "proc-macro2",
- "quasiquote",
- "quote",
- "ssa-traits",
- "swc-cfg",
- "swc-tac",
- "swc_atoms",
- "swc_common 3.0.0",
- "swc_ecma_ast 3.0.0",
- "swc_ecma_utils",
- "swc_ecma_visit 3.0.0",
- "syn 2.0.82",
-]
-
-[[package]]
-name = "swc-ssa"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arena-traits",
- "cfg-traits",
- "id-arena",
- "ssa-traits",
- "swc-cfg",
- "swc-tac",
- "swc_atoms",
- "swc_common 3.0.0",
- "swc_ecma_ast 3.0.0",
- "swc_ecma_utils",
- "swc_ecma_visit 3.0.0",
-]
-
-[[package]]
-name = "swc-tac"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arena-traits",
- "either",
- "id-arena",
- "swc-cfg",
- "swc_atoms",
- "swc_common 3.0.0",
- "swc_ecma_ast 3.0.0",
- "swc_ecma_utils",
- "swc_ecma_visit 3.0.0",
 ]
 
 [[package]]

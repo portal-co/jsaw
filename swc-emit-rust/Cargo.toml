@@ -1,7 +1,10 @@
 [package]
-name = "swc-emit-rust"
+name = "portal-jsc-swc-emit-rust"
 version = "0.1.0"
 edition = "2021"
+
+[lib]
+name = "swc_emit_rust"
 
 [dependencies]
 anyhow.workspace = true
@@ -13,8 +16,8 @@ quote.workspace = true
 
 
 ssa-traits.workspace = true
-swc-cfg = { version = "0.1.0", path = "../swc-cfg" }
-swc-tac = { version = "0.1.0", path = "../swc-tac" }
+portal-jsc-swc-cfg = { version = "0.1.0", path = "../swc-cfg" }
+portal-jsc-swc-tac = { version = "0.1.0", path = "../swc-tac" }
 swc_atoms.workspace = true
 swc_common.workspace = true
 swc_ecma_ast.workspace = true

@@ -1,7 +1,10 @@
 [package]
-name = "swc-cfg"
+name = "portal-jsc-swc-cfg"
 version = "0.1.0"
 edition = "2021"
+
+[lib]
+name = "swc_cfg"
 
 [dependencies]
 anyhow.workspace = true

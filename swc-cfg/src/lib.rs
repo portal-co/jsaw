@@ -35,7 +35,7 @@ impl TryFrom<Function> for Func {
             value.body.map(|a| a.stmts).unwrap_or_else(Vec::new),
             entry,
         )?;
-        cfg.blocks[exit].term = Term::Return(None);
+        cfg.blocks[exit].end.term = Term::Return(None);
 
         return Ok(Self {
             cfg,
@@ -48,14 +48,18 @@ impl TryFrom<Function> for Func {
 }
 impl Into<Function> for Func {
     fn into(self) -> Function {
-        let k = Cfg::reloop_block(&self.cfg, self.entry);
+        let k = ssa_reloop::go(&self, self.entry);
         let x = Cfg::process_block(&self.cfg, &k, Span::dummy_with_cmt(), Default::default());
         return Function {
             params: self.params,
             decorators: vec![],
             span: Span::dummy_with_cmt(),
             ctxt: Default::default(),
-            body: Some(BlockStmt { span: Span::dummy_with_cmt(), ctxt: Default::default(), stmts: x }),
+            body: Some(BlockStmt {
+                span: Span::dummy_with_cmt(),
+                ctxt: Default::default(),
+                stmts: x,
+            }),
             is_generator: self.is_generator,
             is_async: self.is_async,
             type_params: None,
@@ -76,44 +80,44 @@ impl Cfg {
         };
         return (res, entry);
     }
-    pub fn reloop_block(&self, entry: Id<Block>) -> ShapedBlock<Id<Block>> {
-        return *relooper::reloop(
-            self.blocks
-                .iter()
-                .map(|(a, k)| {
-                    (
-                        a,
-                        match &k.catch {
-                            Catch::Throw => None,
-                            Catch::Jump { pat, k } => Some(*k),
-                        }
-                        .into_iter()
-                        .chain(
-                            match &k.term {
-                                Term::Return(expr) => vec![],
-                                Term::Throw(expr) => vec![],
-                                Term::Jmp(id) => vec![*id],
-                                Term::CondJmp {
-                                    cond,
-                                    if_true,
-                                    if_false,
-                                } => vec![*if_true, *if_false],
-                                Term::Switch { x, blocks, default } => {
-                                    blocks.values().cloned().chain(once(*default)).collect()
-                                }
-                                Term::Default => vec![],
-                            }
-                            .into_iter(),
-                        )
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .collect(),
-                    )
-                })
-                .collect(),
-            entry,
-        );
-    }
+    // pub fn reloop_block(&self, entry: Id<Block>) -> ShapedBlock<Id<Block>> {
+    //     return *relooper::reloop(
+    //         self.blocks
+    //             .iter()
+    //             .map(|(a, k)| {
+    //                 (
+    //                     a,
+    //                     match &k.end.catch {
+    //                         Catch::Throw => None,
+    //                         Catch::Jump { pat, k } => Some(*k),
+    //                     }
+    //                     .into_iter()
+    //                     .chain(
+    //                         match &k.end.term {
+    //                             Term::Return(expr) => vec![],
+    //                             Term::Throw(expr) => vec![],
+    //                             Term::Jmp(id) => vec![*id],
+    //                             Term::CondJmp {
+    //                                 cond,
+    //                                 if_true,
+    //                                 if_false,
+    //                             } => vec![*if_true, *if_false],
+    //                             Term::Switch { x, blocks, default } => {
+    //                                 blocks.values().cloned().chain(once(*default)).collect()
+    //                             }
+    //                             Term::Default => vec![],
+    //                         }
+    //                         .into_iter(),
+    //                     )
+    //                     .collect::<BTreeSet<_>>()
+    //                     .into_iter()
+    //                     .collect(),
+    //                 )
+    //             })
+    //             .collect(),
+    //         entry,
+    //     );
+    // }
     pub fn process_block(
         &self,
         k: &ShapedBlock<Id<Block>>,
@@ -176,7 +180,7 @@ impl Cfg {
                 };
                 let l = simple_block.label;
                 let body = self.blocks[l].stmts.iter().cloned().collect::<Vec<_>>();
-                let mut body = match &self.blocks[l].catch {
+                let mut body = match &self.blocks[l].end.catch {
                     Catch::Throw => body,
                     Catch::Jump { pat, k } => {
                         let id = Ident::new_private(Atom::new("caught"), span);
@@ -211,7 +215,7 @@ impl Cfg {
                         }))]
                     }
                 };
-                match &self.blocks[l].term {
+                match &self.blocks[l].end.term {
                     Term::Return(expr) => body.push(Stmt::Return(ReturnStmt {
                         span,
                         arg: expr.as_ref().cloned().map(Box::new),
@@ -358,9 +362,136 @@ impl Cfg {
         }
     }
 }
+
+impl cfg_traits::Func for Func {
+    type Block = Id<Block>;
+
+    type Blocks = Arena<Block>;
+
+    fn blocks(&self) -> &Self::Blocks {
+        &self.cfg.blocks
+    }
+
+    fn blocks_mut(&mut self) -> &mut Self::Blocks {
+        &mut self.cfg.blocks
+    }
+
+    fn entry(&self) -> Self::Block {
+        self.entry
+    }
+}
+
+impl cfg_traits::Block<Func> for Block {
+    type Terminator = End;
+
+    fn term(&self) -> &Self::Terminator {
+        &self.end
+    }
+
+    fn term_mut(&mut self) -> &mut Self::Terminator {
+        &mut self.end
+    }
+}
+
+impl cfg_traits::Term<Func> for End {
+    type Target = Id<Block>;
+
+    fn targets<'a>(&'a self) -> Box<dyn Iterator<Item = &'a Self::Target> + 'a>
+    where
+        Func: 'a,
+    {
+        Box::new(
+            match &self.catch {
+                Catch::Throw => None,
+                Catch::Jump { pat, k } => Some(k),
+            }
+            .into_iter()
+            .chain(
+                match &self.term {
+                    Term::Return(expr) => vec![],
+                    Term::Throw(expr) => vec![],
+                    Term::Jmp(id) => vec![id],
+                    Term::CondJmp {
+                        cond,
+                        if_true,
+                        if_false,
+                    } => vec![if_true, if_false],
+                    Term::Switch { x, blocks, default } => {
+                        blocks.values().chain(once(default)).collect()
+                    }
+                    Term::Default => vec![],
+                }
+                .into_iter(),
+            ),
+        )
+    }
+
+    fn targets_mut<'a>(&'a mut self) -> Box<dyn Iterator<Item = &'a mut Self::Target> + 'a>
+    where
+        Func: 'a,
+    {
+        Box::new(
+            match &mut self.catch {
+                Catch::Throw => None,
+                Catch::Jump { pat, k } => Some(k),
+            }
+            .into_iter()
+            .chain(
+                match &mut self.term {
+                    Term::Return(expr) => vec![],
+                    Term::Throw(expr) => vec![],
+                    Term::Jmp(id) => vec![id],
+                    Term::CondJmp {
+                        cond,
+                        if_true,
+                        if_false,
+                    } => vec![if_true, if_false],
+                    Term::Switch { x, blocks, default } => {
+                        blocks.values_mut().chain(once(default)).collect()
+                    }
+                    Term::Default => vec![],
+                }
+                .into_iter(),
+            ),
+        )
+    }
+}
+
+impl cfg_traits::Term<Func> for Id<Block> {
+    type Target = Id<Block>;
+
+    fn targets<'a>(&'a self) -> Box<dyn Iterator<Item = &'a Self::Target> + 'a>
+    where
+        Func: 'a,
+    {
+        Box::new(once(self))
+    }
+
+    fn targets_mut<'a>(&'a mut self) -> Box<dyn Iterator<Item = &'a mut Self::Target> + 'a>
+    where
+        Func: 'a,
+    {
+        Box::new(once(self))
+    }
+}
+
+impl cfg_traits::Target<Func> for Id<Block> {
+    fn block(&self) -> <Func as cfg_traits::Func>::Block {
+        *self
+    }
+
+    fn block_mut(&mut self) -> &mut <Func as cfg_traits::Func>::Block {
+        self
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
+    pub end: End,
+}
+#[derive(Default, Clone)]
+pub struct End {
     pub catch: Catch,
     pub term: Term,
 }
@@ -406,8 +537,10 @@ impl Ctx {
     pub fn new_block(&self, cfg: &mut Cfg) -> Id<Block> {
         return cfg.blocks.alloc(Block {
             stmts: vec![],
-            catch: self.catch.clone(),
-            term: Term::Default,
+            end: End {
+                catch: self.catch.clone(),
+                term: Term::Default,
+            },
         });
     }
     pub fn transform_all(
@@ -429,11 +562,11 @@ impl Ctx {
         label: Option<Ident>,
     ) -> anyhow::Result<Id<Block>> {
         if let Stmt::Throw(t) = x {
-            cfg.blocks[current].term = Term::Throw(*t.arg);
+            cfg.blocks[current].end.term = Term::Throw(*t.arg);
             return Ok(self.new_block(cfg));
         }
         if let Stmt::Return(r) = x {
-            cfg.blocks[current].term = Term::Return(r.arg.map(|a| *a));
+            cfg.blocks[current].end.term = Term::Return(r.arg.map(|a| *a));
             return Ok(self.new_block(cfg));
         }
         if let Stmt::Try(t) = x {
@@ -443,7 +576,7 @@ impl Ctx {
                 Some(a) => Some({
                     let x = self.new_block(cfg);
                     let y = self.transform_all(cfg, a.body.stmts, x)?;
-                    cfg.blocks[y].term = Term::Jmp(next);
+                    cfg.blocks[y].end.term = Term::Jmp(next);
                     (
                         a.param.unwrap_or(Pat::Ident(BindingIdent {
                             id: Ident::new(Atom::new("_error"), a.span, SyntaxContext::default()),
@@ -458,7 +591,7 @@ impl Ctx {
                 new.catch = Catch::Jump { pat: a, k: b };
             };
             let a = new.transform_all(cfg, t.block.stmts, current)?;
-            cfg.blocks[a].term = Term::Jmp(next);
+            cfg.blocks[a].end.term = Term::Jmp(next);
             let next = match t.finalizer {
                 Some(f) => self.transform_all(cfg, f.stmts, next)?,
                 None => next,
@@ -480,17 +613,17 @@ impl Ctx {
                     Some(_) => None,
                 },
             )?;
-            cfg.blocks[then_end].term = Term::Jmp(next);
+            cfg.blocks[then_end].end.term = Term::Jmp(next);
             let els = match i.alt {
                 None => then,
                 Some(e) => {
                     let els = self.new_block(cfg);
                     let els_end = self.transform(cfg, *e, current, None)?;
-                    cfg.blocks[els_end].term = Term::Jmp(next);
+                    cfg.blocks[els_end].end.term = Term::Jmp(next);
                     els
                 }
             };
-            cfg.blocks[current].term = Term::CondJmp {
+            cfg.blocks[current].end.term = Term::CondJmp {
                 cond: *i.test,
                 if_true: then,
                 if_false: els,
@@ -522,8 +655,8 @@ impl Ctx {
                     }
                 }
             }
-            cfg.blocks[cur].term = Term::Jmp(next);
-            cfg.blocks[current].term = Term::Switch {
+            cfg.blocks[cur].end.term = Term::Jmp(next);
+            cfg.blocks[current].end.term = Term::Switch {
                 x: *i.discriminant,
                 blocks: blocks,
                 default: default,
@@ -531,7 +664,7 @@ impl Ctx {
             return Ok(next);
         }
         if let Stmt::Break(b) = x {
-            cfg.blocks[current].term = Term::Jmp(
+            cfg.blocks[current].end.term = Term::Jmp(
                 match b.label {
                     Some(l) => self.labelled.get(&l),
                     None => self.cur_loop.as_ref(),
@@ -542,7 +675,7 @@ impl Ctx {
             return Ok(self.new_block(cfg));
         }
         if let Stmt::Continue(b) = x {
-            cfg.blocks[current].term = Term::Jmp(
+            cfg.blocks[current].end.term = Term::Jmp(
                 match b.label {
                     Some(l) => self.labelled.get(&l),
                     None => self.cur_loop.as_ref(),
@@ -555,7 +688,7 @@ impl Ctx {
         if let Stmt::Labeled(l) = x {
             let next = self.new_block(cfg);
             let cont = self.new_block(cfg);
-            cfg.blocks[current].term = Term::Jmp(cont);
+            cfg.blocks[current].end.term = Term::Jmp(cont);
             let mut new = self.clone();
             new.labelled.insert(
                 l.label.clone(),
@@ -565,13 +698,13 @@ impl Ctx {
                 },
             );
             let k = new.transform(cfg, *l.body, cont, Some(l.label))?;
-            cfg.blocks[k].term = Term::Jmp(next);
+            cfg.blocks[k].end.term = Term::Jmp(next);
             return Ok(next);
         }
         if let Stmt::DoWhile(w) = x {
             let next = self.new_block(cfg);
             let cont = self.new_block(cfg);
-            cfg.blocks[current].term = Term::Jmp(cont);
+            cfg.blocks[current].end.term = Term::Jmp(cont);
             let mut new = self.clone();
             new.cur_loop = Some(Loop {
                 r#break: next,
@@ -582,7 +715,7 @@ impl Ctx {
                     .insert(l, new.cur_loop.as_ref().cloned().unwrap());
             }
             let k = new.transform(cfg, *w.body, cont, None)?;
-            cfg.blocks[k].term = Term::CondJmp {
+            cfg.blocks[k].end.term = Term::CondJmp {
                 cond: *w.test,
                 if_true: cont,
                 if_false: next,

@@ -9,13 +9,32 @@ use lam::LAM;
 use swc_cfg::{Block, Catch, Cfg, Func};
 use swc_common::pass::Either;
 use swc_ecma_ast::{
-    AssignOp, BinaryOp, Expr, Function, Lit, MemberExpr, Pat, SimpleAssignTarget, Stmt, UnaryOp,
+    AssignOp, BinaryOp, Callee, Expr, ExprOrSpread, Function, Lit, MemberExpr, MemberProp, Pat,
+    SimpleAssignTarget, Stmt, Str, UnaryOp,
 };
 
 use swc_ecma_ast::Id as Ident;
 
 pub mod lam;
 pub mod rew;
+
+pub fn imp(a: MemberProp) -> Expr {
+    match a {
+        swc_ecma_ast::MemberProp::Ident(ident_name) => {
+            let e = Expr::Lit(Lit::Str(Str {
+                span: ident_name.span,
+                value: ident_name.sym,
+                raw: None,
+            }));
+            e
+        }
+        swc_ecma_ast::MemberProp::PrivateName(private_name) => {
+            todo!()
+        }
+        swc_ecma_ast::MemberProp::Computed(computed_prop_name) => *computed_prop_name.expr,
+    }
+}
+
 #[derive(Clone)]
 pub struct TFunc {
     pub cfg: TCfg,
@@ -98,9 +117,11 @@ impl TCfg {
                     Item::Mem { obj, mem } => Box::new(once(obj.clone()).chain(once(mem.clone()))),
                     Item::Func { func } => Box::new(func.cfg.externs()),
                     Item::Lit { lit } => Box::new(empty()),
-                    Item::Call { r#fn, args } => {
-                        Box::new(once(r#fn.clone()).chain(args.iter().cloned()))
-                    }
+                    Item::Call { r#fn, member, args } => Box::new(
+                        once(r#fn.clone())
+                            .chain(member.clone().into_iter())
+                            .chain(args.iter().cloned()),
+                    ),
                     Item::Obj { members } => Box::new(members.iter().flat_map(|(a, b)| {
                         once(b.clone()).chain(
                             match a {
@@ -184,17 +205,46 @@ impl<I> PropKey<I> {
 }
 #[derive(Clone)]
 pub enum Item<I = Ident> {
-    Just { id: I },
-    Bin { left: I, right: I, op: BinaryOp },
-    Un { arg: I, op: UnaryOp },
-    Mem { obj: I, mem: I },
-    Func { func: TFunc },
-    Lit { lit: Lit },
-    Call { r#fn: I, args: Vec<I> },
-    Obj { members: Vec<(PropKey<I>,I)> },
-    Arr { members: Vec<I> },
-    Yield { value: Option<I>, delegate: bool },
-    Await { value: I },
+    Just {
+        id: I,
+    },
+    Bin {
+        left: I,
+        right: I,
+        op: BinaryOp,
+    },
+    Un {
+        arg: I,
+        op: UnaryOp,
+    },
+    Mem {
+        obj: I,
+        mem: I,
+    },
+    Func {
+        func: TFunc,
+    },
+    Lit {
+        lit: Lit,
+    },
+    Call {
+        r#fn: I,
+        member: Option<I>,
+        args: Vec<I>,
+    },
+    Obj {
+        members: Vec<(PropKey<I>, I)>,
+    },
+    Arr {
+        members: Vec<I>,
+    },
+    Yield {
+        value: Option<I>,
+        delegate: bool,
+    },
+    Await {
+        value: I,
+    },
     Undef,
 }
 impl<I> Item<I> {
@@ -213,8 +263,12 @@ impl<I> Item<I> {
             },
             Item::Func { func } => Item::Func { func },
             Item::Lit { lit } => Item::Lit { lit },
-            Item::Call { r#fn, args } => Item::Call {
+            Item::Call { r#fn, member, args } => Item::Call {
                 r#fn: f(r#fn)?,
+                member: match member {
+                    None => None,
+                    Some(member) => Some(f(member)?),
+                },
                 args: args.into_iter().map(f).collect::<Result<Vec<J>, E>>()?,
             },
             Item::Obj { members } => Item::Obj {
@@ -269,7 +323,7 @@ impl Trans {
                 term: Default::default(),
             });
             self.map.insert(b, t);
-            if let Catch::Jump { pat, k } = &i.blocks[b].catch {
+            if let Catch::Jump { pat, k } = &i.blocks[b].end.catch {
                 match pat {
                     Pat::Ident(id) => {
                         let k = self.trans(i, o, *k)?;
@@ -285,7 +339,7 @@ impl Trans {
             for s in i.blocks[b].stmts.iter() {
                 t = self.stmt(i, o, b, t, s)?;
             }
-            let term = match &i.blocks[b].term {
+            let term = match &i.blocks[b].end.term {
                 swc_cfg::Term::Return(expr) => match expr {
                     None => TTerm::Return(None),
                     Some(a) => {
@@ -403,27 +457,8 @@ impl Trans {
         let obj;
         (obj, t) = self.expr(i, o, b, t, &s.obj)?;
         let mem;
-        let e;
-        (mem, t) = self.expr(
-            i,
-            o,
-            b,
-            t,
-            match &s.prop {
-                swc_ecma_ast::MemberProp::Ident(ident_name) => {
-                    e = Expr::Ident(swc_ecma_ast::Ident::new(
-                        ident_name.sym.clone(),
-                        ident_name.span,
-                        Default::default(),
-                    ));
-                    &e
-                }
-                swc_ecma_ast::MemberProp::PrivateName(private_name) => {
-                    todo!()
-                }
-                swc_ecma_ast::MemberProp::Computed(computed_prop_name) => &computed_prop_name.expr,
-            },
-        )?;
+        // let e;
+        (mem, t) = self.expr(i, o, b, t, &imp(s.prop.clone()))?;
         let v = o.regs.alloc(());
         o.blocks[t]
             .stmts
@@ -532,6 +567,41 @@ impl Trans {
                     }
                 };
                 return Ok((right, t));
+            }
+            Expr::Call(call) => {
+                let (r#fn, member) = match &call.callee {
+                    Callee::Expr(e) => match e.as_ref() {
+                        Expr::Member(m) => {
+                            let r#fn;
+                            (r#fn, t) = self.expr(i, o, b, t, &m.obj)?;
+                            let member;
+                            (member, t) = self.expr(i, o, b, t, &imp(m.prop.clone()))?;
+                            (r#fn, Some(member))
+                        }
+                        _ => {
+                            let r#fn;
+                            (r#fn, t) = self.expr(i, o, b, t, e.as_ref())?;
+                            (r#fn, None)
+                        }
+                    },
+                    _ => anyhow::bail!("todo: {}:{}", file!(), line!()),
+                };
+                let args = call
+                    .args
+                    .iter()
+                    .map(|a| {
+                        let arg;
+                        (arg, t) = self.expr(i, o, b, t, &a.expr)?;
+                        anyhow::Ok(arg)
+                    })
+                    .collect::<anyhow::Result<_>>()?;
+                let tmp = o.regs.alloc(());
+                o.blocks[t].stmts.push((
+                    LId::Id { id: tmp.clone() },
+                    Item::Call { r#fn, member, args },
+                ));
+                o.decls.insert(tmp.clone());
+                return Ok((tmp, t));
             }
             Expr::Bin(bin) => {
                 let left;

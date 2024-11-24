@@ -173,8 +173,8 @@ impl ssa_traits::HasChainableValues<SFunc> for SValue {
                 swc_tac::Item::Mem { obj, mem } => Box::new([*obj, *mem].into_iter()),
                 swc_tac::Item::Func { func } => Box::new(empty()),
                 swc_tac::Item::Lit { lit } => Box::new(empty()),
-                swc_tac::Item::Call { r#fn, args } => {
-                    Box::new(once(*r#fn).chain(args.iter().cloned()))
+                swc_tac::Item::Call { r#fn, member, args } => {
+                    Box::new(once(*r#fn).chain(member.iter().cloned()).chain(args.iter().cloned()))
                 }
                 swc_tac::Item::Obj { members } => Box::new(members.iter().flat_map(|m| {
                     let v = once(m.1);
@@ -218,7 +218,7 @@ impl ssa_traits::HasChainableValues<SFunc> for SValue {
                 swc_tac::Item::Mem { obj, mem } => Box::new([obj, mem].into_iter()),
                 swc_tac::Item::Func { func } => Box::new(empty()),
                 swc_tac::Item::Lit { lit } => Box::new(empty()),
-                swc_tac::Item::Call { r#fn, args } => Box::new(once(r#fn).chain(args.iter_mut())),
+                swc_tac::Item::Call { r#fn, member, args } => Box::new(once(r#fn).chain(member.iter_mut()).chain(args.iter_mut())),
                 swc_tac::Item::Obj { members } => Box::new(members.iter_mut().flat_map(|m| {
                     let v = once(&mut m.1);
                     let w: Box<dyn Iterator<Item = &mut Id<SValue>> + '_> = match &mut m.0 {

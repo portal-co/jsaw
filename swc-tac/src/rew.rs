@@ -4,7 +4,6 @@ use id_arena::Id;
 use swc_cfg::{Block, Cfg};
 use swc_cfg::{Func, Term};
 use swc_common::Span;
-use swc_ecma_ast::{AssignTarget, Function};
 use swc_ecma_ast::BinExpr;
 use swc_ecma_ast::CallExpr;
 use swc_ecma_ast::ComputedPropName;
@@ -23,6 +22,7 @@ use swc_ecma_ast::Stmt;
 use swc_ecma_ast::UnaryExpr;
 use swc_ecma_ast::{ArrayLit, Param};
 use swc_ecma_ast::{AssignExpr, Decl, VarDecl, VarDeclarator};
+use swc_ecma_ast::{AssignTarget, Function};
 
 use crate::{TBlock, TCfg, TFunc};
 
@@ -61,7 +61,7 @@ impl TryFrom<TFunc> for Func {
                     }],
                 }))));
         }
-        cfg.blocks[entry2].term = Term::Jmp(entry);
+        cfg.blocks[entry2].end.term = Term::Jmp(entry);
         Ok(Func {
             cfg,
             entry: entry2,
@@ -71,7 +71,7 @@ impl TryFrom<TFunc> for Func {
         })
     }
 }
-impl TryFrom<TFunc> for Function{
+impl TryFrom<TFunc> for Function {
     type Error = anyhow::Error;
 
     fn try_from(value: TFunc) -> Result<Self, Self::Error> {
@@ -106,7 +106,7 @@ impl Rew {
                     k: self.trans(cfg, tcfg, *k)?,
                 },
             };
-            cfg.blocks[l].catch = catch;
+            cfg.blocks[l].end.catch = catch;
             for i2 in tcfg.blocks[k].stmts.iter() {
                 let left = match &i2.0 {
                     crate::LId::Id { id } => swc_ecma_ast::AssignTarget::Simple(
@@ -162,19 +162,32 @@ impl Rew {
                         function: Box::new(func.clone().try_into()?),
                     }),
                     crate::Item::Lit { lit } => Expr::Lit(lit.clone()),
-                    crate::Item::Call { r#fn, args } => Expr::Call(CallExpr {
-                        span: Span::dummy_with_cmt(),
-                        ctxt: r#fn.1.clone(),
-                        callee: swc_ecma_ast::Callee::Expr(Box::new(Expr::Ident(i(r#fn)))),
-                        args: args
-                            .iter()
-                            .map(|a| swc_ecma_ast::ExprOrSpread {
-                                spread: None,
-                                expr: Box::new(Expr::Ident(i(a))),
-                            })
-                            .collect(),
-                        type_args: None,
-                    }),
+                    crate::Item::Call { r#fn, member, args } => {
+                        let f = Box::new(Expr::Ident(i(r#fn)));
+                        Expr::Call(CallExpr {
+                            span: Span::dummy_with_cmt(),
+                            ctxt: r#fn.1.clone(),
+                            callee: swc_ecma_ast::Callee::Expr(match member {
+                                Some(m) => Box::new(Expr::Member(MemberExpr {
+                                    span: Span::dummy_with_cmt(),
+                                    obj: f,
+                                    prop: swc_ecma_ast::MemberProp::Computed(ComputedPropName {
+                                        span: Span::dummy_with_cmt(),
+                                        expr: Box::new(Expr::Ident(i(m))),
+                                    }),
+                                })),
+                                None => f,
+                            }),
+                            args: args
+                                .iter()
+                                .map(|a| swc_ecma_ast::ExprOrSpread {
+                                    spread: None,
+                                    expr: Box::new(Expr::Ident(i(a))),
+                                })
+                                .collect(),
+                            type_args: None,
+                        })
+                    }
                     crate::Item::Obj { members } => Expr::Object(ObjectLit {
                         span: Span::dummy_with_cmt(),
                         props: members
@@ -267,7 +280,7 @@ impl Rew {
                 },
                 crate::TTerm::Default => Term::Default,
             };
-            cfg.blocks[l].term = term;
+            cfg.blocks[l].end.term = term;
         }
     }
 }

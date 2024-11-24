@@ -15,20 +15,20 @@ impl Recfg {
             }
             let l = o.blocks.alloc(Default::default());
             self.map.insert(k, l);
-            let catch = match &i.blocks[k].catch {
+            let catch = match &i.blocks[k].end.catch {
                 crate::Catch::Throw => Catch::Throw,
                 crate::Catch::Jump { pat, k } => Catch::Jump {
                     pat: pat.clone(),
                     k: self.go(i, o, *k)?,
                 },
             };
-            o.blocks[l].catch = catch.clone();
+            o.blocks[l].end.catch = catch.clone();
             let mut ctx = Ctx {
                 catch,
                 ..Default::default()
             };
             let l = ctx.transform_all(o, i.blocks[k].stmts.clone(), l)?;
-            let term = match &i.blocks[k].term {
+            let term = match &i.blocks[k].end.term {
                 crate::Term::Jmp(id) => Term::Jmp(self.go(i, o, *id)?),
                 crate::Term::CondJmp {
                     cond,
@@ -49,7 +49,7 @@ impl Recfg {
                 },
                 a => a.clone(),
             };
-            o.blocks[l].term = term;
+            o.blocks[l].end.term = term;
         }
     }
 }

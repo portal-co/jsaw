@@ -10,6 +10,7 @@ arena-traits = {version="0.2.0",features=["id-arena"]}
 ssa-traits = "0.2.0"
 cfg-traits = "0.2.0"
 ssa-impls = "0.2.0"
+ssa-reloop = "0.2.0"
 swc_atoms = "2.0.0"
 swc_common = "3.0.0"
 swc_ecma_ast = "3.0.0"

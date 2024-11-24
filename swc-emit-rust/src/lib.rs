@@ -171,7 +171,7 @@ fn stmt(opts: &Opts, stmt: &Item, total: &BTreeSet<swc_ecma_ast::Id>) -> TokenSt
             };
         }
         Item::Lit { lit } => todo!(),
-        Item::Call { r#fn, args } => {
+        Item::Call { r#fn, member, args } => {
             let args = args.iter().map(i);
             quasiquote!(
                 #{i(r#fn)}.lock().unwrap().call(#[#(#args),*])?

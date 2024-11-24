@@ -592,6 +592,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b9b39299b249ad65f3b7e96443bad61c02ca5cd3589f46cb6d610a0fd6c0d6a"
 
 [[package]]
+name = "ssa-impls"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a258139308b290ac35e26667d26b27985a1eea55e2c89c79b4f66828eb723aba"
+dependencies = [
+ "arena-traits",
+ "cfg-traits",
+ "ssa-traits",
+]
+
+[[package]]
+name = "ssa-reloop"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "342be410053ae69c9d00e2ffba29638dd5f034175cd12671691b30095d5f8e84"
+dependencies = [
+ "arena-traits",
+ "cfg-traits",
+ "relooper",
+ "ssa-impls",
+ "ssa-traits",
+]
+
+[[package]]
 name = "ssa-traits"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -626,8 +650,11 @@ name = "swc-cfg"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cfg-traits",
  "id-arena",
  "relooper",
+ "ssa-impls",
+ "ssa-reloop",
  "swc_atoms",
  "swc_common 3.0.0",
  "swc_ecma_ast 3.0.0",

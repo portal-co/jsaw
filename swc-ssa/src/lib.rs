@@ -14,6 +14,7 @@ use swc_ecma_ast::{Id as Ident, Lit, Null};
 use swc_tac::{Item, LId, TBlock, TCfg, TFunc};
 pub mod rew;
 pub mod impls;
+pub mod simplify;
 pub struct SFunc {
     pub cfg: SwcFunc,
     pub entry: Id<SBlock>,

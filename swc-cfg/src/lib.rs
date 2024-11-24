@@ -16,6 +16,7 @@ use swc_ecma_ast::{
     SwitchStmt, ThrowStmt, TryStmt, WhileStmt,
 };
 pub mod recfg;
+pub mod simplify;
 #[derive(Clone)]
 pub struct Func {
     pub cfg: Cfg,
@@ -36,6 +37,7 @@ impl TryFrom<Function> for Func {
             entry,
         )?;
         cfg.blocks[exit].end.term = Term::Return(None);
+        cfg.simplify();
 
         return Ok(Self {
             cfg,

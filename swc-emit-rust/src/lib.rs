@@ -173,8 +173,20 @@ fn stmt(opts: &Opts, stmt: &Item, total: &BTreeSet<swc_ecma_ast::Id>) -> TokenSt
         Item::Lit { lit } => todo!(),
         Item::Call { r#fn, member, args } => {
             let args = args.iter().map(i);
+            let obj = quasiquote!{#{i(r#fn)}.lock().unwrap()};
+            let get = match member{
+                Some(a) => quasiquote!{
+                    match obj.get(&*#{i(a)}.lock().unwrap()){
+                        Ok(a) => a,
+                        Err(_) => #root::synth::throw_reference_error()?,   
+                    }
+                },
+                None =>quote! {obj},
+            };
             quasiquote!(
-                #{i(r#fn)}.lock().unwrap().call(#[#(#args),*])?
+                match #obj{
+                    obj => #get.call(obj,#[#(#args),*])?
+                }
             )
         }
         Item::Obj { members } => todo!(),

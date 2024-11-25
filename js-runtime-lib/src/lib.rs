@@ -30,7 +30,7 @@ unsafe impl Trace for O {
 }
 
 #[derive(Clone)]
-pub struct PayClosureFn(pub fn(&[OCell], &[O]) -> Result<O, Err<Infallible>>);
+pub struct PayClosureFn(pub fn(&[OCell], &O, &[O]) -> Result<O, Err<Infallible>>);
 
 unsafe impl Trace for PayClosureFn {
     fn accept<V: dumpster::Visitor>(&self, visitor: &mut V) -> Result<(), ()> {
@@ -42,16 +42,24 @@ unsafe impl Trace for PayClosureFn {
 pub enum Payload {
     Undefined,
     CellVec(Gc<Mutex<Vec<O>>>),
-    CallStrMap(Gc<Mutex<BTreeMap<String, O>>>),
+    CellMap(Gc<Mutex<BTreeMap<String, O>>>),
     Closure {
         cells: Box<[OCell]>,
         r#fn: PayClosureFn,
     },
+    Str(String),
 }
+impl From<Payload> for O{
+    fn from(value: Payload) -> Self {
+        Self(NanBox::from_box(Box::new(value)))
+    }
+}
+
 pub enum Err<W> {
     Rust(W),
     JS(O),
 }
+
 impl O {
     pub fn error<W, O>(self) -> Result<O, Err<W>> {
         Err(Err::JS(self))
@@ -72,16 +80,16 @@ impl O {
             Mutex::new(a.collect()),
         )))));
     }
-    pub fn closure(a: &[OCell], b: fn(&[OCell], &[O]) -> Result<O, Err<Infallible>>) -> Self {
+    pub fn closure(a: &[OCell], b: fn(&[OCell],&O, &[O]) -> Result<O, Err<Infallible>>) -> Self {
         return Self(NanBox::from_box(Box::new(Payload::Closure {
             cells: a.to_owned().into(),
             r#fn: PayClosureFn(b),
         })));
     }
-    pub fn call(&self, args: &[O]) -> Result<O, Err<Infallible>> {
+    pub fn call(&self, this: &O, args: &[O]) -> Result<O, Err<Infallible>> {
         if let Some(a) = self.0.try_ref_boxed() {
             if let Payload::Closure { cells, r#fn } = a {
-                return (r#fn.0)(cells.as_ref(), args);
+                return (r#fn.0)(cells.as_ref(),this, args);
             }
         }
         return Err(Err::JS(O::default()));
@@ -100,8 +108,10 @@ impl O {
                         }
                     }
                 }
-                Payload::CallStrMap(gc) => todo!(),
                 Payload::Closure { cells, r#fn } => todo!(),
+                Payload::CellMap(gc) => todo!(),
+                Payload::Str(_) => todo!(),
+
             },
         }
         return Err(());
@@ -120,8 +130,9 @@ impl O {
                         lock[b as usize] = c.clone();
                     }
                 }
-                Payload::CallStrMap(gc) => todo!(),
                 Payload::Closure { cells, r#fn } => todo!(),
+                Payload::CellMap(gc) => todo!(),
+                Payload::Str(_) => todo!(),
             },
         }
     }

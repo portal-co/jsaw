@@ -1,7 +1,8 @@
 [package]
-name = "portal-swc-js-runtime-lib"
+name = "portal-jsc-js-runtime-lib"
 version = "0.1.0"
 edition = "2021"
+publish = false
 
 [lib]
 name = "js_runtime_lib"

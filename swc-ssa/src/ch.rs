@@ -87,10 +87,13 @@ impl CH {
                             val: params.get(&val).cloned().context("in getting a variable")?,
                         },
                     };
-                let v = match v.const_in(out) {
-                    None => v,
-                    Some(_) if is_loop => v,
-                    Some(a) => SValue::Item(Item::Lit { lit: a }),
+                let v = if is_loop {
+                    v
+                } else {
+                    match v.const_in(out) {
+                        None => v,
+                        Some(a) => SValue::Item(Item::Lit { lit: a }),
+                    }
                 };
                 let v = out.values.alloc(v);
                 out.blocks[n].stmts.push(v);

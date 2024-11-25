@@ -15,6 +15,8 @@ use swc_tac::{Item, LId, TBlock, TCfg, TFunc};
 pub mod rew;
 pub mod impls;
 pub mod simplify;
+pub mod ch;
+
 pub struct SFunc {
     pub cfg: SwcFunc,
     pub entry: Id<SBlock>,
@@ -70,6 +72,7 @@ impl TryFrom<TFunc> for SFunc {
         })
     }
 }
+#[derive(Default)]
 pub struct SwcFunc {
     pub blocks: Arena<SBlock>,
     pub values: Arena<SValue>,
@@ -86,6 +89,7 @@ pub struct SPostcedent{
     pub term: STerm,
     pub catch: SCatch,
 }
+#[derive(Clone)]
 pub enum SValue {
     Param {
         block: Id<SBlock>,

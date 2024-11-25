@@ -18,3 +18,4 @@ swc_common.workspace = true
 swc_ecma_ast.workspace = true
 swc_ecma_utils.workspace = true
 swc_ecma_visit.workspace = true
+num-traits = "0.2.19"

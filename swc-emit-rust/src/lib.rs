@@ -161,12 +161,18 @@ fn stmt(opts: &Opts, stmt: &Item, total: &BTreeSet<swc_ecma_ast::Id>) -> TokenSt
             let k = emit(opts, &func, total);
             let total2 = total.iter().map(i).collect::<BTreeSet<_>>();
             return quasiquote! {
-                #root::O::closure(&[#(#total2 .clone()),*],|rs,arguments|{
+                #root::O::closure(&[#(#total2 .clone()),*],|rs,rsl,this,arguments, arguments_len|{
+                    let rs = unsafe{
+                        ::core::slice::from_raw_parts(rs,rsl)
+                    };
+                    let arguments = unsafe{
+                        ::core::slice::from_raw_parts(arguments,arguments_len)
+                    };
                     let Ok([#(#total2),*]) = rs.try_into() else{
                         unreachable!();
                     };
                     #(let #total2 = #total2.clone());*;
-                    #k
+                    ::alloc::boxed::Box::new((move||#k)())
                 })
             };
         }

@@ -30,7 +30,7 @@ unsafe impl Trace for O {
 }
 
 #[derive(Clone)]
-pub struct PayClosureFn(pub fn(&[OCell], &O, &[O]) -> Result<O, Err<Infallible>>);
+pub struct PayClosureFn(pub fn(*const OCell, usize, &O, *const O, usize) -> Box<Result<O, Err<Infallible>>>);
 
 unsafe impl Trace for PayClosureFn {
     fn accept<V: dumpster::Visitor>(&self, visitor: &mut V) -> Result<(), ()> {
@@ -80,7 +80,7 @@ impl O {
             Mutex::new(a.collect()),
         )))));
     }
-    pub fn closure(a: &[OCell], b: fn(&[OCell],&O, &[O]) -> Result<O, Err<Infallible>>) -> Self {
+    pub fn closure(a: &[OCell], b: fn(*const OCell, usize, &O, *const O, usize) -> Box<Result<O, Err<Infallible>>>) -> Self {
         return Self(NanBox::from_box(Box::new(Payload::Closure {
             cells: a.to_owned().into(),
             r#fn: PayClosureFn(b),
@@ -89,7 +89,7 @@ impl O {
     pub fn call(&self, this: &O, args: &[O]) -> Result<O, Err<Infallible>> {
         if let Some(a) = self.0.try_ref_boxed() {
             if let Payload::Closure { cells, r#fn } = a {
-                return (r#fn.0)(cells.as_ref(),this, args);
+                return *(r#fn.0)(cells.as_ref().as_ptr(),cells.len(),this, args.as_ptr(),args.len());
             }
         }
         return Err(Err::JS(O::default()));

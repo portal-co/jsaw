@@ -1,5 +1,5 @@
 [workspace]
-members=[ "js-runtime-lib","swc-cfg", "swc-emit-rust", "swc-ssa", "swc-tac"]
+members=[ "js-runtime-lib","swc-cfg", "swc-emit-rust", "swc-opt-ssa", "swc-ssa", "swc-tac"]
 resolver="2"
 
 [workspace.dependencies]
@@ -24,3 +24,5 @@ proc-macro2 = "1.0.88"
 quasiquote = "0.1.1"
 quote = "1.0.37"
 syn = "2.0.82"
+
+portal-pc-waffle="0.3.2"

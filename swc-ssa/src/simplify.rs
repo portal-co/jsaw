@@ -13,7 +13,7 @@ impl SwcFunc {
                 if_false,
             } = &mut kd.postcedent.term
             {
-                if let SValue::Item(Item::Lit { lit: Lit::Bool(b) }) = &self.values[*cond] {
+                if let SValue::Item(Item::Lit { lit: Lit::Bool(b) }) = &self.values[*cond].0 {
                     kd.postcedent.term = STerm::Jmp(if b.value {
                         if_true.clone()
                     } else {
@@ -30,8 +30,8 @@ impl SValue {
             SValue::Item(item) => match item {
                 Item::Just { id } => None,
                 Item::Bin { left, right, op } => {
-                    let left = k.values[*left].const_in(k)?;
-                    let right = k.values[*right].const_in(k)?;
+                    let left = k.values[*left].0.const_in(k)?;
+                    let right = k.values[*right].0.const_in(k)?;
                     macro_rules! op2 {
                         ($left:expr => {$($op:tt)*} $right:expr) => {
                             match (
@@ -210,7 +210,7 @@ impl SValue {
                             raw: None,
                         }));
                     }
-                    let l = k.values[*arg].const_in(k)?;
+                    let l = k.values[*arg].0.const_in(k)?;
                     match op {
                         swc_ecma_ast::UnaryOp::Minus => match l {
                             Lit::Num(n) => Some(Lit::Num(Number {

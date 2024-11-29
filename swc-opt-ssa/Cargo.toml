@@ -1,20 +1,17 @@
 [package]
-name = "portal-jsc-swc-emit-rust"
+name = "portal-jsc-swc-opt-ssa"
 version = "0.1.0"
 edition = "2021"
-publish = false
 
 [lib]
-name = "swc_emit_rust"
+name = "swc_opt_ssa"
 
 [dependencies]
 anyhow.workspace = true
 arena-traits.workspace = true
 id-arena.workspace = true
-proc-macro2.workspace = true
-quasiquote.workspace = true
-quote.workspace = true
 
+cfg-traits.workspace = true
 
 ssa-traits.workspace = true
 portal-jsc-swc-cfg = { version = "0.1.0", path = "../swc-cfg" }
@@ -24,7 +21,6 @@ swc_common.workspace = true
 swc_ecma_ast.workspace = true
 swc_ecma_utils.workspace = true
 swc_ecma_visit.workspace = true
-syn.workspace = true
-portal-pc-waffle.workspace = true
 portal-jsc-swc-ssa = { version = "0.1.0", path = "../swc-ssa" }
 paste = "1.0.15"
+ssa-impls.workspace = true

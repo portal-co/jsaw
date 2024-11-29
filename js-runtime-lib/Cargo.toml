@@ -11,3 +11,6 @@ name = "js_runtime_lib"
 anyhow.workspace = true
 boxing = "0.1.2"
 dumpster = "1.0.0"
+itertools = "0.13.0"
+num-bigint = "0.4.6"
+num-traits = "0.2.19"

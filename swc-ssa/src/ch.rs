@@ -1,11 +1,20 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    num::{NonZero, NonZeroUsize},
+};
 
 use swc_ecma_ast::Expr;
 use swc_ecma_utils::{ExprExt, Value};
 
 use crate::*;
+#[derive(Clone, Hash, Eq, PartialEq)]
+pub enum ConstVal {
+    Lit(Lit),
+    Undef,
+}
+
 pub struct CH {
-    pub all: BTreeMap<Id<SBlock>, HashMap<(Vec<Option<Lit>>), Id<SBlock>>>,
+    pub all: BTreeMap<Id<SBlock>, HashMap<(Vec<Option<ConstVal>>), Id<SBlock>>>,
 }
 pub fn ch(a: &SFunc) -> anyhow::Result<SFunc> {
     let mut n = SwcFunc::default();
@@ -36,12 +45,30 @@ impl CH {
         inp: &SwcFunc,
         out: &mut SwcFunc,
         k: Id<SBlock>,
-        lits: Vec<Option<Lit>>,
-        lsk: &BTreeSet<Id<SBlock>>,
+        lits: Vec<Option<ConstVal>>,
+        lsk: &BTreeMap<Id<SBlock>, NonZeroUsize>,
     ) -> anyhow::Result<Id<SBlock>> {
-        let is_loop = lsk.contains(&k);
+        let lits: Vec<Option<ConstVal>> = lits
+            .into_iter()
+            .map(|a| match a {
+                Some(ConstVal::Lit(mut l)) => {
+                    l.set_span(Span::dummy_with_cmt());
+                    Some(ConstVal::Lit(l))
+                }
+                a => a,
+            })
+            .collect();
+        let is_loop = lsk.get(&k);
+        let is_loop = match is_loop {
+            Some(x) => x.clone().into(),
+            None => 0,
+        };
         let mut lsk = lsk.clone();
-        lsk.insert(k);
+        lsk.entry(k)
+            .and_modify(|x| {
+                *x = x.saturating_add(1);
+            })
+            .or_insert(NonZeroUsize::new(1).unwrap());
         loop {
             if let Some(x) = self.all.get(&k).and_then(|x| x.get(&lits)) {
                 return Ok(*x);
@@ -58,8 +85,10 @@ impl CH {
                         a,
                         match l {
                             Some(l) => {
-                                let v =
-                                    out.values.alloc(SValue::Item(Item::Lit { lit: l.clone() }));
+                                let v = out.values.alloc(SValue::Item(match l {
+                                    ConstVal::Lit(lit) => Item::Lit { lit: lit.clone() },
+                                    ConstVal::Undef => Item::Undef,
+                                }).into());
                                 out.blocks[n].stmts.push(v);
                                 v
                             }
@@ -70,7 +99,7 @@ impl CH {
                 .collect::<BTreeMap<_, _>>();
             for s in inp.blocks[k].stmts.iter().cloned() {
                 let v =
-                    match inp.values[s].clone() {
+                    match inp.values[s].0.clone() {
                         SValue::Param { block, idx, ty } => todo!(),
                         SValue::Item(item) => SValue::Item(item.map(&mut |a| {
                             params.get(&a).cloned().context("in getting a variable")
@@ -87,7 +116,7 @@ impl CH {
                             val: params.get(&val).cloned().context("in getting a variable")?,
                         },
                     };
-                let v = if is_loop {
+                let v = if is_loop > 4 {
                     v
                 } else {
                     match v.const_in(out) {
@@ -95,7 +124,7 @@ impl CH {
                         Some(a) => SValue::Item(Item::Lit { lit: a }),
                     }
                 };
-                let v = out.values.alloc(v);
+                let v = out.values.alloc(v.into());
                 out.blocks[n].stmts.push(v);
                 params.insert(s, v);
             }
@@ -112,10 +141,14 @@ impl CH {
                     .filter_map(|b| params.get(b))
                     .filter_map(|b| {
                         'a: {
-                            if let SValue::Item(Item::Lit { lit }) = &out.values[*b] {
-                                funcs.push(Some(lit.clone()));
+                            if let SValue::Item(Item::Lit { lit }) = &out.values[*b].0 {
+                                funcs.push(Some(ConstVal::Lit(lit.clone())));
                                 return None;
                             };
+                            if let SValue::Item(Item::Undef) = &out.values[*b].0 {
+                                funcs.push(Some(ConstVal::Undef));
+                                return None;
+                            }
                         };
                         funcs.push(None);
                         return Some(b);
@@ -139,7 +172,12 @@ impl CH {
                     STerm::Throw(params.get(id).cloned().context("in getting a variable")?)
                 }
                 STerm::Return(id) => STerm::Return(match id.as_ref() {
-                    None => None,
+                    None => Some({
+                        let val = SValue::Item(Item::Undef);
+                        let val = out.values.alloc(val.into());
+                        out.blocks[n].stmts.push(val);
+                        val
+                    }),
                     Some(val) => Some(params.get(&val).cloned().context("in getting a variable")?),
                 }),
                 STerm::Jmp(starget) => STerm::Jmp(tgt(self, inp, out, starget, 0)?),
@@ -149,7 +187,7 @@ impl CH {
                     if_false,
                 } => {
                     let cond = params.get(cond).cloned().context("in getting the cond")?;
-                    match &out.values[cond] {
+                    match &out.values[cond].0 {
                         SValue::Item(Item::Lit { lit }) => {
                             match Expr::Lit(lit.clone()).as_pure_bool(&Default::default()) {
                                 Value::Known(k) => STerm::Jmp(tgt(

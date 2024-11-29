@@ -8,6 +8,7 @@ use std::{
 use anyhow::Context;
 use id_arena::{Arena, Id};
 use ssa_traits::Value;
+use swc_atoms::Atom;
 use swc_cfg::Catch;
 use swc_common::Span;
 use swc_ecma_ast::{Id as Ident, Lit, Null};
@@ -38,11 +39,6 @@ impl TryFrom<TFunc> for SFunc {
             values: Default::default(),
             decls: d,
         };
-        let mut trans = Trans {
-            map: BTreeMap::new(),
-            all: decls.clone(),
-        };
-        let entry = trans.trans(&value.cfg, &mut cfg, value.entry)?;
         let entry2 = cfg.blocks.alloc(Default::default());
         let params = value
             .params
@@ -50,7 +46,13 @@ impl TryFrom<TFunc> for SFunc {
             .cloned()
             .map(|a| (a, cfg.add_blockparam(entry2)))
             .collect::<BTreeMap<_, _>>();
-        let undef = cfg.values.alloc(SValue::Item(Item::Undef));
+        let undef = cfg.values.alloc(SValue::Item(Item::Undef).into());
+        let mut trans = Trans {
+            map: BTreeMap::new(),
+            all: decls.clone(),
+            undef,
+        };
+        let entry = trans.trans(&value.cfg, &mut cfg, value.entry)?;
         let target = STarget {
             block: entry,
             args: decls
@@ -75,77 +77,103 @@ impl TryFrom<TFunc> for SFunc {
 #[derive(Default)]
 pub struct SwcFunc {
     pub blocks: Arena<SBlock>,
-    pub values: Arena<SValue>,
+    pub values: Arena<SValueW>,
     pub decls: BTreeSet<Ident>,
 }
 #[derive(Default)]
 pub struct SBlock {
-    pub params: Vec<(Id<SValue>, ())>,
-    pub stmts: Vec<Id<SValue>>,
+    pub params: Vec<(Id<SValueW>, ())>,
+    pub stmts: Vec<Id<SValueW>>,
     pub postcedent: SPostcedent,
 }
-#[derive(Default)]
-pub struct SPostcedent{
-    pub term: STerm,
-    pub catch: SCatch,
+#[derive(Clone)]
+pub struct SPostcedent<I = Id<SValueW>,B = Id<SBlock>>{
+    pub term: STerm<I,B>,
+    pub catch: SCatch<I,B>,
+}
+impl<I,B> Default for SPostcedent<I,B>{
+    fn default() -> Self {
+        Self { term: Default::default(), catch: Default::default() }
+    }
 }
 #[derive(Clone)]
-pub enum SValue {
+pub enum SValue<I = Id<SValueW>,B = Id<SBlock>> {
     Param {
-        block: Id<SBlock>,
+        block: B,
         idx: usize,
         ty: (),
     },
-    Item(Item<Id<SValue>>),
+    Item(Item<I>),
     Assign {
-        target: LId<Id<SValue>>,
-        val: Id<SValue>,
+        target: LId<I>,
+        val: I,
     },
     LoadId(Ident),
     StoreId {
         target: Ident,
-        val: Id<SValue>,
+        val: I,
     },
 }
-#[derive(Default)]
-pub enum SCatch {
-    #[default]
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct SValueW(pub SValue);
+impl From<SValue> for SValueW{
+    fn from(value: SValue) -> Self {
+        Self(value)
+    }
+}
+impl From<SValueW> for SValue{
+    fn from(value: SValueW) -> Self {
+        value.0
+    }
+}
+#[derive(Clone)]
+pub enum SCatch<I = Id<SValueW>,B = Id<SBlock>> {
     Throw,
     Just {
-        target: STarget,
+        target: STarget<I,B>,
     },
+}
+impl<I,B> Default for SCatch<I,B>{
+    fn default() -> Self {
+        Self::Throw
+    }
 }
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct STarget {
-    pub block: Id<SBlock>,
-    pub args: Vec<Id<SValue>>,
+pub struct STarget<I = Id<SValueW>,B = Id<SBlock>> {
+    pub block: B,
+    pub args: Vec<I>,
 }
-#[derive(Default)]
-pub enum STerm {
-    Throw(Id<SValue>),
-    Return(Option<Id<SValue>>),
-    Jmp(STarget),
+#[derive(Clone)]
+pub enum STerm<I = Id<SValueW>,B = Id<SBlock>> {
+    Throw(I),
+    Return(Option<I>),
+    Jmp(STarget<I,B>),
     CondJmp {
-        cond: Id<SValue>,
-        if_true: STarget,
-        if_false: STarget,
+        cond: I,
+        if_true: STarget<I,B>,
+        if_false: STarget<I,B>,
     },
     Switch {
-        x: Id<SValue>,
-        blocks: Vec<(Id<SValue>,STarget)>,
-        default: STarget,
+        x: I,
+        blocks: Vec<(I,STarget<I,B>)>,
+        default: STarget<I,B>,
     },
-    #[default]
-    Default,
+    Default
+}
+impl<I,B> Default for STerm<I,B>{
+    fn default() -> Self {
+        Self::Default
+    }
 }
 impl SwcFunc {
-    pub fn add_blockparam(&mut self, k: Id<SBlock>) -> Id<SValue> {
+    pub fn add_blockparam(&mut self, k: Id<SBlock>) -> Id<SValueW> {
         let val = SValue::Param {
             block: k,
             idx: self.blocks[k].params.len(),
             ty: (),
         };
-        let val = self.values.alloc(val);
+        let val = self.values.alloc(val.into());
         self.blocks[k].params.push((val, ()));
         return val;
     }
@@ -153,12 +181,13 @@ impl SwcFunc {
 pub struct Trans {
     pub map: BTreeMap<Id<TBlock>, Id<SBlock>>,
     pub all: BTreeSet<Ident>,
+    pub undef: Id<SValueW>
 }
 impl Trans {
     pub fn apply_shim(
         &self,
         o: &mut SwcFunc,
-        state: &BTreeMap<Ident, Id<SValue>>,
+        state: &BTreeMap<Ident, Id<SValueW>>,
         s: &Option<(Id<SBlock>, Vec<Ident>)>,
         x: Id<SBlock>,
     ) {
@@ -176,19 +205,19 @@ impl Trans {
     }
     pub fn load(
         &self,
-        state: &BTreeMap<Ident, Id<SValue>>,
+        state: &BTreeMap<Ident, Id<SValueW>>,
         o: &mut SwcFunc,
         t: Id<SBlock>,
         a: Ident,
-        cache: &BTreeMap<Ident, Id<SValue>>,
-    ) -> Id<SValue> {
+        cache: &BTreeMap<Ident, Id<SValueW>>,
+    ) -> Id<SValueW> {
         if let Some(k) = cache.get(&a) {
             return *k;
         }
         match state.get(&a).cloned() {
             Some(b) => b,
             None => {
-                let v = o.values.alloc(SValue::LoadId(a));
+                let v = o.values.alloc(SValue::LoadId(a).into());
                 o.blocks[t].stmts.push(v);
                 return v;
             }
@@ -252,7 +281,7 @@ impl Trans {
                     .clone()
                     .map::<_, Infallible>(&mut |a| Ok(self.load(&state, o, t, a, &cache)))
                     .unwrap();
-                let b = o.values.alloc(SValue::Item(b));
+                let b = o.values.alloc(SValue::Item(b).into());
                 o.blocks[t].stmts.push(b);
                 match a.clone() {
                     LId::Id { id } => match state.get_mut(&id) {
@@ -275,7 +304,7 @@ impl Trans {
                             let c = o.values.alloc(SValue::StoreId {
                                 target: id.clone(),
                                 val: b,
-                            });
+                            }.into());
                             o.blocks[t].stmts.push(c);
                         }
                     },
@@ -285,7 +314,7 @@ impl Trans {
                         let c = a
                             .map::<_, Infallible>(&mut |a| Ok(self.load(&state, o, t, a, &cache)))
                             .unwrap();
-                        let c = o.values.alloc(SValue::Assign { target: c, val: b });
+                        let c = o.values.alloc(SValue::Assign { target: c, val: b }.into());
                         o.blocks[t].stmts.push(c);
                     }
                 };

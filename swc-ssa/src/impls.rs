@@ -7,7 +7,7 @@ use std::{
 use id_arena::{Arena, Id};
 use ssa_traits::{HasChainableValues, HasValues};
 
-use crate::{SBlock, SCatch, SFunc, SPostcedent, STarget, STerm, SValue};
+use crate::{SBlock, SCatch, SFunc, SPostcedent, STarget, STerm, SValue, SValueW};
 
 impl cfg_traits::Func for SFunc {
     type Block = Id<SBlock>;
@@ -147,9 +147,9 @@ impl cfg_traits::Target<SFunc> for STarget {
     }
 }
 impl ssa_traits::Func for SFunc {
-    type Value = Id<SValue>;
+    type Value = Id<SValueW>;
 
-    type Values = Arena<SValue>;
+    type Values = Arena<SValueW>;
 
     fn values(&self) -> &Self::Values {
         &self.cfg.values
@@ -159,12 +159,12 @@ impl ssa_traits::Func for SFunc {
         &mut self.cfg.values
     }
 }
-impl ssa_traits::Value<SFunc> for SValue {}
-impl ssa_traits::HasChainableValues<SFunc> for SValue {
+impl ssa_traits::Value<SFunc> for SValueW {}
+impl ssa_traits::HasChainableValues<SFunc> for SValueW {
     fn values_chain<'a>(
         &'a self,
     ) -> Box<dyn Iterator<Item = <SFunc as ssa_traits::Func>::Value> + 'a> {
-        match self {
+        match &self.0 {
             SValue::Param { block, idx, ty } => Box::new(empty()),
             SValue::Item(item) => match item {
                 swc_tac::Item::Just { id } => Box::new(once(*id)),
@@ -178,7 +178,7 @@ impl ssa_traits::HasChainableValues<SFunc> for SValue {
                 }
                 swc_tac::Item::Obj { members } => Box::new(members.iter().flat_map(|m| {
                     let v = once(m.1);
-                    let w: Box<dyn Iterator<Item = &Id<SValue>> + '_> = match &m.0 {
+                    let w: Box<dyn Iterator<Item = &Id<SValueW>> + '_> = match &m.0 {
                         swc_tac::PropKey::Lit(_) => Box::new(empty()),
                         swc_tac::PropKey::Computed(c) => Box::new(once(c)),
                     };
@@ -191,7 +191,7 @@ impl ssa_traits::HasChainableValues<SFunc> for SValue {
             },
             SValue::Assign { target, val } => {
                 let v = once(*val);
-                let w: Box<dyn Iterator<Item = &Id<SValue>> + '_> = match target {
+                let w: Box<dyn Iterator<Item = &Id<SValueW>> + '_> = match target {
                     swc_tac::LId::Id { id } => todo!(),
                     swc_tac::LId::Member { obj, mem } => Box::new([obj, mem].into_iter()),
                 };
@@ -209,7 +209,7 @@ impl ssa_traits::HasChainableValues<SFunc> for SValue {
     where
         SFunc: 'a,
     {
-        match self {
+        match &mut self.0 {
             SValue::Param { block, idx, ty } => Box::new(empty()),
             SValue::Item(item) => match item {
                 swc_tac::Item::Just { id } => Box::new(once(id)),
@@ -221,7 +221,7 @@ impl ssa_traits::HasChainableValues<SFunc> for SValue {
                 swc_tac::Item::Call { r#fn, member, args } => Box::new(once(r#fn).chain(member.iter_mut()).chain(args.iter_mut())),
                 swc_tac::Item::Obj { members } => Box::new(members.iter_mut().flat_map(|m| {
                     let v = once(&mut m.1);
-                    let w: Box<dyn Iterator<Item = &mut Id<SValue>> + '_> = match &mut m.0 {
+                    let w: Box<dyn Iterator<Item = &mut Id<SValueW>> + '_> = match &mut m.0 {
                         swc_tac::PropKey::Lit(_) => Box::new(empty()),
                         swc_tac::PropKey::Computed(c) => Box::new(once(c)),
                     };
@@ -234,7 +234,7 @@ impl ssa_traits::HasChainableValues<SFunc> for SValue {
             },
             SValue::Assign { target, val } => {
                 let v = once(val);
-                let w: Box<dyn Iterator<Item = &mut Id<SValue>> + '_> = match target {
+                let w: Box<dyn Iterator<Item = &mut Id<SValueW>> + '_> = match target {
                     swc_tac::LId::Id { id } => todo!(),
                     swc_tac::LId::Member { obj, mem } => Box::new([obj, mem].into_iter()),
                 };
@@ -245,7 +245,7 @@ impl ssa_traits::HasChainableValues<SFunc> for SValue {
         }
     }
 }
-impl HasValues<SFunc> for SValue {
+impl HasValues<SFunc> for SValueW {
     fn values<'a>(
         &'a self,
         f: &'a SFunc,
@@ -477,5 +477,22 @@ impl HasValues<SFunc> for SPostcedent {
         SFunc: 'a,
     {
         self.values_chain_mut()
+    }
+}
+impl ssa_traits::TypedFunc for SFunc{
+    type Ty = ();
+
+    fn add_blockparam(&mut self, k: Self::Block, y: Self::Ty) -> Self::Value {
+        self.cfg.add_blockparam(k)
+    }
+}
+impl ssa_traits::TypedBlock<SFunc> for SBlock{
+    fn params(&self) -> impl Iterator<Item = (<SFunc as ssa_traits::TypedFunc>::Ty, <SFunc as ssa_traits::Func>::Value)> {
+        return self.params.iter().map(|(a,b)|(*b,*a));
+    }
+}
+impl ssa_traits::TypedValue<SFunc> for SValueW{
+    fn ty(&self, f: &SFunc) -> <SFunc as ssa_traits::TypedFunc>::Ty {
+        ()
     }
 }

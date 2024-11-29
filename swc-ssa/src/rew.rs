@@ -5,7 +5,7 @@ use swc_atoms::Atom;
 use swc_ecma_ast::Id as Ident;
 use swc_tac::{Item, LId, TBlock, TCatch, TCfg, TFunc, TTerm};
 
-use crate::{SBlock, SFunc, STarget, SValue};
+use crate::{SBlock, SFunc, STarget, SValue, SValueW};
 
 impl TryFrom<SFunc> for TFunc {
     type Error = anyhow::Error;
@@ -68,7 +68,7 @@ impl Rew {
                     };
                     b.blocks[k2].catch = catch;
                     for val in a.cfg.blocks[*id].stmts.iter() {
-                        match &a.cfg.values[*val] {
+                        match &a.cfg.values[*val].0 {
                             SValue::Param { block, idx, ty } => todo!(),
                             SValue::Item(item) => {
                                 let i =
@@ -189,8 +189,8 @@ pub fn mangle_param(k: Id<SBlock>, i: usize) -> Ident {
         Default::default(),
     )
 }
-pub fn mangle_value(a: &SFunc, v: Id<SValue>) -> Ident {
-    if let SValue::Param { block, idx, ty } = &a.cfg.values[v] {
+pub fn mangle_value(a: &SFunc, v: Id<SValueW>) -> Ident {
+    if let SValue::Param { block, idx, ty } = &a.cfg.values[v].0 {
         return mangle_param(*block, *idx);
     }
     return (Atom::new(format!("v{}", v.index())), Default::default());

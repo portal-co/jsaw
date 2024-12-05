@@ -2,6 +2,8 @@
 name = "portal-jsc-swc-ssa"
 version = "0.1.2"
 edition = "2021"
+license = "CC0-1.0"
+description = "ECMAScript IR"
 [lib]
 name = "swc_ssa"
 

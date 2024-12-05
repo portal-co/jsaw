@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use id_arena::Id;
 use swc_cfg::{Block, Cfg};
 use swc_cfg::{Func, Term};
-use swc_common::Span;
+use swc_common::{Span, SyntaxContext};
 use swc_ecma_ast::BinExpr;
 use swc_ecma_ast::CallExpr;
 use swc_ecma_ast::ComputedPropName;
@@ -24,7 +24,7 @@ use swc_ecma_ast::{ArrayLit, Param};
 use swc_ecma_ast::{AssignExpr, Decl, VarDecl, VarDeclarator};
 use swc_ecma_ast::{AssignTarget, Function};
 
-use crate::{TBlock, TCfg, TFunc};
+use crate::{TBlock, TCallee, TCfg, TFunc};
 
 impl TryFrom<TFunc> for Func {
     type Error = anyhow::Error;
@@ -162,32 +162,35 @@ impl Rew {
                         function: Box::new(func.clone().try_into()?),
                     }),
                     crate::Item::Lit { lit } => Expr::Lit(lit.clone()),
-                    crate::Item::Call { r#fn, member, args } => {
-                        let f = Box::new(Expr::Ident(i(r#fn)));
-                        Expr::Call(CallExpr {
-                            span: Span::dummy_with_cmt(),
-                            ctxt: r#fn.1.clone(),
-                            callee: swc_ecma_ast::Callee::Expr(match member {
-                                Some(m) => Box::new(Expr::Member(MemberExpr {
+                    crate::Item::Call { callee, args } => Expr::Call(CallExpr {
+                        span: Span::dummy_with_cmt(),
+                        ctxt: SyntaxContext::empty(),
+                        callee: swc_ecma_ast::Callee::Expr(match callee {
+                            crate::TCallee::Member { r#fn, member } => {
+                                let f = Box::new(Expr::Ident(i(r#fn)));
+                                Box::new(Expr::Member(MemberExpr {
                                     span: Span::dummy_with_cmt(),
                                     obj: f,
                                     prop: swc_ecma_ast::MemberProp::Computed(ComputedPropName {
                                         span: Span::dummy_with_cmt(),
-                                        expr: Box::new(Expr::Ident(i(m))),
+                                        expr: Box::new(Expr::Ident(i(member))),
                                     }),
-                                })),
-                                None => f,
-                            }),
-                            args: args
-                                .iter()
-                                .map(|a| swc_ecma_ast::ExprOrSpread {
-                                    spread: None,
-                                    expr: Box::new(Expr::Ident(i(a))),
-                                })
-                                .collect(),
-                            type_args: None,
-                        })
-                    }
+                                }))
+                            }
+                            crate::TCallee::Static(r#fn) | TCallee::Val(r#fn) => {
+                                let f = Box::new(Expr::Ident(i(r#fn)));
+                                f
+                            }
+                        }),
+                        args: args
+                            .iter()
+                            .map(|a| swc_ecma_ast::ExprOrSpread {
+                                spread: None,
+                                expr: Box::new(Expr::Ident(i(a))),
+                            })
+                            .collect(),
+                        type_args: None,
+                    }),
                     crate::Item::Obj { members } => Expr::Object(ObjectLit {
                         span: Span::dummy_with_cmt(),
                         props: members

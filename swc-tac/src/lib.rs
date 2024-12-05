@@ -117,10 +117,15 @@ impl TCfg {
                     Item::Mem { obj, mem } => Box::new(once(obj.clone()).chain(once(mem.clone()))),
                     Item::Func { func } => Box::new(func.cfg.externs()),
                     Item::Lit { lit } => Box::new(empty()),
-                    Item::Call { r#fn, member, args } => Box::new(
-                        once(r#fn.clone())
-                            .chain(member.clone().into_iter())
-                            .chain(args.iter().cloned()),
+                    Item::Call { callee, args } => Box::new(
+                        match callee {
+                            TCallee::Val(v) => once(v.clone()).chain(None.into_iter()),
+                            TCallee::Member { r#fn, member } => {
+                                once(r#fn.clone()).chain(Some(member.clone()).into_iter())
+                            }
+                            TCallee::Static(v) => once(v.clone()).chain(None.into_iter()),
+                        }
+                        .chain(args.iter().cloned()),
                     ),
                     Item::Obj { members } => Box::new(members.iter().flat_map(|(a, b)| {
                         once(b.clone()).chain(
@@ -204,47 +209,36 @@ impl<I> PropKey<I> {
     }
 }
 #[derive(Clone)]
+pub enum TCallee<I = Ident> {
+    Val(I),
+    Member { r#fn: I, member: I },
+    Static(Ident),
+}
+impl<I> TCallee<I> {
+    pub fn map<J: Ord, E>(self, f: &mut impl FnMut(I) -> Result<J, E>) -> Result<TCallee<J>, E> {
+        Ok(match self {
+            TCallee::Val(a) => TCallee::Val(f(a)?),
+            TCallee::Member { r#fn, member } => TCallee::Member {
+                r#fn: f(r#fn)?,
+                member: f(member)?,
+            },
+            TCallee::Static(a) => TCallee::Static(a),
+        })
+    }
+}
+#[derive(Clone)]
 pub enum Item<I = Ident> {
-    Just {
-        id: I,
-    },
-    Bin {
-        left: I,
-        right: I,
-        op: BinaryOp,
-    },
-    Un {
-        arg: I,
-        op: UnaryOp,
-    },
-    Mem {
-        obj: I,
-        mem: I,
-    },
-    Func {
-        func: TFunc,
-    },
-    Lit {
-        lit: Lit,
-    },
-    Call {
-        r#fn: I,
-        member: Option<I>,
-        args: Vec<I>,
-    },
-    Obj {
-        members: Vec<(PropKey<I>, I)>,
-    },
-    Arr {
-        members: Vec<I>,
-    },
-    Yield {
-        value: Option<I>,
-        delegate: bool,
-    },
-    Await {
-        value: I,
-    },
+    Just { id: I },
+    Bin { left: I, right: I, op: BinaryOp },
+    Un { arg: I, op: UnaryOp },
+    Mem { obj: I, mem: I },
+    Func { func: TFunc },
+    Lit { lit: Lit },
+    Call { callee: TCallee<I>, args: Vec<I> },
+    Obj { members: Vec<(PropKey<I>, I)> },
+    Arr { members: Vec<I> },
+    Yield { value: Option<I>, delegate: bool },
+    Await { value: I },
     Undef,
 }
 impl<I> Item<I> {
@@ -263,12 +257,8 @@ impl<I> Item<I> {
             },
             Item::Func { func } => Item::Func { func },
             Item::Lit { lit } => Item::Lit { lit },
-            Item::Call { r#fn, member, args } => Item::Call {
-                r#fn: f(r#fn)?,
-                member: match member {
-                    None => None,
-                    Some(member) => Some(f(member)?),
-                },
+            Item::Call { callee, args } => Item::Call {
+                callee: callee.map(f)?,
                 args: args.into_iter().map(f).collect::<Result<Vec<J>, E>>()?,
             },
             Item::Obj { members } => Item::Obj {
@@ -569,19 +559,19 @@ impl Trans {
                 return Ok((right, t));
             }
             Expr::Call(call) => {
-                let (r#fn, member) = match &call.callee {
+                let c = match &call.callee {
                     Callee::Expr(e) => match e.as_ref() {
                         Expr::Member(m) => {
                             let r#fn;
                             (r#fn, t) = self.expr(i, o, b, t, &m.obj)?;
                             let member;
                             (member, t) = self.expr(i, o, b, t, &imp(m.prop.clone()))?;
-                            (r#fn, Some(member))
+                            TCallee::Member { r#fn, member }
                         }
                         _ => {
                             let r#fn;
                             (r#fn, t) = self.expr(i, o, b, t, e.as_ref())?;
-                            (r#fn, None)
+                            TCallee::Val(r#fn)
                         }
                     },
                     _ => anyhow::bail!("todo: {}:{}", file!(), line!()),
@@ -596,10 +586,9 @@ impl Trans {
                     })
                     .collect::<anyhow::Result<_>>()?;
                 let tmp = o.regs.alloc(());
-                o.blocks[t].stmts.push((
-                    LId::Id { id: tmp.clone() },
-                    Item::Call { r#fn, member, args },
-                ));
+                o.blocks[t]
+                    .stmts
+                    .push((LId::Id { id: tmp.clone() }, Item::Call { callee: c, args }));
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
             }

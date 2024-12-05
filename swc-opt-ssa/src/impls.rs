@@ -174,9 +174,12 @@ impl ssa_traits::HasChainableValues<OptFunc> for OptValueW {
                     swc_tac::Item::Mem { obj, mem } => Box::new([*obj, *mem].into_iter()),
                     swc_tac::Item::Func { func } => Box::new(empty()),
                     swc_tac::Item::Lit { lit } => Box::new(empty()),
-                    swc_tac::Item::Call { r#fn, member, args } => Box::new(
-                        once(*r#fn)
-                            .chain(member.iter().cloned())
+                    swc_tac::Item::Call { callee, args } => Box::new(
+                        match callee{
+                            swc_tac::TCallee::Val(a) => vec![*a],
+                            swc_tac::TCallee::Member { r#fn, member } => vec![*r#fn,*member],
+                            swc_tac::TCallee::Static(_) => vec![],
+                        }.into_iter()
                             .chain(args.iter().cloned()),
                     ),
                     swc_tac::Item::Obj { members } => Box::new(members.iter().flat_map(|m| {
@@ -225,8 +228,12 @@ impl ssa_traits::HasChainableValues<OptFunc> for OptValueW {
                     swc_tac::Item::Mem { obj, mem } => Box::new([obj, mem].into_iter()),
                     swc_tac::Item::Func { func } => Box::new(empty()),
                     swc_tac::Item::Lit { lit } => Box::new(empty()),
-                    swc_tac::Item::Call { r#fn, member, args } => {
-                        Box::new(once(r#fn).chain(member.iter_mut()).chain(args.iter_mut()))
+                    swc_tac::Item::Call { callee, args } => {
+                        Box::new(match callee{
+                            swc_tac::TCallee::Val(a) => vec![a],
+                            swc_tac::TCallee::Member { r#fn, member } => vec![r#fn,member],
+                            swc_tac::TCallee::Static(_) => vec![],
+                        }.into_iter().chain(args.iter_mut()))
                     }
                     swc_tac::Item::Obj { members } => Box::new(members.iter_mut().flat_map(|m| {
                         let v = once(&mut m.1);
@@ -507,18 +514,11 @@ impl ssa_traits::TypedBlock<OptFunc> for OptBlock {
             <OptFunc as ssa_traits::Func>::Value,
         ),
     > {
-        return self.params.iter().map(|(a, b)| (*b, *a));
+        return self.params.iter().map(|(a, b)| (b.clone(), *a));
     }
 }
 impl ssa_traits::TypedValue<OptFunc> for OptValueW {
     fn ty(&self, f: &OptFunc) -> <OptFunc as ssa_traits::TypedFunc>::Ty {
-        match &self.0 {
-            OptValue::Deopt(d) => {
-                let x = f.values()[*d].ty(f);
-                x.and_then(|y| y.parent())
-            }
-            OptValue::Assert { val, ty } => ty.clone(),
-            OptValue::Emit { val, ty } => ty.clone(),
-        }
+        self.ty(&f.cfg)
     }
 }

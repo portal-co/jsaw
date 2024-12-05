@@ -1,26 +1,53 @@
 use std::{collections::BTreeSet, iter::once};
 
 use id_arena::Id;
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quasiquote::quasiquote;
 use quote::{format_ident, quote};
+use swc_opt_ssa::{OptBlock, OptFunc, OptType, OptValueW};
 use swc_ssa::{SBlock, SCatch, SFunc, SValue, SValueW};
-use swc_tac::{Item, LId, TBlock, TCfg, TFunc};
-use syn::{Ident, Path};
-pub mod wasm;
+use swc_tac::{Item, LId, TBlock, TCallee, TCfg, TFunc};
+use syn::{Ident, Index, Path};
+// pub mod wasm;
 
 pub struct Opts {
     pub rt_path: Path,
 }
-pub fn emit(opts: &Opts, x: &SFunc, old: &BTreeSet<swc_ecma_ast::Id>) -> TokenStream {
-    let x = swc_ssa::ch::ch(x).unwrap();
+pub fn rty(opts: &Opts, a: Option<OptType>) -> TokenStream {
+    let root = &opts.rt_path;
+    match a {
+        Some(x) => match x {
+            OptType::Number => quote! {
+                f64
+            },
+            OptType::U32 { bits_usable } => quote! {
+                u32
+            },
+            OptType::BigInt => quote! {
+                #root::BigInt
+            },
+            OptType::U64 { bits_usable } => quote! {
+                u64
+            },
+            OptType::Bool => quote! {
+                bool
+            },
+            OptType::Array { elem_ty } => quasiquote! {
+                #root::Vec<#{rty(opts, elem_ty.as_ref().clone())}>
+            },
+        },
+        None => quote! {
+            #root::O
+        },
+    }
+}
+pub fn emit(opts: &Opts, x: &OptFunc, old: &BTreeSet<swc_ecma_ast::Id>) -> TokenStream {
     let root = &opts.rt_path;
     let states = x.cfg.blocks.iter().map(|a| k(a.0)).collect::<Vec<_>>();
-    let s2 = x
-        .cfg
-        .blocks
-        .iter()
-        .map(|(a, b)| quasiquote!(#{k(a)}([#root::O; #{b.params.len()}])));
+    let s2 = x.cfg.blocks.iter().map(|(a, b)| {
+        let params = b.params.iter().map(|a| a.1.clone()).map(|p| rty(opts, p));
+        quasiquote!(#{k(a)}((#(#params),*)))
+    });
     let ids = x
         .cfg
         .decls
@@ -65,7 +92,7 @@ pub fn emit(opts: &Opts, x: &SFunc, old: &BTreeSet<swc_ecma_ast::Id>) -> TokenSt
             swc_ssa::STerm::Jmp(id) => {
                 let args = id.args.iter().map(|a| quasiquote!(#{si(*a)}.clone()));
                 quasiquote! {
-                    Ok(S::#{k(id.block)}([#(#args),*]))
+                    Ok(S::#{k(id.block)}((#(#args),*)))
                 }
             }
             swc_ssa::STerm::CondJmp {
@@ -77,8 +104,8 @@ pub fn emit(opts: &Opts, x: &SFunc, old: &BTreeSet<swc_ecma_ast::Id>) -> TokenSt
                 let args_if = if_false.args.iter().map(|a| quasiquote!(#{si(*a)}.clone()));
                 quasiquote! {
                     Ok(match #{si(*cond)}.lock().unwrap().truthy(){
-                        true => S::#{k(if_true.block)}([#(#args_it),*]),
-                        false => S::#{k(if_false.block)}([#(#args_if),*])
+                        true => S::#{k(if_true.block)}((#(#args_it),*)),
+                        false => S::#{k(if_false.block)}((#(#args_if),*))
                     })
                 }
             }
@@ -90,7 +117,7 @@ pub fn emit(opts: &Opts, x: &SFunc, old: &BTreeSet<swc_ecma_ast::Id>) -> TokenSt
                         let params = blocks.iter().map(|(a,b)|{
                             let args = b.args.iter().map(|a|quasiquote!(#{si(*a)}.clone()));
                             quasiquote!{
-                            (#{si(*a)}.clone(),S::#{k(b.block)}([#(#args),*]))
+                            (#{si(*a)}.clone(),S::#{k(b.block)}((#(#args),*)))
                         }});
                         quote! {
                             #(#params),*
@@ -99,7 +126,7 @@ pub fn emit(opts: &Opts, x: &SFunc, old: &BTreeSet<swc_ecma_ast::Id>) -> TokenSt
                         Some(a.1)
                     }else{
                         None
-                    }).unwrap_or(S::#{k(default.block)}[#(#args),*]))
+                    }).unwrap_or(S::#{k(default.block)}(#(#args),*)))
                 }
             }
             swc_ssa::STerm::Default => todo!(),
@@ -108,10 +135,10 @@ pub fn emit(opts: &Opts, x: &SFunc, old: &BTreeSet<swc_ecma_ast::Id>) -> TokenSt
             .params
             .iter()
             .map(|a| &a.0)
-            .chain(b.stmts.iter())
+            .chain(b.insts.iter())
             .map(|(val)| {
                 quasiquote! {
-                    let #{si(*val)} = #{v(opts,&x,*val,&total)};
+                    let #{si(*val)}: #{rty(opts, x.cfg.values[*val].ty(&x.cfg))} = #{v(opts,&x,*val,&total)};
                 }
             });
         let body = quote! {#(#stmts);*};
@@ -134,11 +161,14 @@ pub fn emit(opts: &Opts, x: &SFunc, old: &BTreeSet<swc_ecma_ast::Id>) -> TokenSt
         }
     });
     let entry = k(x.entry);
+    let args = x.cfg.blocks[x.entry].params.iter().enumerate().map(|a|a.0).map(|i|quasiquote!{
+        arguments[#i].clone()
+    });
     quote! {
         enum S{
             #(#s2),*
         }
-        let mut state = S::#entry(arguments.try_into().unwrap());
+        let mut state = S::#entry((#(#args),*));
         #(let mut #ids = #vals);*
         loop{
             match state{
@@ -147,31 +177,48 @@ pub fn emit(opts: &Opts, x: &SFunc, old: &BTreeSet<swc_ecma_ast::Id>) -> TokenSt
         }
     }
 }
-pub fn k(i: Id<SBlock>) -> Ident {
+pub fn k(i: Id<OptBlock>) -> Ident {
     format_ident!("S{}", i.index())
 }
 pub fn i(i: &swc_ecma_ast::Id) -> Ident {
     format_ident!("v{}_{}", i.0.to_string(), i.1.as_u32())
 }
-pub fn si(a: Id<SValueW>) -> Ident {
+pub fn si(a: Id<OptValueW>) -> Ident {
     format_ident!("s{}", a.index())
 }
-fn v(opts: &Opts, x: &SFunc, val: Id<SValueW>, total: &BTreeSet<swc_ecma_ast::Id>) -> TokenStream {
+fn v(
+    opts: &Opts,
+    x: &OptFunc,
+    val: Id<OptValueW>,
+    total: &BTreeSet<swc_ecma_ast::Id>,
+) -> TokenStream {
     match &x.cfg.values[val].0 {
-        SValue::Param { block, idx, ty } => quote! {
-            params[#idx].clone()
+        swc_opt_ssa::OptValue::Deopt(a) => quasiquote!{
+            #{si(*a)}.clone().into()
         },
-        SValue::Item(item) => stmt(opts, item, total),
-        SValue::Assign { target, val } => lid(opts, target, quasiquote!(#{si(*val)}.clone())),
-        SValue::LoadId(j) => quasiquote! {
-            #{i(j)}.lock().unwrap().clone()
+        swc_opt_ssa::OptValue::Assert { val, ty } => quasiquote!{
+            #{si(*val)}.clone().try_into().unwrap()
         },
-        SValue::StoreId { target, val } => quasiquote! {
-            *#{i(target)}.lock().unwrap() = #{si(*val)}
+        swc_opt_ssa::OptValue::Emit { val, ty } => match val {
+            SValue::Param { block, idx, ty } => quasiquote! {
+                params.#{Index{span: Span::call_site(),index: *idx as u32}}.clone()
+            },
+            SValue::Item(item) => stmt(opts, item, total),
+            SValue::Assign { target, val } => lid(opts, target, quasiquote!(#{si(*val)}.clone())),
+            SValue::LoadId(j) => quasiquote! {
+                #{i(j)}.lock().unwrap().clone()
+            },
+            SValue::StoreId { target, val } => quasiquote! {
+                *#{i(target)}.lock().unwrap() = #{si(*val)}
+            },
         },
     }
 }
-fn stmt(opts: &Opts, stmt: &Item<Id<SValueW>>, total: &BTreeSet<swc_ecma_ast::Id>) -> TokenStream {
+fn stmt(
+    opts: &Opts,
+    stmt: &Item<Id<OptValueW>>,
+    total: &BTreeSet<swc_ecma_ast::Id>,
+) -> TokenStream {
     let root = &opts.rt_path;
     match stmt {
         Item::Just { id } => quasiquote!(#{si(*id)}.clone()),
@@ -198,6 +245,7 @@ fn stmt(opts: &Opts, stmt: &Item<Id<SValueW>>, total: &BTreeSet<swc_ecma_ast::Id
             // let func: anyhow::Result<swc_tac::TFunc> = func.and_then(|a| a.try_into());
             let mut func = func.clone();
             func.cfg.update();
+            let func: SFunc = func.try_into().unwrap();
             let func = func.try_into().unwrap();
             let k = emit(opts, &func, total);
             let total2 = total.iter().map(i).collect::<BTreeSet<_>>();
@@ -220,17 +268,21 @@ fn stmt(opts: &Opts, stmt: &Item<Id<SValueW>>, total: &BTreeSet<swc_ecma_ast::Id
             };
         }
         Item::Lit { lit } => todo!(),
-        Item::Call { r#fn, member, args } => {
+        Item::Call { callee, args } => {
             let args = args.iter().cloned().map(si);
-            let obj = quasiquote! {#{si(*r#fn)}.clone()};
-            let get = match member {
-                Some(a) => quasiquote! {item
-                    match obj.get(&#{si(*a)}){
+            let obj = match callee {
+                swc_tac::TCallee::Val(r#fn) => quasiquote! {#{si(*r#fn)}.clone()},
+                swc_tac::TCallee::Member { r#fn, member } => quasiquote! {#{si(*r#fn)}.clone()},
+                swc_tac::TCallee::Static(r#fn) => quasiquote! {#{i(r#fn)}.lock().unwrap().clone()},
+            };
+            let get = match callee {
+                TCallee::Member { member, .. } => quasiquote! {item
+                    match obj.get(&#{si(*member)}){
                         Ok(a) => a,
                         Err(_) => #root::synth::throw_reference_error()?,
                     }
                 },
-                None => quote! {obj},
+                _ => quote! {obj},
             };
             quasiquote!(
                 match #obj{
@@ -254,7 +306,7 @@ fn stmt(opts: &Opts, stmt: &Item<Id<SValueW>>, total: &BTreeSet<swc_ecma_ast::Id
         }
     }
 }
-fn lid(opts: &Opts, lid: &LId<Id<SValueW>>, val: TokenStream) -> TokenStream {
+fn lid(opts: &Opts, lid: &LId<Id<OptValueW>>, val: TokenStream) -> TokenStream {
     match lid {
         LId::Id { id } => todo!(),
         LId::Member { obj, mem } => {

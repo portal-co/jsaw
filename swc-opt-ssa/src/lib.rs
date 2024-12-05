@@ -2,15 +2,16 @@ use std::collections::BTreeSet;
 
 use id_arena::{Arena, Id};
 use swc_ssa::{SCatch, SPostcedent, STarget, STerm, SValue};
-pub mod into;
 pub mod impls;
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub mod into;
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OptType {
     Number,
     U32 { bits_usable: u8 },
     BigInt,
     U64 { bits_usable: u8 },
     Bool,
+    Array { elem_ty: Box<Option<OptType>> },
 }
 impl OptType {
     pub fn parent(&self) -> Option<OptType> {
@@ -33,6 +34,12 @@ impl OptType {
                     })
                 }
             }
+            OptType::Array { elem_ty } => match elem_ty.as_ref() {
+                Some(a) => Some(OptType::Array {
+                    elem_ty: Box::new(a.parent()),
+                }),
+                None => None,
+            },
             _ => None,
         }
     }
@@ -57,15 +64,27 @@ pub struct OptBlock {
     pub insts: Vec<Id<OptValueW>>,
     pub postcedent: OptPostcedent,
 }
-pub type OptPostcedent = SPostcedent<Id<OptValueW>,Id<OptBlock>>;
-pub type OptTarget = STarget<Id<OptValueW>,Id<OptBlock>>;
-pub type OptTerm = STerm<Id<OptValueW>,Id<OptBlock>>;
-pub type OptCatch = SCatch<Id<OptValueW>,Id<OptBlock>>;
+pub type OptPostcedent = SPostcedent<Id<OptValueW>, Id<OptBlock>>;
+pub type OptTarget = STarget<Id<OptValueW>, Id<OptBlock>>;
+pub type OptTerm = STerm<Id<OptValueW>, Id<OptBlock>>;
+pub type OptCatch = SCatch<Id<OptValueW>, Id<OptBlock>>;
 #[derive(Default)]
 pub struct OptCfg {
     pub values: Arena<OptValueW>,
     pub blocks: Arena<OptBlock>,
     pub decls: BTreeSet<swc_ecma_ast::Id>,
+}
+impl OptValueW{
+    pub fn ty(&self, cfg: &OptCfg) -> Option<OptType>{
+        match &self.0 {
+            OptValue::Deopt(d) => {
+                let x = cfg.values[*d].ty(cfg);
+                x.and_then(|y| y.parent())
+            }
+            OptValue::Assert { val, ty } => ty.clone(),
+            OptValue::Emit { val, ty } => ty.clone(),
+        }
+    }
 }
 pub struct OptFunc {
     pub cfg: OptCfg,
@@ -81,9 +100,9 @@ impl OptCfg {
                 idx: self.blocks[k].params.len(),
                 ty: (),
             },
-            ty,
+            ty: ty.clone(),
         }));
-        self.blocks[k].params.push((v,ty));
+        self.blocks[k].params.push((v, ty));
         return v;
     }
 }

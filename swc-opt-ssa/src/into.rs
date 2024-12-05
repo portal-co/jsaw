@@ -8,7 +8,6 @@ use swc_tac::Item;
 
 use crate::{OptBlock, OptCfg, OptFunc, OptType, OptValue, OptValueW};
 
-
 pub struct Convert {
     pub all: BTreeMap<Id<SBlock>, BTreeMap<Vec<Option<OptType>>, Id<OptBlock>>>,
 }
@@ -70,7 +69,11 @@ impl Convert {
                 .params
                 .iter()
                 .map(|a| a.0)
-                .zip(tys.iter().cloned().map(|a| (out.add_blockparam(k, a), a)))
+                .zip(
+                    tys.iter()
+                        .cloned()
+                        .map(|a| (out.add_blockparam(k, a.clone()), a)),
+                )
                 .collect::<BTreeMap<_, _>>();
             let catch = match &inp.blocks[i].postcedent.catch {
                 swc_ssa::SCatch::Throw => SCatch::Throw,
@@ -105,7 +108,7 @@ impl Convert {
                             (
                                 OptValue::Emit {
                                     val: SValue::Item(Item::Just { id: a }),
-                                    ty: b,
+                                    ty: b.clone(),
                                 },
                                 b,
                             )
@@ -115,7 +118,7 @@ impl Convert {
                                 state.get(left).cloned().context("in getting the value")?;
                             let (right, rty) =
                                 state.get(right).cloned().context("in getting the value")?;
-                            match (lty, rty, op) {
+                            match (lty.clone(), rty.clone(), op) {
                                 (
                                     Some(OptType::U32 { bits_usable }),
                                     Some(OptType::U32 { bits_usable: b2 }),
@@ -130,7 +133,13 @@ impl Convert {
                                         bits_usable: (32 - bits_usable) + (32 - b2) - 32,
                                     });
                                     match op {
-                                        op => (OptValue::Emit { val: result, ty }, ty),
+                                        op => (
+                                            OptValue::Emit {
+                                                val: result,
+                                                ty: ty.clone(),
+                                            },
+                                            ty,
+                                        ),
                                     }
                                 }
                                 (
@@ -147,13 +156,19 @@ impl Convert {
                                         bits_usable: (64 - bits_usable) + (64 - b2) - 64,
                                     });
                                     match op {
-                                        op => (OptValue::Emit { val: result, ty }, ty),
+                                        op => (
+                                            OptValue::Emit {
+                                                val: result,
+                                                ty: ty.clone(),
+                                            },
+                                            ty,
+                                        ),
                                     }
                                 }
                                 (lty, rty, op) => {
                                     let (left, right, ty) =
                                         bi_id_deopt(out, k, left, lty, right, rty)?;
-                                    match (ty, op) {
+                                    match (ty.clone(), op) {
                                         (Some(OptType::Number | OptType::BigInt), op) => {
                                             let result = SValue::Item(Item::Bin {
                                                 left,
@@ -167,7 +182,13 @@ impl Convert {
                                                 ty
                                             };
                                             match op {
-                                                op => (OptValue::Emit { val: result, ty }, ty),
+                                                op => (
+                                                    OptValue::Emit {
+                                                        val: result,
+                                                        ty: ty.clone(),
+                                                    },
+                                                    ty,
+                                                ),
                                             }
                                         }
                                         (
@@ -189,11 +210,17 @@ impl Convert {
                                                 ty.unwrap().parent()
                                             };
                                             match op {
-                                                op => (OptValue::Emit { val: result, ty }, ty),
+                                                op => (
+                                                    OptValue::Emit {
+                                                        val: result,
+                                                        ty: ty.clone(),
+                                                    },
+                                                    ty,
+                                                ),
                                             }
                                         }
                                         (ty, op) => {
-                                            let left = deopt(out, k, left, ty)?;
+                                            let left = deopt(out, k, left, ty.clone())?;
                                             let right = deopt(out, k, right, ty)?;
                                             let result = SValue::Item(Item::Bin {
                                                 left,
@@ -217,11 +244,11 @@ impl Convert {
                         swc_tac::Item::Un { arg, op } => {
                             let (arg, tag) =
                                 state.get(arg).cloned().context("in getting the value")?;
-                            match (tag, op) {
+                            match (tag.clone(), op) {
                                 (Some(OptType::Number | OptType::U32 { .. }), UnaryOp::Plus) => (
                                     OptValue::Emit {
                                         val: SValue::Item(Item::Just { id: arg }),
-                                        ty: tag,
+                                        ty: tag.clone(),
                                     },
                                     tag,
                                 ),
@@ -242,7 +269,7 @@ impl Convert {
                                         op => (
                                             OptValue::Emit {
                                                 val: result,
-                                                ty: tag,
+                                                ty: tag.clone(),
                                             },
                                             tag,
                                         ),
@@ -311,6 +338,65 @@ impl Convert {
                                 None,
                             ),
                         },
+                        Item::Arr { members } if members.len() > 0 => {
+                            let (mut x, mut ty) = state
+                                .get(&members[0])
+                                .cloned()
+                                .context("in getting the var")?;
+                            let mut members = members[1..]
+                                .iter()
+                                .map(|a| {
+                                    let (mut a, mut at) =
+                                        state.get(a).cloned().context("in getting the val")?;
+                                    (a, x, at) = bi_id_deopt(out, k, a, at, x, ty.clone())?;
+                                    ty = at.clone();
+                                    Ok((a))
+                                })
+                                .collect::<anyhow::Result<Vec<_>>>()?;
+                            for m in members.iter_mut() {
+                                while out.values[*m].ty(&out) != ty {
+                                    let n = out.values.alloc(OptValueW(OptValue::Deopt(*m)));
+                                    out.blocks[k].insts.push(n);
+                                    *m = n;
+                                }
+                            }
+                            let ty = Some(OptType::Array {
+                                elem_ty: Box::new(ty),
+                            });
+                            (
+                                OptValue::Emit {
+                                    val: SValue::Item(Item::Arr { members: members }),
+                                    ty: ty.clone(),
+                                },
+                                ty,
+                            )
+                        }
+                        Item::Mem { obj, mem } => {
+                            let (obj,oty) = state.get(obj).cloned().context("in getting the val")?;
+                            let (mem,mty) = state.get(mem).cloned().context("in getting the val")?;
+                            match (oty.clone(),mty.clone()){
+                                (Some(OptType::Array { elem_ty }),Some(OptType::Number | OptType::BigInt | OptType::U32 { .. } | OptType::U64 { .. })) => {
+                                    (
+                                        OptValue::Emit {
+                                            val: SValue::Item(Item::Mem { obj, mem }),
+                                            ty: elem_ty.as_ref().clone(),
+                                        },
+                                        elem_ty.as_ref().clone(),
+                                    )
+                                }
+                                (oty,mty) => {
+                                    let obj = deopt(out, k, obj, oty)?;
+                                    let mem = deopt(out, k, mem, mty)?;
+                                    (
+                                        OptValue::Emit {
+                                            val: SValue::Item(Item::Mem { obj, mem }),
+                                            ty: None,
+                                        },
+                                        None,
+                                    )
+                                }
+                            }
+                        }
                         a => {
                             let a = a.clone().map(&mut |x| {
                                 let (val, tag) =
@@ -428,17 +514,23 @@ impl Convert {
                 swc_ssa::STerm::Switch { x, blocks, default } => {
                     let (mut x, mut ty) = state.get(x).cloned().context("in getting the val")?;
                     let default = tgt(self, out, default)?;
-                    let blocks = blocks
+                    let mut blocks = blocks
                         .iter()
                         .map(|(a, b)| {
                             let (mut a, mut at) =
                                 state.get(a).cloned().context("in getting the val")?;
-                            (a, x, at) = bi_id_deopt(out, k, a, at, x, ty)?;
-                            ty = at;
+                            (a, x, at) = bi_id_deopt(out, k, a, at, x, ty.clone())?;
+                            ty = at.clone();
                             Ok((a, tgt(self, out, b)?))
                         })
-                        .collect::<anyhow::Result<_>>()?;
-
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    for (m, _) in blocks.iter_mut() {
+                        while out.values[*m].ty(&out) != ty {
+                            let n = out.values.alloc(OptValueW(OptValue::Deopt(*m)));
+                            out.blocks[k].insts.push(n);
+                            *m = n;
+                        }
+                    }
                     STerm::Switch { x, blocks, default }
                 }
                 swc_ssa::STerm::Default => STerm::Default,

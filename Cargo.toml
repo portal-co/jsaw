@@ -1,16 +1,16 @@
 [workspace]
-members=[ "js-runtime-lib","swc-cfg", "swc-emit-rust", "swc-opt-ssa", "swc-ssa", "swc-tac"]
+members=[ "js-runtime-lib","swc-cfg", "swc-emit-rust", "swc-opt-ssa", "swc-ssa", "swc-tac", "swc-waffle"]
 resolver="2"
 
 [workspace.dependencies]
 anyhow = "1.0.87"
 bimap = "0.6.3"
 id-arena = "2.2.1"
-arena-traits = {version="0.2.0",features=["id-arena"]}
-ssa-traits = "0.2.0"
-cfg-traits = "0.2.0"
-ssa-impls = "0.2.0"
-ssa-reloop = "0.2.0"
+arena-traits = {version="0.2.1",features=["id-arena"]}
+ssa-traits = "0.2.1"
+cfg-traits = "0.2.1"
+ssa-impls = "0.2.1"
+ssa-reloop = "0.2.1"
 swc_atoms = "2.0.0"
 swc_common = "4.0.0"
 swc_ecma_ast = "4.0.0"
@@ -25,4 +25,5 @@ quasiquote = "0.1.1"
 quote = "1.0.37"
 syn = "2.0.82"
 
-portal-pc-waffle="0.3.2"
+portal-pc-waffle="0.3.3"
+waffle-ast="0.4.2"

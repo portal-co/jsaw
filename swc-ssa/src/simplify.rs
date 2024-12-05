@@ -269,7 +269,7 @@ impl SValue {
                 Item::Mem { obj, mem } => None,
                 Item::Func { func } => None,
                 Item::Lit { lit } => Some(lit.clone()),
-                Item::Call { r#fn, member, args } => None,
+                Item::Call {callee, args } => None,
                 Item::Obj { members } => None,
                 Item::Arr { members } => None,
                 Item::Yield { value, delegate } => None,

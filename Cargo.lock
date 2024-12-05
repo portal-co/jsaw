@@ -122,9 +122,9 @@ checksum = "86fdf8605db99b54d3cd748a44c6d04df638eb5dafb219b135d0149bd0db01f6"
 
 [[package]]
 name = "arena-traits"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "324e412f1771dc6c84a2a53e5c19cf92bd7ea05b5eeddb3f80c18e3473374ab4"
+checksum = "9124fa70d5ebbb2f2bef340dbaa0c5186a2df7ca66be5edd806f1e46383b6a09"
 dependencies = [
  "id-arena",
 ]
@@ -166,6 +166,12 @@ checksum = "50fd297a11c709be8348aec039c8b91de16075d2b2bdaee1bd562c0875993664"
 dependencies = [
  "scoped-tls",
 ]
+
+[[package]]
+name = "bimap"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "230c5f1ca6a325a32553f8640d31ac9b49f2411e901e427570154868b46da4f7"
 
 [[package]]
 name = "bitflags"
@@ -220,9 +226,9 @@ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
 name = "cfg-traits"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a3dfb49182ea18b9cc93b5d43cf340b519af6ca40b90fd5548c46471e19e9fb"
+checksum = "c561f6cffa35f03f4dc575407362fa291e3c97028470e6814df022bbd4d294ef"
 dependencies = [
  "arena-traits",
  "either",
@@ -909,7 +915,7 @@ name = "portal-jsc-swc-cfg"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cfg-traits 0.2.0",
+ "cfg-traits 0.2.1",
  "id-arena",
  "relooper",
  "ssa-impls",
@@ -930,13 +936,14 @@ dependencies = [
  "id-arena",
  "paste",
  "portal-jsc-swc-cfg",
+ "portal-jsc-swc-opt-ssa",
  "portal-jsc-swc-ssa",
  "portal-jsc-swc-tac",
  "portal-pc-waffle",
  "proc-macro2",
  "quasiquote",
  "quote",
- "ssa-traits 0.2.0",
+ "ssa-traits 0.2.1",
  "swc_atoms",
  "swc_common",
  "swc_ecma_ast",
@@ -951,14 +958,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arena-traits",
- "cfg-traits 0.2.0",
+ "cfg-traits 0.2.1",
  "id-arena",
  "paste",
  "portal-jsc-swc-cfg",
  "portal-jsc-swc-ssa",
  "portal-jsc-swc-tac",
  "ssa-impls",
- "ssa-traits 0.2.0",
+ "ssa-traits 0.2.1",
  "swc_atoms",
  "swc_common",
  "swc_ecma_ast",
@@ -972,12 +979,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arena-traits",
- "cfg-traits 0.2.0",
+ "cfg-traits 0.2.1",
  "id-arena",
  "num-traits",
  "portal-jsc-swc-cfg",
  "portal-jsc-swc-tac",
- "ssa-traits 0.2.0",
+ "ssa-traits 0.2.1",
  "swc_atoms",
  "swc_common",
  "swc_ecma_ast",
@@ -1002,15 +1009,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "portal-jsc-swc-waffle"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arena-traits",
+ "id-arena",
+ "paste",
+ "portal-jsc-swc-cfg",
+ "portal-jsc-swc-opt-ssa",
+ "portal-jsc-swc-ssa",
+ "portal-jsc-swc-tac",
+ "portal-pc-waffle",
+ "ssa-traits 0.2.1",
+ "swc_atoms",
+ "swc_common",
+ "swc_ecma_ast",
+ "swc_ecma_utils",
+ "swc_ecma_visit",
+ "waffle-ast",
+]
+
+[[package]]
 name = "portal-pc-waffle"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e98e2390f3f78245bbef92e2a48103b470108545d239baeb4993e89b0761bf6"
+checksum = "2515e60cd2d28a3083b4ecc351aa338e0eed3c5700d798b8edf9936516a14781"
 dependencies = [
  "addr2line",
  "anyhow",
  "arena-traits",
- "cfg-traits 0.2.0",
+ "cfg-traits 0.2.1",
  "cfg-traits 0.3.0-alpha.0",
  "either",
  "env_logger",
@@ -1024,7 +1053,7 @@ dependencies = [
  "rayon",
  "serde",
  "smallvec",
- "ssa-traits 0.2.0",
+ "ssa-traits 0.2.1",
  "ssa-traits 0.3.0-alpha.0",
  "stacker",
  "structopt",
@@ -1301,37 +1330,37 @@ checksum = "3b9b39299b249ad65f3b7e96443bad61c02ca5cd3589f46cb6d610a0fd6c0d6a"
 
 [[package]]
 name = "ssa-impls"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a258139308b290ac35e26667d26b27985a1eea55e2c89c79b4f66828eb723aba"
+checksum = "91f3132c6434c6ff9175d5193a45923cd9aea487623142f0b2a540100627ba10"
 dependencies = [
  "arena-traits",
- "cfg-traits 0.2.0",
- "ssa-traits 0.2.0",
+ "cfg-traits 0.2.1",
+ "ssa-traits 0.2.1",
 ]
 
 [[package]]
 name = "ssa-reloop"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "342be410053ae69c9d00e2ffba29638dd5f034175cd12671691b30095d5f8e84"
+checksum = "a128695f02e8388e6a5071bdfb1bec291892b1f8f795ac6038e311bba94db40f"
 dependencies = [
  "arena-traits",
- "cfg-traits 0.2.0",
+ "cfg-traits 0.2.1",
  "relooper",
  "ssa-impls",
- "ssa-traits 0.2.0",
+ "ssa-traits 0.2.1",
 ]
 
 [[package]]
 name = "ssa-traits"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36d84c7d6066cd100eb6c1d2c7790c9f67db0f41a7d36a4249379e06f11780f2"
+checksum = "d0b5d4195261ebb69852c6e5ea82688edbec5f8d4e177897a209014d273421fa"
 dependencies = [
  "anyhow",
  "arena-traits",
- "cfg-traits 0.2.0",
+ "cfg-traits 0.2.1",
  "either",
 ]
 
@@ -1720,6 +1749,17 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "waffle-ast"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6314d8bc49885e4ad317b19a99b7048f0321ea0305b251797b4fcfd5100f437"
+dependencies = [
+ "anyhow",
+ "bimap",
+ "portal-pc-waffle",
+]
 
 [[package]]
 name = "wasm-encoder"

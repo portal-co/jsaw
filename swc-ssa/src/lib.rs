@@ -12,11 +12,11 @@ use swc_atoms::Atom;
 use swc_cfg::Catch;
 use swc_common::Span;
 use swc_ecma_ast::{Id as Ident, Lit, Null};
-use swc_tac::{Item, LId, TBlock, TCfg, TFunc};
-pub mod rew;
-pub mod impls;
-pub mod simplify;
+use swc_tac::{Item, LId, TBlock, TCallee, TCfg, TFunc};
 pub mod ch;
+pub mod impls;
+pub mod rew;
+pub mod simplify;
 
 pub struct SFunc {
     pub cfg: SwcFunc,
@@ -87,81 +87,72 @@ pub struct SBlock {
     pub postcedent: SPostcedent,
 }
 #[derive(Clone)]
-pub struct SPostcedent<I = Id<SValueW>,B = Id<SBlock>>{
-    pub term: STerm<I,B>,
-    pub catch: SCatch<I,B>,
+pub struct SPostcedent<I = Id<SValueW>, B = Id<SBlock>> {
+    pub term: STerm<I, B>,
+    pub catch: SCatch<I, B>,
 }
-impl<I,B> Default for SPostcedent<I,B>{
+impl<I, B> Default for SPostcedent<I, B> {
     fn default() -> Self {
-        Self { term: Default::default(), catch: Default::default() }
+        Self {
+            term: Default::default(),
+            catch: Default::default(),
+        }
     }
 }
 #[derive(Clone)]
-pub enum SValue<I = Id<SValueW>,B = Id<SBlock>> {
-    Param {
-        block: B,
-        idx: usize,
-        ty: (),
-    },
+pub enum SValue<I = Id<SValueW>, B = Id<SBlock>> {
+    Param { block: B, idx: usize, ty: () },
     Item(Item<I>),
-    Assign {
-        target: LId<I>,
-        val: I,
-    },
+    Assign { target: LId<I>, val: I },
     LoadId(Ident),
-    StoreId {
-        target: Ident,
-        val: I,
-    },
+    StoreId { target: Ident, val: I },
 }
 #[repr(transparent)]
 #[derive(Clone)]
 pub struct SValueW(pub SValue);
-impl From<SValue> for SValueW{
+impl From<SValue> for SValueW {
     fn from(value: SValue) -> Self {
         Self(value)
     }
 }
-impl From<SValueW> for SValue{
+impl From<SValueW> for SValue {
     fn from(value: SValueW) -> Self {
         value.0
     }
 }
 #[derive(Clone)]
-pub enum SCatch<I = Id<SValueW>,B = Id<SBlock>> {
+pub enum SCatch<I = Id<SValueW>, B = Id<SBlock>> {
     Throw,
-    Just {
-        target: STarget<I,B>,
-    },
+    Just { target: STarget<I, B> },
 }
-impl<I,B> Default for SCatch<I,B>{
+impl<I, B> Default for SCatch<I, B> {
     fn default() -> Self {
         Self::Throw
     }
 }
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct STarget<I = Id<SValueW>,B = Id<SBlock>> {
+pub struct STarget<I = Id<SValueW>, B = Id<SBlock>> {
     pub block: B,
     pub args: Vec<I>,
 }
 #[derive(Clone)]
-pub enum STerm<I = Id<SValueW>,B = Id<SBlock>> {
+pub enum STerm<I = Id<SValueW>, B = Id<SBlock>> {
     Throw(I),
     Return(Option<I>),
-    Jmp(STarget<I,B>),
+    Jmp(STarget<I, B>),
     CondJmp {
         cond: I,
-        if_true: STarget<I,B>,
-        if_false: STarget<I,B>,
+        if_true: STarget<I, B>,
+        if_false: STarget<I, B>,
     },
     Switch {
         x: I,
-        blocks: Vec<(I,STarget<I,B>)>,
-        default: STarget<I,B>,
+        blocks: Vec<(I, STarget<I, B>)>,
+        default: STarget<I, B>,
     },
-    Default
+    Default,
 }
-impl<I,B> Default for STerm<I,B>{
+impl<I, B> Default for STerm<I, B> {
     fn default() -> Self {
         Self::Default
     }
@@ -181,7 +172,7 @@ impl SwcFunc {
 pub struct Trans {
     pub map: BTreeMap<Id<TBlock>, Id<SBlock>>,
     pub all: BTreeSet<Ident>,
-    pub undef: Id<SValueW>
+    pub undef: Id<SValueW>,
 }
 impl Trans {
     pub fn apply_shim(
@@ -236,7 +227,7 @@ impl Trans {
             let mut t = o.blocks.alloc(SBlock {
                 params: vec![],
                 stmts: vec![],
-                postcedent: SPostcedent::default()
+                postcedent: SPostcedent::default(),
             });
             self.map.insert(k, t);
             let shim: Option<(Id<SBlock>, Vec<Ident>)> = match &i.blocks[k].catch {
@@ -277,8 +268,20 @@ impl Trans {
             self.apply_shim(o, &state, &shim, t);
             let mut cache = BTreeMap::new();
             for (a, b) in i.blocks[k].stmts.iter() {
+                let mut b = b.clone();
+                if let Item::Call { callee, args } = &mut b {
+                    if let TCallee::Val(v) = callee {
+                        if !i.blocks.iter().any(|k| {
+                            k.1.stmts.iter().any(|a| match &a.0 {
+                                LId::Id { id } => id == v,
+                                _ => false,
+                            })
+                        }) {
+                            *callee = TCallee::Static(v.clone());
+                        }
+                    }
+                }
                 let b = b
-                    .clone()
                     .map::<_, Infallible>(&mut |a| Ok(self.load(&state, o, t, a, &cache)))
                     .unwrap();
                 let b = o.values.alloc(SValue::Item(b).into());
@@ -290,7 +293,7 @@ impl Trans {
                             let u = o.blocks.alloc(SBlock {
                                 params: vec![],
                                 stmts: vec![],
-                                postcedent: Default::default()
+                                postcedent: Default::default(),
                             });
                             self.apply_shim(o, &state, &shim, u);
                             o.blocks[t].postcedent.term = STerm::Jmp(STarget {
@@ -301,10 +304,13 @@ impl Trans {
                         }
                         None => {
                             cache.insert(id.clone(), b);
-                            let c = o.values.alloc(SValue::StoreId {
-                                target: id.clone(),
-                                val: b,
-                            }.into());
+                            let c = o.values.alloc(
+                                SValue::StoreId {
+                                    target: id.clone(),
+                                    val: b,
+                                }
+                                .into(),
+                            );
                             o.blocks[t].stmts.push(c);
                         }
                     },

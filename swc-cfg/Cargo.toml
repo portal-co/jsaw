@@ -13,6 +13,7 @@ id-arena.workspace = true
 relooper = "0.1.0"
 ssa-impls.workspace = true
 ssa-reloop.workspace = true
+arena-traits.workspace = true
 
 swc_atoms.workspace = true
 swc_common.workspace = true

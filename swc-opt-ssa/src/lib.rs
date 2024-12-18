@@ -5,13 +5,31 @@ use swc_ssa::{SCatch, SPostcedent, STarget, STerm, SValue};
 pub mod impls;
 pub mod into;
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum ObjType{
+    Array,
+    Object(Vec<String>)
+}
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum OptType {
     Number,
-    U32 { bits_usable: u8 },
+    U32 {
+        bits_usable: u8,
+    },
     BigInt,
-    U64 { bits_usable: u8 },
+    U64 {
+        bits_usable: u8,
+    },
     Bool,
-    Array { elem_ty: Box<Option<OptType>> },
+    Array {
+        elem_ty: Box<Option<OptType>>,
+    },
+    Object {
+        nest: ObjType,
+        extensible: bool,
+        elem_tys: Vec<Option<OptType>>,
+    },
 }
 impl OptType {
     pub fn parent(&self) -> Option<OptType> {
@@ -40,6 +58,69 @@ impl OptType {
                 }),
                 None => None,
             },
+            OptType::Object {
+                nest,
+                extensible,
+                elem_tys,
+            } => {
+                if !*extensible {
+                    Some(OptType::Object {
+                        nest: nest.clone(),
+                        extensible: true,
+                        elem_tys: elem_tys.clone(),
+                    })
+                } else {
+                    match nest {
+                        ObjType::Array => {
+                            let mut elem_tys = elem_tys.clone();
+                            if elem_tys.len() != 0 {
+                                let Some(f) = elem_tys.iter().find_map(|a| a.clone()) else {
+                                    return Some(OptType::Array {
+                                        elem_ty: Box::new(None),
+                                    });
+                                };
+                                for t in elem_tys.iter_mut().rev() {
+                                    // if *t != f{
+                                    match &*t {
+                                        Some(a) if *a != f => *t = a.parent(),
+                                        _ => {
+                                            continue;
+                                        }
+                                    };
+                                    return Some(OptType::Object {
+                                        nest: ObjType::Array,
+                                        extensible: true,
+                                        elem_tys,
+                                    });
+
+                                    // }
+                                }
+                                return Some(OptType::Array {
+                                    elem_ty: Box::new(Some(f)),
+                                });
+                            }
+                            None
+                        }
+                        ObjType::Object(s) => {
+                            let mut elem_tys = elem_tys.clone();
+                            let mut s = s.clone();
+                            let Some(p) = elem_tys.pop() else {
+                                return None;
+                            };
+                            let q = s.pop().unwrap();
+                            if let Some(p) = p {
+                                elem_tys.push(p.parent());
+                                s.push(q);
+                            };
+                            Some(OptType::Object {
+                                nest: ObjType::Object(s),
+                                extensible: true,
+                                elem_tys,
+                            })
+                        }
+                    }
+                }
+            }
             _ => None,
         }
     }
@@ -74,8 +155,8 @@ pub struct OptCfg {
     pub blocks: Arena<OptBlock>,
     pub decls: BTreeSet<swc_ecma_ast::Id>,
 }
-impl OptValueW{
-    pub fn ty(&self, cfg: &OptCfg) -> Option<OptType>{
+impl OptValueW {
+    pub fn ty(&self, cfg: &OptCfg) -> Option<OptType> {
         match &self.0 {
             OptValue::Deopt(d) => {
                 let x = cfg.values[*d].ty(cfg);

@@ -38,7 +38,7 @@ impl CH {
         k: Id<SBlock>,
     ) -> anyhow::Result<Id<SBlock>> {
         let lits = inp.blocks[k].params.iter().map(|_| None).collect();
-        return self.go(inp, out, k, lits, &Default::default());
+        return self.go(inp, out, k, lits);
     }
     pub fn go(
         &mut self,
@@ -46,7 +46,7 @@ impl CH {
         out: &mut SwcFunc,
         k: Id<SBlock>,
         lits: Vec<Option<ConstVal>>,
-        lsk: &BTreeMap<Id<SBlock>, NonZeroUsize>,
+        // lsk: &BTreeMap<Id<SBlock>, NonZeroUsize>,
     ) -> anyhow::Result<Id<SBlock>> {
         let lits: Vec<Option<ConstVal>> = lits
             .into_iter()
@@ -58,17 +58,17 @@ impl CH {
                 a => a,
             })
             .collect();
-        let is_loop = lsk.get(&k);
-        let is_loop = match is_loop {
-            Some(x) => x.clone().into(),
-            None => 0,
-        };
-        let mut lsk = lsk.clone();
-        lsk.entry(k)
-            .and_modify(|x| {
-                *x = x.saturating_add(1);
-            })
-            .or_insert(NonZeroUsize::new(1).unwrap());
+        // let is_loop = lsk.get(&k);
+        // let is_loop = match is_loop {
+        //     Some(x) => x.clone().into(),
+        //     None => 0,
+        // };
+        // let mut lsk = lsk.clone();
+        // lsk.entry(k)
+        //     .and_modify(|x| {
+        //         *x = x.saturating_add(1);
+        //     })
+        //     .or_insert(NonZeroUsize::new(1).unwrap());
         loop {
             if let Some(x) = self.all.get(&k).and_then(|x| x.get(&lits)) {
                 return Ok(*x);
@@ -85,10 +85,13 @@ impl CH {
                         a,
                         match l {
                             Some(l) => {
-                                let v = out.values.alloc(SValue::Item(match l {
-                                    ConstVal::Lit(lit) => Item::Lit { lit: lit.clone() },
-                                    ConstVal::Undef => Item::Undef,
-                                }).into());
+                                let v = out.values.alloc(
+                                    SValue::Item(match l {
+                                        ConstVal::Lit(lit) => Item::Lit { lit: lit.clone() },
+                                        ConstVal::Undef => Item::Undef,
+                                    })
+                                    .into(),
+                                );
                                 out.blocks[n].stmts.push(v);
                                 v
                             }
@@ -116,13 +119,9 @@ impl CH {
                             val: params.get(&val).cloned().context("in getting a variable")?,
                         },
                     };
-                let v = if is_loop > 4 {
-                    v
-                } else {
-                    match v.const_in(out) {
-                        None => v,
-                        Some(a) => SValue::Item(Item::Lit { lit: a }),
-                    }
+                let v = match v.const_in(out) {
+                    None => v,
+                    Some(a) => SValue::Item(Item::Lit { lit: a }),
                 };
                 let v = out.values.alloc(v.into());
                 out.blocks[n].stmts.push(v);
@@ -156,7 +155,7 @@ impl CH {
                     .cloned()
                     .collect();
                 anyhow::Ok(STarget {
-                    block: this.go(inp, out, t.block, funcs, &lsk)?,
+                    block: this.go(inp, out, t.block, funcs)?,
                     args,
                 })
             };

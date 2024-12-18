@@ -339,29 +339,26 @@ impl Convert {
                             ),
                         },
                         Item::Arr { members } if members.len() > 0 => {
-                            let (mut x, mut ty) = state
+                            let (x, ty) = state
                                 .get(&members[0])
                                 .cloned()
                                 .context("in getting the var")?;
+                            let mut elem_tys = vec![];
                             let mut members = members[1..]
                                 .iter()
                                 .map(|a| {
                                     let (mut a, mut at) =
                                         state.get(a).cloned().context("in getting the val")?;
-                                    (a, x, at) = bi_id_deopt(out, k, a, at, x, ty.clone())?;
-                                    ty = at.clone();
+                                    // (a, x, at) = bi_id_deopt(out, k, a, at, x, ty.clone())?;
+                                    // ty = at.clone();
+                                    elem_tys.push(at.clone());
                                     Ok((a))
                                 })
                                 .collect::<anyhow::Result<Vec<_>>>()?;
-                            for m in members.iter_mut() {
-                                while out.values[*m].ty(&out) != ty {
-                                    let n = out.values.alloc(OptValueW(OptValue::Deopt(*m)));
-                                    out.blocks[k].insts.push(n);
-                                    *m = n;
-                                }
-                            }
-                            let ty = Some(OptType::Array {
-                                elem_ty: Box::new(ty),
+                            let ty = Some(OptType::Object {
+                                nest: crate::ObjType::Array,
+                                extensible: false,
+                                elem_tys,
                             });
                             (
                                 OptValue::Emit {
@@ -372,19 +369,38 @@ impl Convert {
                             )
                         }
                         Item::Mem { obj, mem } => {
-                            let (obj,oty) = state.get(obj).cloned().context("in getting the val")?;
-                            let (mem,mty) = state.get(mem).cloned().context("in getting the val")?;
-                            match (oty.clone(),mty.clone()){
-                                (Some(OptType::Array { elem_ty }),Some(OptType::Number | OptType::BigInt | OptType::U32 { .. } | OptType::U64 { .. })) => {
-                                    (
-                                        OptValue::Emit {
-                                            val: SValue::Item(Item::Mem { obj, mem }),
-                                            ty: elem_ty.as_ref().clone(),
-                                        },
-                                        elem_ty.as_ref().clone(),
-                                    )
-                                }
-                                (oty,mty) => {
+                            let (mut obj, mut oty) =
+                                state.get(obj).cloned().context("in getting the val")?;
+                            let (mem, mty) =
+                                state.get(mem).cloned().context("in getting the val")?;
+                            while let Some(OptType::Object {
+                                nest,
+                                extensible,
+                                elem_tys,
+                            }) = &oty
+                            {
+                                let w = out.values.alloc(OptValueW(OptValue::Deopt(obj)));
+                                out.blocks[k].insts.push(w);
+                                obj = w;
+                                oty = oty.unwrap().parent();
+                            }
+                            match (oty.clone(), mty.clone()) {
+                                (
+                                    Some(OptType::Array { elem_ty }),
+                                    Some(
+                                        OptType::Number
+                                        | OptType::BigInt
+                                        | OptType::U32 { .. }
+                                        | OptType::U64 { .. },
+                                    ),
+                                ) => (
+                                    OptValue::Emit {
+                                        val: SValue::Item(Item::Mem { obj, mem }),
+                                        ty: elem_ty.as_ref().clone(),
+                                    },
+                                    elem_ty.as_ref().clone(),
+                                ),
+                                (oty, mty) => {
                                     let obj = deopt(out, k, obj, oty)?;
                                     let mem = deopt(out, k, mem, mty)?;
                                     (

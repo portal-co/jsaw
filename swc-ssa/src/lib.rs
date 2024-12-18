@@ -17,6 +17,7 @@ pub mod ch;
 pub mod impls;
 pub mod rew;
 pub mod simplify;
+pub mod idw;
 
 pub struct SFunc {
     pub cfg: SwcFunc,

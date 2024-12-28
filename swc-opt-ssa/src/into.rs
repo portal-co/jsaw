@@ -98,7 +98,8 @@ impl Convert {
                             block: self.transform(inp, out, target.block, xs)?,
                         },
                     }
-                }
+                },
+                _ => todo!()
             };
             out.blocks[k].postcedent.catch = catch;
             for i in inp.blocks[i].stmts.iter().cloned() {
@@ -504,7 +505,8 @@ impl Convert {
                             },
                             tag,
                         )
-                    }
+                    },
+                    _ => todo!()
                 };
                 let j = crate::OptValueW(j);
                 let j = out.values.alloc(j);
@@ -589,7 +591,7 @@ impl Convert {
                     }
                     STerm::Switch { x, blocks, default }
                 }
-                swc_ssa::STerm::Default => STerm::Default,
+                _ => STerm::Default,
             };
             out.blocks[k].postcedent.term = term;
         }

@@ -146,6 +146,7 @@ impl OptType {
     }
 }
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum OptValue<I = Id<OptValueW>, B = Id<OptBlock>> {
     Deopt(I),
     Assert {

@@ -119,6 +119,7 @@ impl<I, B> Default for SPostcedent<I, B> {
     }
 }
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum SValue<I = Id<SValueW>, B = Id<SBlock>> {
     Param { block: B, idx: usize, ty: () },
     Item(Item<I>),
@@ -141,6 +142,7 @@ impl From<SValueW> for SValue {
     }
 }
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum SCatch<I = Id<SValueW>, B = Id<SBlock>> {
     Throw,
     Just { target: STarget<I, B> },
@@ -156,6 +158,7 @@ pub struct STarget<I = Id<SValueW>, B = Id<SBlock>> {
     pub args: Vec<I>,
 }
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum STerm<I = Id<SValueW>, B = Id<SBlock>> {
     Throw(I),
     Return(Option<I>),

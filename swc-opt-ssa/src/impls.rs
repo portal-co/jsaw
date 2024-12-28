@@ -74,6 +74,7 @@ impl cfg_traits::Term<OptFunc> for OptTerm {
                 Box::new(blocks.iter().map(|a| &a.1).chain(once(default)))
             }
             OptTerm::Default => Box::new(empty()),
+            _ => todo!()
         }
     }
 
@@ -94,6 +95,7 @@ impl cfg_traits::Term<OptFunc> for OptTerm {
                 Box::new(blocks.iter_mut().map(|a| &mut a.1).chain(once(default)))
             }
             OptTerm::Default => Box::new(empty()),
+            _ => todo!()
         }
     }
 }
@@ -107,6 +109,7 @@ impl cfg_traits::Term<OptFunc> for OptCatch {
         match self {
             OptCatch::Throw => Box::new(empty()),
             OptCatch::Just { target } => Box::new(once(target)),
+            _ => todo!()
         }
     }
 
@@ -117,6 +120,7 @@ impl cfg_traits::Term<OptFunc> for OptCatch {
         match self {
             OptCatch::Throw => Box::new(empty()),
             OptCatch::Just { target } => Box::new(once(target)),
+            _ => todo!()
         }
     }
 }
@@ -206,6 +210,7 @@ impl ssa_traits::HasChainableValues<OptFunc> for OptValueW {
                 SValue::LoadId(_) => Box::new(empty()),
                 SValue::StoreId { target, val } => Box::new(once(*val)),
                 SValue::Benc(a) => Box::new(once(*a)),
+                _ => todo!()
             },
             OptValue::Deopt(a) => Box::new(once(*a)),
             OptValue::Assert { val, ty } => Box::new(once(*val)),
@@ -260,6 +265,7 @@ impl ssa_traits::HasChainableValues<OptFunc> for OptValueW {
                 SValue::LoadId(_) => Box::new(empty()),
                 SValue::StoreId { target, val } => Box::new(once(val)),
                 SValue::Benc(a) => Box::new(once(a)),
+                _ => todo!()
             },
             OptValue::Deopt(a) => Box::new(once(a)),
             OptValue::Assert { val, ty } => Box::new(once(val)),
@@ -371,6 +377,7 @@ impl HasChainableValues<OptFunc> for OptTerm {
                 ),
             ),
             OptTerm::Default => Box::new(empty()),
+            _ => todo!()
         }
     }
 
@@ -401,6 +408,7 @@ impl HasChainableValues<OptFunc> for OptTerm {
                 ),
             ),
             OptTerm::Default => Box::new(empty()),
+            _ => todo!()
         }
     }
 }
@@ -411,6 +419,7 @@ impl HasChainableValues<OptFunc> for OptCatch {
         match self {
             OptCatch::Throw => Box::new(empty()),
             OptCatch::Just { target } => target.values_chain(),
+            _ => todo!()
         }
     }
 
@@ -423,6 +432,7 @@ impl HasChainableValues<OptFunc> for OptCatch {
         match self {
             OptCatch::Throw => Box::new(empty()),
             OptCatch::Just { target } => target.values_chain_mut(),
+            _ => todo!()
         }
     }
 }

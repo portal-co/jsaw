@@ -2,10 +2,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     default,
-    iter::once,
+    iter::once, mem::take,
 };
 
 use anyhow::Context;
+use cfg_traits::Term;
 use id_arena::{Arena, Id};
 use ssa_traits::Value;
 use swc_atoms::Atom;
@@ -18,6 +19,23 @@ pub mod impls;
 pub mod rew;
 pub mod simplify;
 pub mod idw;
+
+
+pub fn benj(a: &mut SwcFunc){
+    for ki in a.blocks.iter().map(|a|a.0).collect::<Vec<_>>(){
+        let mut t = take(&mut a.blocks[ki].postcedent);
+        for r in t.targets_mut(){
+            if r.block.index() <= ki.index(){
+                for w in r.args.iter_mut(){
+                    let v = a.values.alloc(SValueW(SValue::Benc(*w)));
+                    a.blocks[ki].stmts.push(v);
+                    *w = v;
+                }
+            }
+        }
+        a.blocks[ki].postcedent = t;
+    }
+}
 
 pub struct SFunc {
     pub cfg: SwcFunc,
@@ -107,6 +125,7 @@ pub enum SValue<I = Id<SValueW>, B = Id<SBlock>> {
     Assign { target: LId<I>, val: I },
     LoadId(Ident),
     StoreId { target: Ident, val: I },
+    Benc(I)
 }
 #[repr(transparent)]
 #[derive(Clone)]

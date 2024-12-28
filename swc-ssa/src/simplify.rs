@@ -24,14 +24,22 @@ impl SwcFunc {
         }
     }
 }
-impl SValue {
-    pub fn const_in(&self, k: &SwcFunc) -> Option<Lit> {
+pub trait SValGetter<I: Copy,B>{
+    fn val(&self, id: I) -> Option<&SValue<I,B>>;
+}
+impl SValGetter<Id<SValueW>,Id<SBlock>> for SwcFunc{
+    fn val(&self, id: Id<SValueW>) -> Option<&SValue<Id<SValueW>,Id<SBlock>>> {
+        Some(&self.values[id].0)
+    }
+}
+impl<I: Copy,B> SValue<I,B> {
+    pub fn const_in(&self, k: &impl SValGetter<I,B>) -> Option<Lit> {
         match self {
             SValue::Item(item) => match item {
                 Item::Just { id } => None,
                 Item::Bin { left, right, op } => {
-                    let left = k.values[*left].0.const_in(k)?;
-                    let right = k.values[*right].0.const_in(k)?;
+                    let left = k.val(*left)?.const_in(k)?;
+                    let right = k.val(*right)?.const_in(k)?;
                     macro_rules! op2 {
                         ($left:expr => {$($op:tt)*} $right:expr) => {
                             match (
@@ -210,7 +218,7 @@ impl SValue {
                             raw: None,
                         }));
                     }
-                    let l = k.values[*arg].0.const_in(k)?;
+                    let l = k.val(*arg)?.const_in(k)?;
                     match op {
                         swc_ecma_ast::UnaryOp::Minus => match l {
                             Lit::Num(n) => Some(Lit::Num(Number {

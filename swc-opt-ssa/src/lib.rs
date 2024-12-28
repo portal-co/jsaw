@@ -1,16 +1,18 @@
 use std::collections::BTreeSet;
 
 use id_arena::{Arena, Id};
-use swc_ssa::{SCatch, SPostcedent, STarget, STerm, SValue};
+use swc_ecma_ast::Lit;
+use swc_ssa::{ch::ConstVal, simplify::SValGetter, SCatch, SPostcedent, STarget, STerm, SValue};
+use swc_tac::Item;
 pub mod impls;
 pub mod into;
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum ObjType{
     Array,
     Object(Vec<String>)
 }
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum OptType {
     Number,
@@ -30,6 +32,7 @@ pub enum OptType {
         extensible: bool,
         elem_tys: Vec<Option<OptType>>,
     },
+    Lit(Lit)
 }
 impl OptType {
     pub fn parent(&self) -> Option<OptType> {
@@ -121,6 +124,23 @@ impl OptType {
                     }
                 }
             }
+            OptType::Lit(l) => match l{
+                Lit::BigInt(i) => {
+                    if *i.value > 0u8.into() && i.value.as_ref().clone() >> 64 == 0u8.into(){
+                        let a: u64 = i.value.as_ref().clone().try_into().unwrap();
+                        return Some(OptType::U64 { bits_usable: a.leading_zeros() as u8 })
+                    }
+                    Some(OptType::BigInt)
+                }
+                Lit::Num(n) => {
+                    if let Some(a) = num_traits::cast(n.value){
+                        let a: u32 = a;
+                        return Some(OptType::U32 { bits_usable: a.leading_zeros() as u8 });
+                    }
+                    Some(OptType::Number)
+                }
+                _ => None
+            },
             _ => None,
         }
     }
@@ -164,6 +184,28 @@ impl OptValueW {
             }
             OptValue::Assert { val, ty } => ty.clone(),
             OptValue::Emit { val, ty } => ty.clone(),
+        }
+    }
+    pub fn constant(&self, cfg: &OptCfg) -> Option<Lit>{
+        match &self.0{
+            OptValue::Deopt(a) => cfg.values[*a].constant(cfg),
+            OptValue::Assert { val, ty } => cfg.values[*val].constant(cfg),
+            OptValue::Emit { val, ty } => match val{
+                SValue::Item(i) => match i{
+                    Item::Lit { lit } => Some(lit.clone()),
+                    _ => None
+                }
+                _ => None,
+            },
+        }
+    }
+}
+impl SValGetter<Id<OptValueW>,Id<OptBlock>> for OptCfg{
+    fn val(&self, id: Id<OptValueW>) -> Option<&SValue<Id<OptValueW>,Id<OptBlock>>> {
+        match &self.values[id].0{
+            OptValue::Deopt(a) => self.val(*a),
+            OptValue::Assert { val, ty } => self.val(*val),
+            OptValue::Emit { val, ty } => Some(val),
         }
     }
 }

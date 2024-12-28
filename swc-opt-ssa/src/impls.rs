@@ -205,6 +205,7 @@ impl ssa_traits::HasChainableValues<OptFunc> for OptValueW {
                 }
                 SValue::LoadId(_) => Box::new(empty()),
                 SValue::StoreId { target, val } => Box::new(once(*val)),
+                SValue::Benc(a) => Box::new(once(*a)),
             },
             OptValue::Deopt(a) => Box::new(once(*a)),
             OptValue::Assert { val, ty } => Box::new(once(*val)),
@@ -258,6 +259,7 @@ impl ssa_traits::HasChainableValues<OptFunc> for OptValueW {
                 }
                 SValue::LoadId(_) => Box::new(empty()),
                 SValue::StoreId { target, val } => Box::new(once(val)),
+                SValue::Benc(a) => Box::new(once(a)),
             },
             OptValue::Deopt(a) => Box::new(once(a)),
             OptValue::Assert { val, ty } => Box::new(once(val)),

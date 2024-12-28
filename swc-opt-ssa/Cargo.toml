@@ -26,3 +26,4 @@ swc_ecma_visit.workspace = true
 portal-jsc-swc-ssa = { version = "0.2.0", path = "../swc-ssa" }
 paste = "1.0.15"
 ssa-impls.workspace = true
+num-traits = "0.2.19"

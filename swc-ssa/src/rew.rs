@@ -111,6 +111,12 @@ impl Rew {
                                     },
                                 ));
                             }
+                            SValue::Benc(v) => {
+                                b.blocks[k2].stmts.push((
+                                    LId::Id { id: mangle_value(a, *val) },
+                                    Item::Just { id: mangle_value(a, *v) }
+                                ));
+                            },
                         }
                     }
                     let term = match &a.cfg.blocks[*id].postcedent.term {

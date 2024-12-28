@@ -118,6 +118,7 @@ impl CH {
                             target,
                             val: params.get(&val).cloned().context("in getting a variable")?,
                         },
+                        SValue::Benc(val) => SValue::Benc(params.get(&val).cloned().context("in getting a variable")?),
                     };
                 let v = match v.const_in(out) {
                     None => v,

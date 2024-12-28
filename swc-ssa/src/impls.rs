@@ -203,6 +203,7 @@ impl ssa_traits::HasChainableValues<SFunc> for SValueW {
             }
             SValue::LoadId(_) => Box::new(empty()),
             SValue::StoreId { target, val } => Box::new(once(*val)),
+            SValue::Benc(a) => Box::new(once(*a)),
         }
     }
 
@@ -250,6 +251,7 @@ impl ssa_traits::HasChainableValues<SFunc> for SValueW {
             }
             SValue::LoadId(_) => Box::new(empty()),
             SValue::StoreId { target, val } => Box::new(once(val)),
+            SValue::Benc(a) => Box::new(once(a)),
         }
     }
 }

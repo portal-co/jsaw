@@ -1,6 +1,6 @@
 [package]
 name = "portal-jsc-swc-tac"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "CC0-1.0"
 description = "ECMAScript IR"
@@ -14,7 +14,7 @@ anyhow.workspace = true
 arena-traits.workspace = true
 either = "1.13.0"
 id-arena.workspace = true
-portal-jsc-swc-cfg = { version = "0.2.0", path = "../swc-cfg" }
+portal-jsc-swc-cfg = { version = "0.3.0", path = "../swc-cfg" }
 swc_atoms.workspace = true
 swc_common.workspace = true
 swc_ecma_ast.workspace = true

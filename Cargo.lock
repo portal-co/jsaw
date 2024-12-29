@@ -955,7 +955,7 @@ dependencies = [
 
 [[package]]
 name = "portal-jsc-swc-opt-ssa"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "arena-traits",
@@ -977,7 +977,7 @@ dependencies = [
 
 [[package]]
 name = "portal-jsc-swc-ssa"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "arena-traits",

@@ -164,47 +164,7 @@ impl ssa_traits::HasChainableValues<SFunc> for SValueW {
     fn values_chain<'a>(
         &'a self,
     ) -> Box<dyn Iterator<Item = <SFunc as ssa_traits::Func>::Value> + 'a> {
-        match &self.0 {
-            SValue::Param { block, idx, ty } => Box::new(empty()),
-            SValue::Item(item) => match item {
-                swc_tac::Item::Just { id } => Box::new(once(*id)),
-                swc_tac::Item::Bin { left, right, op } => Box::new([*left, *right].into_iter()),
-                swc_tac::Item::Un { arg, op } => Box::new(once(*arg)),
-                swc_tac::Item::Mem { obj, mem } => Box::new([*obj, *mem].into_iter()),
-                swc_tac::Item::Func { func } => Box::new(empty()),
-                swc_tac::Item::Lit { lit } => Box::new(empty()),
-                swc_tac::Item::Call { callee, args } => {
-                    Box::new(match callee{
-                        swc_tac::TCallee::Val(a) => vec![*a],
-                        swc_tac::TCallee::Member { r#fn, member } => vec![*r#fn,*member],
-                        swc_tac::TCallee::Static(_) => vec![],
-                    }.into_iter().chain(args.iter().cloned()))
-                }
-                swc_tac::Item::Obj { members } => Box::new(members.iter().flat_map(|m| {
-                    let v = once(m.1);
-                    let w: Box<dyn Iterator<Item = &Id<SValueW>> + '_> = match &m.0 {
-                        swc_tac::PropKey::Lit(_) => Box::new(empty()),
-                        swc_tac::PropKey::Computed(c) => Box::new(once(c)),
-                    };
-                    v.chain(w.cloned())
-                })),
-                swc_tac::Item::Arr { members } => Box::new(members.iter().cloned()),
-                swc_tac::Item::Yield { value, delegate } => Box::new(value.iter().cloned()),
-                swc_tac::Item::Await { value } => Box::new(once(*value)),
-                swc_tac::Item::Undef => Box::new(empty()),
-            },
-            SValue::Assign { target, val } => {
-                let v = once(*val);
-                let w: Box<dyn Iterator<Item = &Id<SValueW>> + '_> = match target {
-                    swc_tac::LId::Id { id } => todo!(),
-                    swc_tac::LId::Member { obj, mem } => Box::new([obj, mem].into_iter()),
-                };
-                Box::new(v.chain(w.cloned()))
-            }
-            SValue::LoadId(_) => Box::new(empty()),
-            SValue::StoreId { target, val } => Box::new(once(*val)),
-            SValue::Benc(a) => Box::new(once(*a)),
-        }
+        self.0.vals()
     }
 
     fn values_chain_mut<'a>(
@@ -214,45 +174,7 @@ impl ssa_traits::HasChainableValues<SFunc> for SValueW {
     where
         SFunc: 'a,
     {
-        match &mut self.0 {
-            SValue::Param { block, idx, ty } => Box::new(empty()),
-            SValue::Item(item) => match item {
-                swc_tac::Item::Just { id } => Box::new(once(id)),
-                swc_tac::Item::Bin { left, right, op } => Box::new([left, right].into_iter()),
-                swc_tac::Item::Un { arg, op } => Box::new(once(arg)),
-                swc_tac::Item::Mem { obj, mem } => Box::new([obj, mem].into_iter()),
-                swc_tac::Item::Func { func } => Box::new(empty()),
-                swc_tac::Item::Lit { lit } => Box::new(empty()),
-                swc_tac::Item::Call { callee, args } => Box::new(match callee{
-                    swc_tac::TCallee::Val(a) => vec![a],
-                    swc_tac::TCallee::Member { r#fn, member } => vec![r#fn,member],
-                    swc_tac::TCallee::Static(_) => vec![],
-                }.into_iter().chain(args.iter_mut())),
-                swc_tac::Item::Obj { members } => Box::new(members.iter_mut().flat_map(|m| {
-                    let v = once(&mut m.1);
-                    let w: Box<dyn Iterator<Item = &mut Id<SValueW>> + '_> = match &mut m.0 {
-                        swc_tac::PropKey::Lit(_) => Box::new(empty()),
-                        swc_tac::PropKey::Computed(c) => Box::new(once(c)),
-                    };
-                    v.chain(w)
-                })),
-                swc_tac::Item::Arr { members } => Box::new(members.iter_mut()),
-                swc_tac::Item::Yield { value, delegate } => Box::new(value.iter_mut()),
-                swc_tac::Item::Await { value } => Box::new(once(value)),
-                swc_tac::Item::Undef => Box::new(empty()),
-            },
-            SValue::Assign { target, val } => {
-                let v = once(val);
-                let w: Box<dyn Iterator<Item = &mut Id<SValueW>> + '_> = match target {
-                    swc_tac::LId::Id { id } => todo!(),
-                    swc_tac::LId::Member { obj, mem } => Box::new([obj, mem].into_iter()),
-                };
-                Box::new(v.chain(w))
-            }
-            SValue::LoadId(_) => Box::new(empty()),
-            SValue::StoreId { target, val } => Box::new(once(val)),
-            SValue::Benc(a) => Box::new(once(a)),
-        }
+        self.0.vals_mut()
     }
 }
 impl HasValues<SFunc> for SValueW {

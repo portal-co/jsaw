@@ -1,0 +1,17 @@
+[package]
+name = "portal-jsc-simpl-js"
+version = "0.1.0"
+edition = "2021"
+license = "CC0-1.0"
+description = "ECMAScript IR"
+
+[dependencies]
+swc_atoms.workspace = true
+swc_common.workspace = true
+swc_ecma_ast.workspace = true
+swc_ecma_utils.workspace = true
+swc_ecma_visit.workspace = true
+
+portal-jsc-swc-batch = { version = "0.1.0", path = "../swc-batch" }
+portal-jsc-swc-util = { version = "0.1.0", path = "../swc-util" }
+typenum = "1.18.0"

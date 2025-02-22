@@ -10,7 +10,7 @@ use swc_cfg::{Block, Catch, Cfg, Func};
 use swc_common::pass::Either;
 use swc_ecma_ast::{
     AssignOp, BinaryOp, Callee, Expr, ExprOrSpread, Function, Lit, MemberExpr, MemberProp, Pat,
-    SimpleAssignTarget, Stmt, Str, UnaryOp,
+    SimpleAssignTarget, Stmt, Str, TsType, TsTypeAnn, TsTypeParamDecl, UnaryOp,
 };
 
 use swc_ecma_ast::Id as Ident;
@@ -40,6 +40,7 @@ pub struct TFunc {
     pub cfg: TCfg,
     pub entry: Id<TBlock>,
     pub params: Vec<Ident>,
+    pub ts_params: Vec<Option<TsType>>,
     pub is_generator: bool,
     pub is_async: bool,
 }
@@ -53,11 +54,17 @@ impl TryFrom<Func> for TFunc {
             map: BTreeMap::new(),
         }
         .trans(&value.cfg, &mut cfg, value.entry)?;
+        cfg.ts_retty = value.cfg.ts_retty;
+        cfg.generics = value.cfg.generics;
+        let mut ts_params = vec![];
         let params = value
             .params
             .iter()
             .filter_map(|x| match &x.pat {
-                Pat::Ident(i) => Some(i.id.clone().into()),
+                Pat::Ident(i) => {
+                    ts_params.push(i.type_ann.as_ref().map(|a| (&*a.type_ann).clone()));
+                    Some(i.id.clone().into())
+                }
                 _ => None,
             })
             .collect::<Vec<Ident>>();
@@ -67,6 +74,7 @@ impl TryFrom<Func> for TFunc {
             params,
             is_generator: value.is_generator,
             is_async: value.is_async,
+            ts_params,
         })
     }
 }
@@ -83,6 +91,9 @@ pub struct TCfg {
     pub blocks: Arena<TBlock>,
     pub regs: LAM<()>,
     pub decls: BTreeSet<Ident>,
+    pub type_annotations: BTreeMap<Ident, TsType>,
+    pub generics: Option<TsTypeParamDecl>,
+    pub ts_retty: Option<TsTypeAnn>,
 }
 impl TCfg {
     pub fn refs<'a>(&'a self) -> impl Iterator<Item = Ident> + 'a {
@@ -227,6 +238,7 @@ impl<I> TCallee<I> {
     }
 }
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum Item<I = Ident> {
     Just { id: I },
     Bin { left: I, right: I, op: BinaryOp },
@@ -280,6 +292,70 @@ impl<I> Item<I> {
             Item::Await { value } => Item::Await { value: f(value)? },
             Item::Undef => Item::Undef,
         })
+    }
+    pub fn refs<'a>(&'a self) -> Box<dyn Iterator<Item = &'a I> + 'a> {
+        use crate as swc_tac;
+        match self {
+            swc_tac::Item::Just { id } => Box::new(once(id)),
+            swc_tac::Item::Bin { left, right, op } => Box::new([left, right].into_iter()),
+            swc_tac::Item::Un { arg, op } => Box::new(once(arg)),
+            swc_tac::Item::Mem { obj, mem } => Box::new([obj, mem].into_iter()),
+            swc_tac::Item::Func { func } => Box::new(empty()),
+            swc_tac::Item::Lit { lit } => Box::new(empty()),
+            swc_tac::Item::Call { callee, args } => Box::new(
+                match callee {
+                    swc_tac::TCallee::Val(a) => vec![a],
+                    swc_tac::TCallee::Member { r#fn, member } => vec![r#fn, member],
+                    swc_tac::TCallee::Static(_) => vec![],
+                }
+                .into_iter()
+                .chain(args.iter()),
+            ),
+            swc_tac::Item::Obj { members } => Box::new(members.iter().flat_map(|m| {
+                let v = once(&m.1);
+                let w: Box<dyn Iterator<Item = &I> + '_> = match &m.0 {
+                    swc_tac::PropKey::Lit(_) => Box::new(empty()),
+                    swc_tac::PropKey::Computed(c) => Box::new(once(c)),
+                };
+                v.chain(w)
+            })),
+            swc_tac::Item::Arr { members } => Box::new(members.iter()),
+            swc_tac::Item::Yield { value, delegate } => Box::new(value.iter()),
+            swc_tac::Item::Await { value } => Box::new(once(value)),
+            swc_tac::Item::Undef => Box::new(empty()),
+        }
+    }
+    pub fn refs_mut<'a>(&'a mut self) -> Box<dyn Iterator<Item = &'a mut I> + 'a> {
+        use crate as swc_tac;
+        match self {
+            swc_tac::Item::Just { id } => Box::new(once(id)),
+            swc_tac::Item::Bin { left, right, op } => Box::new([left, right].into_iter()),
+            swc_tac::Item::Un { arg, op } => Box::new(once(arg)),
+            swc_tac::Item::Mem { obj, mem } => Box::new([obj, mem].into_iter()),
+            swc_tac::Item::Func { func } => Box::new(empty()),
+            swc_tac::Item::Lit { lit } => Box::new(empty()),
+            swc_tac::Item::Call { callee, args } => Box::new(
+                match callee {
+                    swc_tac::TCallee::Val(a) => vec![a],
+                    swc_tac::TCallee::Member { r#fn, member } => vec![r#fn, member],
+                    swc_tac::TCallee::Static(_) => vec![],
+                }
+                .into_iter()
+                .chain(args.iter_mut()),
+            ),
+            swc_tac::Item::Obj { members } => Box::new(members.iter_mut().flat_map(|m| {
+                let v = once(&mut m.1);
+                let w: Box<dyn Iterator<Item = &mut I> + '_> = match &mut m.0 {
+                    swc_tac::PropKey::Lit(_) => Box::new(empty()),
+                    swc_tac::PropKey::Computed(c) => Box::new(once(c)),
+                };
+                v.chain(w)
+            })),
+            swc_tac::Item::Arr { members } => Box::new(members.iter_mut()),
+            swc_tac::Item::Yield { value, delegate } => Box::new(value.iter_mut()),
+            swc_tac::Item::Await { value } => Box::new(once(value)),
+            swc_tac::Item::Undef => Box::new(empty()),
+        }
     }
 }
 #[derive(Clone)]
@@ -420,6 +496,9 @@ impl Trans {
                                         Item::Just { id: f },
                                     ));
                                     o.decls.insert(i2.id.clone().into());
+                                    if let Some(a) = i2.type_ann.as_ref().cloned() {
+                                        o.type_annotations.insert(i2.id.clone().into(), *a.type_ann);
+                                    }
                                 }
                                 _ => anyhow::bail!("todo: {}:{}", file!(), line!()),
                             }

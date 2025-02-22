@@ -6,7 +6,7 @@ use std::{
 use swc_ecma_ast::Expr;
 use swc_ecma_utils::{ExprExt, Value};
 
-use crate::*;
+use crate::{simplify::default_ctx, *};
 #[derive(Clone, Hash, Eq, PartialEq)]
 pub enum ConstVal {
     Lit(Lit),
@@ -23,11 +23,14 @@ pub fn ch(a: &SFunc) -> anyhow::Result<SFunc> {
     }
     .init(&a.cfg, &mut n, a.entry)?;
     n.decls.extend(a.cfg.decls.clone().into_iter());
+    n.generics = a.cfg.generics.clone();
+    n.ts_retty = a.cfg.ts_retty.clone();
     return Ok(SFunc {
         cfg: n,
         entry,
         is_generator: a.is_generator,
         is_async: a.is_async,
+        ts_params: a.ts_params.clone(),
     });
 }
 impl CH {
@@ -189,7 +192,7 @@ impl CH {
                     let cond = params.get(cond).cloned().context("in getting the cond")?;
                     match &out.values[cond].0 {
                         SValue::Item(Item::Lit { lit }) => {
-                            match Expr::Lit(lit.clone()).as_pure_bool(&Default::default()) {
+                            match Expr::Lit(lit.clone()).as_pure_bool(default_ctx()) {
                                 Value::Known(k) => STerm::Jmp(tgt(
                                     self,
                                     inp,

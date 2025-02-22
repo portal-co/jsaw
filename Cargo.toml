@@ -1,5 +1,8 @@
 [workspace]
-members=[ "js-runtime-lib","swc-cfg", "swc-emit-rust", "swc-opt-ssa", "swc-ssa", "swc-tac", "swc-waffle"]
+members=[ "js-runtime-lib", "simpl-js", "swc-batch","swc-cfg",  "swc-opt-ssa", "swc-ssa", "swc-tac", "swc-util"]
+
+# "swc-emit-rust","swc-waffle"
+
 resolver="2"
 
 [workspace.dependencies]
@@ -11,19 +14,19 @@ ssa-traits = "0.2.1"
 cfg-traits = "0.2.1"
 ssa-impls = "0.2.1"
 ssa-reloop = "0.2.1"
-swc_atoms = "3.0.0"
-swc_common = "5.0.0"
-swc_ecma_ast = "5.0.0"
-swc_ecma_compat_es2015 = "6.0.0"
-swc_ecma_minifier = "6.0.0"
-swc_ecma_transforms_base = "6.0.0"
-swc_ecma_utils = "6.0.0"
-swc_ecma_visit = "5.0.0"
+swc_atoms = "4.0.0"
+swc_common = "7.0.0"
+swc_ecma_ast = "7.0.0"
+swc_ecma_compat_es2015 = "10.0.0"
+swc_ecma_minifier = "11.0.0"
+swc_ecma_transforms_base = "10.0.0"
+swc_ecma_utils = "10.0.0"
+swc_ecma_visit = "7.0.0"
 
 proc-macro2 = "1.0.88"
 quasiquote = "0.1.1"
 quote = "1.0.37"
 syn = "2.0.82"
 
-portal-pc-waffle="0.3.3"
+portal-pc-waffle="0.3.6"
 waffle-ast="0.4.2"

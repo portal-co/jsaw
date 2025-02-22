@@ -22,12 +22,19 @@ impl TryFrom<SFunc> for TFunc {
             .iter()
             .map(|v| mangle_value(&value, v.0))
             .collect();
+        for (v, t) in value.cfg.ts.clone().into_iter() {
+            cfg.type_annotations.insert(mangle_value(&value, v), t);
+        }
+        cfg.ts_retty = value.cfg.ts_retty;
+        cfg.generics = value.cfg.generics;
+
         Ok(Self {
             cfg,
             entry,
             params,
             is_generator: value.is_generator,
             is_async: value.is_async,
+            ts_params: value.ts_params,
         })
     }
 }
@@ -113,10 +120,14 @@ impl Rew {
                             }
                             SValue::Benc(v) => {
                                 b.blocks[k2].stmts.push((
-                                    LId::Id { id: mangle_value(a, *val) },
-                                    Item::Just { id: mangle_value(a, *v) }
+                                    LId::Id {
+                                        id: mangle_value(a, *val),
+                                    },
+                                    Item::Just {
+                                        id: mangle_value(a, *v),
+                                    },
                                 ));
-                            },
+                            }
                         }
                     }
                     let term = match &a.cfg.blocks[*id].postcedent.term {

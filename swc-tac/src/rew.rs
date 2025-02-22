@@ -4,7 +4,6 @@ use id_arena::Id;
 use swc_cfg::{Block, Cfg};
 use swc_cfg::{Func, Term};
 use swc_common::{Span, SyntaxContext};
-use swc_ecma_ast::BinExpr;
 use swc_ecma_ast::CallExpr;
 use swc_ecma_ast::ComputedPropName;
 use swc_ecma_ast::Expr;
@@ -23,6 +22,7 @@ use swc_ecma_ast::UnaryExpr;
 use swc_ecma_ast::{ArrayLit, Param};
 use swc_ecma_ast::{AssignExpr, Decl, VarDecl, VarDeclarator};
 use swc_ecma_ast::{AssignTarget, Function};
+use swc_ecma_ast::{BinExpr, BindingIdent, TsTypeAnn};
 
 use crate::{TBlock, TCallee, TCfg, TFunc};
 
@@ -38,10 +38,19 @@ impl TryFrom<TFunc> for Func {
         let params = value
             .params
             .iter()
-            .map(|a| Param {
+            .zip(value.ts_params.iter())
+            .map(|(a, t)| Param {
                 span: Span::dummy_with_cmt(),
                 decorators: vec![],
-                pat: Pat::Ident(i(a).into()),
+                pat: Pat::Ident(BindingIdent {
+                    id: i(a),
+                    type_ann: t.as_ref().map(|a| {
+                        Box::new(TsTypeAnn {
+                            span: Span::dummy_with_cmt(),
+                            type_ann: Box::new(a.clone()),
+                        })
+                    }),
+                }),
             })
             .collect::<Vec<_>>();
         let entry2 = cfg.blocks.alloc(Default::default());
@@ -55,13 +64,23 @@ impl TryFrom<TFunc> for Func {
                     kind: swc_ecma_ast::VarDeclKind::Var,
                     decls: vec![VarDeclarator {
                         span: Span::dummy_with_cmt(),
-                        name: Pat::Ident(i(d).into()),
+                        name: Pat::Ident(BindingIdent {
+                            id: i(d),
+                            type_ann: value.cfg.type_annotations.get(d).map(|a| {
+                                Box::new(TsTypeAnn {
+                                    span: Span::dummy_with_cmt(),
+                                    type_ann: Box::new(a.clone()),
+                                })
+                            }),
+                        }),
                         init: None,
                         definite: false,
                     }],
                 }))));
         }
         cfg.blocks[entry2].end.term = Term::Jmp(entry);
+        cfg.ts_retty = value.cfg.ts_retty;
+        cfg.generics = value.cfg.generics;
         Ok(Func {
             cfg,
             entry: entry2,

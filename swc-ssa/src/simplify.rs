@@ -1,8 +1,8 @@
 use crate::*;
 use swc_atoms::Atom;
-use swc_common::{EqIgnoreSpan, Spanned};
+use swc_common::{EqIgnoreSpan, Spanned, SyntaxContext};
 use swc_ecma_ast::{op, BinaryOp, Bool, Expr, Number, Str, UnaryOp};
-use swc_ecma_utils::{ExprExt, Value};
+use swc_ecma_utils::{ExprCtx, ExprExt, Value};
 
 impl SwcFunc {
     pub fn simplify(&mut self) {
@@ -32,6 +32,9 @@ impl SValGetter<Id<SValueW>,Id<SBlock>> for SwcFunc{
         Some(&self.values[id].0)
     }
 }
+pub(crate)fn default_ctx() -> ExprCtx{
+    ExprCtx { unresolved_ctxt: SyntaxContext::empty(), is_unresolved_ref_safe: false, in_strict: true, remaining_depth: 4 }
+}
 impl<I: Copy,B> SValue<I,B> {
     pub fn const_in(&self, k: &impl SValGetter<I,B>) -> Option<Lit> {
         match self {
@@ -43,8 +46,8 @@ impl<I: Copy,B> SValue<I,B> {
                     macro_rules! op2 {
                         ($left:expr => {$($op:tt)*} $right:expr) => {
                             match (
-                                Expr::Lit($left.clone()).as_pure_number(&Default::default()),
-                                Expr::Lit($right.clone()).as_pure_number(&Default::default()),
+                                Expr::Lit($left.clone()).as_pure_number(default_ctx()),
+                                Expr::Lit($right.clone()).as_pure_number(default_ctx()),
                             ) {
                                 (Value::Known(k), Value::Known(l))
                                     if !k.is_nan() && !l.is_nan() =>
@@ -67,8 +70,8 @@ impl<I: Copy,B> SValue<I,B> {
                     macro_rules! bop2 {
                         ($left:expr => {$($op:tt)*} $right:expr) => {
                             match (
-                                Expr::Lit($left.clone()).as_pure_number(&Default::default()),
-                                Expr::Lit($right.clone()).as_pure_number(&Default::default()),
+                                Expr::Lit($left.clone()).as_pure_number(default_ctx()),
+                                Expr::Lit($right.clone()).as_pure_number(default_ctx()),
                             ) {
                                 (Value::Known(k), Value::Known(l))
                                     if !k.is_nan() && !l.is_nan() =>
@@ -86,8 +89,8 @@ impl<I: Copy,B> SValue<I,B> {
                     macro_rules! iop2 {
                         ($left:expr => {$($op:tt)*} $right:expr) => {
                             match (
-                                Expr::Lit($left.clone()).as_pure_number(&Default::default()),
-                                Expr::Lit($right.clone()).as_pure_number(&Default::default()),
+                                Expr::Lit($left.clone()).as_pure_number(default_ctx()),
+                                Expr::Lit($right.clone()).as_pure_number(default_ctx()),
                             ) {
                                 (Value::Known(k), Value::Known(l))
                                     if !k.is_nan() && !l.is_nan() =>
@@ -113,8 +116,8 @@ impl<I: Copy,B> SValue<I,B> {
                     match op {
                         BinaryOp::Add => {
                             match (
-                                Expr::Lit(left.clone()).as_pure_string(&Default::default()),
-                                Expr::Lit(right.clone()).as_pure_string(&Default::default()),
+                                Expr::Lit(left.clone()).as_pure_string(default_ctx()),
+                                Expr::Lit(right.clone()).as_pure_string(default_ctx()),
                             ) {
                                 (Value::Known(k), Value::Known(l)) => Some(Lit::Str(Str {
                                     span: left.span(),
@@ -122,8 +125,8 @@ impl<I: Copy,B> SValue<I,B> {
                                     raw: None,
                                 })),
                                 _ => match (
-                                    Expr::Lit(left.clone()).as_pure_number(&Default::default()),
-                                    Expr::Lit(right.clone()).as_pure_number(&Default::default()),
+                                    Expr::Lit(left.clone()).as_pure_number(default_ctx()),
+                                    Expr::Lit(right.clone()).as_pure_number(default_ctx()),
                                 ) {
                                     (Value::Known(k), Value::Known(l))
                                         if !k.is_nan() && !l.is_nan() =>
@@ -150,8 +153,8 @@ impl<I: Copy,B> SValue<I,B> {
                         op!("<<") => iop2!(left => {<<} right),
                         op!(">>") => iop2!(left => {>>} right),
                         op!("**") => match (
-                            Expr::Lit(left.clone()).as_pure_number(&Default::default()),
-                            Expr::Lit(right.clone()).as_pure_number(&Default::default()),
+                            Expr::Lit(left.clone()).as_pure_number(default_ctx()),
+                            Expr::Lit(right.clone()).as_pure_number(default_ctx()),
                         ) {
                             (Value::Known(k), Value::Known(l)) if !k.is_nan() && !l.is_nan() => {
                                 let sum = k.powf(l);
@@ -168,8 +171,8 @@ impl<I: Copy,B> SValue<I,B> {
                             _ => None,
                         },
                         op!(">>>") => match (
-                            Expr::Lit(left.clone()).as_pure_number(&Default::default()),
-                            Expr::Lit(right.clone()).as_pure_number(&Default::default()),
+                            Expr::Lit(left.clone()).as_pure_number(default_ctx()),
+                            Expr::Lit(right.clone()).as_pure_number(default_ctx()),
                         ) {
                             (Value::Known(k), Value::Known(l)) if !k.is_nan() && !l.is_nan() => {
                                 let k: i32 = num_traits::cast(k)?;
@@ -230,7 +233,7 @@ impl<I: Copy,B> SValue<I,B> {
                         },
                         swc_ecma_ast::UnaryOp::Plus => {
                             let x = Expr::Lit(l);
-                            let synth = <Expr as ExprExt>::as_pure_number(&x, &Default::default());
+                            let synth = <Expr as ExprExt>::as_pure_number(&x, default_ctx());
                             match synth {
                                 Value::Known(k) if !k.is_nan() => Some(Lit::Num(Number {
                                     span: x.span(),
@@ -242,7 +245,7 @@ impl<I: Copy,B> SValue<I,B> {
                         }
                         swc_ecma_ast::UnaryOp::Bang => {
                             let x = Expr::Lit(l);
-                            let synth = x.as_pure_bool(&Default::default());
+                            let synth = x.as_pure_bool(default_ctx());
                             match synth {
                                 Value::Known(k) => Some(Lit::Bool(Bool {
                                     span: x.span(),
@@ -253,7 +256,7 @@ impl<I: Copy,B> SValue<I,B> {
                         }
                         swc_ecma_ast::UnaryOp::Tilde => {
                             let x = Expr::Lit(l);
-                            let synth = <Expr as ExprExt>::as_pure_number(&x, &Default::default());
+                            let synth = <Expr as ExprExt>::as_pure_number(&x, default_ctx());
                             match synth {
                                 Value::Known(value) if value.fract() == 0.0 => {
                                     Some(Lit::Num(Number {
@@ -283,6 +286,7 @@ impl<I: Copy,B> SValue<I,B> {
                 Item::Yield { value, delegate } => None,
                 Item::Await { value } => None,
                 Item::Undef => None,
+                _ => None,
             },
             _ => None,
         }

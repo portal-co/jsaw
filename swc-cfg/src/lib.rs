@@ -10,10 +10,7 @@ use relooper::ShapedBlock;
 use swc_atoms::Atom;
 use swc_common::{Span, Spanned, SyntaxContext};
 use swc_ecma_ast::{
-    ArrayLit, AssignExpr, BindingIdent, BlockStmt, Bool, BreakStmt, CallExpr, CatchClause,
-    ContinueStmt, Decl, DoWhileStmt, Expr, ExprOrSpread, ExprStmt, Function, Ident, IdentName,
-    IfStmt, LabeledStmt, Lit, MemberExpr, Param, Pat, ReturnStmt, Stmt, Str, SwitchCase,
-    SwitchStmt, ThrowStmt, TryStmt, WhileStmt,
+    ArrayLit, AssignExpr, BindingIdent, BlockStmt, Bool, BreakStmt, CallExpr, CatchClause, ContinueStmt, Decl, DoWhileStmt, Expr, ExprOrSpread, ExprStmt, Function, Ident, IdentName, IfStmt, LabeledStmt, Lit, MemberExpr, Param, Pat, ReturnStmt, Stmt, Str, SwitchCase, SwitchStmt, ThrowStmt, TryStmt, TsTypeAnn, TsTypeParamDecl, WhileStmt
 };
 pub mod recfg;
 pub mod simplify;
@@ -38,7 +35,8 @@ impl TryFrom<Function> for Func {
         )?;
         cfg.blocks[exit].end.term = Term::Return(None);
         cfg.simplify();
-
+        cfg.generics = value.type_params.map(|a|*a);
+        cfg.ts_retty = value.return_type.map(|a|*a);
         return Ok(Self {
             cfg,
             entry,
@@ -64,8 +62,8 @@ impl Into<Function> for Func {
             }),
             is_generator: self.is_generator,
             is_async: self.is_async,
-            type_params: None,
-            return_type: None,
+            type_params: self.cfg.generics.map(Box::new),
+            return_type: self.cfg.ts_retty.map(Box::new),
         };
     }
 }
@@ -73,10 +71,14 @@ impl Into<Function> for Func {
 #[derive(Clone, Default)]
 pub struct Cfg {
     pub blocks: Arena<Block>,
+    pub generics: Option<TsTypeParamDecl>,
+    pub ts_retty: Option<TsTypeAnn>
 }
 impl Cfg {
     pub fn recfg(&self, entry: Id<Block>) -> (Cfg, Id<Block>) {
         let mut res = Cfg::default();
+        res.generics = self.generics.clone();
+        res.ts_retty = self.ts_retty.clone();
         let Ok(entry) = recfg::Recfg::default().go(self, &mut res, entry) else {
             return (self.clone(), entry);
         };

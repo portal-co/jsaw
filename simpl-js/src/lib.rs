@@ -308,20 +308,29 @@ impl std::error::Error for Error {
         }
     }
 }
-pub trait ConvCtx: ImportMapper {}
-impl<T: ImportMapper + ?Sized> ConvCtx for T {}
+pub trait ConvCtx<D: ConvDialect>: ImportMapper {}
+impl<D: ConvDialect, T: ImportMapper + ?Sized> ConvCtx<D> for T {}
 pub trait Conv {
     type Target<D: Dialect>;
-    fn conv<D: ConvDialect>(&self, imports: &impl ConvCtx) -> Result<Self::Target<D>, Error>;
+    fn conv<D: ConvDialect>(&self, imports: &impl ConvCtx<D>) -> Result<Self::Target<D>, Error>;
 }
 pub trait ConvDialect: Dialect {
-    fn new_import<T: Eq + Hash + Clone + Spanned + Debug>(a: ImportOr<T>) -> Self::MarkSpanned<T>;
-    fn get_import<T: Eq + Hash + Clone + Spanned + Debug>(a: Self::MarkSpanned<T>) -> ImportOr<T>;
+    type IMark<T>: Extract<T> + From<T>;
+    type IMarkSpanned<T: Spanned + Clone + Debug + Hash + Eq>: Same<Output = Self::IMark<T>>
+        + Extract<T>
+        + From<T>
+        + Spanned
+        + Clone
+        + Debug
+        + Hash
+        + Eq;
+    fn new_import<T: Eq + Hash + Clone + Spanned + Debug>(a: ImportOr<Self::IMarkSpanned<T>>) -> Self::MarkSpanned<T>;
+    fn get_import<T: Eq + Hash + Clone + Spanned + Debug>(a: Self::MarkSpanned<T>) -> ImportOr<Self::IMarkSpanned<T>>;
 }
 impl Conv for Expr {
     type Target<D: Dialect> = SimplExpr<D>;
 
-    fn conv<D: ConvDialect>(&self, imports: &impl ConvCtx) -> Result<Self::Target<D>, Error> {
+    fn conv<D: ConvDialect>(&self, imports: &impl ConvCtx<D>) -> Result<Self::Target<D>, Error> {
         Ok(match self {
             Expr::Lit(l) => SimplExpr::Lit(l.clone()),
             Expr::Ident(i) => SimplExpr::Ident(match i.clone() {
@@ -329,12 +338,12 @@ impl Conv for Expr {
                     None => ImportOr::NotImport(SimplPath {
                         root: i,
                         keys: vec![],
-                    }),
+                    }.into()),
                     Some((a, b)) => ImportOr::Import {
                         value: SimplPath {
                             root: i,
                             keys: vec![],
-                        },
+                        }.into(),
                         module: a,
                         name: b,
                     },
@@ -342,7 +351,7 @@ impl Conv for Expr {
             }),
             Expr::Member(m) => {
                 let a: SimplExpr<D> = m.obj.conv(imports)?;
-                let mut path: ImportOr<SimplPath> = D::get_import(match a {
+                let mut path: ImportOr<_> = D::get_import(match a {
                     SimplExpr::Ident(path) => path,
                     SimplExpr::Assign(a) => a.value.target,
                     _ => return Err(Error::Unsupported),
@@ -352,14 +361,14 @@ impl Conv for Expr {
                 };
                 match &mut path {
                     ImportOr::NotImport(value) => {
-                        value.keys.push(i.sym.clone());
+                        value.as_mut().keys.push(i.sym.clone());
                     }
                     ImportOr::Import {
                         value,
                         module,
                         name,
                     } => {
-                        value.keys.push(i.sym.clone());
+                        value.as_mut().keys.push(i.sym.clone());
                     }
                 };
                 SimplExpr::Ident(D::new_import(path))
@@ -373,7 +382,7 @@ impl Conv for Expr {
                             }
                             swc_ecma_ast::SimpleAssignTarget::Member(m) => {
                                 let a: SimplExpr<D> = m.obj.conv(imports)?;
-                                let mut path: ImportOr<SimplPath> = D::get_import(match a {
+                                let mut path: ImportOr<_> = D::get_import(match a {
                                     SimplExpr::Ident(path) => path,
                                     SimplExpr::Assign(a) => a.value.target,
                                     _ => return Err(Error::Unsupported),
@@ -383,14 +392,14 @@ impl Conv for Expr {
                                 };
                                 match &mut path {
                                     ImportOr::NotImport(value) => {
-                                        value.keys.push(i.sym.clone());
+                                        value.as_mut().keys.push(i.sym.clone());
                                     }
                                     ImportOr::Import {
                                         value,
                                         module,
                                         name,
                                     } => {
-                                        value.keys.push(i.sym.clone());
+                                        value.as_mut().keys.push(i.sym.clone());
                                     }
                                 };
                                 SimplExpr::Ident(D::new_import(path))
@@ -508,7 +517,7 @@ impl Conv for Expr {
 impl Conv for Stmt {
     type Target<D: Dialect> = SimplStmt<D>;
 
-    fn conv<D: ConvDialect>(&self, imports: &impl ConvCtx) -> Result<Self::Target<D>, Error> {
+    fn conv<D: ConvDialect>(&self, imports: &impl ConvCtx<D>) -> Result<Self::Target<D>, Error> {
         Ok(match self {
             Stmt::Expr(e) => SimplStmt::Expr(MakeSpanned {
                 value: Box::new(e.expr.conv(imports)?),

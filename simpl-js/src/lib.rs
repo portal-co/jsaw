@@ -10,6 +10,8 @@ use portal_jsc_swc_util::ModuleMapper;
 use portal_jsc_swc_util::{Extract, ImportMapper, ImportOr, MakeSpanned};
 use swc_atoms::Atom;
 use swc_common::{Span, Spanned};
+use swc_ecma_ast::BreakStmt;
+use swc_ecma_ast::ContinueStmt;
 use swc_ecma_ast::Function;
 use swc_ecma_ast::Id;
 use swc_ecma_ast::MethodProp;
@@ -52,6 +54,8 @@ pub enum SimplStmt<D: Dialect> {
     Block(MakeSpanned<Vec<SimplStmt<D>>>),
     If(MakeSpanned<SimplIf<D>>),
     Return(MakeSpanned<Box<SimplExpr<D>>>),
+    Break(Ident),
+    Continue(Ident),
 }
 #[derive(Clone, Hash, Debug, PartialEq, Eq, Spanned)]
 pub struct SimplPath {
@@ -135,6 +139,9 @@ impl<D: Dialect> SimplStmt<D> {
                     *l = label.clone();
                 }
             },
+            SimplStmt::Break(l) | SimplStmt::Continue(l) => {
+                *l = label.clone();
+            }
         }
     }
 }
@@ -281,7 +288,16 @@ impl<D: Dialect<Tag = Infallible>> From<SimplExpr<D>> for Expr {
                                             decorators: vec![],
                                             span: s.span,
                                             ctxt: Default::default(),
-                                            body: Some(BlockStmt { span: s.span, ctxt: Default::default(), stmts: p.1.0.into_iter().map(|a|a.into()).collect() }),
+                                            body: Some(BlockStmt {
+                                                span: s.span,
+                                                ctxt: Default::default(),
+                                                stmts: p
+                                                    .1
+                                                     .0
+                                                    .into_iter()
+                                                    .map(|a| a.into())
+                                                    .collect(),
+                                            }),
                                             is_generator: false,
                                             is_async: false,
                                             type_params: None,
@@ -369,6 +385,14 @@ impl<D: Dialect<Tag = Infallible>> From<SimplStmt<D>> for Stmt {
                     })),
                 }),
             },
+            SimplStmt::Break(b) => Stmt::Break(BreakStmt {
+                span: b.span(),
+                label: Some(b),
+            }),
+            SimplStmt::Continue(b) => Stmt::Continue(ContinueStmt {
+                span: b.span(),
+                label: Some(b),
+            }),
             _ => todo!(),
         }
     }
@@ -703,6 +727,14 @@ impl Conv for Stmt {
 
     fn conv<D: ConvDialect>(&self, imports: &impl ConvCtx<D>) -> Result<Self::Target<D>, Error> {
         Ok(match self {
+            Stmt::Break(b) => SimplStmt::Break(match b.label.as_ref().cloned() {
+                Some(l) => l,
+                None => return Err(Error::Unsupported),
+            }),
+            Stmt::Continue(b) => SimplStmt::Continue(match b.label.as_ref().cloned() {
+                Some(l) => l,
+                None => return Err(Error::Unsupported),
+            }),
             Stmt::Expr(e) => SimplStmt::Expr(MakeSpanned {
                 value: Box::new(e.expr.conv(imports)?),
                 span: e.span,

@@ -19,9 +19,9 @@ pub struct TSimplCfg<D: TacDialect> {
     pub regs: LAM<()>,
     pub blocks: Arena<TSimplBlock<D>>,
 }
-pub struct TSimplFunc<D: TacDialect>{
+pub struct TSimplFunc<D: TacDialect> {
     pub cfg: TSimplCfg<D>,
-    pub entry: Id<TSimplBlock<D>>
+    pub entry: Id<TSimplBlock<D>>,
 }
 impl<D: TacDialect> Default for TSimplCfg<D> {
     fn default() -> Self {
@@ -39,12 +39,15 @@ impl<D: TacDialect> Clone for TSimplCfg<D> {
         }
     }
 }
-impl<D: TacDialect> Clone for TSimplFunc<D>{
+impl<D: TacDialect> Clone for TSimplFunc<D> {
     fn clone(&self) -> Self {
-        Self { cfg: self.cfg.clone(), entry: self.entry.clone() }
+        Self {
+            cfg: self.cfg.clone(),
+            entry: self.entry.clone(),
+        }
     }
 }
-impl<D: TacDialect> Default for TSimplFunc<D>{
+impl<D: TacDialect> Default for TSimplFunc<D> {
     fn default() -> Self {
         let mut cfg = TSimplCfg::default();
         let e = cfg.blocks.alloc(Default::default());
@@ -423,6 +426,18 @@ impl<D: TacDialect> Bake<D> for SimplStmt<D> {
                         }
                     };
                     cfg.blocks[start_block].orig_span = Some(make_spanned.span);
+                    cfg.blocks.alloc(Default::default())
+                }
+                SimplStmt::Break(b) => {
+                    let b2 = labels(b.to_id()).r#break;
+                    cfg.blocks[start_block].orig_span = Some(b.span);
+                    cfg.blocks[start_block].term = TSimplTerm::Jmp(b2);
+                    cfg.blocks.alloc(Default::default())
+                }
+                SimplStmt::Continue(b) => {
+                    let b2 = labels(b.to_id()).r#continue;
+                    cfg.blocks[start_block].orig_span = Some(b.span);
+                    cfg.blocks[start_block].term = TSimplTerm::Jmp(b2);
                     cfg.blocks.alloc(Default::default())
                 }
                 _ => todo!(),

@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use swc_atoms::Atom;
 use swc_common::{Span, Spanned};
-use swc_ecma_ast::{Expr, ExprStmt, Id, Ident, Lit, Stmt};
+use swc_ecma_ast::{Expr, ExprStmt, Id, Ident, Lit, ModuleDecl, ModuleItem, Stmt};
 
 #[derive(Clone, Copy, Hash, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct MakeSpanned<T> {
@@ -77,6 +77,11 @@ impl<T> Extract<T> for ImportOr<T> {
         }
     }
 }
+impl<T: AsRef<T> + AsMut<T>> Extract<T> for T {
+    fn extract_own(self) -> T {
+        self
+    }
+}
 // impl<T, U: Into<T> + AsRef<T> + AsMut<T>> Extract<T> for U {}
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum ImportMap<T> {
@@ -89,4 +94,7 @@ pub fn mangle((a, b): &Id) -> Atom {
 }
 pub trait ImportMapper {
     fn import_of(&self, cx: &Id) -> Option<(Atom, ImportMap<Atom>)>;
+}
+pub trait ModuleMapper{
+    fn item_of(&self, id: &Id) -> Option<&ModuleItem>;
 }

@@ -1,11 +1,14 @@
+use std::convert::Infallible;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::hash::Hash;
 
 use portal_jsc_swc_batch::ImportMapping;
+use portal_jsc_swc_util::ModuleMapper;
 use portal_jsc_swc_util::{Extract, ImportMapper, ImportOr, MakeSpanned};
 use swc_atoms::Atom;
 use swc_common::{Span, Spanned};
+use swc_ecma_ast::Id;
 use swc_ecma_ast::{
     ArrowExpr, AssignExpr, AssignOp, BinExpr, BinaryOp, BindingIdent, BlockStmt, CallExpr, Expr,
     ExprOrSpread, ExprStmt, Ident, IdentName, IfStmt, LabeledStmt, Lit, MemberExpr, MemberProp,
@@ -22,6 +25,7 @@ pub trait Dialect {
         + Debug
         + Hash
         + Eq;
+    type Tag: Spanned + Clone + Debug + Hash + Eq;
 }
 
 #[non_exhaustive]
@@ -47,11 +51,29 @@ pub struct SimplPath {
     pub root: Ident,
     pub keys: Vec<Atom>,
 }
+#[derive(Clone, Hash, Debug, PartialEq, Eq)]
+pub struct SimplPathId {
+    pub root: Id,
+    pub keys: Vec<Atom>,
+}
+impl SimplPath {
+    pub fn to_id(&self) -> SimplPathId {
+        SimplPathId {
+            root: self.root.to_id(),
+            keys: self.keys.clone(),
+        }
+    }
+}
 #[derive(Clone, Hash, Debug, PartialEq, Eq, Spanned)]
 pub enum SimplCallExpr<D: Dialect> {
     Path {
         #[span]
         path: D::MarkSpanned<SimplPath>,
+        args: Vec<SimplExpr<D>>,
+    },
+    Tag {
+        #[span]
+        tag: D::Tag,
         args: Vec<SimplExpr<D>>,
     },
     Block(Box<SimplStmt<D>>),
@@ -104,7 +126,7 @@ impl<D: Dialect> SimplStmt<D> {
     }
 }
 
-impl<D: Dialect> From<SimplExpr<D>> for Expr {
+impl<D: Dialect<Tag = Infallible>> From<SimplExpr<D>> for Expr {
     fn from(value: SimplExpr<D>) -> Self {
         match value {
             SimplExpr::Ident(i) => match i.extract_own() {
@@ -211,6 +233,7 @@ impl<D: Dialect> From<SimplExpr<D>> for Expr {
                         type_args: None,
                     })
                 }
+                SimplCallExpr::Tag { tag, args } => match tag {},
             },
             _ => todo!(),
         }
@@ -237,7 +260,7 @@ impl<D: Dialect> SimplStmt<D> {
         }
     }
 }
-impl<D: Dialect> From<SimplStmt<D>> for Stmt {
+impl<D: Dialect<Tag = Infallible>> From<SimplStmt<D>> for Stmt {
     fn from(value: SimplStmt<D>) -> Self {
         match value {
             SimplStmt::Expr(e) => Stmt::Expr(ExprStmt {
@@ -308,8 +331,11 @@ impl std::error::Error for Error {
         }
     }
 }
-pub trait ConvCtx<D: ConvDialect>: ImportMapper {}
-impl<D: ConvDialect, T: ImportMapper + ?Sized> ConvCtx<D> for T {}
+pub trait ConvTagLookup<D: Dialect> {
+    fn lookup_tag<'a>(&self, a: &'a Expr) -> Result<D::Tag, &'a Expr>;
+}
+pub trait ConvCtx<D: ConvDialect>: ImportMapper + ModuleMapper + ConvTagLookup<D> {}
+impl<D: ConvDialect, T: ImportMapper + ModuleMapper + ConvTagLookup<D> + ?Sized> ConvCtx<D> for T {}
 pub trait Conv {
     type Target<D: Dialect>;
     fn conv<D: ConvDialect>(&self, imports: &impl ConvCtx<D>) -> Result<Self::Target<D>, Error>;
@@ -324,8 +350,12 @@ pub trait ConvDialect: Dialect {
         + Debug
         + Hash
         + Eq;
-    fn new_import<T: Eq + Hash + Clone + Spanned + Debug>(a: ImportOr<Self::IMarkSpanned<T>>) -> Self::MarkSpanned<T>;
-    fn get_import<T: Eq + Hash + Clone + Spanned + Debug>(a: Self::MarkSpanned<T>) -> ImportOr<Self::IMarkSpanned<T>>;
+    fn new_import<T: Eq + Hash + Clone + Spanned + Debug>(
+        a: ImportOr<Self::IMarkSpanned<T>>,
+    ) -> Self::MarkSpanned<T>;
+    fn get_import<T: Eq + Hash + Clone + Spanned + Debug>(
+        a: Self::MarkSpanned<T>,
+    ) -> ImportOr<Self::IMarkSpanned<T>>;
 }
 impl Conv for Expr {
     type Target<D: Dialect> = SimplExpr<D>;
@@ -335,15 +365,19 @@ impl Conv for Expr {
             Expr::Lit(l) => SimplExpr::Lit(l.clone()),
             Expr::Ident(i) => SimplExpr::Ident(match i.clone() {
                 i => D::new_import(match imports.import_of(&i.to_id()) {
-                    None => ImportOr::NotImport(SimplPath {
-                        root: i,
-                        keys: vec![],
-                    }.into()),
+                    None => ImportOr::NotImport(
+                        SimplPath {
+                            root: i,
+                            keys: vec![],
+                        }
+                        .into(),
+                    ),
                     Some((a, b)) => ImportOr::Import {
                         value: SimplPath {
                             root: i,
                             keys: vec![],
-                        }.into(),
+                        }
+                        .into(),
                         module: a,
                         name: b,
                     },
@@ -489,16 +523,29 @@ impl Conv for Expr {
                         )))),
                         span: f.span(),
                     }),
-                    e => {
-                        let a: SimplExpr<D> = e.conv(imports)?;
-                        let mut path = match a {
-                            SimplExpr::Ident(path) => path,
-                            SimplExpr::Assign(a) => a.value.target,
-                            _ => return Err(Error::Unsupported),
-                        };
-                        SimplExpr::Call(MakeSpanned {
-                            value: Box::new(SimplCallExpr::Path {
-                                path,
+                    e => match imports.lookup_tag(e) {
+                        Err(e) => {
+                            let a: SimplExpr<D> = e.conv(imports)?;
+                            let mut path = match a {
+                                SimplExpr::Ident(path) => path,
+                                SimplExpr::Assign(a) => a.value.target,
+                                _ => return Err(Error::Unsupported),
+                            };
+                            SimplExpr::Call(MakeSpanned {
+                                value: Box::new(SimplCallExpr::Path {
+                                    path,
+                                    args: c
+                                        .args
+                                        .iter()
+                                        .map(|a| a.expr.conv(imports))
+                                        .collect::<Result<Vec<_>, _>>()?,
+                                }),
+                                span: c.span,
+                            })
+                        }
+                        Ok(t) => SimplExpr::Call(MakeSpanned {
+                            value: Box::new(SimplCallExpr::Tag {
+                                tag: t,
                                 args: c
                                     .args
                                     .iter()
@@ -506,8 +553,8 @@ impl Conv for Expr {
                                     .collect::<Result<Vec<_>, _>>()?,
                             }),
                             span: c.span,
-                        })
-                    }
+                        }),
+                    },
                 },
             },
             _ => return Err(Error::Unsupported),

@@ -14,7 +14,7 @@ use swc_atoms::Atom;
 use swc_cfg::Catch;
 use swc_common::Span;
 use swc_ecma_ast::{Id as Ident, Lit, Null, TsType, TsTypeAnn, TsTypeParamDecl};
-use swc_tac::{Item, LId, TBlock, TCallee, TCfg, TFunc};
+use swc_tac::{Item, LId, TBlock, TCallee, TCfg, TFunc, ValFlags};
 pub mod ch;
 pub mod idw;
 pub mod impls;
@@ -249,7 +249,7 @@ impl Trans {
     pub fn apply_shim(
         &self,
         o: &mut SwcFunc,
-        state: &BTreeMap<Ident, Id<SValueW>>,
+        state: &BTreeMap<Ident, (Id<SValueW>, ValFlags)>,
         s: &Option<(Id<SBlock>, Vec<Ident>)>,
         x: Id<SBlock>,
     ) {
@@ -260,14 +260,19 @@ impl Trans {
         let k = SCatch::Just {
             target: STarget {
                 block: *a,
-                args: b.iter().filter_map(|x| state.get(x)).cloned().collect(),
+                args: b
+                    .iter()
+                    .filter_map(|x| state.get(x))
+                    .map(|a| &a.0)
+                    .cloned()
+                    .collect(),
             },
         };
         o.blocks[x].postcedent.catch = k;
     }
     pub fn load(
         &self,
-        state: &BTreeMap<Ident, Id<SValueW>>,
+        state: &BTreeMap<Ident, (Id<SValueW>, ValFlags)>,
         i: &TCfg,
         o: &mut SwcFunc,
         t: Id<SBlock>,
@@ -278,7 +283,7 @@ impl Trans {
             return *k;
         }
         let x = match state.get(&a).cloned() {
-            Some(b) => b,
+            Some(b) => b.0,
             None => {
                 let v = o.values.alloc(SValue::LoadId(a).into());
                 o.blocks[t].stmts.push(v);
@@ -339,11 +344,11 @@ impl Trans {
             let mut state = self
                 .all
                 .iter()
-                .map(|a| (a.clone(), o.add_blockparam(t)))
+                .map(|a| (a.clone(), (o.add_blockparam(t), ValFlags::all())))
                 .collect::<BTreeMap<_, _>>();
             self.apply_shim(o, &state, &shim, t);
             let mut cache = BTreeMap::new();
-            for (a, b) in i.blocks[k].stmts.iter() {
+            for (a, flags, b) in i.blocks[k].stmts.iter() {
                 let mut b = b.clone();
                 if let Item::Call { callee, args } = &mut b {
                     if let TCallee::Val(v) = callee {
@@ -362,21 +367,26 @@ impl Trans {
                     .unwrap();
                 let b = o.values.alloc(SValue::Item(b).into());
                 o.blocks[t].stmts.push(b);
-                match a.clone() {
+                let flags = match a.clone() {
                     LId::Id { id } => match state.get_mut(&id) {
-                        Some(a) => {
+                        Some((a, f)) => {
+                            *f &= *flags;
+                            let f = *f;
                             *a = b;
-                            let u = o.blocks.alloc(SBlock {
-                                params: vec![],
-                                stmts: vec![],
-                                postcedent: Default::default(),
-                            });
-                            self.apply_shim(o, &state, &shim, u);
-                            o.blocks[t].postcedent.term = STerm::Jmp(STarget {
-                                block: u,
-                                args: vec![],
-                            });
-                            t = u;
+                            if !f.contains(ValFlags::SSA_LIKE) {
+                                let u = o.blocks.alloc(SBlock {
+                                    params: vec![],
+                                    stmts: vec![],
+                                    postcedent: Default::default(),
+                                });
+                                self.apply_shim(o, &state, &shim, u);
+                                o.blocks[t].postcedent.term = STerm::Jmp(STarget {
+                                    block: u,
+                                    args: vec![],
+                                });
+                                t = u;
+                            }
+                            Some(f)
                         }
                         None => {
                             cache.insert(id.clone(), b);
@@ -388,6 +398,7 @@ impl Trans {
                                 .into(),
                             );
                             o.blocks[t].stmts.push(c);
+                            None
                         }
                     },
                     a => {
@@ -400,6 +411,7 @@ impl Trans {
                             .unwrap();
                         let c = o.values.alloc(SValue::Assign { target: c, val: b }.into());
                         o.blocks[t].stmts.push(c);
+                        None
                     }
                 };
             }
@@ -407,6 +419,7 @@ impl Trans {
                 .all
                 .iter()
                 .filter_map(|a| state.get(a))
+                .map(|a| &a.0)
                 .cloned()
                 .collect::<Vec<_>>();
             let term = match &i.blocks[k].term {

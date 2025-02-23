@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use id_arena::Id;
 use swc_atoms::Atom;
 use swc_ecma_ast::Id as Ident;
-use swc_tac::{Item, LId, TBlock, TCatch, TCfg, TFunc, TTerm};
+use swc_tac::{Item, LId, TBlock, TCatch, TCfg, TFunc, TTerm, ValFlags};
 
 use crate::{SBlock, SFunc, STarget, SValue, SValueW};
 
@@ -84,6 +84,7 @@ impl Rew {
                                     LId::Id {
                                         id: mangle_value(a, *val),
                                     },
+                                    ValFlags::SSA_LIKE,
                                     i,
                                 ));
                                 b.decls.insert(mangle_value(a, *val));
@@ -96,6 +97,7 @@ impl Rew {
                                 })?;
                                 b.blocks[k2].stmts.push((
                                     target,
+                                    Default::default(),
                                     Item::Just {
                                         id: mangle_value(a, *val),
                                     },
@@ -106,6 +108,7 @@ impl Rew {
                                     LId::Id {
                                         id: mangle_value(a, *val),
                                     },
+                                    ValFlags::SSA_LIKE,
                                     Item::Just { id: i.clone() },
                                 ));
                                 b.decls.insert(mangle_value(a, *val));
@@ -113,6 +116,7 @@ impl Rew {
                             SValue::StoreId { target, val } => {
                                 b.blocks[k2].stmts.push((
                                     LId::Id { id: target.clone() },
+                                    Default::default(),
                                     Item::Just {
                                         id: mangle_value(a, *val),
                                     },
@@ -123,6 +127,7 @@ impl Rew {
                                     LId::Id {
                                         id: mangle_value(a, *val),
                                     },
+                                    ValFlags::SSA_LIKE,
                                     Item::Just {
                                         id: mangle_value(a, *v),
                                     },
@@ -188,6 +193,7 @@ impl Rew {
                                 LId::Id {
                                     id: mangle_param(starget.block, a2),
                                 },
+                                Default::default(),
                                 Item::Just { id: b },
                             )
                         });

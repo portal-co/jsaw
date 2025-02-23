@@ -4,6 +4,7 @@ use std::default;
 use std::iter::{empty, once};
 
 use arena_traits::{Arena as TArena, IndexAlloc};
+use bitflags::bitflags;
 use id_arena::{Arena, Id};
 use lam::LAM;
 use swc_cfg::{Block, Catch, Cfg, Func};
@@ -17,6 +18,9 @@ use swc_ecma_ast::Id as Ident;
 
 pub mod lam;
 pub mod rew;
+
+#[cfg(feature = "simpl")]
+pub mod simpl;
 
 pub fn imp(a: MemberProp) -> Expr {
     match a {
@@ -34,7 +38,13 @@ pub fn imp(a: MemberProp) -> Expr {
         swc_ecma_ast::MemberProp::Computed(computed_prop_name) => *computed_prop_name.expr,
     }
 }
-
+bitflags! {
+    #[repr(transparent)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+    pub struct ValFlags: u64{
+        const SSA_LIKE = 0x1;
+    }
+}
 #[derive(Clone)]
 pub struct TFunc {
     pub cfg: TCfg,
@@ -112,7 +122,7 @@ impl TCfg {
                 }
                 TTerm::Default => Box::new(std::iter::empty()),
             };
-            i.chain(k.1.stmts.iter().flat_map(|(a, b)| {
+            i.chain(k.1.stmts.iter().flat_map(|(a, _, b)| {
                 let a: Box<dyn Iterator<Item = Ident> + '_> = match a {
                     LId::Id { id } => Box::new(once(id.clone())),
                     LId::Member { obj, mem } => {
@@ -175,7 +185,7 @@ impl TCfg {
 }
 #[derive(Clone, Default)]
 pub struct TBlock {
-    pub stmts: Vec<(LId, Item)>,
+    pub stmts: Vec<(LId, ValFlags, Item)>,
     pub catch: TCatch,
     pub term: TTerm,
 }
@@ -475,6 +485,7 @@ impl Trans {
                         LId::Id {
                             id: f.ident.clone().into(),
                         },
+                        Default::default(),
                         Item::Func {
                             func: f.function.as_ref().clone().try_into()?,
                         },
@@ -493,11 +504,13 @@ impl Trans {
                                         LId::Id {
                                             id: i2.id.clone().into(),
                                         },
+                                        Default::default(),
                                         Item::Just { id: f },
                                     ));
                                     o.decls.insert(i2.id.clone().into());
                                     if let Some(a) = i2.type_ann.as_ref().cloned() {
-                                        o.type_annotations.insert(i2.id.clone().into(), *a.type_ann);
+                                        o.type_annotations
+                                            .insert(i2.id.clone().into(), *a.type_ann);
                                     }
                                 }
                                 _ => anyhow::bail!("todo: {}:{}", file!(), line!()),
@@ -529,9 +542,11 @@ impl Trans {
         // let e;
         (mem, t) = self.expr(i, o, b, t, &imp(s.prop.clone()))?;
         let v = o.regs.alloc(());
-        o.blocks[t]
-            .stmts
-            .push((LId::Id { id: v.clone() }, Item::Mem { obj, mem }));
+        o.blocks[t].stmts.push((
+            LId::Id { id: v.clone() },
+            ValFlags::SSA_LIKE,
+            Item::Mem { obj, mem },
+        ));
         o.decls.insert(v.clone());
         Ok((v, t))
     }
@@ -564,6 +579,7 @@ impl Trans {
                                     LId::Id {
                                         id: i.id.clone().into(),
                                     },
+                                    Default::default(),
                                     item,
                                 ));
                                 right = i.id.clone().into();
@@ -601,6 +617,7 @@ impl Trans {
                                         let id = o.regs.alloc(());
                                         o.blocks[t].stmts.push((
                                             LId::Id { id: id.clone() },
+                                            ValFlags::SSA_LIKE,
                                             Item::Mem {
                                                 obj: obj.clone(),
                                                 mem: mem.clone(),
@@ -618,12 +635,15 @@ impl Trans {
                                         obj: obj.clone(),
                                         mem: mem.clone(),
                                     },
+                                    Default::default(),
                                     item,
                                 ));
                                 right = o.regs.alloc(());
-                                o.blocks[t]
-                                    .stmts
-                                    .push((LId::Id { id: right.clone() }, Item::Mem { obj, mem }));
+                                o.blocks[t].stmts.push((
+                                    LId::Id { id: right.clone() },
+                                    ValFlags::SSA_LIKE,
+                                    Item::Mem { obj, mem },
+                                ));
                                 o.decls.insert(right.clone());
                             }
                             _ => anyhow::bail!("todo: {}:{}", file!(), line!()),
@@ -665,9 +685,11 @@ impl Trans {
                     })
                     .collect::<anyhow::Result<_>>()?;
                 let tmp = o.regs.alloc(());
-                o.blocks[t]
-                    .stmts
-                    .push((LId::Id { id: tmp.clone() }, Item::Call { callee: c, args }));
+                o.blocks[t].stmts.push((
+                    LId::Id { id: tmp.clone() },
+                    ValFlags::SSA_LIKE,
+                    Item::Call { callee: c, args },
+                ));
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
             }
@@ -679,6 +701,7 @@ impl Trans {
                 let tmp = o.regs.alloc(());
                 o.blocks[t].stmts.push((
                     LId::Id { id: tmp.clone() },
+                    ValFlags::SSA_LIKE,
                     Item::Bin {
                         left,
                         right,
@@ -691,9 +714,11 @@ impl Trans {
             Expr::Unary(un) => {
                 if un.op == UnaryOp::Void {
                     let tmp = o.regs.alloc(());
-                    o.blocks[t]
-                        .stmts
-                        .push((LId::Id { id: tmp.clone() }, Item::Undef));
+                    o.blocks[t].stmts.push((
+                        LId::Id { id: tmp.clone() },
+                        ValFlags::SSA_LIKE,
+                        Item::Undef,
+                    ));
                     o.decls.insert(tmp.clone());
                     return Ok((tmp, t));
                 }
@@ -704,6 +729,7 @@ impl Trans {
                 let tmp = o.regs.alloc(());
                 o.blocks[t].stmts.push((
                     LId::Id { id: tmp.clone() },
+                    ValFlags::SSA_LIKE,
                     Item::Un {
                         arg,
                         op: un.op.clone(),
@@ -715,9 +741,11 @@ impl Trans {
             Expr::Member(m) => return self.member_expr(i, o, b, t, m),
             Expr::Lit(l) => {
                 let tmp = o.regs.alloc(());
-                o.blocks[t]
-                    .stmts
-                    .push((LId::Id { id: tmp.clone() }, Item::Lit { lit: l.clone() }));
+                o.blocks[t].stmts.push((
+                    LId::Id { id: tmp.clone() },
+                    ValFlags::SSA_LIKE,
+                    Item::Lit { lit: l.clone() },
+                ));
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
             }
@@ -728,6 +756,7 @@ impl Trans {
                 };
                 o.blocks[t].stmts.push((
                     LId::Id { id: tmp.clone() },
+                    Default::default(),
                     Item::Func {
                         func: f.function.as_ref().clone().try_into()?,
                     },
@@ -749,9 +778,11 @@ impl Trans {
                     })
                     .collect::<anyhow::Result<_>>()?;
                 let tmp = o.regs.alloc(());
-                o.blocks[t]
-                    .stmts
-                    .push((LId::Id { id: tmp.clone() }, Item::Arr { members }));
+                o.blocks[t].stmts.push((
+                    LId::Id { id: tmp.clone() },
+                    ValFlags::SSA_LIKE,
+                    Item::Arr { members },
+                ));
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
             }
@@ -818,18 +849,23 @@ impl Trans {
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
                 let tmp = o.regs.alloc(());
-                o.blocks[t]
-                    .stmts
-                    .push((LId::Id { id: tmp.clone() }, Item::Obj { members }));
+                o.blocks[t].stmts.push((
+                    LId::Id { id: tmp.clone() },
+                    ValFlags::SSA_LIKE,
+                    Item::Obj { members },
+                ));
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
             }
             Expr::Await(x) => {
                 let (a, t) = self.expr(i, o, b, t, &x.arg)?;
-                o.blocks[t]
-                    .stmts
-                    .push((LId::Id { id: a.clone() }, Item::Await { value: a.clone() }));
-                return Ok((a, t));
+                let tmp = o.regs.alloc(());
+                o.blocks[t].stmts.push((
+                    LId::Id { id: tmp.clone() },
+                    ValFlags::SSA_LIKE,
+                    Item::Await { value: a.clone() },
+                ));
+                return Ok((tmp, t));
             }
             Expr::Yield(y) => {
                 let y2 = match &y.arg {
@@ -843,6 +879,7 @@ impl Trans {
                 let tmp = o.regs.alloc(());
                 o.blocks[t].stmts.push((
                     LId::Id { id: tmp.clone() },
+                    ValFlags::SSA_LIKE,
                     Item::Yield {
                         value: y2,
                         delegate: y.delegate,

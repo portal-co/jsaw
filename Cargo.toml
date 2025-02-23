@@ -28,5 +28,8 @@ quasiquote = "0.1.1"
 quote = "1.0.37"
 syn = "2.0.82"
 
+typenum = "1.18.0"
+bitflags = "2.8.0"
+
 portal-pc-waffle="0.3.6"
 waffle-ast="0.4.2"

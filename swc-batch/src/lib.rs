@@ -1,12 +1,12 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
-use portal_jsc_swc_util::{ImportMap, ImportMapper};
+use portal_jsc_swc_util::{ImportMap, ImportMapper, ModuleMapper};
 use swc_atoms::Atom;
 use swc_common::{sync::Lrc, Mark, Spanned, SyntaxContext};
 use swc_ecma_ast::{
     BlockStmt, CallExpr, Decl, Expr, ExprOrSpread, FnDecl, FnExpr, Function, Id, Ident, IdentName,
-    Import, ImportDecl, Lit, MemberExpr, MethodProp, ObjectLit, PropOrSpread, ReturnStmt, Stmt,
-    Str, VarDecl, VarDeclarator,
+    Import, ImportDecl, Lit, MemberExpr, MethodProp, Module, ModuleDecl, ModuleItem, ObjectLit,
+    PropOrSpread, ReturnStmt, Stmt, Str, VarDecl, VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitMut, VisitMutWith};
 
@@ -71,6 +71,73 @@ impl ImportMapper for ImportMapping {
             return Some(a.clone());
         }
         return None;
+    }
+}
+pub struct ModuleMapping {
+    pub mapping: BTreeMap<Id, Arc<ModuleItem>>,
+    pub remainder: Vec<Arc<ModuleItem>>,
+}
+impl ModuleMapper for ModuleMapping {
+    fn item_of(&self, id: &Id) -> Option<&ModuleItem> {
+        self.mapping.get(id).map(|a| &**a)
+    }
+}
+impl ModuleMapping {
+    pub fn new(m: Module) -> Self {
+        let mut r = vec![];
+        Self {
+            mapping: m
+                .body
+                .into_iter()
+                .flat_map(|d| {
+                    // match d{ModuleItem::ModuleDecl(d) => {
+                    let d = Arc::new(d);
+                    match &*d {
+                        ModuleItem::ModuleDecl(module_decl) => match &module_decl {
+                            ModuleDecl::Import(import_decl) => import_decl
+                                .specifiers
+                                .iter()
+                                .flat_map(|s| match s {
+                                    swc_ecma_ast::ImportSpecifier::Named(
+                                        import_named_specifier,
+                                    ) => vec![(import_named_specifier.local.to_id(), d.clone())],
+                                    swc_ecma_ast::ImportSpecifier::Default(
+                                        import_default_specifier,
+                                    ) => vec![(import_default_specifier.local.to_id(), d.clone())],
+                                    swc_ecma_ast::ImportSpecifier::Namespace(
+                                        import_star_as_specifier,
+                                    ) => vec![(import_star_as_specifier.local.to_id(), d.clone())],
+                                })
+                                .collect::<Vec<_>>(),
+                            _ => {
+                                r.push(d);
+                                vec![]
+                            }
+                        },
+                        ModuleItem::Stmt(stmt) => match stmt {
+                            Stmt::Decl(d2) => match d2 {
+                                Decl::Var(v) => v
+                                    .decls
+                                    .iter()
+                                    .filter_map(|d2| d2.name.as_ident())
+                                    .map(|i| (i.id.to_id(), d.clone()))
+                                    .collect(),
+                                Decl::Fn(f) => vec![(f.ident.to_id(), d.clone())],
+                                _ => {
+                                    r.push(d);
+                                    vec![]
+                                }
+                            },
+                            _ => {
+                                r.push(d);
+                                vec![]
+                            }
+                        },
+                    }
+                })
+                .collect(),
+            remainder: r,
+        }
     }
 }
 pub struct SourceMapper {

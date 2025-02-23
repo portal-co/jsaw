@@ -149,7 +149,7 @@ impl Rew {
                         }))
                     }
                 };
-                let right = Box::new(match &i2.1 {
+                let right = Box::new(match &i2.2 {
                     crate::Item::Just { id } => Expr::Ident(i(id)),
                     crate::Item::Bin { left, right, op } => Expr::Bin(BinExpr {
                         span: Span::dummy_with_cmt(),

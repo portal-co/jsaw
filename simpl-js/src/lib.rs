@@ -83,6 +83,19 @@ impl SimplPath {
         }
     }
 }
+impl SimplPathId {
+    pub fn span(self, span: Span) -> SimplPath {
+        SimplPath {
+            root: Ident {
+                span: span,
+                ctxt: self.root.1,
+                sym: self.root.0,
+                optional: false,
+            },
+            keys: self.keys,
+        }
+    }
+}
 #[derive(Clone, Hash, Debug, PartialEq, Eq, Spanned)]
 pub enum SimplCallExpr<D: Dialect> {
     Path {

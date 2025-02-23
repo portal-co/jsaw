@@ -25,6 +25,11 @@ pub enum ImportOr<T> {
         name: ImportMap<Atom>,
     },
 }
+impl<T: Default> Default for ImportOr<T> {
+    fn default() -> Self {
+        Self::NotImport(T::default())
+    }
+}
 
 impl<T> AsRef<T> for ImportOr<T> {
     fn as_ref(&self) -> &T {
@@ -95,6 +100,6 @@ pub fn mangle((a, b): &Id) -> Atom {
 pub trait ImportMapper {
     fn import_of(&self, cx: &Id) -> Option<(Atom, ImportMap<Atom>)>;
 }
-pub trait ModuleMapper{
+pub trait ModuleMapper {
     fn item_of(&self, id: &Id) -> Option<&ModuleItem>;
 }

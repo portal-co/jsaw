@@ -133,6 +133,10 @@ impl Cfg {
     ) -> Vec<Stmt> {
         match k {
             ShapedBlock::Simple(simple_block) => {
+                let span = match self.blocks[simple_block.label].end.orig_span.clone() {
+                    None => span,
+                    Some(s) => s,
+                };
                 let jmp = |k: Id<Block>| {
                     vec![Stmt::Expr(ExprStmt {
                         span,

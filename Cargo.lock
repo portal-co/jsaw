@@ -682,6 +682,7 @@ dependencies = [
  "anyhow",
  "arena-traits",
  "bitflags",
+ "cfg-traits",
  "either",
  "id-arena",
  "portal-jsc-simpl-js",

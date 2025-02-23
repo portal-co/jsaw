@@ -11,11 +11,17 @@ use swc_ecma_ast::{BinaryOp, Id as Ident, Lit};
 
 use crate::{lam::LAM, ValFlags};
 
+pub mod impls;
+
 pub trait TacDialect: Dialect {}
 
 pub struct TSimplCfg<D: TacDialect> {
     pub regs: LAM<()>,
     pub blocks: Arena<TSimplBlock<D>>,
+}
+pub struct TSimplFunc<D: TacDialect>{
+    pub cfg: TSimplCfg<D>,
+    pub entry: Id<TSimplBlock<D>>
 }
 impl<D: TacDialect> Default for TSimplCfg<D> {
     fn default() -> Self {
@@ -33,7 +39,18 @@ impl<D: TacDialect> Clone for TSimplCfg<D> {
         }
     }
 }
-
+impl<D: TacDialect> Clone for TSimplFunc<D>{
+    fn clone(&self) -> Self {
+        Self { cfg: self.cfg.clone(), entry: self.entry.clone() }
+    }
+}
+impl<D: TacDialect> Default for TSimplFunc<D>{
+    fn default() -> Self {
+        let mut cfg = TSimplCfg::default();
+        let e = cfg.blocks.alloc(Default::default());
+        Self { cfg, entry: e }
+    }
+}
 pub struct TSimplBlock<D: TacDialect> {
     pub stmts: Vec<(SimplPathId, ValFlags, SimplItem<D>, Span)>,
     pub term: TSimplTerm<D>,

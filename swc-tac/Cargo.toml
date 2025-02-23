@@ -12,6 +12,7 @@ name = "swc_tac"
 [dependencies]
 anyhow.workspace = true
 arena-traits.workspace = true
+cfg-traits.workspace = true
 either = "1.13.0"
 id-arena.workspace = true
 portal-jsc-swc-cfg = { version = "0.3.0", path = "../swc-cfg" }

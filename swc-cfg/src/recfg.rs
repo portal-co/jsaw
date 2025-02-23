@@ -14,6 +14,7 @@ impl Recfg {
                 return Ok(*a);
             }
             let l = o.blocks.alloc(Default::default());
+            o.blocks[l].end.orig_span = i.blocks[k].end.orig_span.clone();
             self.map.insert(k, l);
             let catch = match &i.blocks[k].end.catch {
                 crate::Catch::Throw => Catch::Throw,

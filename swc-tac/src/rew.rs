@@ -35,18 +35,19 @@ impl TryFrom<TFunc> for Func {
             all: BTreeMap::new(),
         }
         .trans(&mut cfg, &value.cfg, value.entry)?;
+        let span = Span::dummy_with_cmt();
         let params = value
             .params
             .iter()
             .zip(value.ts_params.iter())
             .map(|(a, t)| Param {
-                span: Span::dummy_with_cmt(),
+                span: span,
                 decorators: vec![],
                 pat: Pat::Ident(BindingIdent {
-                    id: i(a),
+                    id: i(a, span),
                     type_ann: t.as_ref().map(|a| {
                         Box::new(TsTypeAnn {
-                            span: Span::dummy_with_cmt(),
+                            span: span,
                             type_ann: Box::new(a.clone()),
                         })
                     }),
@@ -58,17 +59,17 @@ impl TryFrom<TFunc> for Func {
             cfg.blocks[entry2]
                 .stmts
                 .push(Stmt::Decl(Decl::Var(Box::new(VarDecl {
-                    span: Span::dummy_with_cmt(),
+                    span: span,
                     ctxt: d.1.clone(),
                     declare: false,
                     kind: swc_ecma_ast::VarDeclKind::Var,
                     decls: vec![VarDeclarator {
-                        span: Span::dummy_with_cmt(),
+                        span: span,
                         name: Pat::Ident(BindingIdent {
-                            id: i(d),
+                            id: i(d, span),
                             type_ann: value.cfg.type_annotations.get(d).map(|a| {
                                 Box::new(TsTypeAnn {
-                                    span: Span::dummy_with_cmt(),
+                                    span: span,
                                     type_ann: Box::new(a.clone()),
                                 })
                             }),
@@ -114,12 +115,13 @@ impl Rew {
                 return Ok(*x);
             }
             let l = cfg.blocks.alloc(Default::default());
+            cfg.blocks[l].end.orig_span = tcfg.blocks[k].orig_span.clone();
             self.all.insert(k, l);
             let catch = match &tcfg.blocks[k].catch {
                 crate::TCatch::Throw => swc_cfg::Catch::Throw,
                 crate::TCatch::Jump { pat, k } => swc_cfg::Catch::Jump {
                     pat: Pat::Ident(swc_ecma_ast::BindingIdent {
-                        id: i(pat),
+                        id: i(pat, Span::dummy_with_cmt()),
                         type_ann: None,
                     }),
                     k: self.trans(cfg, tcfg, *k)?,
@@ -127,22 +129,23 @@ impl Rew {
             };
             cfg.blocks[l].end.catch = catch;
             for i2 in tcfg.blocks[k].stmts.iter() {
+                let span = i2.3;
                 let left = match &i2.0 {
                     crate::LId::Id { id } => swc_ecma_ast::AssignTarget::Simple(
                         swc_ecma_ast::SimpleAssignTarget::Ident(swc_ecma_ast::BindingIdent {
-                            id: i(id),
+                            id: i(id, span),
                             type_ann: None,
                         }),
                     ),
                     crate::LId::Member { obj, mem } => {
-                        let obj = i(obj);
-                        let mem = i(mem);
+                        let obj = i(obj, span);
+                        let mem = i(mem, span);
                         AssignTarget::Simple(swc_ecma_ast::SimpleAssignTarget::Member(MemberExpr {
-                            span: Span::dummy_with_cmt(),
+                            span: span,
                             obj: Box::new(Expr::Ident(obj)),
                             prop: swc_ecma_ast::MemberProp::Computed(
                                 swc_ecma_ast::ComputedPropName {
-                                    span: Span::dummy_with_cmt(),
+                                    span: span,
                                     expr: Box::new(Expr::Ident(mem)),
                                 },
                             ),
@@ -150,27 +153,27 @@ impl Rew {
                     }
                 };
                 let right = Box::new(match &i2.2 {
-                    crate::Item::Just { id } => Expr::Ident(i(id)),
+                    crate::Item::Just { id } => Expr::Ident(i(id, span)),
                     crate::Item::Bin { left, right, op } => Expr::Bin(BinExpr {
-                        span: Span::dummy_with_cmt(),
+                        span: span,
                         op: *op,
-                        left: Box::new(Expr::Ident(i(left))),
-                        right: Box::new(Expr::Ident(i(right))),
+                        left: Box::new(Expr::Ident(i(left, span))),
+                        right: Box::new(Expr::Ident(i(right, span))),
                     }),
                     crate::Item::Un { arg, op } => Expr::Unary(UnaryExpr {
-                        span: Span::dummy_with_cmt(),
+                        span: span,
                         op: *op,
-                        arg: Box::new(Expr::Ident(i(arg))),
+                        arg: Box::new(Expr::Ident(i(arg, span))),
                     }),
                     crate::Item::Mem { obj, mem } => {
-                        let obj = i(obj);
-                        let mem = i(mem);
+                        let obj = i(obj, span);
+                        let mem = i(mem, span);
                         Expr::Member(MemberExpr {
-                            span: Span::dummy_with_cmt(),
+                            span: span,
                             obj: Box::new(Expr::Ident(obj)),
                             prop: swc_ecma_ast::MemberProp::Computed(
                                 swc_ecma_ast::ComputedPropName {
-                                    span: Span::dummy_with_cmt(),
+                                    span: span,
                                     expr: Box::new(Expr::Ident(mem)),
                                 },
                             ),
@@ -182,22 +185,22 @@ impl Rew {
                     }),
                     crate::Item::Lit { lit } => Expr::Lit(lit.clone()),
                     crate::Item::Call { callee, args } => Expr::Call(CallExpr {
-                        span: Span::dummy_with_cmt(),
+                        span: span,
                         ctxt: SyntaxContext::empty(),
                         callee: swc_ecma_ast::Callee::Expr(match callee {
                             crate::TCallee::Member { r#fn, member } => {
-                                let f = Box::new(Expr::Ident(i(r#fn)));
+                                let f = Box::new(Expr::Ident(i(r#fn, span)));
                                 Box::new(Expr::Member(MemberExpr {
-                                    span: Span::dummy_with_cmt(),
+                                    span: span,
                                     obj: f,
                                     prop: swc_ecma_ast::MemberProp::Computed(ComputedPropName {
-                                        span: Span::dummy_with_cmt(),
-                                        expr: Box::new(Expr::Ident(i(member))),
+                                        span: span,
+                                        expr: Box::new(Expr::Ident(i(member, span))),
                                     }),
                                 }))
                             }
                             crate::TCallee::Static(r#fn) | TCallee::Val(r#fn) => {
-                                let f = Box::new(Expr::Ident(i(r#fn)));
+                                let f = Box::new(Expr::Ident(i(r#fn, span)));
                                 f
                             }
                         }),
@@ -205,24 +208,24 @@ impl Rew {
                             .iter()
                             .map(|a| swc_ecma_ast::ExprOrSpread {
                                 spread: None,
-                                expr: Box::new(Expr::Ident(i(a))),
+                                expr: Box::new(Expr::Ident(i(a, span))),
                             })
                             .collect(),
                         type_args: None,
                     }),
                     crate::Item::Obj { members } => Expr::Object(ObjectLit {
-                        span: Span::dummy_with_cmt(),
+                        span: span,
                         props: members
                             .iter()
                             .map(|a| {
                                 PropOrSpread::Prop({
-                                    let b = i(&a.1);
+                                    let b = i(&a.1, span);
                                     let b = Box::new(Expr::Ident(b));
                                     Box::new(match &a.0 {
                                         crate::PropKey::Lit(l) => Prop::KeyValue(KeyValueProp {
                                             key: swc_ecma_ast::PropName::Ident(
                                                 swc_ecma_ast::IdentName {
-                                                    span: Span::dummy_with_cmt(),
+                                                    span: span,
                                                     sym: l.0.clone(),
                                                 },
                                             ),
@@ -232,8 +235,8 @@ impl Rew {
                                             Prop::KeyValue(KeyValueProp {
                                                 key: swc_ecma_ast::PropName::Computed(
                                                     ComputedPropName {
-                                                        span: Span::dummy_with_cmt(),
-                                                        expr: Box::new(Expr::Ident(i(c))),
+                                                        span: span,
+                                                        expr: Box::new(Expr::Ident(i(c, span))),
                                                     },
                                                 ),
                                                 value: b,
@@ -245,34 +248,34 @@ impl Rew {
                             .collect(),
                     }),
                     crate::Item::Arr { members } => Expr::Array(ArrayLit {
-                        span: Span::dummy_with_cmt(),
+                        span: span,
                         elems: members
                             .iter()
                             .map(|a| {
                                 Some(ExprOrSpread {
                                     spread: None,
-                                    expr: Box::new(Expr::Ident(i(a))),
+                                    expr: Box::new(Expr::Ident(i(a, span))),
                                 })
                             })
                             .collect(),
                     }),
                     crate::Item::Yield { value, delegate } => {
                         Expr::Yield(swc_ecma_ast::YieldExpr {
-                            span: Span::dummy_with_cmt(),
-                            arg: value.as_ref().map(|x| Box::new(Expr::Ident(i(x)))),
+                            span: span,
+                            arg: value.as_ref().map(|x| Box::new(Expr::Ident(i(x, span)))),
                             delegate: *delegate,
                         })
                     }
                     crate::Item::Await { value } => Expr::Await(swc_ecma_ast::AwaitExpr {
-                        span: Span::dummy_with_cmt(),
-                        arg: Box::new(Expr::Ident(i(value))),
+                        span: span,
+                        arg: Box::new(Expr::Ident(i(value, span))),
                     }),
-                    crate::Item::Undef => *Expr::undefined(Span::dummy_with_cmt()),
+                    crate::Item::Undef => *Expr::undefined(span),
                 });
                 cfg.blocks[l].stmts.push(Stmt::Expr(ExprStmt {
-                    span: Span::dummy_with_cmt(),
+                    span: span,
                     expr: Box::new(Expr::Assign(AssignExpr {
-                        span: Span::dummy_with_cmt(),
+                        span: span,
                         op: swc_ecma_ast::AssignOp::Assign,
                         left,
                         right,
@@ -280,23 +283,64 @@ impl Rew {
                 }));
             }
             let term = match &tcfg.blocks[k].term {
-                crate::TTerm::Return(r) => Term::Return(r.as_ref().map(i).map(Expr::Ident)),
-                crate::TTerm::Throw(x) => Term::Throw(Expr::Ident(i(x))),
+                crate::TTerm::Return(r) => Term::Return(
+                    r.as_ref()
+                        .map(|v| {
+                            i(
+                                v,
+                                tcfg.blocks[k]
+                                    .orig_span
+                                    .clone()
+                                    .unwrap_or(Span::dummy_with_cmt()),
+                            )
+                        })
+                        .map(Expr::Ident),
+                ),
+                crate::TTerm::Throw(x) => Term::Throw(Expr::Ident(i(
+                    x,
+                    tcfg.blocks[k]
+                        .orig_span
+                        .clone()
+                        .unwrap_or(Span::dummy_with_cmt()),
+                ))),
                 crate::TTerm::Jmp(id) => Term::Jmp(self.trans(cfg, tcfg, *id)?),
                 crate::TTerm::CondJmp {
                     cond,
                     if_true,
                     if_false,
                 } => Term::CondJmp {
-                    cond: Expr::Ident(i(cond)),
+                    cond: Expr::Ident(i(
+                        cond,
+                        tcfg.blocks[k]
+                            .orig_span
+                            .clone()
+                            .unwrap_or(Span::dummy_with_cmt()),
+                    )),
                     if_true: self.trans(cfg, tcfg, *if_true)?,
                     if_false: self.trans(cfg, tcfg, *if_false)?,
                 },
                 crate::TTerm::Switch { x, blocks, default } => Term::Switch {
-                    x: Expr::Ident(i(x)),
+                    x: Expr::Ident(i(
+                        x,
+                        tcfg.blocks[k]
+                            .orig_span
+                            .clone()
+                            .unwrap_or(Span::dummy_with_cmt()),
+                    )),
                     blocks: blocks
                         .iter()
-                        .map(|a| anyhow::Ok((Expr::Ident(i(a.0)), self.trans(cfg, tcfg, *a.1)?)))
+                        .map(|a| {
+                            anyhow::Ok((
+                                Expr::Ident(i(
+                                    a.0,
+                                    tcfg.blocks[k]
+                                        .orig_span
+                                        .clone()
+                                        .unwrap_or(Span::dummy_with_cmt()),
+                                )),
+                                self.trans(cfg, tcfg, *a.1)?,
+                            ))
+                        })
                         .collect::<anyhow::Result<_>>()?,
                     default: self.trans(cfg, tcfg, *default)?,
                 },
@@ -306,9 +350,9 @@ impl Rew {
         }
     }
 }
-pub fn i(a: &Ident) -> swc_ecma_ast::Ident {
+pub fn i(a: &Ident, span: Span) -> swc_ecma_ast::Ident {
     swc_ecma_ast::Ident {
-        span: Span::dummy_with_cmt(),
+        span: span,
         ctxt: a.1.clone(),
         sym: a.0.clone(),
         optional: false,

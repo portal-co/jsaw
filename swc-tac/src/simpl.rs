@@ -6,6 +6,7 @@ use portal_jsc_simpl_js::{
     self as simpl_ast, Dialect, SimplExpr, SimplPath, SimplPathId, SimplStmt,
 };
 use swc_cfg::Loop;
+use swc_common::{Span, Spanned};
 use swc_ecma_ast::{BinaryOp, Id as Ident, Lit};
 
 use crate::{lam::LAM, ValFlags};
@@ -34,14 +35,16 @@ impl<D: TacDialect> Clone for TSimplCfg<D> {
 }
 
 pub struct TSimplBlock<D: TacDialect> {
-    pub stmts: Vec<(SimplPathId, ValFlags, SimplItem<D>)>,
+    pub stmts: Vec<(SimplPathId, ValFlags, SimplItem<D>, Span)>,
     pub term: TSimplTerm<D>,
+    pub orig_span: Option<Span>,
 }
 impl<D: TacDialect> Default for TSimplBlock<D> {
     fn default() -> Self {
         Self {
             stmts: Default::default(),
             term: Default::default(),
+            orig_span: Default::default(),
         }
     }
 }
@@ -50,6 +53,7 @@ impl<D: TacDialect> Clone for TSimplBlock<D> {
         Self {
             stmts: self.stmts.clone(),
             term: self.term.clone(),
+            orig_span: self.orig_span.clone(),
         }
     }
 }
@@ -156,6 +160,7 @@ impl<D: TacDialect> Bake<D> for SimplExpr<D> {
                     i.clone(),
                     ValFlags::SSA_LIKE,
                     SimplItem::Lit { lit: lit.clone() },
+                    lit.span(),
                 ));
                 (i, start_block)
             }
@@ -174,6 +179,7 @@ impl<D: TacDialect> Bake<D> for SimplExpr<D> {
                             op: b,
                         },
                     },
+                    make_spanned.span,
                 ));
                 (o, start_block)
             }
@@ -194,6 +200,7 @@ impl<D: TacDialect> Bake<D> for SimplExpr<D> {
                         right: right,
                         op: make_spanned.value.op,
                     },
+                    make_spanned.span,
                 ));
                 (i, start_block)
             }
@@ -211,6 +218,7 @@ impl<D: TacDialect> Bake<D> for SimplExpr<D> {
                             r#fn: path.as_ref().to_id(),
                             args: args,
                         },
+                        make_spanned.span,
                     ));
                     (i, start_block)
                 }
@@ -227,6 +235,7 @@ impl<D: TacDialect> Bake<D> for SimplExpr<D> {
                             tag: tag.clone(),
                             args: args,
                         },
+                        make_spanned.span,
                     ));
                     (i, start_block)
                 }
@@ -239,6 +248,7 @@ impl<D: TacDialect> Bake<D> for SimplExpr<D> {
                     let (_, start_block) =
                         simpl_stmt.bake(labels, Some(&(then, i.clone())), cfg, start_block);
                     cfg.blocks[start_block].term = TSimplTerm::Jmp(then);
+                    cfg.blocks[start_block].orig_span = Some(make_spanned.span);
                     (i, then)
                 }
             },
@@ -260,6 +270,7 @@ impl<D: TacDialect> Bake<D> for SimplExpr<D> {
                     .map(|(a, (s, i2))| {
                         let k = cfg.blocks.alloc(Default::default());
                         let (_, start_block) = s.bake(labels, Some(&(then, i.clone())), cfg, k);
+                        cfg.blocks[start_block].orig_span = Some(make_spanned.span);
                         cfg.blocks[start_block].term = TSimplTerm::Jmp(then);
                         (
                             a.clone(),
@@ -275,6 +286,7 @@ impl<D: TacDialect> Bake<D> for SimplExpr<D> {
                         )
                     })
                     .collect();
+                cfg.blocks[start_block].orig_span = Some(make_spanned.span);
                 cfg.blocks[start_block].term = TSimplTerm::Switch {
                     scrutinee: v,
                     cases: xs,
@@ -341,6 +353,7 @@ impl<D: TacDialect> Bake<D> for SimplStmt<D> {
                             if_true: then,
                             if_false: els,
                         };
+                        cfg.blocks[start_block].orig_span = Some(make_spanned.span);
                         let (_, then) = make_spanned.value.body.bake(labels, ret, cfg, then);
                         let (_, els) = r#else.bake(labels, ret, cfg, els);
                         cfg.blocks[then].term = TSimplTerm::Jmp(after);
@@ -352,6 +365,7 @@ impl<D: TacDialect> Bake<D> for SimplStmt<D> {
                         let brk = cfg.blocks.alloc(Default::default());
                         let bb = cfg.blocks.alloc(Default::default());
                         cfg.blocks[start_block].term = TSimplTerm::Jmp(cont);
+                        cfg.blocks[start_block].orig_span = Some(make_spanned.span);
                         let (v, ct) = make_spanned.value.cond.bake(labels, ret, cfg, cont);
                         cfg.blocks[ct].term = TSimplTerm::CondJmp {
                             cond: v,
@@ -386,10 +400,12 @@ impl<D: TacDialect> Bake<D> for SimplStmt<D> {
                                 v,
                                 Default::default(),
                                 SimplItem::Just { id: v2 },
+                                make_spanned.span,
                             ));
                             cfg.blocks[start_block].term = TSimplTerm::Jmp(k);
                         }
                     };
+                    cfg.blocks[start_block].orig_span = Some(make_spanned.span);
                     cfg.blocks.alloc(Default::default())
                 }
                 _ => todo!(),

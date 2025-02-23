@@ -501,6 +501,7 @@ pub struct Block {
 pub struct End {
     pub catch: Catch,
     pub term: Term,
+    pub orig_span: Option<Span>,
 }
 #[derive(Clone, Default)]
 pub enum Catch {
@@ -547,6 +548,7 @@ impl Ctx {
             end: End {
                 catch: self.catch.clone(),
                 term: Term::Default,
+                orig_span: None,
             },
         });
     }
@@ -569,14 +571,17 @@ impl Ctx {
         label: Option<Ident>,
     ) -> anyhow::Result<Id<Block>> {
         if let Stmt::Throw(t) = x {
+            cfg.blocks[current].end.orig_span = Some(t.span());
             cfg.blocks[current].end.term = Term::Throw(*t.arg);
             return Ok(self.new_block(cfg));
         }
         if let Stmt::Return(r) = x {
+            cfg.blocks[current].end.orig_span = Some(r.span());
             cfg.blocks[current].end.term = Term::Return(r.arg.map(|a| *a));
             return Ok(self.new_block(cfg));
         }
         if let Stmt::Try(t) = x {
+            let s = t.span();
             let next = self.new_block(cfg);
             let catch = match t.handler {
                 None => None,
@@ -599,6 +604,7 @@ impl Ctx {
             };
             let a = new.transform_all(cfg, t.block.stmts, current)?;
             cfg.blocks[a].end.term = Term::Jmp(next);
+            cfg.blocks[a].end.orig_span = Some(s);
             let next = match t.finalizer {
                 Some(f) => self.transform_all(cfg, f.stmts, next)?,
                 None => next,
@@ -609,6 +615,7 @@ impl Ctx {
             return self.transform_all(cfg, b.stmts, current);
         }
         if let Stmt::If(i) = x {
+            let s = i.span();
             let next = self.new_block(cfg);
             let then = self.new_block(cfg);
             let then_end = self.transform(
@@ -635,9 +642,11 @@ impl Ctx {
                 if_true: then,
                 if_false: els,
             };
+            cfg.blocks[current].end.orig_span = Some(s);
             return Ok(next);
         }
         if let Stmt::Switch(i) = x {
+            let s = i.span();
             let next = self.new_block(cfg);
             let mut target = self.clone();
             if let None = target.cur_loop {
@@ -668,9 +677,11 @@ impl Ctx {
                 blocks: blocks,
                 default: default,
             };
+            cfg.blocks[current].end.orig_span = Some(s);
             return Ok(next);
         }
         if let Stmt::Break(b) = x {
+            cfg.blocks[current].end.orig_span = Some(b.span());
             cfg.blocks[current].end.term = Term::Jmp(
                 match b.label {
                     Some(l) => self.labelled.get(&l),
@@ -682,6 +693,7 @@ impl Ctx {
             return Ok(self.new_block(cfg));
         }
         if let Stmt::Continue(b) = x {
+            cfg.blocks[current].end.orig_span = Some(b.span());
             cfg.blocks[current].end.term = Term::Jmp(
                 match b.label {
                     Some(l) => self.labelled.get(&l),
@@ -695,6 +707,7 @@ impl Ctx {
         if let Stmt::Labeled(l) = x {
             let next = self.new_block(cfg);
             let cont = self.new_block(cfg);
+            cfg.blocks[current].end.orig_span = Some(l.span());
             cfg.blocks[current].end.term = Term::Jmp(cont);
             let mut new = self.clone();
             new.labelled.insert(
@@ -711,6 +724,7 @@ impl Ctx {
         if let Stmt::DoWhile(w) = x {
             let next = self.new_block(cfg);
             let cont = self.new_block(cfg);
+            cfg.blocks[current].end.orig_span = Some(w.span());
             cfg.blocks[current].end.term = Term::Jmp(cont);
             let mut new = self.clone();
             new.cur_loop = Some(Loop {

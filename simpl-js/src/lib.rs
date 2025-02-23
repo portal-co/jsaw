@@ -35,6 +35,13 @@ pub trait Dialect {
         + Hash
         + Eq;
     type Tag: Spanned + Clone + Debug + Hash + Eq;
+    fn span<T: Spanned + Clone + Debug + Hash + Eq>(
+        a: Self::Mark<()>,
+        b: T,
+    ) -> Self::MarkSpanned<T>;
+    fn despan<T: Spanned + Clone + Debug + Hash + Eq>(
+        a: Self::MarkSpanned<T>,
+    ) -> (Self::Mark<()>, T);
 }
 
 #[non_exhaustive]

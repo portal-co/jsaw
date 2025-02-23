@@ -12,8 +12,9 @@ use swc_ecma_ast::{BinaryOp, Id as Ident, Lit};
 use crate::{lam::LAM, ValFlags};
 
 pub mod impls;
+pub mod reloop;
 
-pub trait TacDialect: Dialect {}
+pub trait TacDialect: Dialect<Mark<()>: Clone + Default> {}
 
 pub struct TSimplCfg<D: TacDialect> {
     pub regs: LAM<()>,
@@ -55,7 +56,7 @@ impl<D: TacDialect> Default for TSimplFunc<D> {
     }
 }
 pub struct TSimplBlock<D: TacDialect> {
-    pub stmts: Vec<(SimplPathId, ValFlags, SimplItem<D>, Span)>,
+    pub stmts: Vec<(SimplPathId, D::Mark<()>, ValFlags, SimplItem<D>, Span)>,
     pub term: TSimplTerm<D>,
     pub orig_span: Option<Span>,
 }
@@ -81,27 +82,27 @@ impl<D: TacDialect> Clone for TSimplBlock<D> {
 #[non_exhaustive]
 pub enum SimplItem<D: TacDialect, P = SimplPathId> {
     Just {
-        id: P,
+        id: (P, D::Mark<()>),
     },
     Bin {
-        left: P,
-        right: P,
+        left: (P, D::Mark<()>),
+        right: (P, D::Mark<()>),
         op: BinaryOp,
     },
     Lit {
         lit: Lit,
     },
     CallStatic {
-        r#fn: P,
-        args: Vec<P>,
+        r#fn: (P, D::Mark<()>),
+        args: Vec<(P, D::Mark<()>)>,
     },
     CallTag {
         tag: D::Tag,
-        args: Vec<P>,
+        args: Vec<(P, D::Mark<()>)>,
     },
     DiscriminantIn {
-        value: P,
-        ids: BTreeMap<Ident, Vec<P>>,
+        value: (P, D::Mark<()>),
+        ids: BTreeMap<Ident, Vec<(P, D::Mark<()>)>>,
     },
 }
 impl<D: TacDialect, P: Clone> Clone for SimplItem<D, P> {
@@ -131,17 +132,17 @@ impl<D: TacDialect, P: Clone> Clone for SimplItem<D, P> {
 }
 
 pub enum TSimplTerm<D: TacDialect> {
-    Return(SimplPathId),
+    Return((SimplPathId, D::Mark<()>)),
     // Throw(Ident),
     Jmp(Id<TSimplBlock<D>>),
     CondJmp {
-        cond: SimplPathId,
+        cond: (SimplPathId, D::Mark<()>),
         if_true: Id<TSimplBlock<D>>,
         if_false: Id<TSimplBlock<D>>,
     },
     Switch {
-        scrutinee: SimplPathId,
-        cases: BTreeMap<Ident, (Id<TSimplBlock<D>>, Vec<SimplPathId>)>,
+        scrutinee: (SimplPathId, D::Mark<()>),
+        cases: BTreeMap<Ident, (Id<TSimplBlock<D>>, Vec<(SimplPathId, D::Mark<()>)>)>,
     },
     Default,
 }
@@ -183,7 +184,7 @@ pub trait Bake<D: TacDialect> {
     ) -> (Self::Res, Id<TSimplBlock<D>>);
 }
 impl<D: TacDialect> Bake<D> for SimplExpr<D> {
-    type Res = SimplPathId;
+    type Res = (SimplPathId, D::Mark<()>);
 
     fn bake(
         &self,
@@ -200,30 +201,39 @@ impl<D: TacDialect> Bake<D> for SimplExpr<D> {
                 };
                 cfg.blocks[start_block].stmts.push((
                     i.clone(),
+                    Default::default(),
                     ValFlags::SSA_LIKE,
                     SimplItem::Lit { lit: lit.clone() },
                     lit.span(),
                 ));
-                (i, start_block)
+                ((i, Default::default()), start_block)
             }
-            SimplExpr::Ident(i) => (i.as_ref().to_id(), start_block),
+            SimplExpr::Ident(i) => (
+                match D::despan(i.clone()) {
+                    (a, b) => (b.to_id(), a),
+                },
+                start_block,
+            ),
             SimplExpr::Assign(make_spanned) => {
                 let (v, start_block) = make_spanned.value.body.bake(labels, ret, cfg, start_block);
-                let o = make_spanned.value.target.as_ref().to_id();
+                let o = make_spanned.value.target.clone();
+                let (m, o) = D::despan(o);
+                let o = o.to_id();
                 cfg.blocks[start_block].stmts.push((
                     o.clone(),
+                    m.clone(),
                     Default::default(),
                     match make_spanned.value.assign.to_update() {
                         None => SimplItem::Just { id: v },
                         Some(b) => SimplItem::Bin {
-                            left: o.clone(),
+                            left: (o.clone(), m.clone()),
                             right: v,
                             op: b,
                         },
                     },
                     make_spanned.span,
                 ));
-                (o, start_block)
+                ((o, m), start_block)
             }
             SimplExpr::Bin(make_spanned) => {
                 let (left, start_block) =
@@ -236,6 +246,7 @@ impl<D: TacDialect> Bake<D> for SimplExpr<D> {
                 };
                 cfg.blocks[start_block].stmts.push((
                     i.clone(),
+                    Default::default(),
                     ValFlags::SSA_LIKE,
                     SimplItem::Bin {
                         left: left,
@@ -244,7 +255,7 @@ impl<D: TacDialect> Bake<D> for SimplExpr<D> {
                     },
                     make_spanned.span,
                 ));
-                (i, start_block)
+                ((i, Default::default()), start_block)
             }
             SimplExpr::Call(make_spanned) => match &*make_spanned.value {
                 portal_jsc_simpl_js::SimplCallExpr::Path { path, args } => {
@@ -255,14 +266,17 @@ impl<D: TacDialect> Bake<D> for SimplExpr<D> {
                     };
                     cfg.blocks[start_block].stmts.push((
                         i.clone(),
+                        Default::default(),
                         ValFlags::SSA_LIKE,
                         SimplItem::CallStatic {
-                            r#fn: path.as_ref().to_id(),
+                            r#fn: match D::despan(path.clone()) {
+                                (a, b) => (b.to_id(), a),
+                            },
                             args: args,
                         },
                         make_spanned.span,
                     ));
-                    (i, start_block)
+                    ((i, Default::default()), start_block)
                 }
                 portal_jsc_simpl_js::SimplCallExpr::Tag { tag, args } => {
                     let (args, start_block) = args.bake(labels, ret, cfg, start_block);
@@ -272,6 +286,7 @@ impl<D: TacDialect> Bake<D> for SimplExpr<D> {
                     };
                     cfg.blocks[start_block].stmts.push((
                         i.clone(),
+                        Default::default(),
                         ValFlags::SSA_LIKE,
                         SimplItem::CallTag {
                             tag: tag.clone(),
@@ -279,7 +294,7 @@ impl<D: TacDialect> Bake<D> for SimplExpr<D> {
                         },
                         make_spanned.span,
                     ));
-                    (i, start_block)
+                    ((i, Default::default()), start_block)
                 }
                 portal_jsc_simpl_js::SimplCallExpr::Block(simpl_stmt) => {
                     let i = SimplPathId {
@@ -291,7 +306,7 @@ impl<D: TacDialect> Bake<D> for SimplExpr<D> {
                         simpl_stmt.bake(labels, Some(&(then, i.clone())), cfg, start_block);
                     cfg.blocks[start_block].term = TSimplTerm::Jmp(then);
                     cfg.blocks[start_block].orig_span = Some(make_spanned.span);
-                    (i, then)
+                    ((i, Default::default()), then)
                 }
             },
             SimplExpr::Switch(make_spanned) => {
@@ -323,6 +338,7 @@ impl<D: TacDialect> Bake<D> for SimplExpr<D> {
                                         root: a.to_id(),
                                         keys: vec![],
                                     })
+                                    .map(|a| (a, Default::default()))
                                     .collect(),
                             ),
                         )
@@ -333,7 +349,7 @@ impl<D: TacDialect> Bake<D> for SimplExpr<D> {
                     scrutinee: v,
                     cases: xs,
                 };
-                (i, then)
+                ((i, Default::default()), then)
                 // (i, then)
             }
             _ => todo!(),
@@ -440,6 +456,7 @@ impl<D: TacDialect> Bake<D> for SimplStmt<D> {
                         Some((k, v)) => {
                             cfg.blocks[start_block].stmts.push((
                                 v,
+                                Default::default(),
                                 Default::default(),
                                 SimplItem::Just { id: v2 },
                                 make_spanned.span,

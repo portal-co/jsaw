@@ -348,7 +348,7 @@ impl Trans {
                 .collect::<BTreeMap<_, _>>();
             self.apply_shim(o, &state, &shim, t);
             let mut cache = BTreeMap::new();
-            for (a, flags, b) in i.blocks[k].stmts.iter() {
+            for (a, flags, b, _) in i.blocks[k].stmts.iter() {
                 let mut b = b.clone();
                 if let Item::Call { callee, args } = &mut b {
                     if let TCallee::Val(v) = callee {

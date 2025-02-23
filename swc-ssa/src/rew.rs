@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use id_arena::Id;
 use swc_atoms::Atom;
+use swc_common::Span;
 use swc_ecma_ast::Id as Ident;
 use swc_tac::{Item, LId, TBlock, TCatch, TCfg, TFunc, TTerm, ValFlags};
 
@@ -86,6 +87,7 @@ impl Rew {
                                     },
                                     ValFlags::SSA_LIKE,
                                     i,
+                                    Span::dummy_with_cmt()
                                 ));
                                 b.decls.insert(mangle_value(a, *val));
                             }
@@ -101,6 +103,7 @@ impl Rew {
                                     Item::Just {
                                         id: mangle_value(a, *val),
                                     },
+                                    Span::dummy_with_cmt()
                                 ));
                             }
                             SValue::LoadId(i) => {
@@ -110,6 +113,7 @@ impl Rew {
                                     },
                                     ValFlags::SSA_LIKE,
                                     Item::Just { id: i.clone() },
+                                    Span::dummy_with_cmt()
                                 ));
                                 b.decls.insert(mangle_value(a, *val));
                             }
@@ -120,6 +124,7 @@ impl Rew {
                                     Item::Just {
                                         id: mangle_value(a, *val),
                                     },
+                                    Span::dummy_with_cmt()
                                 ));
                             }
                             SValue::Benc(v) => {
@@ -131,6 +136,7 @@ impl Rew {
                                     Item::Just {
                                         id: mangle_value(a, *v),
                                     },
+                                    Span::dummy_with_cmt()
                                 ));
                             }
                         }
@@ -195,6 +201,7 @@ impl Rew {
                                 },
                                 Default::default(),
                                 Item::Just { id: b },
+                                Span::dummy_with_cmt()
                             )
                         });
                     b.blocks[k2].stmts.extend(stmts);

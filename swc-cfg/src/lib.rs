@@ -10,7 +10,10 @@ use relooper::ShapedBlock;
 use swc_atoms::Atom;
 use swc_common::{Span, Spanned, SyntaxContext};
 use swc_ecma_ast::{
-    ArrayLit, AssignExpr, BindingIdent, BlockStmt, Bool, BreakStmt, CallExpr, CatchClause, ContinueStmt, Decl, DoWhileStmt, Expr, ExprOrSpread, ExprStmt, Function, Ident, IdentName, IfStmt, LabeledStmt, Lit, MemberExpr, Param, Pat, ReturnStmt, Stmt, Str, SwitchCase, SwitchStmt, ThrowStmt, TryStmt, TsTypeAnn, TsTypeParamDecl, WhileStmt
+    ArrayLit, AssignExpr, BindingIdent, BlockStmt, Bool, BreakStmt, CallExpr, CatchClause,
+    ContinueStmt, Decl, DoWhileStmt, Expr, ExprOrSpread, ExprStmt, Function, Ident, IdentName,
+    IfStmt, LabeledStmt, Lit, MemberExpr, Param, Pat, ReturnStmt, Stmt, Str, SwitchCase,
+    SwitchStmt, ThrowStmt, TryStmt, TsTypeAnn, TsTypeParamDecl, WhileStmt,
 };
 pub mod recfg;
 pub mod simplify;
@@ -35,8 +38,8 @@ impl TryFrom<Function> for Func {
         )?;
         cfg.blocks[exit].end.term = Term::Return(None);
         cfg.simplify();
-        cfg.generics = value.type_params.map(|a|*a);
-        cfg.ts_retty = value.return_type.map(|a|*a);
+        cfg.generics = value.type_params.map(|a| *a);
+        cfg.ts_retty = value.return_type.map(|a| *a);
         return Ok(Self {
             cfg,
             entry,
@@ -72,7 +75,7 @@ impl Into<Function> for Func {
 pub struct Cfg {
     pub blocks: Arena<Block>,
     pub generics: Option<TsTypeParamDecl>,
-    pub ts_retty: Option<TsTypeAnn>
+    pub ts_retty: Option<TsTypeAnn>,
 }
 impl Cfg {
     pub fn recfg(&self, entry: Id<Block>) -> (Cfg, Id<Block>) {
@@ -526,10 +529,10 @@ pub enum Term {
     #[default]
     Default,
 }
-#[derive(Clone)]
-pub struct Loop {
-    pub r#break: Id<Block>,
-    pub r#continue: Id<Block>,
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Loop<T = Id<Block>> {
+    pub r#break: T,
+    pub r#continue: T,
 }
 #[derive(Clone, Default)]
 pub struct Ctx {

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use arena_traits::{Arena as TArena, IndexAlloc};
 use id_arena::{Arena, Id};
@@ -80,11 +80,29 @@ impl<D: TacDialect> Clone for TSimplBlock<D> {
 
 #[non_exhaustive]
 pub enum SimplItem<D: TacDialect, P = SimplPathId> {
-    Just { id: P },
-    Bin { left: P, right: P, op: BinaryOp },
-    Lit { lit: Lit },
-    CallStatic { r#fn: P, args: Vec<P> },
-    CallTag { tag: D::Tag, args: Vec<P> },
+    Just {
+        id: P,
+    },
+    Bin {
+        left: P,
+        right: P,
+        op: BinaryOp,
+    },
+    Lit {
+        lit: Lit,
+    },
+    CallStatic {
+        r#fn: P,
+        args: Vec<P>,
+    },
+    CallTag {
+        tag: D::Tag,
+        args: Vec<P>,
+    },
+    DiscriminantIn {
+        value: P,
+        ids: BTreeMap<Ident, Vec<P>>,
+    },
 }
 impl<D: TacDialect, P: Clone> Clone for SimplItem<D, P> {
     fn clone(&self) -> Self {
@@ -103,6 +121,10 @@ impl<D: TacDialect, P: Clone> Clone for SimplItem<D, P> {
             Self::CallTag { tag, args } => Self::CallTag {
                 tag: tag.clone(),
                 args: args.clone(),
+            },
+            Self::DiscriminantIn { value, ids } => Self::DiscriminantIn {
+                value: value.clone(),
+                ids: ids.clone(),
             },
         }
     }

@@ -69,7 +69,7 @@ impl TryFrom<TFunc> for SFunc {
             .cloned()
             .map(|a| (a, cfg.add_blockparam(entry2)))
             .collect::<BTreeMap<_, _>>();
-        let undef = cfg.values.alloc(SValue::Item(Item::Undef).into());
+        let undef = cfg.values.alloc(SValue::Item{item:Item::Undef,span: None}.into());
         let mut trans = Trans {
             map: BTreeMap::new(),
             all: decls.clone(),
@@ -132,7 +132,7 @@ impl<I, B> Default for SPostcedent<I, B> {
 #[non_exhaustive]
 pub enum SValue<I = Id<SValueW>, B = Id<SBlock>> {
     Param { block: B, idx: usize, ty: () },
-    Item(Item<I>),
+    Item{item: Item<I>, span: Option<Span>},
     Assign { target: LId<I>, val: I },
     LoadId(Ident),
     StoreId { target: Ident, val: I },
@@ -142,7 +142,7 @@ impl<I: Copy, B> SValue<I, B> {
     pub fn vals<'a>(&'a self) -> Box<dyn Iterator<Item = I> + 'a> {
         match self {
             SValue::Param { block, idx, ty } => Box::new(empty()),
-            SValue::Item(item) => Box::new(item.refs().map(|a| *a)),
+            SValue::Item{item,span} => Box::new(item.refs().map(|a| *a)),
             SValue::Assign { target, val } => {
                 let v = once(*val);
                 let w: Box<dyn Iterator<Item = &I> + '_> = match target {
@@ -161,7 +161,7 @@ impl<I, B> SValue<I, B> {
     pub fn vals_mut<'a>(&'a mut self) -> Box<dyn Iterator<Item = &'a mut I> + 'a> {
         match self {
             SValue::Param { block, idx, ty } => Box::new(empty()),
-            SValue::Item(item) => item.refs_mut(),
+            SValue::Item{item,span} => item.refs_mut(),
             SValue::Assign { target, val } => {
                 let v = once(val);
                 let w: Box<dyn Iterator<Item = &mut I> + '_> = match target {
@@ -357,7 +357,7 @@ impl Trans {
                 .collect::<BTreeMap<_, _>>();
             self.apply_shim(o, &state, &shim, t);
             let mut cache = BTreeMap::new();
-            for (a, flags, b, _) in i.blocks[k].stmts.iter() {
+            for (a, flags, b, s) in i.blocks[k].stmts.iter() {
                 let mut b = b.clone();
                 if let Item::Call { callee, args } = &mut b {
                     if let TCallee::Val(v) = callee {
@@ -374,7 +374,7 @@ impl Trans {
                 let b = b
                     .map::<_, Infallible>(&mut |a| Ok(self.load(&state, i, o, t, a, &cache)))
                     .unwrap();
-                let b = o.values.alloc(SValue::Item(b).into());
+                let b = o.values.alloc(SValue::Item{item:b,span:Some(*s)}.into());
                 o.blocks[t].stmts.push(b);
                 let flags = match a.clone() {
                     LId::Id { id } => match state.get_mut(&id) {

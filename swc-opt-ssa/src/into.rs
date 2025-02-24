@@ -105,13 +105,13 @@ impl Convert {
             for i in inp.blocks[i].stmts.iter().cloned() {
                 let (j, tag) = match &inp.values[i].0 {
                     SValue::Param { block, idx, ty } => todo!(),
-                    SValue::Item(item) => match item {
+                    SValue::Item{item,span} => match item {
                         swc_tac::Item::Just { id } => {
                             let (a, b) = state.get(id).cloned().context("in getting the value")?;
 
                             (
                                 OptValue::Emit {
-                                    val: SValue::Item(Item::Just { id: a }),
+                                    val: SValue::Item{item:Item::Just { id: a },span: span.clone()},
                                     ty: b.clone(),
                                 },
                                 b,
@@ -127,15 +127,15 @@ impl Convert {
                             match (cnstl, cnstr) {
                                 (Some(_), Some(_)) => {
                                     let v: SValue<Id<OptValueW>, Id<OptBlock>> =
-                                        SValue::Item(Item::Bin {
+                                        SValue::Item{item:Item::Bin {
                                             left,
                                             right,
                                             op: op.clone(),
-                                        });
+                                        },span: span.clone()};
                                     let Some(a) = v.const_in(out) else { todo!() };
                                     (
                                         OptValue::Emit {
-                                            val: SValue::Item(Item::Lit { lit: a.clone() }),
+                                            val: SValue::Item{item:Item::Lit { lit: a.clone() },span: span.clone()},
                                             ty: Some(OptType::Lit(a.clone())),
                                         },
                                         Some(OptType::Lit(a.clone())),
@@ -147,11 +147,11 @@ impl Convert {
                                         Some(OptType::U32 { bits_usable: b2 }),
                                         BinaryOp::Mul,
                                     ) if (32 - bits_usable) + (32 - b2) <= 32 => {
-                                        let result = SValue::Item(Item::Bin {
+                                        let result = SValue::Item{item:Item::Bin {
                                             left,
                                             right,
                                             op: op.clone(),
-                                        });
+                                        },span: span.clone()};
                                         let ty = Some(OptType::U32 {
                                             bits_usable: (32 - bits_usable) + (32 - b2) - 32,
                                         });
@@ -170,11 +170,11 @@ impl Convert {
                                         Some(OptType::U64 { bits_usable: b2 }),
                                         BinaryOp::Mul,
                                     ) if (64 - bits_usable) + (64 - b2) <= 64 => {
-                                        let result = SValue::Item(Item::Bin {
+                                        let result = SValue::Item{item:Item::Bin {
                                             left,
                                             right,
                                             op: op.clone(),
-                                        });
+                                        },span: span.clone()};
                                         let ty = Some(OptType::U64 {
                                             bits_usable: (64 - bits_usable) + (64 - b2) - 64,
                                         });
@@ -193,11 +193,11 @@ impl Convert {
                                             bi_id_deopt(out, k, left, lty, right, rty)?;
                                         match (ty.clone(), op) {
                                             (Some(OptType::Number | OptType::BigInt), op) => {
-                                                let result = SValue::Item(Item::Bin {
+                                                let result = SValue::Item{item:Item::Bin {
                                                     left,
                                                     right,
                                                     op: op.clone(),
-                                                });
+                                                },span: span.clone()};
                                                 let ty = if op.precedence() == 6
                                                     || op.precedence() == 7
                                                 {
@@ -222,11 +222,11 @@ impl Convert {
                                                 ),
                                                 BinaryOp::Add | BinaryOp::Sub,
                                             ) if bits_usable != 0 => {
-                                                let result = SValue::Item(Item::Bin {
+                                                let result = SValue::Item{item:Item::Bin {
                                                     left,
                                                     right,
                                                     op: op.clone(),
-                                                });
+                                                },span: span.clone()};
                                                 let ty = if op.precedence() == 6
                                                     || op.precedence() == 7
                                                 {
@@ -247,11 +247,11 @@ impl Convert {
                                             (ty, op) => {
                                                 let left = deopt(out, k, left, ty.clone())?;
                                                 let right = deopt(out, k, right, ty)?;
-                                                let result = SValue::Item(Item::Bin {
+                                                let result = SValue::Item{item:Item::Bin {
                                                     left,
                                                     right,
                                                     op: op.clone(),
-                                                });
+                                                },span: span.clone()};
                                                 match op {
                                                     op => (
                                                         OptValue::Emit {
@@ -274,14 +274,14 @@ impl Convert {
                             match cnst {
                                 Some(k) => {
                                     let v: SValue<Id<OptValueW>, Id<OptBlock>> =
-                                        SValue::Item(Item::Un {
+                                        SValue::Item{item:Item::Un {
                                             arg: arg,
                                             op: op.clone(),
-                                        });
+                                        },span: span.clone()};
                                     let Some(a) = v.const_in(out) else { todo!() };
                                     (
                                         OptValue::Emit {
-                                            val: SValue::Item(Item::Lit { lit: a.clone() }),
+                                            val: SValue::Item{item:Item::Lit { lit: a.clone() },span: span.clone()},
                                             ty: Some(OptType::Lit(a.clone())),
                                         },
                                         Some(OptType::Lit(a.clone())),
@@ -293,7 +293,7 @@ impl Convert {
                                         UnaryOp::Plus,
                                     ) => (
                                         OptValue::Emit {
-                                            val: SValue::Item(Item::Just { id: arg }),
+                                            val: SValue::Item{item:Item::Just { id: arg },span: span.clone()},
                                             ty: tag.clone(),
                                         },
                                         tag,
@@ -307,10 +307,10 @@ impl Convert {
                                         ),
                                         UnaryOp::Minus,
                                     ) => {
-                                        let result = SValue::Item(Item::Un {
+                                        let result = SValue::Item{item:Item::Un {
                                             arg: arg,
                                             op: op.clone(),
-                                        });
+                                        },span: span.clone()};
                                         match op {
                                             op => (
                                                 OptValue::Emit {
@@ -323,10 +323,10 @@ impl Convert {
                                     }
                                     (tag, op) => {
                                         let arg = deopt(out, k, arg, tag)?;
-                                        let result = SValue::Item(Item::Un {
+                                        let result = SValue::Item{item:Item::Un {
                                             arg: arg,
                                             op: op.clone(),
-                                        });
+                                        },span: span.clone()};
                                         match op {
                                             UnaryOp::Plus => {
                                                 let val = OptValueW(OptValue::Emit {
@@ -357,7 +357,7 @@ impl Convert {
                         }
                         Item::Lit { lit } => (
                             OptValue::Emit {
-                                val: SValue::Item(Item::Lit { lit: lit.clone() }),
+                                val: SValue::Item{item:Item::Lit { lit: lit.clone() },span: span.clone()},
                                 ty: Some(OptType::Lit(lit.clone())),
                             },
                             Some(OptType::Lit(lit.clone())),
@@ -386,7 +386,7 @@ impl Convert {
                             });
                             (
                                 OptValue::Emit {
-                                    val: SValue::Item(Item::Arr { members: members }),
+                                    val: SValue::Item{item:Item::Arr { members: members },span: span.clone()},
                                     ty: ty.clone(),
                                 },
                                 ty,
@@ -419,7 +419,7 @@ impl Convert {
                                     ),
                                 ) => (
                                     OptValue::Emit {
-                                        val: SValue::Item(Item::Mem { obj, mem }),
+                                        val: SValue::Item{item:Item::Mem { obj, mem },span: span.clone()},
                                         ty: elem_ty.as_ref().clone(),
                                     },
                                     elem_ty.as_ref().clone(),
@@ -429,7 +429,7 @@ impl Convert {
                                     let mem = deopt(out, k, mem, mty)?;
                                     (
                                         OptValue::Emit {
-                                            val: SValue::Item(Item::Mem { obj, mem }),
+                                            val: SValue::Item{item:Item::Mem { obj, mem },span: span.clone()},
                                             ty: None,
                                         },
                                         None,
@@ -445,7 +445,7 @@ impl Convert {
                             })?;
                             (
                                 OptValue::Emit {
-                                    val: SValue::Item(a),
+                                    val: SValue::Item{item:a,span:span.clone()},
                                     ty: None,
                                 },
                                 None,

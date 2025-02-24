@@ -13,7 +13,7 @@ impl SwcFunc {
                 if_false,
             } = &mut kd.postcedent.term
             {
-                if let SValue::Item(Item::Lit { lit: Lit::Bool(b) }) = &self.values[*cond].0 {
+                if let SValue::Item{item:Item::Lit { lit: Lit::Bool(b) },span} = &self.values[*cond].0 {
                     kd.postcedent.term = STerm::Jmp(if b.value {
                         if_true.clone()
                     } else {
@@ -38,7 +38,7 @@ pub(crate)fn default_ctx() -> ExprCtx{
 impl<I: Copy,B> SValue<I,B> {
     pub fn const_in(&self, k: &impl SValGetter<I,B>) -> Option<Lit> {
         match self {
-            SValue::Item(item) => match item {
+            SValue::Item{item,span} => match item {
                 Item::Just { id } => None,
                 Item::Bin { left, right, op } => {
                     let left = k.val(*left)?.const_in(k)?;

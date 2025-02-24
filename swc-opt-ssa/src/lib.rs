@@ -54,7 +54,7 @@ impl OptValueW {
             OptValue::Deopt(a) => cfg.values[*a].constant(cfg),
             OptValue::Assert { val, ty } => cfg.values[*val].constant(cfg),
             OptValue::Emit { val, ty } => match val {
-                SValue::Item(i) => match i {
+                SValue::Item{item:i,span} => match i {
                     Item::Lit { lit } => Some(lit.clone()),
                     _ => None,
                 },

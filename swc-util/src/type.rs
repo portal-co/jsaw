@@ -1,4 +1,13 @@
+use bitflags::bitflags;
 use swc_ecma_ast::Lit;
+
+
+bitflags! {
+    #[derive(Default,Clone,Copy,Eq,PartialEq,Ord,PartialOrd,Hash,Debug)]
+    pub struct ParentFlags: u64{
+        const STRICT = 0x1;
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
@@ -29,7 +38,7 @@ pub enum OptType {
     Lit(Lit)
 }
 impl OptType {
-    pub fn parent(&self) -> Option<OptType> {
+    pub fn parent(&self, flags: ParentFlags) -> Option<OptType> {
         match self {
             OptType::U32 { bits_usable } => {
                 if *bits_usable == 0 {
@@ -51,7 +60,7 @@ impl OptType {
             }
             OptType::Array { elem_ty } => match elem_ty.as_ref() {
                 Some(a) => Some(OptType::Array {
-                    elem_ty: Box::new(a.parent()),
+                    elem_ty: Box::new(a.parent(flags)),
                 }),
                 None => None,
             },
@@ -79,7 +88,7 @@ impl OptType {
                                 for t in elem_tys.iter_mut().rev() {
                                     // if *t != f{
                                     match &*t {
-                                        Some(a) if *a != f => *t = a.parent(),
+                                        Some(a) if *a != f => *t = a.parent(flags),
                                         _ => {
                                             continue;
                                         }
@@ -106,7 +115,7 @@ impl OptType {
                             };
                             let q = s.pop().unwrap();
                             if let Some(p) = p {
-                                elem_tys.push(p.parent());
+                                elem_tys.push(p.parent(flags));
                                 s.push(q);
                             };
                             Some(OptType::Object {

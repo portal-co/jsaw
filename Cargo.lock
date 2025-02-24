@@ -622,6 +622,7 @@ dependencies = [
 name = "portal-jsc-swc-util"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "num-traits",
  "swc_atoms",
  "swc_common",

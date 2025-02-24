@@ -24,7 +24,7 @@ fn deopt(
         let w = out.values.alloc(OptValueW(OptValue::Deopt(v)));
         out.blocks[k].insts.push(w);
         v = w;
-        ty = t.parent();
+        ty = t.parent(Default::default());
     }
     return Ok(v);
 }
@@ -42,7 +42,7 @@ fn bi_id_deopt(
             let w = out.values.alloc(OptValueW(OptValue::Deopt(v1)));
             out.blocks[k].insts.push(w);
             v1 = w;
-            ty1 = t.parent();
+            ty1 = t.parent(Default::default());
         };
         swap(&mut ty1, &mut ty2);
         swap(&mut v1, &mut v2);
@@ -232,7 +232,7 @@ impl Convert {
                                                 {
                                                     Some(OptType::Bool)
                                                 } else {
-                                                    ty.unwrap().parent()
+                                                    ty.unwrap().parent(Default::default())
                                                 };
                                                 match op {
                                                     op => (
@@ -406,7 +406,7 @@ impl Convert {
                                 let w = out.values.alloc(OptValueW(OptValue::Deopt(obj)));
                                 out.blocks[k].insts.push(w);
                                 obj = w;
-                                oty = oty.unwrap().parent();
+                                oty = oty.unwrap().parent(Default::default());
                             }
                             match (oty.clone(), mty.clone()) {
                                 (
@@ -496,7 +496,7 @@ impl Convert {
                             let w = out.values.alloc(OptValueW(OptValue::Deopt(val)));
                             out.blocks[k].insts.push(w);
                             val = w;
-                            tag = tag.unwrap().parent();
+                            tag = tag.unwrap().parent(Default::default());
                         }
                         (
                             OptValue::Emit {

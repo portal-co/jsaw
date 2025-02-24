@@ -43,7 +43,7 @@ impl OptValueW {
         match &self.0 {
             OptValue::Deopt(d) => {
                 let x = cfg.values[*d].ty(cfg);
-                x.and_then(|y| y.parent())
+                x.and_then(|y| y.parent(Default::default()))
             }
             OptValue::Assert { val, ty } => ty.clone(),
             OptValue::Emit { val, ty } => ty.clone(),

@@ -1,7 +1,7 @@
 [workspace]
-members=[ "js-runtime-lib", "simpl-js", "swc-batch","swc-cfg",  "swc-opt-ssa", "swc-ssa", "swc-tac", "swc-util"]
+members=[  "simpl-js", "swc-batch","swc-cfg",  "swc-opt-ssa", "swc-ssa", "swc-tac", "swc-util"]
 
-# "swc-emit-rust","swc-waffle"
+# "js-runtime-lib","swc-emit-rust","swc-waffle"
 
 resolver="2"
 

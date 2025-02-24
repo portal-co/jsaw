@@ -1,9 +1,10 @@
 use std::iter::once;
 
 use portal_jsc_simpl_js::{
-    SimplAssignment, SimplBinOp, SimplCallExpr, SimplIf, SimplIfKind, SimplSwitchExpr,
+    SimplAssignment, SimplBinOp, SimplCallExpr, SimplIf, SimplIfKind, SimplSelectExpr,
+    SimplSwitchStmt,
 };
-use portal_jsc_swc_util::MakeSpanned;
+use portal_jsc_swc_util::{BreakKind, MakeSpanned};
 use relooper::ShapedBlock;
 use swc_atoms::Atom;
 use swc_ecma_ast::{AssignOp, Bool, Number};
@@ -132,8 +133,8 @@ pub fn reloop<D: TacDialect>(
                             span: span,
                         }),
                         SimplItem::DiscriminantIn { value, ids } => {
-                            SimplExpr::Switch(MakeSpanned {
-                                value: SimplSwitchExpr {
+                            SimplExpr::Select(MakeSpanned {
+                                value: SimplSelectExpr {
                                     scrutinee: Box::new(SimplExpr::Ident(D::span(
                                         value.1.clone(),
                                         value.0.clone().span(e),
@@ -216,9 +217,9 @@ pub fn reloop<D: TacDialect>(
                         span: span,
                     }))
                 }
-                TSimplTerm::Switch { scrutinee, cases } => {
-                    let val = SimplExpr::<D>::Switch(MakeSpanned {
-                        value: SimplSwitchExpr {
+                TSimplTerm::Select { scrutinee, cases } => {
+                    let val = SimplExpr::<D>::Select(MakeSpanned {
+                        value: SimplSelectExpr {
                             scrutinee: Box::new(SimplExpr::Ident(D::span(
                                 scrutinee.1.clone(),
                                 scrutinee.0.clone().span(span),
@@ -253,6 +254,30 @@ pub fn reloop<D: TacDialect>(
                     }))
                 }
                 TSimplTerm::Default => {}
+                TSimplTerm::Switch { scrutinee, cases } => {
+                    let scrutinee = match scrutinee {
+                        id => SimplExpr::<D>::Ident(D::span(id.1.clone(), id.0.clone().span(span))),
+                    };
+                    body.push(SimplStmt::Switch(MakeSpanned {
+                        value: SimplSwitchStmt {
+                            scrutinee: Box::new(scrutinee),
+                            cases: cases
+                                .iter()
+                                .map(|(cond, k)| {
+                                    let cond = match cond {
+                                        id => SimplExpr::<D>::Ident(D::span(
+                                            id.1.clone(),
+                                            id.0.clone().span(span),
+                                        )),
+                                    };
+                                    (Box::new(cond), jmp(*k), BreakKind::BreakAfter)
+                                })
+                                .collect(),
+                            label: swc_ecma_ast::Ident::new_private(Atom::new("$"), span),
+                        },
+                        span: span,
+                    }));
+                }
             };
             for a in [&simple_block.immediate, &simple_block.next]
                 .into_iter()
@@ -288,87 +313,108 @@ pub fn reloop<D: TacDialect>(
             body
         }
         ShapedBlock::Multiple(multiple_block) => {
-            let mut body = vec![SimplStmt::If(MakeSpanned {
-                value: SimplIf {
-                    kind: SimplIfKind::While { label: cff.clone() },
-                    cond: Box::new(SimplExpr::Lit(Lit::Bool(Bool {
-                        span: cff.span,
-                        value: true,
-                    }))),
-                    body: multiple_block
+            let mut body = vec![SimplStmt::<D>::Switch(MakeSpanned {
+                value: SimplSwitchStmt {
+                    scrutinee: Box::new(SimplExpr::Ident(D::span(
+                        Default::default(),
+                        SimplPath {
+                            root: cff.clone(),
+                            keys: vec![],
+                        },
+                    ))),
+                    label: cff.clone(),
+                    cases: multiple_block
                         .handled
                         .iter()
-                        .fold(vec![], |mut v, i| {
+                        .flat_map(|i| {
                             let j = || reloop(cfg, &i.inner, span, cff);
-                            if !i.break_after {
-                                v.extend(i.labels.iter().fold(vec![], |v, l| {
-                                    vec![SimplStmt::If(MakeSpanned {
+                            i.labels.iter().map(move |l| {
+                                (
+                                    Box::new(SimplExpr::Lit(Lit::Num(Number {
                                         span,
-                                        value: SimplIf {
-                                            kind: SimplIfKind::If { r#else: v },
-                                            cond: Box::new(SimplExpr::Bin(MakeSpanned {
-                                                span,
-                                                value: SimplBinOp {
-                                                    lhs: Box::new(SimplExpr::Lit(Lit::Num(
-                                                        Number {
-                                                            span,
-                                                            raw: None,
-                                                            value: l.index() as u32 as f64,
-                                                        },
-                                                    ))),
-                                                    op: BinaryOp::EqEqEq,
-                                                    rhs: Box::new(SimplExpr::Ident(D::span(
-                                                        Default::default(),
-                                                        SimplPath {
-                                                            root: cff.clone(),
-                                                            keys: vec![],
-                                                        },
-                                                    ))),
-                                                },
-                                            })),
-                                            body: j(),
-                                        },
-                                    })]
-                                }));
-                                v
-                            } else {
-                                i.labels.iter().fold(v, |v, l| {
-                                    vec![SimplStmt::If(MakeSpanned {
-                                        span,
-                                        value: SimplIf {
-                                            kind: SimplIfKind::If { r#else: v },
-                                            cond: Box::new(SimplExpr::Bin(MakeSpanned {
-                                                span,
-                                                value: SimplBinOp {
-                                                    lhs: Box::new(SimplExpr::Lit(Lit::Num(
-                                                        Number {
-                                                            span,
-                                                            raw: None,
-                                                            value: l.index() as u32 as f64,
-                                                        },
-                                                    ))),
-                                                    op: BinaryOp::EqEqEq,
-                                                    rhs: Box::new(SimplExpr::Ident(D::span(
-                                                        Default::default(),
-                                                        SimplPath {
-                                                            root: cff.clone(),
-                                                            keys: vec![],
-                                                        },
-                                                    ))),
-                                                },
-                                            })),
-                                            body: j(),
-                                        },
-                                    })]
-                                })
-                            }
+                                        raw: None,
+                                        value: l.index() as u32 as f64,
+                                    }))),
+                                    j(),
+                                    if i.break_after {
+                                        BreakKind::BreakAfter
+                                    } else {
+                                        BreakKind::DoNotBreakAfter
+                                    },
+                                )
+                            })
                         })
-                        .into_iter()
-                        .chain(once(SimplStmt::Break(cff.clone())))
                         .collect(),
                 },
                 span: span,
             })];
+            // .fold(vec![], |mut v, i| {
+            //     let j = || reloop(cfg, &i.inner, span, cff);
+            //     if !i.break_after {
+            //         // v.extend(i.labels.iter().fold(vec![], |v, l| {
+            //         //     vec![SimplStmt::If(MakeSpanned {
+            //         //         span,
+            //         //         value: SimplIf {
+            //         //             kind: SimplIfKind::If { r#else: v },
+            //         //             cond: Box::new(SimplExpr::Bin(MakeSpanned {
+            //         //                 span,
+            //         //                 value: SimplBinOp {
+            //         //                     lhs: Box::new(SimplExpr::Lit(Lit::Num(
+            //         //                         Number {
+            //         //                             span,
+            //         //                             raw: None,
+            //         //                             value: l.index() as u32 as f64,
+            //         //                         },
+            //         //                     ))),
+            //         //                     op: BinaryOp::EqEqEq,
+            //         //                     rhs: Box::new(SimplExpr::Ident(D::span(
+            //         //                         Default::default(),
+            //         //                         SimplPath {
+            //         //                             root: cff.clone(),
+            //         //                             keys: vec![],
+            //         //                         },
+            //         //                     ))),
+            //         //                 },
+            //         //             })),
+            //         //             body: j(),
+            //         //         },
+            //         //     })]
+            //         // }));
+            //         v.push(SimplStmt::Switch(Simple))
+            //         v
+            //     } else {
+            //         i.labels.iter().fold(v, |v, l| {
+            //             vec![SimplStmt::If(MakeSpanned {
+            //                 span,
+            //                 value: SimplIf {
+            //                     kind: SimplIfKind::If { r#else: v },
+            //                     cond: Box::new(SimplExpr::Bin(MakeSpanned {
+            //                         span,
+            //                         value: SimplBinOp {
+            //                             lhs: Box::new(SimplExpr::Lit(Lit::Num(
+            //                                 Number {
+            //                                     span,
+            //                                     raw: None,
+            //                                     value: l.index() as u32 as f64,
+            //                                 },
+            //                             ))),
+            //                             op: BinaryOp::EqEqEq,
+            //                             rhs: Box::new(SimplExpr::Ident(D::span(
+            //                                 Default::default(),
+            //                                 SimplPath {
+            //                                     root: cff.clone(),
+            //                                     keys: vec![],
+            //                                 },
+            //                             ))),
+            //                         },
+            //                     })),
+            //                     body: j(),
+            //                 },
+            //             })]
+            //         })
+            //     }
+            // })
+
             body
         }
     }

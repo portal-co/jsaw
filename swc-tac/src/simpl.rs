@@ -183,9 +183,13 @@ pub enum TSimplTerm<D: TacDialect> {
         if_true: Id<TSimplBlock<D>>,
         if_false: Id<TSimplBlock<D>>,
     },
-    Switch {
+    Select {
         scrutinee: (SimplPathId, D::Mark<()>),
         cases: BTreeMap<Ident, (Id<TSimplBlock<D>>, Vec<(SimplPathId, D::Mark<()>)>)>,
+    },
+    Switch {
+        scrutinee: (SimplPathId, D::Mark<()>),
+        cases: Vec<((SimplPathId, D::Mark<()>), Id<TSimplBlock<D>>)>,
     },
     Default,
 }
@@ -203,10 +207,11 @@ impl<D: TacDialect> Clone for TSimplTerm<D> {
                 if_true: if_true.clone(),
                 if_false: if_false.clone(),
             },
-            Self::Switch { scrutinee, cases } => Self::Switch {
+            Self::Select { scrutinee, cases } => Self::Select {
                 scrutinee: scrutinee.clone(),
                 cases: cases.clone(),
             },
+            Self::Switch { scrutinee, cases } => Self::Switch { scrutinee: scrutinee.clone(), cases: cases.clone() },
             Self::Default => Self::Default,
         }
     }
@@ -352,7 +357,7 @@ impl<D: TacDialect> Bake<D> for SimplExpr<D> {
                     ((i, Default::default()), then)
                 }
             },
-            SimplExpr::Switch(make_spanned) => {
+            SimplExpr::Select(make_spanned) => {
                 let (v, start_block) =
                     make_spanned
                         .value
@@ -388,7 +393,7 @@ impl<D: TacDialect> Bake<D> for SimplExpr<D> {
                     })
                     .collect();
                 cfg.blocks[start_block].orig_span = Some(make_spanned.span);
-                cfg.blocks[start_block].term = TSimplTerm::Switch {
+                cfg.blocks[start_block].term = TSimplTerm::Select {
                     scrutinee: v,
                     cases: xs,
                 };
@@ -442,6 +447,30 @@ impl<D: TacDialect> Bake<D> for SimplStmt<D> {
                         return start_block;
                     },
                 ),
+                SimplStmt::Switch(s) => {
+                    let after = cfg.blocks.alloc(Default::default());
+                    let (scrutinee,mut start_block) = s.value.scrutinee.bake(labels, ret, cfg, start_block);
+                    let mut cases = vec![];
+                    let start = s.value.cases.iter().enumerate().rev().fold(after, |prev,(i,c)|{
+                        let v;
+                        (v,start_block) = c.0.bake(labels, ret, cfg, start_block);
+                        let n = cfg.blocks.alloc(Default::default());
+                        let (_,nf) = c.1.bake(labels, ret, cfg, n);
+                        cfg.blocks[nf].term = TSimplTerm::Jmp(prev);
+                        cases.push((v,n));
+                        if i == s.value.cases.len() - 1{
+                            after
+                        }else{
+                            match &s.value.cases[i + 1].2{
+                                portal_jsc_swc_util::BreakKind::BreakAfter => after,
+                                portal_jsc_swc_util::BreakKind::DoNotBreakAfter => n,
+                            }
+                        }
+                    });
+                    cfg.blocks[start_block].orig_span = Some(s.span);
+                    cfg.blocks[start_block].term = TSimplTerm::Switch { scrutinee, cases };
+                    cfg.blocks.alloc(Default::default())
+                }
                 SimplStmt::If(make_spanned) => match &make_spanned.value.kind {
                     portal_jsc_simpl_js::SimplIfKind::If { r#else } => {
                         let after = cfg.blocks.alloc(Default::default());

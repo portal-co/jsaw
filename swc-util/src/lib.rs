@@ -105,3 +105,8 @@ pub trait ModuleMapper {
 }
 #[cfg(feature = "ty")]
 pub mod r#type;
+#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum BreakKind{
+    BreakAfter,
+    DoNotBreakAfter,
+}

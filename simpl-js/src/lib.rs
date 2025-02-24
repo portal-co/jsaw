@@ -6,6 +6,7 @@ use std::fmt::Display;
 use std::hash::Hash;
 
 use portal_jsc_swc_batch::ImportMapping;
+use portal_jsc_swc_util::BreakKind;
 use portal_jsc_swc_util::ModuleMapper;
 use portal_jsc_swc_util::{Extract, ImportMapper, ImportOr, MakeSpanned};
 use swc_atoms::Atom;
@@ -18,6 +19,8 @@ use swc_ecma_ast::MethodProp;
 use swc_ecma_ast::ObjectLit;
 use swc_ecma_ast::Param;
 use swc_ecma_ast::Prop;
+use swc_ecma_ast::SwitchCase;
+use swc_ecma_ast::SwitchStmt;
 use swc_ecma_ast::{
     ArrowExpr, AssignExpr, AssignOp, BinExpr, BinaryOp, BindingIdent, BlockStmt, CallExpr, Expr,
     ExprOrSpread, ExprStmt, Ident, IdentName, IfStmt, LabeledStmt, Lit, MemberExpr, MemberProp,
@@ -52,7 +55,7 @@ pub enum SimplExpr<D: Dialect> {
     Assign(MakeSpanned<SimplAssignment<D>>),
     Bin(MakeSpanned<SimplBinOp<D>>),
     Call(MakeSpanned<Box<SimplCallExpr<D>>>),
-    Switch(MakeSpanned<SimplSwitchExpr<D>>),
+    Select(MakeSpanned<SimplSelectExpr<D>>),
 }
 #[non_exhaustive]
 #[derive(Clone, Hash, Debug, PartialEq, Eq, Spanned)]
@@ -63,6 +66,7 @@ pub enum SimplStmt<D: Dialect> {
     Return(MakeSpanned<Box<SimplExpr<D>>>),
     Break(Ident),
     Continue(Ident),
+    Switch(MakeSpanned<SimplSwitchStmt<D>>),
 }
 #[derive(Clone, Hash, Debug, PartialEq, Eq, Spanned)]
 pub struct SimplPath {
@@ -111,9 +115,15 @@ pub enum SimplCallExpr<D: Dialect> {
     Block(Box<SimplStmt<D>>),
 }
 #[derive(Clone, Hash, Debug, PartialEq, Eq)]
-pub struct SimplSwitchExpr<D: Dialect> {
+pub struct SimplSelectExpr<D: Dialect> {
     pub scrutinee: Box<SimplExpr<D>>,
     pub cases: BTreeMap<Id, (Vec<SimplStmt<D>>, Vec<Ident>)>,
+}
+#[derive(Clone, Hash, Debug, PartialEq, Eq)]
+pub struct SimplSwitchStmt<D: Dialect> {
+    pub scrutinee: Box<SimplExpr<D>>,
+    pub label: Ident,
+    pub cases: Vec<(Box<SimplExpr<D>>, Vec<SimplStmt<D>>, BreakKind)>,
 }
 #[derive(Clone, Hash, Debug, PartialEq, Eq)]
 pub struct SimplAssignment<D: Dialect> {
@@ -161,6 +171,9 @@ impl<D: Dialect> SimplStmt<D> {
             },
             SimplStmt::Break(l) | SimplStmt::Continue(l) => {
                 *l = label.clone();
+            }
+            SimplStmt::Switch(make_spanned) => {
+                make_spanned.value.label = label.clone();
             }
         }
     }
@@ -275,7 +288,7 @@ impl<D: Dialect<Tag = Infallible>> From<SimplExpr<D>> for Expr {
                 }
                 SimplCallExpr::Tag { tag, args } => match tag {},
             },
-            SimplExpr::Switch(s) => Expr::Call(CallExpr {
+            SimplExpr::Select(s) => Expr::Call(CallExpr {
                 span: s.span,
                 ctxt: Default::default(),
                 callee: swc_ecma_ast::Callee::Expr(Box::new((*s.value.scrutinee).into())),
@@ -412,6 +425,34 @@ impl<D: Dialect<Tag = Infallible>> From<SimplStmt<D>> for Stmt {
             SimplStmt::Continue(b) => Stmt::Continue(ContinueStmt {
                 span: b.span(),
                 label: Some(b),
+            }),
+            SimplStmt::Switch(s) => Stmt::Labeled(LabeledStmt {
+                span: s.span,
+                label: s.value.label,
+                body: Box::new(Stmt::Switch(SwitchStmt {
+                    span: s.span,
+                    discriminant: Box::new((*s.value.scrutinee).into()),
+                    cases: s
+                        .value
+                        .cases
+                        .into_iter()
+                        .map(|(a, b, c)| SwitchCase {
+                            span: s.span,
+                            test: Some(Box::new((*a).into())),
+                            cons: b
+                                .into_iter()
+                                .map(|c| c.into())
+                                .chain(match c {
+                                    BreakKind::BreakAfter => Some(Stmt::Break(BreakStmt {
+                                        span: s.span,
+                                        label: None,
+                                    })),
+                                    BreakKind::DoNotBreakAfter => None,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                })),
             }),
             _ => todo!(),
         }
@@ -640,8 +681,8 @@ impl Conv for Expr {
                                             ref expr,
                                         }] if expr.as_object().is_some() => {
                                             let obj = expr.as_object().unwrap();
-                                            SimplExpr::Switch(MakeSpanned {
-                                        value: SimplSwitchExpr {
+                                            SimplExpr::Select(MakeSpanned {
+                                        value: SimplSelectExpr {
                                             scrutinee: Box::new(a),
                                             cases: obj
                                                 .props
@@ -803,6 +844,21 @@ impl Conv for Stmt {
                 }),
                 span: r.span,
             }),
+            Stmt::Switch(s) => SimplStmt::Switch(MakeSpanned { value: SimplSwitchStmt { scrutinee: Box::new(s.discriminant.conv(imports)?), label:  Ident::new_private(Atom::new("$"), s.span), cases: s.cases.iter().map(|c|{
+                let Some(a) = c.test.as_ref() else{
+                    return Err(Error::Unsupported);
+                };
+                let a = a.conv(imports)?;
+                let (b,d) = match c.cons.last(){
+                    Some(Stmt::Break(BreakStmt { span, label: None })) => {
+                        (c.cons[..(c.cons.len() - 2)].iter().map(|a|a.conv(imports)).collect::<Result<Vec<_>,Error>>()?,BreakKind::BreakAfter)
+                    }
+                    _ => {
+                        (c.cons.iter().map(|a|a.conv(imports)).collect::<Result<Vec<_>,Error>>()?,BreakKind::DoNotBreakAfter)
+                    }
+                };
+                Ok((Box::new(a),b,d))
+            }).collect::<Result<_,Error>>()? }, span: s.span() }),
             _ => return Err(Error::Unsupported),
         })
     }

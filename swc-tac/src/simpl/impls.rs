@@ -46,8 +46,9 @@ impl<D: TacDialect> Term<TSimplFunc<D>> for TSimplTerm<D> {
                 if_true,
                 if_false,
             } => Box::new([if_true, if_false].into_iter()),
-            TSimplTerm::Switch { scrutinee, cases } => Box::new(cases.values().map(|a| &a.0)),
+            TSimplTerm::Select { scrutinee, cases } => Box::new(cases.values().map(|a| &a.0)),
             TSimplTerm::Default => Box::new(empty()),
+            TSimplTerm::Switch { scrutinee, cases } => Box::new(cases.iter().map(|a| &a.1)),
         }
     }
 
@@ -63,10 +64,11 @@ impl<D: TacDialect> Term<TSimplFunc<D>> for TSimplTerm<D> {
                 if_true,
                 if_false,
             } => Box::new([if_true, if_false].into_iter()),
-            TSimplTerm::Switch { scrutinee, cases } => {
+            TSimplTerm::Select { scrutinee, cases } => {
                 Box::new(cases.values_mut().map(|a| &mut a.0))
             }
             TSimplTerm::Default => Box::new(empty()),
+            TSimplTerm::Switch { scrutinee, cases } => Box::new(cases.iter_mut().map(|a| &mut a.1)),
         }
     }
 }

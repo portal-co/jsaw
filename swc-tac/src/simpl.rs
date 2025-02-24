@@ -105,6 +105,49 @@ pub enum SimplItem<D: TacDialect, P = SimplPathId> {
         ids: BTreeMap<Ident, Vec<(P, D::Mark<()>)>>,
     },
 }
+impl<D: TacDialect, P> SimplItem<D, P> {
+    pub fn map<Q, E>(self, mut go: impl FnMut(P) -> Result<Q, E>) -> Result<SimplItem<D, Q>, E> {
+        Ok(match self {
+            SimplItem::Just { id } => SimplItem::Just {
+                id: (go(id.0)?, id.1),
+            },
+            SimplItem::Bin { left, right, op } => SimplItem::Bin {
+                left: (go(left.0)?, left.1),
+                right: (go(right.0)?, right.1),
+                op: op,
+            },
+            SimplItem::Lit { lit } => SimplItem::Lit { lit: lit },
+            SimplItem::CallStatic { r#fn, args } => SimplItem::CallStatic {
+                r#fn: (go(r#fn.0)?, r#fn.1),
+                args: args
+                    .into_iter()
+                    .map(|(a, b)| Ok((go(a)?, b)))
+                    .collect::<Result<_, E>>()?,
+            },
+            SimplItem::CallTag { tag, args } => SimplItem::CallTag {
+                tag: tag,
+                args: args
+                    .into_iter()
+                    .map(|(a, b)| Ok((go(a)?, b)))
+                    .collect::<Result<_, E>>()?,
+            },
+            SimplItem::DiscriminantIn { value, ids } => SimplItem::DiscriminantIn {
+                value: (go(value.0)?, value.1),
+                ids: ids
+                    .into_iter()
+                    .map(|(i, v)| {
+                        Ok((
+                            i,
+                            v.into_iter()
+                                .map(|(a, b)| Ok((go(a)?, b)))
+                                .collect::<Result<_, E>>()?,
+                        ))
+                    })
+                    .collect::<Result<_, E>>()?,
+            },
+        })
+    }
+}
 impl<D: TacDialect, P: Clone> Clone for SimplItem<D, P> {
     fn clone(&self) -> Self {
         match self {

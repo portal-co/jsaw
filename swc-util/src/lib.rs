@@ -103,3 +103,4 @@ pub trait ImportMapper {
 pub trait ModuleMapper {
     fn item_of(&self, id: &Id) -> Option<&ModuleItem>;
 }
+pub mod r#type;

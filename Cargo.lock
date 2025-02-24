@@ -647,6 +647,7 @@ dependencies = [
  "portal-jsc-swc-cfg",
  "portal-jsc-swc-ssa",
  "portal-jsc-swc-tac",
+ "portal-jsc-swc-util",
  "ssa-impls",
  "ssa-traits",
  "swc_atoms",
@@ -702,6 +703,7 @@ dependencies = [
 name = "portal-jsc-swc-util"
 version = "0.1.0"
 dependencies = [
+ "num-traits",
  "swc_atoms",
  "swc_common",
  "swc_ecma_ast",

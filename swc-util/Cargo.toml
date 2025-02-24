@@ -7,6 +7,7 @@ license = "CC0-1.0"
 description = "ECMAScript IR"
 
 [dependencies]
+num-traits = "0.2.19"
 swc_atoms.workspace = true
 swc_common.workspace = true
 swc_ecma_ast.workspace = true

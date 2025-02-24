@@ -103,4 +103,5 @@ pub trait ImportMapper {
 pub trait ModuleMapper {
     fn item_of(&self, id: &Id) -> Option<&ModuleItem>;
 }
+#[cfg(feature = "ty")]
 pub mod r#type;

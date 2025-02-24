@@ -13,3 +13,6 @@ swc_common.workspace = true
 swc_ecma_ast.workspace = true
 swc_ecma_utils.workspace = true
 swc_ecma_visit.workspace = true
+
+[features]
+ty=[]

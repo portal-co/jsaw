@@ -386,6 +386,8 @@ impl<I> LId<I> {
         })
     }
 }
+#[derive(Default)]
+#[non_exhaustive]
 pub struct Trans {
     pub map: BTreeMap<Id<Block>, Id<TBlock>>,
 }

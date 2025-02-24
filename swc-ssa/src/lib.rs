@@ -240,12 +240,21 @@ impl SwcFunc {
         return val;
     }
 }
+
+#[non_exhaustive]
 pub struct Trans {
     pub map: BTreeMap<Id<TBlock>, Id<SBlock>>,
     pub all: BTreeSet<Ident>,
     pub undef: Id<SValueW>,
 }
 impl Trans {
+    pub fn from_undef(undef: Id<SValueW>) -> Self {
+        Self {
+            map: Default::default(),
+            all: Default::default(),
+            undef: undef,
+        }
+    }
     pub fn apply_shim(
         &self,
         o: &mut SwcFunc,

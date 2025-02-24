@@ -39,7 +39,8 @@ impl TryFrom<SFunc> for TFunc {
         })
     }
 }
-
+#[derive(Default)]
+#[non_exhaustive]
 pub struct Rew {
     pub blocks: BTreeMap<BlockEntry, Id<TBlock>>,
 }

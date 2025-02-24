@@ -99,7 +99,8 @@ impl TryFrom<TFunc> for Function {
         return Ok(a.into());
     }
 }
-
+#[derive(Default)]
+#[non_exhaustive]
 pub struct Rew {
     pub all: BTreeMap<Id<TBlock>, Id<Block>>,
 }

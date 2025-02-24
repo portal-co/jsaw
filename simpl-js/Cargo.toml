@@ -13,6 +13,6 @@ swc_ecma_utils.workspace = true
 swc_ecma_visit.workspace = true
 
 portal-jsc-swc-batch = { version = "0.1.0", path = "../swc-batch" }
-portal-jsc-swc-util = { version = "0.1.0", path = "../swc-util" }
+portal-jsc-swc-util = { version = "0.1.0", path = "../swc-util",features = ["ty"] }
 typenum.workspace = true
 

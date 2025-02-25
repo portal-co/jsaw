@@ -1,6 +1,8 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::env::Args;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::hash::Hash;
@@ -477,7 +479,7 @@ impl std::error::Error for Error {
     }
 }
 pub trait ConvTagLookup<D: Dialect> {
-    fn lookup_tag<'a>(&self, a: &'a Expr) -> Result<D::Tag, &'a Expr>;
+    fn lookup_tag<'a,'b>(&self, a: &'a Expr, args: &'b [ExprOrSpread]) -> Result<(D::Tag,Cow<'b,[ExprOrSpread]>), &'a Expr>;
 }
 pub trait ConvCtx<D: ConvDialect>: ImportMapper + ModuleMapper + ConvTagLookup<D> {}
 impl<D: ConvDialect, T: ImportMapper + ModuleMapper + ConvTagLookup<D> + ?Sized> ConvCtx<D> for T {}
@@ -672,7 +674,7 @@ impl Conv for Expr {
                                 )))),
                                 span: f.span(),
                             }),
-                            e => match imports.lookup_tag(e) {
+                            e => match imports.lookup_tag(e,&c.args) {
                                 Err(e) => {
                                     let a: SimplExpr<D> = e.conv(imports)?;
                                     match &c.args[..] {
@@ -763,11 +765,10 @@ impl Conv for Expr {
                                         }
                                     }
                                 }
-                                Ok(t) => SimplExpr::Call(MakeSpanned {
+                                Ok((t,args)) => SimplExpr::Call(MakeSpanned {
                                     value: Box::new(SimplCallExpr::Tag {
                                         tag: t,
-                                        args: c
-                                            .args
+                                        args: args
                                             .iter()
                                             .map(|a| a.expr.conv(imports))
                                             .collect::<Result<Vec<_>, _>>()?,

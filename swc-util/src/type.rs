@@ -152,7 +152,7 @@ impl OptType {
             OptType::Variant { parts } => {
                 let mut parts = parts.clone();
                 for (_,p) in parts.iter_mut(){
-                    for p in p.iter_mut(){
+                    for p in p.iter_mut().rev(){
                         if let Some(r) = p.take(){
                             *p = r.parent(flags);
                             return Some(OptType::Variant { parts: parts })

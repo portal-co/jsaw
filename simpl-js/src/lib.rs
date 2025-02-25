@@ -479,7 +479,11 @@ impl std::error::Error for Error {
     }
 }
 pub trait ConvTagLookup<D: Dialect> {
-    fn lookup_tag<'a,'b>(&self, a: &'a Expr, args: &'b [ExprOrSpread]) -> Result<(D::Tag,Cow<'b,[ExprOrSpread]>), &'a Expr>;
+    fn lookup_tag<'a, 'b>(
+        &self,
+        a: &'a Expr,
+        args: &'b [ExprOrSpread],
+    ) -> Result<(D::Tag, Cow<'b, [ExprOrSpread]>), &'a Expr>;
 }
 pub trait ConvCtx<D: ConvDialect>: ImportMapper + ModuleMapper + ConvTagLookup<D> {}
 impl<D: ConvDialect, T: ImportMapper + ModuleMapper + ConvTagLookup<D> + ?Sized> ConvCtx<D> for T {}
@@ -674,7 +678,7 @@ impl Conv for Expr {
                                 )))),
                                 span: f.span(),
                             }),
-                            e => match imports.lookup_tag(e,&c.args) {
+                            e => match imports.lookup_tag(e, &c.args) {
                                 Err(e) => {
                                     let a: SimplExpr<D> = e.conv(imports)?;
                                     match &c.args[..] {
@@ -765,7 +769,7 @@ impl Conv for Expr {
                                         }
                                     }
                                 }
-                                Ok((t,args)) => SimplExpr::Call(MakeSpanned {
+                                Ok((t, args)) => SimplExpr::Call(MakeSpanned {
                                     value: Box::new(SimplCallExpr::Tag {
                                         tag: t,
                                         args: args
@@ -845,21 +849,40 @@ impl Conv for Stmt {
                 }),
                 span: r.span,
             }),
-            Stmt::Switch(s) => SimplStmt::Switch(MakeSpanned { value: SimplSwitchStmt { scrutinee: Box::new(s.discriminant.conv(imports)?), label:  Ident::new_private(Atom::new("$"), s.span), cases: s.cases.iter().map(|c|{
-                let Some(a) = c.test.as_ref() else{
-                    return Err(Error::Unsupported);
-                };
-                let a = a.conv(imports)?;
-                let (b,d) = match c.cons.last(){
-                    Some(Stmt::Break(BreakStmt { span, label: None })) => {
-                        (c.cons[..(c.cons.len() - 1)].iter().map(|a|a.conv(imports)).collect::<Result<Vec<_>,Error>>()?,BreakKind::BreakAfter)
-                    }
-                    _ => {
-                        (c.cons.iter().map(|a|a.conv(imports)).collect::<Result<Vec<_>,Error>>()?,BreakKind::DoNotBreakAfter)
-                    }
-                };
-                Ok((Box::new(a),b,d))
-            }).collect::<Result<_,Error>>()? }, span: s.span() }),
+            Stmt::Switch(s) => SimplStmt::Switch(MakeSpanned {
+                value: SimplSwitchStmt {
+                    scrutinee: Box::new(s.discriminant.conv(imports)?),
+                    label: Ident::new_private(Atom::new("$"), s.span),
+                    cases: s
+                        .cases
+                        .iter()
+                        .map(|c| {
+                            let Some(a) = c.test.as_ref() else {
+                                return Err(Error::Unsupported);
+                            };
+                            let a = a.conv(imports)?;
+                            let (b, d) = match c.cons.last() {
+                                Some(Stmt::Break(BreakStmt { span, label: None })) => (
+                                    c.cons[..(c.cons.len() - 1)]
+                                        .iter()
+                                        .map(|a| a.conv(imports))
+                                        .collect::<Result<Vec<_>, Error>>()?,
+                                    BreakKind::BreakAfter,
+                                ),
+                                _ => (
+                                    c.cons
+                                        .iter()
+                                        .map(|a| a.conv(imports))
+                                        .collect::<Result<Vec<_>, Error>>()?,
+                                    BreakKind::DoNotBreakAfter,
+                                ),
+                            };
+                            Ok((Box::new(a), b, d))
+                        })
+                        .collect::<Result<_, Error>>()?,
+                },
+                span: s.span(),
+            }),
             _ => return Err(Error::Unsupported),
         })
     }

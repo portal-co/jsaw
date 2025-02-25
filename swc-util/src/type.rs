@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use bitflags::bitflags;
 use swc_ecma_ast::Lit;
 
@@ -35,7 +37,10 @@ pub enum OptType {
         extensible: bool,
         elem_tys: Vec<Option<OptType>>,
     },
-    Lit(Lit)
+    Lit(Lit),
+    Variant{
+        parts: BTreeMap<String,Vec<Option<OptType>>>
+    }
 }
 impl OptType {
     pub fn parent(&self, flags: ParentFlags) -> Option<OptType> {
@@ -144,6 +149,18 @@ impl OptType {
                 }
                 _ => None
             },
+            OptType::Variant { parts } => {
+                let mut parts = parts.clone();
+                for (_,p) in parts.iter_mut(){
+                    for p in p.iter_mut(){
+                        if let Some(r) = p.take(){
+                            *p = r.parent(flags);
+                            return Some(OptType::Variant { parts: parts })
+                        }
+                    }
+                }
+                None
+            }
             _ => None,
         }
     }

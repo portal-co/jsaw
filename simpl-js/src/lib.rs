@@ -851,7 +851,7 @@ impl Conv for Stmt {
                 let a = a.conv(imports)?;
                 let (b,d) = match c.cons.last(){
                     Some(Stmt::Break(BreakStmt { span, label: None })) => {
-                        (c.cons[..(c.cons.len() - 2)].iter().map(|a|a.conv(imports)).collect::<Result<Vec<_>,Error>>()?,BreakKind::BreakAfter)
+                        (c.cons[..(c.cons.len() - 1)].iter().map(|a|a.conv(imports)).collect::<Result<Vec<_>,Error>>()?,BreakKind::BreakAfter)
                     }
                     _ => {
                         (c.cons.iter().map(|a|a.conv(imports)).collect::<Result<Vec<_>,Error>>()?,BreakKind::DoNotBreakAfter)

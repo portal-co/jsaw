@@ -139,7 +139,7 @@ pub enum SimplCallExpr<D: Dialect> {
     },
     Tag {
         #[span]
-        tag: D::Tag,
+        tag: FuncId<Expr,D::Tag>,
         args: Vec<SimplExpr<D>>,
     },
     Block(Box<SimplStmt<D>>),
@@ -856,16 +856,36 @@ impl Conv for Expr {
                                 }
                             }
                         }
-                        Ok((t, args)) => SimplExpr::Call(MakeSpanned {
+                        Ok((t, args)) => {                     let mut args = args.as_ref();
+                            let mut template = BTreeMap::new();
+                            while let Some(([a], b)) = args.split_first_chunk() {
+                                if let Some(a) = a.expr.as_object() {
+                                    args = b;
+                                    for k in a
+                                        .props
+                                        .iter()
+                                        .filter_map(|p| p.as_prop())
+                                        .filter_map(|p| p.as_key_value())
+                                    {
+                                        template.insert(
+                                            match k.key.as_ident() {
+                                                Some(a) => a.sym.clone(),
+                                                None => return Err(Error::Unsupported),
+                                            },
+                                            (&*k.value).clone(),
+                                        );
+                                    }
+                                }
+                            }SimplExpr::Call(MakeSpanned {
                             value: Box::new(SimplCallExpr::Tag {
-                                tag: t,
+                                tag: FuncId{path: t, template_args: template},
                                 args: args
                                     .iter()
                                     .map(|a| a.expr.conv(imports))
                                     .collect::<Result<Vec<_>, _>>()?,
                             }),
                             span: c.span,
-                        }),
+                        })},
                     },
                 },
             },

@@ -17,6 +17,7 @@ use swc_ecma_ast::BreakStmt;
 use swc_ecma_ast::ContinueStmt;
 use swc_ecma_ast::Function;
 use swc_ecma_ast::Id;
+use swc_ecma_ast::KeyValueProp;
 use swc_ecma_ast::MethodProp;
 use swc_ecma_ast::ObjectLit;
 use swc_ecma_ast::Param;
@@ -102,11 +103,38 @@ impl SimplPathId {
         }
     }
 }
+#[derive(Clone, Hash, Debug, PartialEq, Eq)]
+pub struct FuncId<E, P> {
+    // #[span]
+    pub path: P,
+    pub template_args: BTreeMap<Atom, E>,
+}
+impl<E, P: Spanned> Spanned for FuncId<E, P> {
+    fn span(&self) -> Span {
+        self.path.span()
+    }
+}
+impl<E, P> FuncId<E, P> {
+    pub fn map<F, Q, Error>(
+        self,
+        mut path: impl FnMut(P) -> Result<Q, Error>,
+        mut arg: impl FnMut(E) -> Result<F, Error>,
+    ) -> Result<FuncId<F, Q>, Error> {
+        Ok(FuncId {
+            path: path(self.path)?,
+            template_args: self
+                .template_args
+                .into_iter()
+                .map(|(k, v)| Ok((k, arg(v)?)))
+                .collect::<Result<_, Error>>()?,
+        })
+    }
+}
 #[derive(Clone, Hash, Debug, PartialEq, Eq, Spanned)]
 pub enum SimplCallExpr<D: Dialect> {
     Path {
         #[span]
-        path: D::MarkSpanned<SimplPath>,
+        path: FuncId<Expr, D::MarkSpanned<SimplPath>>,
         args: Vec<SimplExpr<D>>,
     },
     Tag {
@@ -237,7 +265,7 @@ impl<D: Dialect<Tag = Infallible>> From<SimplExpr<D>> for Expr {
             SimplExpr::Lit(l) => Expr::Lit(l),
             SimplExpr::Call(c) => match *c.value {
                 SimplCallExpr::Path { path, args } => {
-                    let pid = match path.extract_own() {
+                    let pid = match path.path.extract_own() {
                         p => p.keys.into_iter().fold(Expr::Ident(p.root), |a, b| {
                             let asp = a.span();
                             Expr::Member(MemberExpr {
@@ -254,14 +282,35 @@ impl<D: Dialect<Tag = Infallible>> From<SimplExpr<D>> for Expr {
                         span: c.span,
                         ctxt: Default::default(),
                         callee: swc_ecma_ast::Callee::Expr(Box::new(pid)),
-                        args: args
-                            .into_iter()
-                            .map(|a| a.into())
-                            .map(|a| ExprOrSpread {
-                                spread: None,
-                                expr: Box::new(a),
-                            })
-                            .collect(),
+                        args: if path.template_args.len() == 0 {
+                            None
+                        } else {
+                            Some(Expr::Object(ObjectLit {
+                                span: c.span,
+                                props: path
+                                    .template_args
+                                    .into_iter()
+                                    .map(|(a, b)| {
+                                        swc_ecma_ast::PropOrSpread::Prop(Box::new(Prop::KeyValue(
+                                            KeyValueProp {
+                                                key: swc_ecma_ast::PropName::Ident(IdentName {
+                                                    span: c.span,
+                                                    sym: a,
+                                                }),
+                                                value: Box::new(b),
+                                            },
+                                        )))
+                                    })
+                                    .collect(),
+                            }))
+                        }
+                        .into_iter()
+                        .chain(args.into_iter().map(|a| a.into()))
+                        .map(|a| ExprOrSpread {
+                            spread: None,
+                            expr: Box::new(a),
+                        })
+                        .collect(),
                         type_args: None,
                     })
                 }
@@ -293,7 +342,14 @@ impl<D: Dialect<Tag = Infallible>> From<SimplExpr<D>> for Expr {
             SimplExpr::Select(s) => Expr::Call(CallExpr {
                 span: s.span,
                 ctxt: Default::default(),
-                callee: swc_ecma_ast::Callee::Expr(Box::new((*s.value.scrutinee).into())),
+                callee: swc_ecma_ast::Callee::Expr(Box::new(Expr::Member(MemberExpr {
+                    span: s.span,
+                    obj: Box::new((*s.value.scrutinee).into()),
+                    prop: MemberProp::Ident(IdentName {
+                        span: s.span,
+                        sym: Atom::new("$match"),
+                    }),
+                }))),
                 args: vec![ExprOrSpread {
                     spread: None,
                     expr: Box::new(Expr::Object(ObjectLit {
@@ -632,62 +688,67 @@ impl Conv for Expr {
                 },
                 span: b.span,
             }),
-            Expr::Call(c) => {
-                match &c.callee {
-                    swc_ecma_ast::Callee::Super(_) => todo!(),
-                    swc_ecma_ast::Callee::Import(import) => todo!(),
-                    swc_ecma_ast::Callee::Expr(expr) => {
-                        match &**expr {
-                            Expr::Fn(f) if f.function.params.len() == 0 => {
-                                SimplExpr::Call(MakeSpanned {
-                                    value: Box::new(SimplCallExpr::Block(Box::new(
-                                        SimplStmt::Block(MakeSpanned {
-                                            value: f
-                                                .function
-                                                .body
-                                                .iter()
-                                                .flat_map(|a| a.stmts.iter())
-                                                .map(|s| s.conv(imports))
-                                                .collect::<Result<Vec<_>, _>>()?,
-                                            span: f.span(),
-                                        }),
-                                    ))),
-                                    span: f.span(),
-                                })
-                            }
-                            Expr::Arrow(f) if f.params.len() == 0 => SimplExpr::Call(MakeSpanned {
-                                value: Box::new(SimplCallExpr::Block(Box::new(SimplStmt::Block(
-                                    MakeSpanned {
-                                        value: match &*f.body {
-                                            swc_ecma_ast::BlockStmtOrExpr::BlockStmt(
-                                                block_stmt,
-                                            ) => block_stmt
-                                                .stmts
-                                                .iter()
-                                                .map(|s| s.conv(imports))
-                                                .collect::<Result<Vec<_>, _>>()?,
-                                            swc_ecma_ast::BlockStmtOrExpr::Expr(expr) => {
-                                                vec![SimplStmt::Return(MakeSpanned {
-                                                    value: Box::new(expr.conv(imports)?),
-                                                    span: f.span(),
-                                                })]
-                                            }
-                                        },
-                                        span: f.span(),
-                                    },
-                                )))),
+            Expr::Call(c) => match &c.callee {
+                swc_ecma_ast::Callee::Super(_) => todo!(),
+                swc_ecma_ast::Callee::Import(import) => todo!(),
+                swc_ecma_ast::Callee::Expr(expr) => match &**expr {
+                    Expr::Fn(f) if f.function.params.len() == 0 => SimplExpr::Call(MakeSpanned {
+                        value: Box::new(SimplCallExpr::Block(Box::new(SimplStmt::Block(
+                            MakeSpanned {
+                                value: f
+                                    .function
+                                    .body
+                                    .iter()
+                                    .flat_map(|a| a.stmts.iter())
+                                    .map(|s| s.conv(imports))
+                                    .collect::<Result<Vec<_>, _>>()?,
                                 span: f.span(),
-                            }),
-                            e => match imports.lookup_tag(e, &c.args) {
-                                Err(e) => {
-                                    let a: SimplExpr<D> = e.conv(imports)?;
-                                    match &c.args[..] {
-                                        &[ExprOrSpread {
-                                            ref spread,
-                                            ref expr,
-                                        }] if expr.as_object().is_some() => {
-                                            let obj = expr.as_object().unwrap();
-                                            SimplExpr::Select(MakeSpanned {
+                            },
+                        )))),
+                        span: f.span(),
+                    }),
+                    Expr::Arrow(f) if f.params.len() == 0 => SimplExpr::Call(MakeSpanned {
+                        value: Box::new(SimplCallExpr::Block(Box::new(SimplStmt::Block(
+                            MakeSpanned {
+                                value: match &*f.body {
+                                    swc_ecma_ast::BlockStmtOrExpr::BlockStmt(block_stmt) => {
+                                        block_stmt
+                                            .stmts
+                                            .iter()
+                                            .map(|s| s.conv(imports))
+                                            .collect::<Result<Vec<_>, _>>()?
+                                    }
+                                    swc_ecma_ast::BlockStmtOrExpr::Expr(expr) => {
+                                        vec![SimplStmt::Return(MakeSpanned {
+                                            value: Box::new(expr.conv(imports)?),
+                                            span: f.span(),
+                                        })]
+                                    }
+                                },
+                                span: f.span(),
+                            },
+                        )))),
+                        span: f.span(),
+                    }),
+                    e => match imports.lookup_tag(e, &c.args) {
+                        Err(e) => {
+                            let a: SimplExpr<D> = e.conv(imports)?;
+                            let mut path = match &a {
+                                SimplExpr::Ident(path) => path,
+                                SimplExpr::Assign(a) => &a.value.target,
+                                _ => return Err(Error::Unsupported),
+                            }
+                            .clone();
+                            match (&c.args[..], path.as_ref().keys.last().map(|a| a as &str)) {
+                                (
+                                    &[ExprOrSpread {
+                                        ref spread,
+                                        ref expr,
+                                    }],
+                                    Some("$match"),
+                                ) if expr.as_object().is_some() => {
+                                    let obj = expr.as_object().unwrap();
+                                    SimplExpr::Select(MakeSpanned {
                                         value: SimplSelectExpr {
                                             scrutinee: Box::new(a),
                                             cases: obj
@@ -705,11 +766,11 @@ impl Conv for Expr {
                                                                 .map(|a| a.pat.clone())
                                                                 .collect(),
                                                         ),
-                                                        Prop::Assign(a) => match &*a.value {
+                                                        Prop::KeyValue(a) => match &*a.value {
                                                             Expr::Fn(f) => (
                                                                 IdentName {
-                                                                    span: a.key.span,
-                                                                    sym: a.key.sym.clone(),
+                                                                    span: a.key.as_ident().unwrap().span,
+                                                                    sym: a.key.as_ident().unwrap().sym.clone(),
                                                                 },
                                                                 f.function.body.as_ref(),
                                                                 f.function
@@ -720,8 +781,8 @@ impl Conv for Expr {
                                                             ),
                                                             Expr::Arrow(f) => (
                                                                 IdentName {
-                                                                    span: a.key.span,
-                                                                    sym: a.key.sym.clone(),
+                                                                    span: a.key.as_ident().unwrap().span,
+                                                                    sym: a.key.as_ident().unwrap().sym.clone(),
                                                                 },
                                                                 f.body.as_block_stmt(),
                                                                 f.params.clone(),
@@ -738,52 +799,76 @@ impl Conv for Expr {
                                                             id.sym,
                                                             id.span,
                                                             Default::default(),
-                                                        ).to_id(),
-                                                        (body
-                                                            .iter()
-                                                            .flat_map(|c| c.stmts.iter())
-                                                            .map(|a| a.conv(imports)).collect::<Result<Vec<_>,_>>()?,arg.iter().filter_map(|a|a.as_ident()).map(|a|a.id.clone()).collect()),
+                                                        )
+                                                        .to_id(),
+                                                        (
+                                                            body.iter()
+                                                                .flat_map(|c| c.stmts.iter())
+                                                                .map(|a| a.conv(imports))
+                                                                .collect::<Result<Vec<_>, _>>()?,
+                                                            arg.iter()
+                                                                .filter_map(|a| a.as_ident())
+                                                                .map(|a| a.id.clone())
+                                                                .collect(),
+                                                        ),
                                                     ))
-                                                }).collect::<Result<BTreeMap<_,_>,Error>>()?,
+                                                })
+                                                .collect::<Result<BTreeMap<_, _>, Error>>()?,
                                         },
                                         span: c.span,
                                     })
-                                        }
-                                        _ => {
-                                            let mut path = match a {
-                                                SimplExpr::Ident(path) => path,
-                                                SimplExpr::Assign(a) => a.value.target,
-                                                _ => return Err(Error::Unsupported),
-                                            };
-                                            SimplExpr::Call(MakeSpanned {
-                                                value: Box::new(SimplCallExpr::Path {
-                                                    path,
-                                                    args: c
-                                                        .args
-                                                        .iter()
-                                                        .map(|a| a.expr.conv(imports))
-                                                        .collect::<Result<Vec<_>, _>>()?,
-                                                }),
-                                                span: c.span,
-                                            })
+                                }
+                                _ => {
+                                    let mut args = c.args.as_slice();
+                                    let mut template = BTreeMap::new();
+                                    while let Some(([a], b)) = args.split_first_chunk() {
+                                        if let Some(a) = a.expr.as_object() {
+                                            args = b;
+                                            for k in a
+                                                .props
+                                                .iter()
+                                                .filter_map(|p| p.as_prop())
+                                                .filter_map(|p| p.as_key_value())
+                                            {
+                                                template.insert(
+                                                    match k.key.as_ident() {
+                                                        Some(a) => a.sym.clone(),
+                                                        None => return Err(Error::Unsupported),
+                                                    },
+                                                    (&*k.value).clone(),
+                                                );
+                                            }
                                         }
                                     }
+                                    SimplExpr::Call(MakeSpanned {
+                                        value: Box::new(SimplCallExpr::Path {
+                                            path: FuncId {
+                                                path: path,
+                                                template_args: template,
+                                            },
+                                            args: args
+                                                .iter()
+                                                .map(|a| a.expr.conv(imports))
+                                                .collect::<Result<Vec<_>, _>>()?,
+                                        }),
+                                        span: c.span,
+                                    })
                                 }
-                                Ok((t, args)) => SimplExpr::Call(MakeSpanned {
-                                    value: Box::new(SimplCallExpr::Tag {
-                                        tag: t,
-                                        args: args
-                                            .iter()
-                                            .map(|a| a.expr.conv(imports))
-                                            .collect::<Result<Vec<_>, _>>()?,
-                                    }),
-                                    span: c.span,
-                                }),
-                            },
+                            }
                         }
-                    }
-                }
-            }
+                        Ok((t, args)) => SimplExpr::Call(MakeSpanned {
+                            value: Box::new(SimplCallExpr::Tag {
+                                tag: t,
+                                args: args
+                                    .iter()
+                                    .map(|a| a.expr.conv(imports))
+                                    .collect::<Result<Vec<_>, _>>()?,
+                            }),
+                            span: c.span,
+                        }),
+                    },
+                },
+            },
             _ => return Err(Error::Unsupported),
         })
     }

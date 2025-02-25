@@ -1,4 +1,4 @@
-use std::iter::once;
+use std::{convert::Infallible, iter::once};
 
 use portal_jsc_simpl_js::{
     SimplAssignment, SimplBinOp, SimplCallExpr, SimplIf, SimplIfKind, SimplSelectExpr,
@@ -104,7 +104,10 @@ pub fn reloop<D: TacDialect>(
                         SimplItem::Lit { lit } => SimplExpr::Lit(lit.clone()),
                         SimplItem::CallStatic { r#fn, args } => SimplExpr::Call(MakeSpanned {
                             value: Box::new(SimplCallExpr::Path {
-                                path: D::span(r#fn.1.clone(), r#fn.0.clone().span(e)),
+                                path: FuncId {
+                                    path: D::span(r#fn.path.1.clone(), r#fn.path.0.clone().span(e)),
+                                    template_args: r#fn.template_args.clone(),
+                                },
                                 args: args
                                     .iter()
                                     .map(|id| {

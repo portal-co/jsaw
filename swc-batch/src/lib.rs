@@ -9,7 +9,13 @@ use swc_ecma_ast::{
     PropOrSpread, ReturnStmt, Stmt, Str, VarDecl, VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitMut, VisitMutWith};
+pub fn setup(mut module: Module) -> (ImportMapping, ModuleMapping) {
+    let mut i = ImportMapping::default();
+    module.visit_mut_with(&mut i);
+    (i, ModuleMapping::new(module))
+}
 
+#[derive(Default)]
 pub struct ImportMapping {
     pub mapping: BTreeMap<(Atom, SyntaxContext), (Atom, ImportMap<Atom>)>,
 }
@@ -73,9 +79,10 @@ impl ImportMapper for ImportMapping {
         return None;
     }
 }
+#[derive(Default)]
 pub struct ModuleMapping {
     pub mapping: BTreeMap<Id, Arc<ModuleItem>>,
-    pub remainder: Vec<Arc<ModuleItem>>,
+    pub remainder: Vec<ModuleItem>,
 }
 impl ModuleMapper for ModuleMapping {
     fn item_of(&self, id: &Id) -> Option<&ModuleItem> {
@@ -136,7 +143,7 @@ impl ModuleMapping {
                     }
                 })
                 .collect(),
-            remainder: r,
+            remainder: r.into_iter().map(|a| Arc::unwrap_or_clone(a)).collect(),
         }
     }
 }

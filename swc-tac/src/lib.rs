@@ -115,8 +115,8 @@ impl TCfg {
                 LId::Id { id } => !self.decls.contains(&id),
                 LId::Member { obj, mem } => {
                     !self.decls.contains(&obj) || !self.decls.contains(&mem[0])
-                },
-                _ => todo!()
+                }
+                _ => todo!(),
             } {
                 continue;
             }
@@ -127,8 +127,8 @@ impl TCfg {
                 LId::Id { id } => !self.decls.contains(&id),
                 LId::Member { obj, mem } => {
                     !self.decls.contains(&obj) || !self.decls.contains(&mem[0])
-                },
-                _ => todo!()
+                }
+                _ => todo!(),
             } {
                 continue;
             }

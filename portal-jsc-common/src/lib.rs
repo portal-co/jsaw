@@ -1,6 +1,6 @@
 #![no_std]
-
 use core::iter::once;
+pub use portal_pc_asm_common as asm;
 
 use either::Either;
 
@@ -22,14 +22,20 @@ impl<I> LId<I> {
     }
 }
 impl<I, M: IntoIterator<Item = I>> LId<I, M> {
-    pub fn as_ref<'a>(&'a self) -> LId<&'a I,&'a M> where &'a M: IntoIterator<Item = &'a I>{
-        match self{
+    pub fn as_ref<'a>(&'a self) -> LId<&'a I, &'a M>
+    where
+        &'a M: IntoIterator<Item = &'a I>,
+    {
+        match self {
             LId::Id { id } => LId::Id { id },
             LId::Member { obj, mem } => LId::Member { obj, mem },
         }
     }
-    pub fn as_mut<'a>(&'a mut self) -> LId<&'a mut I,&'a mut M> where &'a mut M: IntoIterator<Item = &'a mut I>{
-        match self{
+    pub fn as_mut<'a>(&'a mut self) -> LId<&'a mut I, &'a mut M>
+    where
+        &'a mut M: IntoIterator<Item = &'a mut I>,
+    {
+        match self {
             LId::Id { id } => LId::Id { id },
             LId::Member { obj, mem } => LId::Member { obj, mem },
         }

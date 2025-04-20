@@ -1,5 +1,5 @@
 [workspace]
-members=[  "simpl-js", "simpl-js-rust", "swc-batch","swc-cfg",  "swc-opt-ssa", "swc-ssa", "swc-tac", "swc-util"]
+members=[ "portal-jsc-common",  "simpl-js", "simpl-js-rust", "swc-batch","swc-cfg",  "swc-opt-ssa", "swc-ssa", "swc-tac", "swc-util"]
 
 # "js-runtime-lib","swc-emit-rust","swc-waffle"
 

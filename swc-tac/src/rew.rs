@@ -152,6 +152,7 @@ impl Rew {
                             ),
                         }))
                     }
+                    _ => todo!(),
                 };
                 let right = Box::new(match &i2.2 {
                     crate::Item::Just { id } => Expr::Ident(i(id, span)),

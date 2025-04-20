@@ -9,12 +9,13 @@ use std::{
 use anyhow::Context;
 use cfg_traits::Term;
 use id_arena::{Arena, Id};
+use portal_jsc_common::LId;
 use ssa_traits::Value;
 use swc_atoms::Atom;
 use swc_cfg::Catch;
 use swc_common::Span;
 use swc_ecma_ast::{Id as Ident, Lit, Null, TsType, TsTypeAnn, TsTypeParamDecl};
-use swc_tac::{Item, LId, TBlock, TCallee, TCfg, TFunc, ValFlags};
+use swc_tac::{Item, TBlock, TCallee, TCfg, TFunc, ValFlags};
 pub mod ch;
 pub mod idw;
 pub mod impls;
@@ -152,8 +153,8 @@ impl<I: Copy, B> SValue<I, B> {
             SValue::Assign { target, val } => {
                 let v = once(*val);
                 let w: Box<dyn Iterator<Item = &I> + '_> = match target {
-                    swc_tac::LId::Id { id } => todo!(),
-                    swc_tac::LId::Member { obj, mem } => Box::new([obj, &mem[0]].into_iter()),
+                    LId::Id { id } => todo!(),
+                    LId::Member { obj, mem } => Box::new([obj, &mem[0]].into_iter()),
                     _ => todo!(),
                 };
                 Box::new(v.chain(w.cloned()))
@@ -172,8 +173,8 @@ impl<I, B> SValue<I, B> {
             SValue::Assign { target, val } => {
                 let v = once(val);
                 let w: Box<dyn Iterator<Item = &mut I> + '_> = match target {
-                    swc_tac::LId::Id { id } => todo!(),
-                    swc_tac::LId::Member { obj, mem } => Box::new([obj, &mut mem[0]].into_iter()),
+                    LId::Id { id } => todo!(),
+                    LId::Member { obj, mem } => Box::new([obj, &mut mem[0]].into_iter()),
                     _ => todo!(),
                 };
                 Box::new(v.chain(w))

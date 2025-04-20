@@ -129,7 +129,7 @@ impl TCfg {
             } {
                 continue;
             }
-            if a.get(&s.0) == Some(&1) {
+            if a.remove(&s.0) == Some(1) {
                 s.1 |= ValFlags::SSA_LIKE
             }
         }

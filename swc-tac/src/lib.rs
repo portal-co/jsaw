@@ -110,9 +110,25 @@ impl TCfg {
     pub fn remark(&mut self) {
         let mut a: BTreeMap<LId, usize> = BTreeMap::new();
         for s in self.blocks.iter().flat_map(|a| &a.1.stmts) {
+            if match &s.0 {
+                LId::Id { id } => !self.decls.contains(&id),
+                LId::Member { obj, mem } => {
+                    !self.decls.contains(&obj) || !self.decls.contains(&mem[0])
+                }
+            } {
+                continue;
+            }
             *a.entry(s.0.clone()).or_default() += 1usize;
         }
         for s in self.blocks.iter_mut().flat_map(|a| &mut a.1.stmts) {
+            if match &s.0 {
+                LId::Id { id } => !self.decls.contains(&id),
+                LId::Member { obj, mem } => {
+                    !self.decls.contains(&obj) || !self.decls.contains(&mem[0])
+                }
+            } {
+                continue;
+            }
             if a.get(&s.0) == Some(&1) {
                 s.1 |= ValFlags::SSA_LIKE
             }

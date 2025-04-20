@@ -131,6 +131,8 @@ impl TCfg {
             }
             if a.remove(&s.0) == Some(1) {
                 s.1 |= ValFlags::SSA_LIKE
+            } else {
+                s.1 &= !ValFlags::SSA_LIKE;
             }
         }
     }
@@ -407,6 +409,7 @@ impl<I> Item<I> {
     }
 }
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum LId<I = Ident, M: IntoIterator<Item = I> = [I; 1]> {
     Id { id: I },
     Member { obj: I, mem: M },

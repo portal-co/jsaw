@@ -36,5 +36,4 @@ bitflags = "2.8.0"
 relooper = "0.1.0"
 cityhasher = "0.1.0"
 
-portal-pc-waffle="0.3.6"
-waffle-ast="0.4.2"
+portal-pc-waffle="^0.5"

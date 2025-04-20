@@ -79,7 +79,7 @@ impl Rew {
                     for val in a.cfg.blocks[*id].stmts.iter() {
                         match &a.cfg.values[*val].0 {
                             SValue::Param { block, idx, ty } => todo!(),
-                            SValue::Item{item,span} => {
+                            SValue::Item { item, span } => {
                                 let i =
                                     item.clone().map(&mut |v| anyhow::Ok(mangle_value(a, v)))?;
                                 b.blocks[k2].stmts.push((
@@ -88,7 +88,7 @@ impl Rew {
                                     },
                                     ValFlags::SSA_LIKE,
                                     i,
-                                   span.clone().unwrap_or_else(|| Span::dummy_with_cmt())
+                                    span.clone().unwrap_or_else(|| Span::dummy_with_cmt()),
                                 ));
                                 b.decls.insert(mangle_value(a, *val));
                             }
@@ -104,7 +104,7 @@ impl Rew {
                                     Item::Just {
                                         id: mangle_value(a, *val),
                                     },
-                                    Span::dummy_with_cmt()
+                                    Span::dummy_with_cmt(),
                                 ));
                             }
                             SValue::LoadId(i) => {
@@ -114,7 +114,7 @@ impl Rew {
                                     },
                                     ValFlags::SSA_LIKE,
                                     Item::Just { id: i.clone() },
-                                    Span::dummy_with_cmt()
+                                    Span::dummy_with_cmt(),
                                 ));
                                 b.decls.insert(mangle_value(a, *val));
                             }
@@ -125,7 +125,7 @@ impl Rew {
                                     Item::Just {
                                         id: mangle_value(a, *val),
                                     },
-                                    Span::dummy_with_cmt()
+                                    Span::dummy_with_cmt(),
                                 ));
                             }
                             SValue::Benc(v) => {
@@ -137,7 +137,7 @@ impl Rew {
                                     Item::Just {
                                         id: mangle_value(a, *v),
                                     },
-                                    Span::dummy_with_cmt()
+                                    Span::dummy_with_cmt(),
                                 ));
                             }
                         }
@@ -202,7 +202,7 @@ impl Rew {
                                 },
                                 Default::default(),
                                 Item::Just { id: b },
-                                Span::dummy_with_cmt()
+                                Span::dummy_with_cmt(),
                             )
                         });
                     b.blocks[k2].stmts.extend(stmts);

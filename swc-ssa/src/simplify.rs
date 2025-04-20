@@ -13,7 +13,11 @@ impl SwcFunc {
                 if_false,
             } = &mut kd.postcedent.term
             {
-                if let SValue::Item{item:Item::Lit { lit: Lit::Bool(b) },span} = &self.values[*cond].0 {
+                if let SValue::Item {
+                    item: Item::Lit { lit: Lit::Bool(b) },
+                    span,
+                } = &self.values[*cond].0
+                {
                     kd.postcedent.term = STerm::Jmp(if b.value {
                         if_true.clone()
                     } else {
@@ -24,21 +28,26 @@ impl SwcFunc {
         }
     }
 }
-pub trait SValGetter<I: Copy,B>{
-    fn val(&self, id: I) -> Option<&SValue<I,B>>;
+pub trait SValGetter<I: Copy, B> {
+    fn val(&self, id: I) -> Option<&SValue<I, B>>;
 }
-impl SValGetter<Id<SValueW>,Id<SBlock>> for SwcFunc{
-    fn val(&self, id: Id<SValueW>) -> Option<&SValue<Id<SValueW>,Id<SBlock>>> {
+impl SValGetter<Id<SValueW>, Id<SBlock>> for SwcFunc {
+    fn val(&self, id: Id<SValueW>) -> Option<&SValue<Id<SValueW>, Id<SBlock>>> {
         Some(&self.values[id].0)
     }
 }
-pub(crate)fn default_ctx() -> ExprCtx{
-    ExprCtx { unresolved_ctxt: SyntaxContext::empty(), is_unresolved_ref_safe: false, in_strict: true, remaining_depth: 4 }
+pub(crate) fn default_ctx() -> ExprCtx {
+    ExprCtx {
+        unresolved_ctxt: SyntaxContext::empty(),
+        is_unresolved_ref_safe: false,
+        in_strict: true,
+        remaining_depth: 4,
+    }
 }
-impl<I: Copy,B> SValue<I,B> {
-    pub fn const_in(&self, k: &impl SValGetter<I,B>) -> Option<Lit> {
+impl<I: Copy, B> SValue<I, B> {
+    pub fn const_in(&self, k: &impl SValGetter<I, B>) -> Option<Lit> {
         match self {
-            SValue::Item{item,span} => match item {
+            SValue::Item { item, span } => match item {
                 Item::Just { id } => None,
                 Item::Bin { left, right, op } => {
                     let left = k.val(*left)?.const_in(k)?;
@@ -280,7 +289,7 @@ impl<I: Copy,B> SValue<I,B> {
                 Item::Mem { obj, mem } => None,
                 Item::Func { func } => None,
                 Item::Lit { lit } => Some(lit.clone()),
-                Item::Call {callee, args } => None,
+                Item::Call { callee, args } => None,
                 Item::Obj { members } => None,
                 Item::Arr { members } => None,
                 Item::Yield { value, delegate } => None,

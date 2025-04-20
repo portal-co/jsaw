@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use bitflags::bitflags;
 use swc_ecma_ast::Lit;
 
-
 bitflags! {
     #[derive(Default,Clone,Copy,Eq,PartialEq,Ord,PartialOrd,Hash,Debug)]
     pub struct ParentFlags: u64{
@@ -13,9 +12,9 @@ bitflags! {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
-pub enum ObjType{
+pub enum ObjType {
     Array,
-    Object(Vec<String>)
+    Object(Vec<String>),
 }
 #[derive(Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -38,9 +37,9 @@ pub enum OptType {
         elem_tys: Vec<Option<OptType>>,
     },
     Lit(Lit),
-    Variant{
-        parts: BTreeMap<String,Vec<Option<OptType>>>
-    }
+    Variant {
+        parts: BTreeMap<String, Vec<Option<OptType>>>,
+    },
 }
 impl OptType {
     pub fn parent(&self, flags: ParentFlags) -> Option<OptType> {
@@ -132,30 +131,34 @@ impl OptType {
                     }
                 }
             }
-            OptType::Lit(l) => match l{
+            OptType::Lit(l) => match l {
                 Lit::BigInt(i) => {
-                    if *i.value > 0u8.into() && i.value.as_ref().clone() >> 64 == 0u8.into(){
+                    if *i.value > 0u8.into() && i.value.as_ref().clone() >> 64 == 0u8.into() {
                         let a: u64 = i.value.as_ref().clone().try_into().unwrap();
-                        return Some(OptType::U64 { bits_usable: a.leading_zeros() as u8 })
+                        return Some(OptType::U64 {
+                            bits_usable: a.leading_zeros() as u8,
+                        });
                     }
                     Some(OptType::BigInt)
                 }
                 Lit::Num(n) => {
-                    if let Some(a) = num_traits::cast(n.value){
+                    if let Some(a) = num_traits::cast(n.value) {
                         let a: u32 = a;
-                        return Some(OptType::U32 { bits_usable: a.leading_zeros() as u8 });
+                        return Some(OptType::U32 {
+                            bits_usable: a.leading_zeros() as u8,
+                        });
                     }
                     Some(OptType::Number)
                 }
-                _ => None
+                _ => None,
             },
             OptType::Variant { parts } => {
                 let mut parts = parts.clone();
-                for (_,p) in parts.iter_mut(){
-                    for p in p.iter_mut().rev(){
-                        if let Some(r) = p.take(){
+                for (_, p) in parts.iter_mut() {
+                    for p in p.iter_mut().rev() {
+                        if let Some(r) = p.take() {
                             *p = r.parent(flags);
-                            return Some(OptType::Variant { parts: parts })
+                            return Some(OptType::Variant { parts: parts });
                         }
                     }
                 }

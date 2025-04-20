@@ -97,7 +97,7 @@ pub enum SimplItem<D: TacDialect, P = SimplPathId> {
         args: Vec<(P, D::Mark<()>)>,
     },
     CallTag {
-        tag: FuncId<Expr,D::Tag>,
+        tag: FuncId<Expr, D::Tag>,
         args: Vec<(P, D::Mark<()>)>,
     },
     DiscriminantIn {

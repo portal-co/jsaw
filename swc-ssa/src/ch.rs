@@ -90,10 +90,13 @@ impl CH {
                         match l {
                             Some(l) => {
                                 let v = out.values.alloc(
-                                    SValue::Item{item:match l {
-                                        ConstVal::Lit(lit) => Item::Lit { lit: lit.clone() },
-                                        ConstVal::Undef => Item::Undef,
-                                    },span: None}
+                                    SValue::Item {
+                                        item: match l {
+                                            ConstVal::Lit(lit) => Item::Lit { lit: lit.clone() },
+                                            ConstVal::Undef => Item::Undef,
+                                        },
+                                        span: None,
+                                    }
                                     .into(),
                                 );
                                 out.blocks[n].stmts.push(v);
@@ -105,28 +108,35 @@ impl CH {
                 })
                 .collect::<BTreeMap<_, _>>();
             for s in inp.blocks[k].stmts.iter().cloned() {
-                let v =
-                    match inp.values[s].0.clone() {
-                        SValue::Param { block, idx, ty } => todo!(),
-                        SValue::Item{item,span} => SValue::Item{item:item.map(&mut |a| {
+                let v = match inp.values[s].0.clone() {
+                    SValue::Param { block, idx, ty } => todo!(),
+                    SValue::Item { item, span } => SValue::Item {
+                        item: item.map(&mut |a| {
                             params.get(&a).cloned().context("in getting a variable")
-                        })?,span},
-                        SValue::Assign { target, val } => SValue::Assign {
-                            target: target.map(&mut |a| {
-                                params.get(&a).cloned().context("in getting a variable")
-                            })?,
-                            val: params.get(&val).cloned().context("in getting a variable")?,
-                        },
-                        SValue::LoadId(i) => SValue::LoadId(i),
-                        SValue::StoreId { target, val } => SValue::StoreId {
-                            target,
-                            val: params.get(&val).cloned().context("in getting a variable")?,
-                        },
-                        SValue::Benc(val) => SValue::Benc(params.get(&val).cloned().context("in getting a variable")?),
-                    };
+                        })?,
+                        span,
+                    },
+                    SValue::Assign { target, val } => SValue::Assign {
+                        target: target.map(&mut |a| {
+                            params.get(&a).cloned().context("in getting a variable")
+                        })?,
+                        val: params.get(&val).cloned().context("in getting a variable")?,
+                    },
+                    SValue::LoadId(i) => SValue::LoadId(i),
+                    SValue::StoreId { target, val } => SValue::StoreId {
+                        target,
+                        val: params.get(&val).cloned().context("in getting a variable")?,
+                    },
+                    SValue::Benc(val) => {
+                        SValue::Benc(params.get(&val).cloned().context("in getting a variable")?)
+                    }
+                };
                 let v = match v.const_in(out) {
                     None => v,
-                    Some(a) => SValue::Item{item:Item::Lit { lit: a.clone() },span: Some(a.span())},
+                    Some(a) => SValue::Item {
+                        item: Item::Lit { lit: a.clone() },
+                        span: Some(a.span()),
+                    },
                 };
                 let v = out.values.alloc(v.into());
                 out.blocks[n].stmts.push(v);
@@ -145,11 +155,19 @@ impl CH {
                     .filter_map(|b| params.get(b))
                     .filter_map(|b| {
                         'a: {
-                            if let SValue::Item{item:Item::Lit { lit },span} = &out.values[*b].0 {
+                            if let SValue::Item {
+                                item: Item::Lit { lit },
+                                span,
+                            } = &out.values[*b].0
+                            {
                                 funcs.push(Some(ConstVal::Lit(lit.clone())));
                                 return None;
                             };
-                            if let SValue::Item{item:Item::Undef,span} = &out.values[*b].0 {
+                            if let SValue::Item {
+                                item: Item::Undef,
+                                span,
+                            } = &out.values[*b].0
+                            {
                                 funcs.push(Some(ConstVal::Undef));
                                 return None;
                             }
@@ -177,7 +195,10 @@ impl CH {
                 }
                 STerm::Return(id) => STerm::Return(match id.as_ref() {
                     None => Some({
-                        let val = SValue::Item{item:Item::Undef,span:None};
+                        let val = SValue::Item {
+                            item: Item::Undef,
+                            span: None,
+                        };
                         let val = out.values.alloc(val.into());
                         out.blocks[n].stmts.push(val);
                         val
@@ -192,22 +213,23 @@ impl CH {
                 } => {
                     let cond = params.get(cond).cloned().context("in getting the cond")?;
                     match &out.values[cond].0 {
-                        SValue::Item{item:Item::Lit { lit },span} => {
-                            match Expr::Lit(lit.clone()).as_pure_bool(default_ctx()) {
-                                Value::Known(k) => STerm::Jmp(tgt(
-                                    self,
-                                    inp,
-                                    out,
-                                    if k { if_true } else { if_false },
-                                    0,
-                                )?),
-                                _ => STerm::CondJmp {
-                                    cond: cond,
-                                    if_true: tgt(self, inp, out, if_true, 0)?,
-                                    if_false: tgt(self, inp, out, if_false, 0)?,
-                                },
-                            }
-                        }
+                        SValue::Item {
+                            item: Item::Lit { lit },
+                            span,
+                        } => match Expr::Lit(lit.clone()).as_pure_bool(default_ctx()) {
+                            Value::Known(k) => STerm::Jmp(tgt(
+                                self,
+                                inp,
+                                out,
+                                if k { if_true } else { if_false },
+                                0,
+                            )?),
+                            _ => STerm::CondJmp {
+                                cond: cond,
+                                if_true: tgt(self, inp, out, if_true, 0)?,
+                                if_false: tgt(self, inp, out, if_false, 0)?,
+                            },
+                        },
                         _ => STerm::CondJmp {
                             cond: cond,
                             if_true: tgt(self, inp, out, if_true, 0)?,

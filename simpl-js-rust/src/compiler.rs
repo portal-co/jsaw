@@ -1,4 +1,7 @@
-use std::{collections::{BTreeMap, BTreeSet}, vec::Vec};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    vec::Vec,
+};
 
 use portal_jsc_swc_batch::{ImportMapping, ModuleMapping};
 use quote::ToTokens;

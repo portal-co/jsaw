@@ -411,19 +411,26 @@ impl HasValues<SFunc> for SPostcedent {
         self.values_chain_mut()
     }
 }
-impl ssa_traits::TypedFunc for SFunc{
+impl ssa_traits::TypedFunc for SFunc {
     type Ty = ();
 
     fn add_blockparam(&mut self, k: Self::Block, y: Self::Ty) -> Self::Value {
         self.cfg.add_blockparam(k)
     }
 }
-impl ssa_traits::TypedBlock<SFunc> for SBlock{
-    fn params(&self) -> impl Iterator<Item = (<SFunc as ssa_traits::TypedFunc>::Ty, <SFunc as ssa_traits::Func>::Value)> {
-        return self.params.iter().map(|(a,b)|(*b,*a));
+impl ssa_traits::TypedBlock<SFunc> for SBlock {
+    fn params(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            <SFunc as ssa_traits::TypedFunc>::Ty,
+            <SFunc as ssa_traits::Func>::Value,
+        ),
+    > {
+        return self.params.iter().map(|(a, b)| (*b, *a));
     }
 }
-impl ssa_traits::TypedValue<SFunc> for SValueW{
+impl ssa_traits::TypedValue<SFunc> for SValueW {
     fn ty(&self, f: &SFunc) -> <SFunc as ssa_traits::TypedFunc>::Ty {
         ()
     }

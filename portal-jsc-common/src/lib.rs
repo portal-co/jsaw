@@ -54,3 +54,9 @@ impl<I, M: IntoIterator<Item = I>> LId<I, M> {
         })
     }
 }
+#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum ImportMap<T> {
+    Default,
+    Star,
+    Named { name: T },
+}

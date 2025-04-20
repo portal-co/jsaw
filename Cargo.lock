@@ -659,6 +659,7 @@ version = "0.4.0"
 dependencies = [
  "bitflags",
  "num-traits",
+ "portal-jsc-common",
  "swc_atoms",
  "swc_common",
  "swc_ecma_ast",

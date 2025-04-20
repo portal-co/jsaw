@@ -1,5 +1,6 @@
 use std::fmt::Display;
 
+pub use portal_jsc_common::ImportMap;
 use swc_atoms::Atom;
 use swc_common::{
     errors::{ColorConfig, Handler},
@@ -94,12 +95,7 @@ impl<T: AsRef<T> + AsMut<T>> Extract<T> for T {
     }
 }
 // impl<T, U: Into<T> + AsRef<T> + AsMut<T>> Extract<T> for U {}
-#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub enum ImportMap<T> {
-    Default,
-    Star,
-    Named { name: T },
-}
+
 pub fn mangle((a, b): &Id) -> Atom {
     Atom::new(format!("{}${a}", b.as_u32()))
 }

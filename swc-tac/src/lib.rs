@@ -426,6 +426,24 @@ impl<I> LId<I> {
     }
 }
 impl<I, M: IntoIterator<Item = I>> LId<I, M> {
+    pub fn as_ref<'a>(&'a self) -> LId<&'a I,&'a M> where &'a M: IntoIterator<Item = &'a I>{
+        match self{
+            LId::Id { id } => LId::Id { id },
+            LId::Member { obj, mem } => LId::Member { obj, mem },
+        }
+    }
+    pub fn as_mut<'a>(&'a mut self) -> LId<&'a mut I,&'a mut M> where &'a mut M: IntoIterator<Item = &'a mut I>{
+        match self{
+            LId::Id { id } => LId::Id { id },
+            LId::Member { obj, mem } => LId::Member { obj, mem },
+        }
+    }
+    pub fn refs(self) -> impl Iterator<Item = I> {
+        match self {
+            LId::Id { id } => Either::Left(once(id)),
+            LId::Member { obj, mem } => Either::Right(once(obj).chain(mem)),
+        }
+    }
     pub fn map2<J, N: IntoIterator<Item = J>, E>(
         self,
         f: &mut impl FnMut(I) -> Result<J, E>,

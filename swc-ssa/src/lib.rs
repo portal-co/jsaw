@@ -153,7 +153,7 @@ impl<I: Copy, B> SValue<I, B> {
                 let v = once(*val);
                 let w: Box<dyn Iterator<Item = &I> + '_> = match target {
                     swc_tac::LId::Id { id } => todo!(),
-                    swc_tac::LId::Member { obj, mem } => Box::new([obj, mem].into_iter()),
+                    swc_tac::LId::Member { obj, mem } => Box::new([obj, &mem[0]].into_iter()),
                 };
                 Box::new(v.chain(w.cloned()))
             }
@@ -172,7 +172,7 @@ impl<I, B> SValue<I, B> {
                 let v = once(val);
                 let w: Box<dyn Iterator<Item = &mut I> + '_> = match target {
                     swc_tac::LId::Id { id } => todo!(),
-                    swc_tac::LId::Member { obj, mem } => Box::new([obj, mem].into_iter()),
+                    swc_tac::LId::Member { obj, mem } => Box::new([obj, &mut mem[0]].into_iter()),
                 };
                 Box::new(v.chain(w))
             }

@@ -147,7 +147,7 @@ impl TCfg {
                 let a: Box<dyn Iterator<Item = Ident> + '_> = match a {
                     LId::Id { id } => Box::new(once(id.clone())),
                     LId::Member { obj, mem } => {
-                        Box::new(once(obj.clone()).chain(once(mem.clone())))
+                        Box::new(once(obj.clone()).chain(once(mem[0].clone())))
                     }
                 };
                 let b: Box<dyn Iterator<Item = Ident> + '_> = match b {
@@ -391,17 +391,32 @@ impl<I> Item<I> {
     }
 }
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum LId<I = Ident> {
+pub enum LId<I = Ident, M: IntoIterator<Item = I> = [I; 1]> {
     Id { id: I },
-    Member { obj: I, mem: I },
+    Member { obj: I, mem: M },
 }
 impl<I> LId<I> {
     pub fn map<J, E>(self, f: &mut impl FnMut(I) -> Result<J, E>) -> Result<LId<J>, E> {
         Ok(match self {
             LId::Id { id } => LId::Id { id: f(id)? },
+            LId::Member { obj, mem: [mem] } => LId::Member {
+                obj: f(obj)?,
+                mem: [f(mem)?],
+            },
+        })
+    }
+}
+impl<I, M: IntoIterator<Item = I>> LId<I, M> {
+    pub fn map2<J, N: IntoIterator<Item = J>, E>(
+        self,
+        f: &mut impl FnMut(I) -> Result<J, E>,
+        g: &mut impl FnMut(M) -> Result<N, E>,
+    ) -> Result<LId<J, N>, E> {
+        Ok(match self {
+            LId::Id { id } => LId::Id { id: f(id)? },
             LId::Member { obj, mem } => LId::Member {
                 obj: f(obj)?,
-                mem: f(mem)?,
+                mem: g(mem)?,
             },
         })
     }
@@ -663,7 +678,7 @@ impl Trans {
                                 o.blocks[t].stmts.push((
                                     LId::Member {
                                         obj: obj.clone(),
-                                        mem: mem.clone(),
+                                        mem: [mem.clone()],
                                     },
                                     Default::default(),
                                     item,

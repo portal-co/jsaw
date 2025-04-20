@@ -140,7 +140,7 @@ impl Rew {
                     ),
                     crate::LId::Member { obj, mem } => {
                         let obj = i(obj, span);
-                        let mem = i(mem, span);
+                        let mem = i(&mem[0], span);
                         AssignTarget::Simple(swc_ecma_ast::SimpleAssignTarget::Member(MemberExpr {
                             span: span,
                             obj: Box::new(Expr::Ident(obj)),

@@ -107,6 +107,17 @@ pub struct TCfg {
     pub ts_retty: Option<TsTypeAnn>,
 }
 impl TCfg {
+    pub fn remark(&mut self) {
+        let mut a: BTreeMap<LId, usize> = BTreeMap::new();
+        for s in self.blocks.iter().flat_map(|a| &a.1.stmts) {
+            *a.entry(s.0.clone()).or_default() += 1usize;
+        }
+        for s in self.blocks.iter_mut().flat_map(|a| &mut a.1.stmts) {
+            if a.get(&s.0) == Some(&1) {
+                s.1 |= ValFlags::SSA_LIKE
+            }
+        }
+    }
     pub fn def(&self, i: LId<Ident>) -> Option<&Item> {
         self.blocks.iter().flat_map(|a| &a.1.stmts).find_map(|a| {
             if a.0 == i && a.1.contains(ValFlags::SSA_LIKE) {

@@ -107,6 +107,15 @@ pub struct TCfg {
     pub ts_retty: Option<TsTypeAnn>,
 }
 impl TCfg {
+    pub fn def(&self, i: LId<Ident>) -> Option<&Item> {
+        self.blocks.iter().flat_map(|a| &a.1.stmts).find_map(|a| {
+            if a.0 == i && a.1.contains(ValFlags::SSA_LIKE) {
+                Some(&a.2)
+            } else {
+                None
+            }
+        })
+    }
     pub fn refs<'a>(&'a self) -> impl Iterator<Item = Ident> + 'a {
         let a = self.blocks.iter().flat_map(|k| {
             let i: Box<dyn Iterator<Item = Ident> + '_> = match &k.1.term {
@@ -123,7 +132,7 @@ impl TCfg {
                 }
                 TTerm::Default => Box::new(std::iter::empty()),
             };
-            i.chain(k.1.stmts.iter().flat_map(|(a, _, b,_)| {
+            i.chain(k.1.stmts.iter().flat_map(|(a, _, b, _)| {
                 let a: Box<dyn Iterator<Item = Ident> + '_> = match a {
                     LId::Id { id } => Box::new(once(id.clone())),
                     LId::Member { obj, mem } => {
@@ -189,7 +198,7 @@ pub struct TBlock {
     pub stmts: Vec<(LId, ValFlags, Item, Span)>,
     pub catch: TCatch,
     pub term: TTerm,
-    pub orig_span: Option<Span>
+    pub orig_span: Option<Span>,
 }
 #[derive(Clone, Default)]
 pub enum TCatch {
@@ -370,7 +379,7 @@ impl<I> Item<I> {
         }
     }
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LId<I = Ident> {
     Id { id: I },
     Member { obj: I, mem: I },
@@ -512,7 +521,7 @@ impl Trans {
                                         },
                                         Default::default(),
                                         Item::Just { id: f },
-                                        e.span()
+                                        e.span(),
                                     ));
                                     o.decls.insert(i2.id.clone().into());
                                     if let Some(a) = i2.type_ann.as_ref().cloned() {
@@ -553,7 +562,7 @@ impl Trans {
             LId::Id { id: v.clone() },
             ValFlags::SSA_LIKE,
             Item::Mem { obj, mem },
-            s.span()
+            s.span(),
         ));
         o.decls.insert(v.clone());
         Ok((v, t))
@@ -589,7 +598,7 @@ impl Trans {
                                     },
                                     Default::default(),
                                     item,
-                                    i.span()
+                                    i.span(),
                                 ));
                                 right = i.id.clone().into();
                             }
@@ -631,7 +640,7 @@ impl Trans {
                                                 obj: obj.clone(),
                                                 mem: mem.clone(),
                                             },
-                                            m.span()
+                                            m.span(),
                                         ));
                                         Item::Bin {
                                             left: right,
@@ -654,7 +663,7 @@ impl Trans {
                                     LId::Id { id: right.clone() },
                                     ValFlags::SSA_LIKE,
                                     Item::Mem { obj, mem },
-                                    m.span()
+                                    m.span(),
                                 ));
                                 o.decls.insert(right.clone());
                             }
@@ -701,7 +710,7 @@ impl Trans {
                     LId::Id { id: tmp.clone() },
                     ValFlags::SSA_LIKE,
                     Item::Call { callee: c, args },
-                    call.span()
+                    call.span(),
                 ));
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
@@ -720,7 +729,7 @@ impl Trans {
                         right,
                         op: bin.op.clone(),
                     },
-                    bin.span()
+                    bin.span(),
                 ));
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
@@ -732,7 +741,7 @@ impl Trans {
                         LId::Id { id: tmp.clone() },
                         ValFlags::SSA_LIKE,
                         Item::Undef,
-                        un.span()
+                        un.span(),
                     ));
                     o.decls.insert(tmp.clone());
                     return Ok((tmp, t));
@@ -749,7 +758,7 @@ impl Trans {
                         arg,
                         op: un.op.clone(),
                     },
-                    un.span()
+                    un.span(),
                 ));
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
@@ -761,7 +770,7 @@ impl Trans {
                     LId::Id { id: tmp.clone() },
                     ValFlags::SSA_LIKE,
                     Item::Lit { lit: l.clone() },
-                    l.span()
+                    l.span(),
                 ));
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
@@ -777,7 +786,7 @@ impl Trans {
                     Item::Func {
                         func: f.function.as_ref().clone().try_into()?,
                     },
-                    f.span()
+                    f.span(),
                 ));
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
@@ -800,7 +809,7 @@ impl Trans {
                     LId::Id { id: tmp.clone() },
                     ValFlags::SSA_LIKE,
                     Item::Arr { members },
-                    arr.span()
+                    arr.span(),
                 ));
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
@@ -872,7 +881,7 @@ impl Trans {
                     LId::Id { id: tmp.clone() },
                     ValFlags::SSA_LIKE,
                     Item::Obj { members },
-                    obj.span()
+                    obj.span(),
                 ));
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
@@ -884,7 +893,7 @@ impl Trans {
                     LId::Id { id: tmp.clone() },
                     ValFlags::SSA_LIKE,
                     Item::Await { value: a.clone() },
-                    x.span()
+                    x.span(),
                 ));
                 return Ok((tmp, t));
             }
@@ -905,7 +914,7 @@ impl Trans {
                         value: y2,
                         delegate: y.delegate,
                     },
-                    y.span()
+                    y.span(),
                 ));
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));

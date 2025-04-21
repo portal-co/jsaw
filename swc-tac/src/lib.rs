@@ -732,7 +732,45 @@ impl Trans {
                         _ => {
                             let r#fn;
                             (r#fn, t) = self.expr(i, o, b, t, e.as_ref())?;
-                            TCallee::Val(r#fn)
+                            match o
+                                .def(portal_jsc_common::LId::Id { id: r#fn.clone() })
+                                .cloned()
+                            {
+                                Some(Item::Func { func })
+                                    if func.params.len() == call.args.len() =>
+                                {
+                                    for (p, a) in func.params.iter().zip(call.args.iter()) {
+                                        // let Pat::Ident(id) = &p.pat else {
+                                        //     anyhow::bail!("non-simple pattern")
+                                        // };
+                                        let arg;
+                                        (arg, t) = self.expr(i, o, b, t, &a.expr)?;
+                                        o.blocks[t].stmts.push((
+                                            LId::Id { id: p.clone() },
+                                            Default::default(),
+                                            Item::Just { id: arg },
+                                            a.span(),
+                                        ));
+                                    }
+                                    let tmp = o.regs.alloc(());
+                                    let t2 = o.blocks.alloc(TBlock {
+                                        stmts: vec![],
+                                        catch: o.blocks[t].catch.clone(),
+                                        term: Default::default(),
+                                        orig_span: Some(e.span()),
+                                    });
+                                    let cfg: swc_cfg::Func = func.clone().try_into()?;
+                                    let mut t4 = Trans {
+                                        map: Default::default(),
+                                        ret_to: Some((tmp.clone(), t2)),
+                                        recatch: o.blocks[t].catch.clone(),
+                                    };
+                                    let t3 = t4.trans(&cfg.cfg, o, cfg.entry)?;
+                                    o.blocks[t].term = TTerm::Jmp(t3);
+                                    return Ok((tmp, t2));
+                                }
+                                _ => TCallee::Val(r#fn),
+                            }
                         }
                     },
                     _ => anyhow::bail!("todo: {}:{}", file!(), line!()),

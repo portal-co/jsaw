@@ -575,6 +575,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "portal-jsc-jacon-backend"
+version = "0.1.0"
+dependencies = [
+ "either",
+ "itertools",
+]
+
+[[package]]
 name = "portal-jsc-simpl-js"
 version = "0.4.0"
 dependencies = [

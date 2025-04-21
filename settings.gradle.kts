@@ -6,3 +6,4 @@
  */
 
 rootProject.name = "jsaw"
+include(":jacon")

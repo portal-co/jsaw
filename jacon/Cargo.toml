@@ -3,7 +3,7 @@ name = "portal-jsc-jacon-backend"
 version = "0.1.0"
 edition = "2024"
 license = "MPL-2.0"
-description = "Java backend for JavaScript"
+description = "Java backend for ECMAScript"
 
 [dependencies]
 either = { version = "^1.15.0", default-features = false }

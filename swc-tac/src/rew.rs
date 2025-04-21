@@ -4,7 +4,6 @@ use id_arena::Id;
 use swc_cfg::{Block, Cfg};
 use swc_cfg::{Func, Term};
 use swc_common::{Span, SyntaxContext};
-use swc_ecma_ast::CallExpr;
 use swc_ecma_ast::ComputedPropName;
 use swc_ecma_ast::Expr;
 use swc_ecma_ast::ExprOrSpread;
@@ -23,6 +22,7 @@ use swc_ecma_ast::{ArrayLit, Param};
 use swc_ecma_ast::{AssignExpr, Decl, VarDecl, VarDeclarator};
 use swc_ecma_ast::{AssignTarget, Function};
 use swc_ecma_ast::{BinExpr, BindingIdent, TsTypeAnn};
+use swc_ecma_ast::{BinaryOp, CallExpr, Lit, Number};
 
 use crate::{TBlock, TCallee, TCfg, TFunc};
 
@@ -273,6 +273,19 @@ impl Rew {
                         arg: Box::new(Expr::Ident(i(value, span))),
                     }),
                     crate::Item::Undef => *Expr::undefined(span),
+                    crate::Item::Asm { value } => match value {
+                        portal_jsc_common::Asm::OrZero(a) => Expr::Bin(BinExpr {
+                            span,
+                            op: BinaryOp::BitOr,
+                            left: Box::new(Expr::Ident(i(a, span))),
+                            right: Box::new(Expr::Lit(Lit::Num(Number {
+                                span,
+                                value: 0.0,
+                                raw: None,
+                            }))),
+                        }),
+                        _ => todo!(),
+                    },
                 });
                 cfg.blocks[l].stmts.push(Stmt::Expr(ExprStmt {
                     span: span,

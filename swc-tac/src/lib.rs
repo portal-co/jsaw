@@ -7,12 +7,13 @@ use arena_traits::{Arena as TArena, IndexAlloc};
 use bitflags::bitflags;
 use id_arena::{Arena, Id};
 use lam::LAM;
+use portal_jsc_common::Asm;
 use swc_cfg::{Block, Catch, Cfg, Func};
 use swc_common::pass::Either;
 use swc_common::{Span, Spanned};
 use swc_ecma_ast::{
-    AssignOp, BinaryOp, Callee, Expr, ExprOrSpread, Function, Lit, MemberExpr, MemberProp, Pat,
-    SimpleAssignTarget, Stmt, Str, TsType, TsTypeAnn, TsTypeParamDecl, UnaryOp,
+    AssignOp, BinaryOp, Callee, Expr, ExprOrSpread, Function, Lit, MemberExpr, MemberProp, Number,
+    Pat, SimpleAssignTarget, Stmt, Str, TsType, TsTypeAnn, TsTypeParamDecl, UnaryOp,
 };
 
 use swc_ecma_ast::Id as Ident;
@@ -64,6 +65,8 @@ impl TryFrom<Func> for TFunc {
         let mut cfg = TCfg::default();
         let entry = Trans {
             map: BTreeMap::new(),
+            ret_to: None,
+            recatch: TCatch::Throw,
         }
         .trans(&value.cfg, &mut cfg, value.entry)?;
         cfg.ts_retty = value.cfg.ts_retty;
@@ -166,39 +169,7 @@ impl TCfg {
             };
             i.chain(k.1.stmts.iter().flat_map(|(a, _, b, _)| {
                 let a: Box<dyn Iterator<Item = Ident> + '_> = Box::new(a.as_ref().refs().cloned());
-                let b: Box<dyn Iterator<Item = Ident> + '_> = match b {
-                    Item::Just { id } => Box::new(once(id.clone())),
-                    Item::Bin { left, right, op } => {
-                        Box::new(vec![left.clone(), right.clone()].into_iter())
-                    }
-                    Item::Un { arg, op } => Box::new(once(arg.clone())),
-                    Item::Mem { obj, mem } => Box::new(once(obj.clone()).chain(once(mem.clone()))),
-                    Item::Func { func } => Box::new(func.cfg.externs()),
-                    Item::Lit { lit } => Box::new(empty()),
-                    Item::Call { callee, args } => Box::new(
-                        match callee {
-                            TCallee::Val(v) => once(v.clone()).chain(None.into_iter()),
-                            TCallee::Member { r#fn, member } => {
-                                once(r#fn.clone()).chain(Some(member.clone()).into_iter())
-                            }
-                            TCallee::Static(v) => once(v.clone()).chain(None.into_iter()),
-                        }
-                        .chain(args.iter().cloned()),
-                    ),
-                    Item::Obj { members } => Box::new(members.iter().flat_map(|(a, b)| {
-                        once(b.clone()).chain(
-                            match a {
-                                PropKey::Lit(i) => None,
-                                PropKey::Computed(i) => Some(i.clone()),
-                            }
-                            .into_iter(),
-                        )
-                    })),
-                    Item::Arr { members } => Box::new(members.iter().cloned()),
-                    Item::Yield { value, delegate } => Box::new(value.iter().cloned()),
-                    Item::Await { value } => Box::new(once(value.clone())),
-                    Item::Undef => Box::new(empty()),
-                };
+                let b = b.refs().cloned();
                 a.chain(b)
             }))
         });
@@ -299,6 +270,7 @@ pub enum Item<I = Ident> {
     Arr { members: Vec<I> },
     Yield { value: Option<I>, delegate: bool },
     Await { value: I },
+    Asm { value: Asm<I> },
     Undef,
 }
 impl<I> Item<I> {
@@ -339,6 +311,9 @@ impl<I> Item<I> {
             },
             Item::Await { value } => Item::Await { value: f(value)? },
             Item::Undef => Item::Undef,
+            Item::Asm { value } => Item::Asm {
+                value: value.map(f)?,
+            },
         })
     }
     pub fn refs<'a>(&'a self) -> Box<dyn Iterator<Item = &'a I> + 'a> {
@@ -371,6 +346,7 @@ impl<I> Item<I> {
             swc_tac::Item::Yield { value, delegate } => Box::new(value.iter()),
             swc_tac::Item::Await { value } => Box::new(once(value)),
             swc_tac::Item::Undef => Box::new(empty()),
+            Item::Asm { value } => Box::new(value.refs()),
         }
     }
     pub fn refs_mut<'a>(&'a mut self) -> Box<dyn Iterator<Item = &'a mut I> + 'a> {
@@ -403,6 +379,7 @@ impl<I> Item<I> {
             swc_tac::Item::Yield { value, delegate } => Box::new(value.iter_mut()),
             swc_tac::Item::Await { value } => Box::new(once(value)),
             swc_tac::Item::Undef => Box::new(empty()),
+            Item::Asm { value } => Box::new(value.refs_mut()),
         }
     }
 }
@@ -411,6 +388,8 @@ impl<I> Item<I> {
 #[non_exhaustive]
 pub struct Trans {
     pub map: BTreeMap<Id<Block>, Id<TBlock>>,
+    pub ret_to: Option<(Ident, Id<TBlock>)>,
+    pub recatch: TCatch,
 }
 impl Trans {
     pub fn trans(&mut self, i: &Cfg, o: &mut TCfg, b: Id<Block>) -> anyhow::Result<Id<TBlock>> {
@@ -420,7 +399,7 @@ impl Trans {
             }
             let t = o.blocks.alloc(TBlock {
                 stmts: vec![],
-                catch: TCatch::Throw,
+                catch: self.recatch.clone(),
                 term: Default::default(),
                 orig_span: i.blocks[b].end.orig_span.clone(),
             });
@@ -442,12 +421,31 @@ impl Trans {
                 t = self.stmt(i, o, b, t, s)?;
             }
             let term = match &i.blocks[b].end.term {
-                swc_cfg::Term::Return(expr) => match expr {
-                    None => TTerm::Return(None),
-                    Some(a) => {
-                        let c;
-                        (c, t) = self.expr(i, o, b, t, a)?;
-                        TTerm::Return(Some(c))
+                swc_cfg::Term::Return(expr) => match self.ret_to.clone() {
+                    None => match expr {
+                        None => TTerm::Return(None),
+                        Some(a) => {
+                            let c;
+                            (c, t) = self.expr(i, o, b, t, a)?;
+                            TTerm::Return(Some(c))
+                        }
+                    },
+                    Some((i2, b2)) => {
+                        if let Some(a) = expr {
+                            let c;
+                            (c, t) = self.expr(i, o, b, t, a)?;
+                            o.blocks[t].stmts.push((
+                                LId::Id { id: i2.clone() },
+                                Default::default(),
+                                Item::Just { id: c },
+                                i.blocks[b]
+                                    .end
+                                    .orig_span
+                                    .clone()
+                                    .unwrap_or_else(|| Span::dummy_with_cmt()),
+                            ));
+                        }
+                        TTerm::Jmp(b2)
                     }
                 },
                 swc_cfg::Term::Throw(expr) => {
@@ -700,6 +698,37 @@ impl Trans {
                             (member, t) = self.expr(i, o, b, t, &imp(m.prop.clone()))?;
                             TCallee::Member { r#fn, member }
                         }
+                        Expr::Fn(f) if f.function.params.len() == call.args.len() => {
+                            for (p, a) in f.function.params.iter().zip(call.args.iter()) {
+                                let Pat::Ident(id) = &p.pat else {
+                                    anyhow::bail!("non-simple pattern")
+                                };
+                                let arg;
+                                (arg, t) = self.expr(i, o, b, t, &a.expr)?;
+                                o.blocks[t].stmts.push((
+                                    LId::Id { id: id.to_id() },
+                                    Default::default(),
+                                    Item::Just { id: arg },
+                                    a.span(),
+                                ));
+                            }
+                            let tmp = o.regs.alloc(());
+                            let t2 = o.blocks.alloc(TBlock {
+                                stmts: vec![],
+                                catch: o.blocks[t].catch.clone(),
+                                term: Default::default(),
+                                orig_span: Some(f.span()),
+                            });
+                            let cfg: swc_cfg::Func = f.function.as_ref().clone().try_into()?;
+                            let mut t4 = Trans {
+                                map: Default::default(),
+                                ret_to: Some((tmp.clone(), t2)),
+                                recatch: o.blocks[t].catch.clone(),
+                            };
+                            let t3 = t4.trans(&cfg.cfg, o, cfg.entry)?;
+                            o.blocks[t].term = TTerm::Jmp(t3);
+                            return Ok((tmp, t2));
+                        }
                         _ => {
                             let r#fn;
                             (r#fn, t) = self.expr(i, o, b, t, e.as_ref())?;
@@ -727,25 +756,41 @@ impl Trans {
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
             }
-            Expr::Bin(bin) => {
-                let left;
-                let right;
-                (left, t) = self.expr(i, o, b, t, &bin.left)?;
-                (right, t) = self.expr(i, o, b, t, &bin.right)?;
-                let tmp = o.regs.alloc(());
-                o.blocks[t].stmts.push((
-                    LId::Id { id: tmp.clone() },
-                    ValFlags::SSA_LIKE,
-                    Item::Bin {
-                        left,
-                        right,
-                        op: bin.op.clone(),
-                    },
-                    bin.span(),
-                ));
-                o.decls.insert(tmp.clone());
-                return Ok((tmp, t));
-            }
+            Expr::Bin(bin) => match (&*bin.left, &*bin.right, bin.op.clone()) {
+                (l, Expr::Lit(Lit::Num(Number { value: 0.0, .. })), BinaryOp::BitOr)
+                | (Expr::Lit(Lit::Num(Number { value: 0.0, .. })), l, BinaryOp::BitOr) => {
+                    let left;
+                    // let right;
+                    (left, t) = self.expr(i, o, b, t, l)?;
+                    // (right, t) = self.expr(i, o, b, t, r)?;
+                    let tmp = o.regs.alloc(());
+                    o.blocks[t].stmts.push((
+                        LId::Id { id: tmp.clone() },
+                        ValFlags::SSA_LIKE,
+                        Item::Asm {
+                            value: Asm::OrZero(left),
+                        },
+                        bin.span(),
+                    ));
+                    o.decls.insert(tmp.clone());
+                    return Ok((tmp, t));
+                }
+                (l, r, op) => {
+                    let left;
+                    let right;
+                    (left, t) = self.expr(i, o, b, t, l)?;
+                    (right, t) = self.expr(i, o, b, t, r)?;
+                    let tmp = o.regs.alloc(());
+                    o.blocks[t].stmts.push((
+                        LId::Id { id: tmp.clone() },
+                        ValFlags::SSA_LIKE,
+                        Item::Bin { left, right, op },
+                        bin.span(),
+                    ));
+                    o.decls.insert(tmp.clone());
+                    return Ok((tmp, t));
+                }
+            },
             Expr::Unary(un) => {
                 if un.op == UnaryOp::Void {
                     let tmp = o.regs.alloc(());

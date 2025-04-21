@@ -1,6 +1,6 @@
 [package]
 name = "portal-jsc-swc-tac"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 license = "CC0-1.0"
 description = "ECMAScript IR"
@@ -27,7 +27,7 @@ swc_ecma_ast.workspace = true
 swc_ecma_utils.workspace = true
 swc_ecma_visit.workspace = true
 bitflags.workspace = true
-portal-jsc-common = { version = "0.1.0", path = "../portal-jsc-common" }
+portal-jsc-common = { version = "0.4.1", path = "../portal-jsc-common" }
 
 [features]
 simpl=["dep:portal-jsc-simpl-js"]

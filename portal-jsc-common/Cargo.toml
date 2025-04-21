@@ -6,5 +6,5 @@ license = "CC0-1.0"
 description = "ECMAScript IR"
 
 [dependencies]
-either = { version = "1.15.0", default-features = false }
-portal-pc-asm-common = "0.1.0"
+either = { version = "^1.15.0", default-features = false }
+portal-pc-asm-common = "^0.1.0"

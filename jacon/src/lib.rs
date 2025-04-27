@@ -43,7 +43,7 @@ impl<K: Display> Display for Blocks<K> {
             self.entry.id,
             (0..(self.map.keys().map(|a| a.id).max().unwrap_or_default()))
                 .map(|a| {
-                    let Some(a) = self.map.get(&TargetBlock { id: a }) else{
+                    let Some(a) = self.map.get(&TargetBlock { id: a }) else {
                         return alloc::format!("null");
                     };
 

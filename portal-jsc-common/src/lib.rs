@@ -77,13 +77,13 @@ impl<I> Asm<I> {
             Asm::OrZero(a) => Asm::OrZero(f(a)?),
         })
     }
-    pub fn refs(&self) -> impl Iterator<Item = &I>{
-        match self{
+    pub fn refs(&self) -> impl Iterator<Item = &I> {
+        match self {
             Asm::OrZero(a) => once(a),
         }
     }
-    pub fn refs_mut(&mut self) -> impl Iterator<Item = &mut I>{
-        match self{
+    pub fn refs_mut(&mut self) -> impl Iterator<Item = &mut I> {
+        match self {
             Asm::OrZero(a) => once(a),
         }
     }

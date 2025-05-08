@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::{collections::BTreeMap, fmt::Display};
 
 pub use portal_jsc_common::ImportMap;
 use swc_atoms::Atom;
@@ -10,6 +10,11 @@ use swc_common::{
 };
 use swc_ecma_ast::{Expr, ExprStmt, Id, Ident, Lit, Module, ModuleDecl, ModuleItem, Stmt};
 use swc_ecma_parser::{lexer::Lexer, Parser, Syntax};
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+pub struct Natives {
+    pub all: BTreeMap<Atom, Id>,
+}
 
 #[derive(Clone, Copy, Hash, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct MakeSpanned<T> {

@@ -7,9 +7,9 @@ use either::Either;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[non_exhaustive]
 pub enum Native<E> {
-    AssertString(E),
-    AssertNumber(E),
-    AssertStaticFn(E),
+    AssertString { value: E, comptime: bool },
+    AssertNumber { value: E, comptime: bool },
+    AssertStaticFn { value: E, comptime: bool },
     FastAdd { lhs: E, rhs: E },
     FastAnd { lhs: E, rhs: E },
     FastOr { lhs: E, rhs: E },
@@ -21,9 +21,30 @@ pub enum Native<E> {
 impl Native<()> {
     pub fn of(a: &str) -> Option<Self> {
         Some(match a {
-            "assert_string" => Self::AssertString(()),
-            "assert_number" => Self::AssertNumber(()),
-            "assert_static_fn" => Self::AssertStaticFn(()),
+            "assert_string" => Self::AssertString {
+                value: (),
+                comptime: false,
+            },
+            "assert_number" => Self::AssertNumber {
+                value: (),
+                comptime: false,
+            },
+            "assert_static_fn" => Self::AssertStaticFn {
+                value: (),
+                comptime: false,
+            },
+            "comptime_string" => Self::AssertString {
+                value: (),
+                comptime: true,
+            },
+            "comptime_number" => Self::AssertNumber {
+                value: (),
+                comptime: true,
+            },
+            "comptime_static_fn" => Self::AssertStaticFn {
+                value: (),
+                comptime: true,
+            },
             "fast_add" => Self::FastAdd { lhs: (), rhs: () },
             "fast_and" => Self::FastAnd { lhs: (), rhs: () },
             "fast_or" => Self::FastOr { lhs: (), rhs: () },
@@ -47,9 +68,27 @@ impl Native<()> {
 impl<E> Native<E> {
     pub fn key(&self) -> &'static str {
         match self {
-            Native::AssertString(_) => "assert_string",
-            Native::AssertNumber(_) => "aasert_number",
-            Native::AssertStaticFn(_) => "assert_static_fn",
+            Native::AssertString { value, comptime } => {
+                if *comptime {
+                    "comptime_string"
+                } else {
+                    "assert_string"
+                }
+            }
+            Native::AssertNumber { value, comptime } => {
+                if *comptime {
+                    "comptime_number"
+                } else {
+                    "aasert_number"
+                }
+            }
+            Native::AssertStaticFn { value, comptime } => {
+                if *comptime {
+                    "comptime_static_fn"
+                } else {
+                    "assert_static_fn"
+                }
+            }
             Native::FastAdd { lhs, rhs } => "fast_add",
             Native::FastAnd { lhs, rhs } => "fast_and",
             Native::FastOr { lhs, rhs } => "fast_or",
@@ -67,9 +106,18 @@ impl<E> Native<E> {
     }
     pub fn as_ref<'a>(&'a self) -> Native<&'a E> {
         match self {
-            Native::AssertString(a) => Native::AssertString(a),
-            Native::AssertNumber(a) => Native::AssertNumber(a),
-            Native::AssertStaticFn(a) => Native::AssertStaticFn(a),
+            Native::AssertString { value, comptime } => Native::AssertString {
+                value,
+                comptime: *comptime,
+            },
+            Native::AssertNumber { value, comptime } => Native::AssertNumber {
+                value,
+                comptime: *comptime,
+            },
+            Native::AssertStaticFn { value, comptime } => Native::AssertStaticFn {
+                value,
+                comptime: *comptime,
+            },
             Native::FastAdd { lhs, rhs } => Native::FastAdd { lhs, rhs },
             Native::FastAnd { lhs, rhs } => Native::FastAnd { lhs, rhs },
             Native::FastOr { lhs, rhs } => Native::FastOr { lhs, rhs },
@@ -85,9 +133,18 @@ impl<E> Native<E> {
     }
     pub fn as_mut<'a>(&'a mut self) -> Native<&'a mut E> {
         match self {
-            Native::AssertString(a) => Native::AssertString(a),
-            Native::AssertNumber(a) => Native::AssertNumber(a),
-            Native::AssertStaticFn(a) => Native::AssertStaticFn(a),
+            Native::AssertString { value, comptime } => Native::AssertString {
+                value,
+                comptime: *comptime,
+            },
+            Native::AssertNumber { value, comptime } => Native::AssertNumber {
+                value,
+                comptime: *comptime,
+            },
+            Native::AssertStaticFn { value, comptime } => Native::AssertStaticFn {
+                value,
+                comptime: *comptime,
+            },
             Native::FastAdd { lhs, rhs } => Native::FastAdd { lhs, rhs },
             Native::FastAnd { lhs, rhs } => Native::FastAnd { lhs, rhs },
             Native::FastOr { lhs, rhs } => Native::FastOr { lhs, rhs },
@@ -103,9 +160,18 @@ impl<E> Native<E> {
     }
     pub fn map<E2, Er>(self, f: &mut impl FnMut(E) -> Result<E2, Er>) -> Result<Native<E2>, Er> {
         Ok(match self {
-            Native::AssertString(a) => Native::AssertString(f(a)?),
-            Native::AssertNumber(a) => Native::AssertNumber(f(a)?),
-            Native::AssertStaticFn(a) => Native::AssertStaticFn(f(a)?),
+            Native::AssertString { value, comptime } => Native::AssertString {
+                value: f(value)?,
+                comptime,
+            },
+            Native::AssertNumber { value, comptime } => Native::AssertNumber {
+                value: f(value)?,
+                comptime,
+            },
+            Native::AssertStaticFn { value, comptime } => Native::AssertStaticFn {
+                value: f(value)?,
+                comptime,
+            },
             Native::FastAdd { lhs, rhs } => Native::FastAdd {
                 lhs: f(lhs)?,
                 rhs: f(rhs)?,

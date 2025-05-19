@@ -1,6 +1,6 @@
 [package]
 name = "portal-jsc-swc-opt-ssa"
-version = "0.5.0"
+version = "0.5.2"
 edition = "2021"
 license = "CC0-1.0"
 description = "ECMAScript IR"
@@ -16,7 +16,7 @@ id-arena.workspace = true
 cfg-traits.workspace = true
 
 ssa-traits.workspace = true
-portal-jsc-swc-cfg = { version = "0.4.0", path = "../swc-cfg" }
+portal-jsc-swc-cfg = { version = "0.5.2", path = "../swc-cfg" }
 portal-jsc-swc-tac = { version = "0.5.0", path = "../swc-tac" }
 portal-jsc-swc-util = { version = "0.5.0", path = "../swc-util", features = ["ty"] }
 portal-jsc-simpl-js = { version = "0.5.0", path = "../simpl-js", optional = true }

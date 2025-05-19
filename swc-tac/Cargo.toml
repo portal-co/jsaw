@@ -1,6 +1,6 @@
 [package]
 name = "portal-jsc-swc-tac"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 license = "CC0-1.0"
 description = "ECMAScript IR"
@@ -19,15 +19,15 @@ relooper.workspace = true
 either = "1.13.0"
 id-arena.workspace = true
 portal-jsc-swc-cfg = { version = "0.4.0", path = "../swc-cfg" }
-portal-jsc-swc-util = { version = "0.4.0", path = "../swc-util" }
-portal-jsc-simpl-js = { version = "0.4.0", path = "../simpl-js", optional = true }
+portal-jsc-swc-util = { version = "0.5.0", path = "../swc-util" }
+portal-jsc-simpl-js = { version = "0.5.0", path = "../simpl-js", optional = true }
 swc_atoms.workspace = true
 swc_common.workspace = true
 swc_ecma_ast.workspace = true
 swc_ecma_utils.workspace = true
 swc_ecma_visit.workspace = true
 bitflags.workspace = true
-portal-jsc-common = { version = "0.4.1", path = "../portal-jsc-common" }
+portal-jsc-common = { version = "0.5.0", path = "../portal-jsc-common" }
 
 [features]
 simpl=["dep:portal-jsc-simpl-js"]

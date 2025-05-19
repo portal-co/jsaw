@@ -1,6 +1,6 @@
 [package]
 name = "portal-jsc-simpl-js-rust"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 license = "CC0-1.0"
 description = "ECMAScript IR"
@@ -15,9 +15,9 @@ swc_ecma_ast= {workspace=true,optional=true}
 swc_ecma_utils= {workspace=true,optional=true}
 swc_ecma_visit= {workspace=true,optional=true}
 syn= {workspace=true,optional=true}
-portal-jsc-swc-util = { version = "0.4.0", path = "../swc-util",optional=true }
-portal-jsc-swc-batch = { version = "0.4.0", path = "../swc-batch",optional=true }
-portal-jsc-simpl-js = { version = "0.4.0", path = "../simpl-js",optional=true }
+portal-jsc-swc-util = { version = "0.5.0", path = "../swc-util",optional=true }
+portal-jsc-swc-batch = { version = "0.5.0", path = "../swc-batch",optional=true }
+portal-jsc-simpl-js = { version = "0.5.0", path = "../simpl-js",optional=true }
 
 [features]
 compiler=["dep:proc-macro2","dep:quote","dep:swc_atoms","dep:swc_common","dep:swc_ecma_ast","dep:swc_ecma_utils","dep:swc_ecma_visit","dep:syn","dep:portal-jsc-swc-util","dep:portal-jsc-simpl-js","dep:portal-jsc-swc-batch"]

@@ -25,6 +25,7 @@ swc_ecma_visit = "^11.0.0"
 swc_bundler = "^19.0.0"
 swc_ecma_loader = "^11.0.0"
 swc_ecma_parser = "^14.0.0"
+swc_ecma_codegen = "^13"
 
 proc-macro2 = "^1.0.88"
 quasiquote = "^0.1.1"

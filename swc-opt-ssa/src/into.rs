@@ -128,27 +128,27 @@ impl Convert {
                             let cnstl = out.val(left).and_then(|a| a.const_in(out));
                             let cnstr = out.val(right).and_then(|a| a.const_in(out));
                             match (cnstl, cnstr) {
-                                (Some(_), Some(_)) => {
-                                    let v: SValue<Id<OptValueW>, Id<OptBlock>> = SValue::Item {
-                                        item: Item::Bin {
-                                            left,
-                                            right,
-                                            op: op.clone(),
-                                        },
-                                        span: span.clone(),
-                                    };
-                                    let Some(a) = v.const_in(out) else { todo!() };
-                                    (
-                                        OptValue::Emit {
-                                            val: SValue::Item {
-                                                item: Item::Lit { lit: a.clone() },
-                                                span: span.clone(),
-                                            },
-                                            ty: Some(OptType::Lit(a.clone())),
-                                        },
-                                        Some(OptType::Lit(a.clone())),
-                                    )
-                                }
+                                // (Some(_), Some(_)) => {
+                                //     let v: SValue<Id<OptValueW>, Id<OptBlock>> = SValue::Item {
+                                //         item: Item::Bin {
+                                //             left,
+                                //             right,
+                                //             op: op.clone(),
+                                //         },
+                                //         span: span.clone(),
+                                //     };
+                                //     let Some(a) = v.const_in(out) else { todo!() };
+                                //     (
+                                //         OptValue::Emit {
+                                //             val: SValue::Item {
+                                //                 item: Item::Lit { lit: a.clone() },
+                                //                 span: span.clone(),
+                                //             },
+                                //             ty: Some(OptType::Lit(a.clone())),
+                                //         },
+                                //         Some(OptType::Lit(a.clone())),
+                                //     )
+                                // }
                                 _ => match (lty.clone(), rty.clone(), op) {
                                     (
                                         Some(OptType::U32 { bits_usable }),
@@ -295,26 +295,26 @@ impl Convert {
                                 state.get(arg).cloned().context("in getting the value")?;
                             let cnst = out.val(arg).and_then(|a| a.const_in(out));
                             match cnst {
-                                Some(k) => {
-                                    let v: SValue<Id<OptValueW>, Id<OptBlock>> = SValue::Item {
-                                        item: Item::Un {
-                                            arg: arg,
-                                            op: op.clone(),
-                                        },
-                                        span: span.clone(),
-                                    };
-                                    let Some(a) = v.const_in(out) else { todo!() };
-                                    (
-                                        OptValue::Emit {
-                                            val: SValue::Item {
-                                                item: Item::Lit { lit: a.clone() },
-                                                span: span.clone(),
-                                            },
-                                            ty: Some(OptType::Lit(a.clone())),
-                                        },
-                                        Some(OptType::Lit(a.clone())),
-                                    )
-                                }
+                                // Some(k) => {
+                                //     let v: SValue<Id<OptValueW>, Id<OptBlock>> = SValue::Item {
+                                //         item: Item::Un {
+                                //             arg: arg,
+                                //             op: op.clone(),
+                                //         },
+                                //         span: span.clone(),
+                                //     };
+                                //     let Some(a) = v.const_in(out) else { todo!() };
+                                //     (
+                                //         OptValue::Emit {
+                                //             val: SValue::Item {
+                                //                 item: Item::Lit { lit: a.clone() },
+                                //                 span: span.clone(),
+                                //             },
+                                //             ty: Some(OptType::Lit(a.clone())),
+                                //         },
+                                //         Some(OptType::Lit(a.clone())),
+                                //     )
+                                // }
                                 _ => match (tag.clone(), op) {
                                     (
                                         Some(OptType::Number | OptType::U32 { .. }),
@@ -487,11 +487,11 @@ impl Convert {
                             }
                         }
                         a => {
-                            let a = a.clone().map(&mut |x| {
+                            let a = a.clone().map2(&mut (),&mut |_,x| {
                                 let (val, tag) =
                                     state.get(&x).cloned().context("in getting the val")?;
                                 deopt(out, k, val, tag)
-                            })?;
+                            },&mut |_,a|a.try_into())?;
                             (
                                 OptValue::Emit {
                                     val: SValue::Item {

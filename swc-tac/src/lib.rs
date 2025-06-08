@@ -231,6 +231,18 @@ pub enum PropKey<I = Ident> {
     Computed(I),
 }
 impl<I> PropKey<I> {
+    pub fn as_ref(&self) -> PropKey<&I> {
+        match self {
+            PropKey::Lit(a) => PropKey::Lit(a.clone()),
+            PropKey::Computed(c) => PropKey::Computed(c),
+        }
+    }
+    pub fn as_mut(&mut self) -> PropKey<&mut I> {
+        match self {
+            PropKey::Lit(a) => PropKey::Lit(a.clone()),
+            PropKey::Computed(c) => PropKey::Computed(c),
+        }
+    }
     pub fn map<J: Ord, E>(self, f: &mut impl FnMut(I) -> Result<J, E>) -> Result<PropKey<J>, E> {
         Ok(match self {
             PropKey::Lit(l) => PropKey::Lit(l),
@@ -245,6 +257,20 @@ pub enum TCallee<I = Ident> {
     Static(Ident),
 }
 impl<I> TCallee<I> {
+    pub fn as_ref(&self) -> TCallee<&I> {
+        match self {
+            TCallee::Val(a) => TCallee::Val(a),
+            TCallee::Member { r#fn, member } => TCallee::Member { r#fn, member },
+            TCallee::Static(a) => TCallee::Static(a.clone()),
+        }
+    }
+    pub fn as_mut(&mut self) -> TCallee<&mut I> {
+        match self {
+            TCallee::Val(a) => TCallee::Val(a),
+            TCallee::Member { r#fn, member } => TCallee::Member { r#fn, member },
+            TCallee::Static(a) => TCallee::Static(a.clone()),
+        }
+    }
     pub fn map<J: Ord, E>(self, f: &mut impl FnMut(I) -> Result<J, E>) -> Result<TCallee<J>, E> {
         Ok(match self {
             TCallee::Val(a) => TCallee::Val(f(a)?),
@@ -258,12 +284,12 @@ impl<I> TCallee<I> {
 }
 #[derive(Clone)]
 #[non_exhaustive]
-pub enum Item<I = Ident> {
+pub enum Item<I = Ident, F = TFunc> {
     Just { id: I },
     Bin { left: I, right: I, op: BinaryOp },
     Un { arg: I, op: UnaryOp },
     Mem { obj: I, mem: I },
-    Func { func: TFunc },
+    Func { func: F },
     Lit { lit: Lit },
     Call { callee: TCallee<I>, args: Vec<I> },
     Obj { members: Vec<(PropKey<I>, I)> },
@@ -274,45 +300,132 @@ pub enum Item<I = Ident> {
     Undef,
 }
 impl<I> Item<I> {
-    pub fn map<J: Ord, E>(self, f: &mut impl FnMut(I) -> Result<J, E>) -> Result<Item<J>, E> {
-        Ok(match self {
-            Item::Just { id } => Item::Just { id: f(id)? },
+    pub fn map<J: Ord, E>(self, f: &mut (dyn FnMut(I) -> Result<J, E> + '_)) -> Result<Item<J>, E> {
+        self.map2(f, &mut |a, b| a(b), &mut |_, b| Ok(b))
+    }
+}
+impl<I, F> Item<I, F> {
+    pub fn as_ref(&self) -> Item<&I, &F> {
+        match self {
+            Item::Just { id } => Item::Just { id },
             Item::Bin { left, right, op } => Item::Bin {
-                left: f(left)?,
-                right: f(right)?,
+                left,
+                right,
+                op: *op,
+            },
+            Item::Un { arg, op } => Item::Un { arg, op: *op },
+            Item::Mem { obj, mem } => Item::Mem { obj, mem },
+            Item::Func { func } => Item::Func { func },
+            Item::Lit { lit } => Item::Lit { lit: lit.clone() },
+            Item::Call { callee, args } => Item::Call {
+                callee: callee.as_ref(),
+                args: args.iter().collect(),
+            },
+            Item::Obj { members } => Item::Obj {
+                members: members.iter().map(|(a, b)| (a.as_ref(), b)).collect(),
+            },
+            Item::Arr { members } => Item::Arr {
+                members: members.iter().collect(),
+            },
+            Item::Yield { value, delegate } => Item::Yield {
+                value: value.as_ref(),
+                delegate: *delegate,
+            },
+            Item::Await { value } => Item::Await { value },
+            Item::Asm { value } => Item::Asm {
+                value: value.as_ref(),
+            },
+            Item::Undef => Item::Undef,
+        }
+    }
+    pub fn as_mut(&mut self) -> Item<&mut I, &mut F> {
+        match self {
+            Item::Just { id } => Item::Just { id },
+            Item::Bin { left, right, op } => Item::Bin {
+                left,
+                right,
+                op: *op,
+            },
+            Item::Un { arg, op } => Item::Un { arg, op: *op },
+            Item::Mem { obj, mem } => Item::Mem { obj, mem },
+            Item::Func { func } => Item::Func { func },
+            Item::Lit { lit } => Item::Lit { lit: lit.clone() },
+            Item::Call { callee, args } => Item::Call {
+                callee: callee.as_mut(),
+                args: args.iter_mut().collect(),
+            },
+            Item::Obj { members } => Item::Obj {
+                members: members.iter_mut().map(|(a, b)| (a.as_mut(), b)).collect(),
+            },
+            Item::Arr { members } => Item::Arr {
+                members: members.iter_mut().collect(),
+            },
+            Item::Yield { value, delegate } => Item::Yield {
+                value: value.as_mut(),
+                delegate: *delegate,
+            },
+            Item::Await { value } => Item::Await { value },
+            Item::Asm { value } => Item::Asm {
+                value: value.as_mut(),
+            },
+            Item::Undef => Item::Undef,
+        }
+    }
+    pub fn map2<J: Ord, G, E, C: ?Sized>(
+        self,
+        cx: &mut C,
+        f: &mut (dyn FnMut(&mut C, I) -> Result<J, E> + '_),
+        g: &mut (dyn FnMut(&mut C, F) -> Result<G, E> + '_),
+    ) -> Result<Item<J, G>, E> {
+        Ok(match self {
+            Item::Just { id } => Item::Just { id: f(cx, id)? },
+            Item::Bin { left, right, op } => Item::Bin {
+                left: f(cx, left)?,
+                right: f(cx, right)?,
                 op,
             },
-            Item::Un { arg, op } => Item::Un { arg: f(arg)?, op },
-            Item::Mem { obj, mem } => Item::Mem {
-                obj: f(obj)?,
-                mem: f(mem)?,
+            Item::Un { arg, op } => Item::Un {
+                arg: f(cx, arg)?,
+                op,
             },
-            Item::Func { func } => Item::Func { func },
+            Item::Mem { obj, mem } => Item::Mem {
+                obj: f(cx, obj)?,
+                mem: f(cx, mem)?,
+            },
+            Item::Func { func } => Item::Func { func: g(cx, func)? },
             Item::Lit { lit } => Item::Lit { lit },
             Item::Call { callee, args } => Item::Call {
-                callee: callee.map(f)?,
-                args: args.into_iter().map(f).collect::<Result<Vec<J>, E>>()?,
+                callee: callee.map(&mut |a| f(cx, a))?,
+                args: args
+                    .into_iter()
+                    .map(|a| f(cx, a))
+                    .collect::<Result<Vec<J>, E>>()?,
             },
             Item::Obj { members } => Item::Obj {
                 members: members
                     .into_iter()
-                    .map(|(a, b)| Ok((a.map(f)?, f(b)?)))
+                    .map(|(a, b)| Ok((a.map(&mut |a| f(cx, a))?, f(cx, b)?)))
                     .collect::<Result<_, E>>()?,
             },
             Item::Arr { members } => Item::Arr {
-                members: members.into_iter().map(f).collect::<Result<_, E>>()?,
+                members: members
+                    .into_iter()
+                    .map(|a| f(cx, a))
+                    .collect::<Result<_, E>>()?,
             },
             Item::Yield { value, delegate } => Item::Yield {
                 value: match value {
                     None => None,
-                    Some(a) => Some(f(a)?),
+                    Some(a) => Some(f(cx, a)?),
                 },
                 delegate: delegate,
             },
-            Item::Await { value } => Item::Await { value: f(value)? },
+            Item::Await { value } => Item::Await {
+                value: f(cx, value)?,
+            },
             Item::Undef => Item::Undef,
             Item::Asm { value } => Item::Asm {
-                value: value.map(f)?,
+                value: value.map(&mut |a| f(cx, a))?,
             },
         })
     }

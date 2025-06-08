@@ -80,8 +80,11 @@ impl Rew {
                         match &a.cfg.values[*val].0 {
                             SValue::Param { block, idx, ty } => todo!(),
                             SValue::Item { item, span } => {
-                                let i =
-                                    item.clone().map(&mut |v| anyhow::Ok(mangle_value(a, v)))?;
+                                let i = item.clone().map2(
+                                    &mut (),
+                                    &mut |_, v| anyhow::Ok(mangle_value(a, v)),
+                                    &mut |_, f| f.try_into(),
+                                )?;
                                 b.blocks[k2].stmts.push((
                                     LId::Id {
                                         id: mangle_value(a, *val),

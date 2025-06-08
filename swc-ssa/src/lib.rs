@@ -37,7 +37,7 @@ pub fn benj(a: &mut SwcFunc) {
         a.blocks[ki].postcedent = t;
     }
 }
-
+#[derive(Clone)]
 pub struct SFunc {
     pub cfg: SwcFunc,
     pub entry: Id<SBlock>,
@@ -106,7 +106,7 @@ impl TryFrom<TFunc> for SFunc {
         })
     }
 }
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct SwcFunc {
     pub blocks: Arena<SBlock>,
     pub values: Arena<SValueW>,
@@ -115,7 +115,7 @@ pub struct SwcFunc {
     pub generics: Option<TsTypeParamDecl>,
     pub ts_retty: Option<TsTypeAnn>,
 }
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct SBlock {
     pub params: Vec<(Id<SValueW>, ())>,
     pub stmts: Vec<Id<SValueW>>,
@@ -137,15 +137,28 @@ impl<I, B> Default for SPostcedent<I, B> {
 
 #[derive(Clone)]
 #[non_exhaustive]
-pub enum SValue<I = Id<SValueW>, B = Id<SBlock>> {
-    Param { block: B, idx: usize, ty: () },
-    Item { item: Item<I>, span: Option<Span> },
-    Assign { target: LId<I>, val: I },
+pub enum SValue<I = Id<SValueW>, B = Id<SBlock>, F = SFunc> {
+    Param {
+        block: B,
+        idx: usize,
+        ty: (),
+    },
+    Item {
+        item: Item<I, F>,
+        span: Option<Span>,
+    },
+    Assign {
+        target: LId<I>,
+        val: I,
+    },
     LoadId(Ident),
-    StoreId { target: Ident, val: I },
+    StoreId {
+        target: Ident,
+        val: I,
+    },
     Benc(I),
 }
-impl<I: Copy, B> SValue<I, B> {
+impl<I: Copy, B, F> SValue<I, B, F> {
     pub fn vals<'a>(&'a self) -> Box<dyn Iterator<Item = I> + 'a> {
         match self {
             SValue::Param { block, idx, ty } => Box::new(empty()),
@@ -165,7 +178,7 @@ impl<I: Copy, B> SValue<I, B> {
         }
     }
 }
-impl<I, B> SValue<I, B> {
+impl<I, B, F> SValue<I, B, F> {
     pub fn vals_mut<'a>(&'a mut self) -> Box<dyn Iterator<Item = &'a mut I> + 'a> {
         match self {
             SValue::Param { block, idx, ty } => Box::new(empty()),
@@ -380,9 +393,11 @@ impl Trans {
                         }
                     }
                 }
-                let b = b
-                    .map::<_, Infallible>(&mut |a| Ok(self.load(&state, i, o, t, a, &cache)))
-                    .unwrap();
+                let b = b.map2::<_, _, anyhow::Error, ()>(
+                    &mut (),
+                    &mut |_, a| Ok(self.load(&state, i, o, t, a, &cache)),
+                    &mut |_, b| b.try_into(),
+                )?;
                 let b = o.values.alloc(
                     SValue::Item {
                         item: b,

@@ -28,8 +28,8 @@ impl SwcFunc {
         }
     }
 }
-pub trait SValGetter<I: Copy, B> {
-    fn val(&self, id: I) -> Option<&SValue<I, B>>;
+pub trait SValGetter<I: Copy, B,F = SFunc> {
+    fn val(&self, id: I) -> Option<&SValue<I, B,F>>;
 }
 impl SValGetter<Id<SValueW>, Id<SBlock>> for SwcFunc {
     fn val(&self, id: Id<SValueW>) -> Option<&SValue<Id<SValueW>, Id<SBlock>>> {
@@ -44,8 +44,8 @@ pub(crate) fn default_ctx() -> ExprCtx {
         remaining_depth: 4,
     }
 }
-impl<I: Copy, B> SValue<I, B> {
-    pub fn const_in(&self, k: &impl SValGetter<I, B>) -> Option<Lit> {
+impl<I: Copy, B,F> SValue<I, B,F> {
+    pub fn const_in(&self, k: &impl SValGetter<I, B,F>) -> Option<Lit> {
         match self {
             SValue::Item { item, span } => match item {
                 Item::Just { id } => None,

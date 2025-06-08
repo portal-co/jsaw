@@ -111,9 +111,11 @@ impl CH {
                 let v = match inp.values[s].0.clone() {
                     SValue::Param { block, idx, ty } => todo!(),
                     SValue::Item { item, span } => SValue::Item {
-                        item: item.map(&mut |a| {
-                            params.get(&a).cloned().context("in getting a variable")
-                        })?,
+                        item: item.map2(
+                            &mut (),
+                            &mut |_, a| params.get(&a).cloned().context("in getting a variable"),
+                            &mut |_, b| Ok(b.into()),
+                        )?,
                         span,
                     },
                     SValue::Assign { target, val } => SValue::Assign {

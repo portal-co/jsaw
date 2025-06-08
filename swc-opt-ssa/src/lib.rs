@@ -9,20 +9,20 @@ pub mod into;
 pub use portal_jsc_swc_util::r#type::{ObjType, OptType};
 #[derive(Clone)]
 #[non_exhaustive]
-pub enum OptValue<I = Id<OptValueW>, B = Id<OptBlock>> {
+pub enum OptValue<I = Id<OptValueW>, B = Id<OptBlock>, F = OptFunc> {
     Deopt(I),
     Assert {
         val: I,
         ty: Option<OptType>,
     },
     Emit {
-        val: SValue<I, B>,
+        val: SValue<I, B, F>,
         ty: Option<OptType>,
     },
 }
 #[derive(Clone)]
 pub struct OptValueW(pub OptValue);
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct OptBlock {
     pub params: Vec<(Id<OptValueW>, Option<OptType>)>,
     pub insts: Vec<Id<OptValueW>>,
@@ -32,7 +32,7 @@ pub type OptPostcedent = SPostcedent<Id<OptValueW>, Id<OptBlock>>;
 pub type OptTarget = STarget<Id<OptValueW>, Id<OptBlock>>;
 pub type OptTerm = STerm<Id<OptValueW>, Id<OptBlock>>;
 pub type OptCatch = SCatch<Id<OptValueW>, Id<OptBlock>>;
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct OptCfg {
     pub values: Arena<OptValueW>,
     pub blocks: Arena<OptBlock>,
@@ -63,8 +63,8 @@ impl OptValueW {
         }
     }
 }
-impl SValGetter<Id<OptValueW>, Id<OptBlock>> for OptCfg {
-    fn val(&self, id: Id<OptValueW>) -> Option<&SValue<Id<OptValueW>, Id<OptBlock>>> {
+impl SValGetter<Id<OptValueW>, Id<OptBlock>, OptFunc> for OptCfg {
+    fn val(&self, id: Id<OptValueW>) -> Option<&SValue<Id<OptValueW>, Id<OptBlock>, OptFunc>> {
         match &self.values[id].0 {
             OptValue::Deopt(a) => self.val(*a),
             OptValue::Assert { val, ty } => self.val(*val),
@@ -72,6 +72,7 @@ impl SValGetter<Id<OptValueW>, Id<OptBlock>> for OptCfg {
         }
     }
 }
+#[derive(Clone)]
 pub struct OptFunc {
     pub cfg: OptCfg,
     pub entry: Id<OptBlock>,

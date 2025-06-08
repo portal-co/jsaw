@@ -273,6 +273,16 @@ pub enum Asm<I> {
     OrZero(I),
 }
 impl<I> Asm<I> {
+    pub fn as_ref(&self) -> Asm<&I>{
+        match self{
+            Asm::OrZero(a) => Asm::OrZero(a)
+        }
+    }
+       pub fn as_mut(&mut self) -> Asm<&mut I>{
+        match self{
+            Asm::OrZero(a) => Asm::OrZero(a)
+        }
+    }
     pub fn map<J, E>(self, f: &mut impl FnMut(I) -> Result<J, E>) -> Result<Asm<J>, E> {
         Ok(match self {
             Asm::OrZero(a) => Asm::OrZero(f(a)?),

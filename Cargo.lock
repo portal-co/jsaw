@@ -593,7 +593,7 @@ checksum = "bda66fc9667c18cb2758a2ac84d1167245054bcf85d5d1aaa6923f45801bdd02"
 
 [[package]]
 name = "portal-jsc-common"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "either",
  "portal-pc-asm-common",
@@ -670,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "portal-jsc-swc-opt-ssa"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "arena-traits",
@@ -694,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "portal-jsc-swc-ssa"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "arena-traits",
@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "portal-jsc-swc-tac"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "arena-traits",

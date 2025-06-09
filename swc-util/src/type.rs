@@ -33,6 +33,7 @@ pub enum OptType {
     },
     Object {
         nest: ObjType,
+        /// Represents whether an object type has been extended; may be changed to `extended` in 0.7
         extensible: bool,
         elem_tys: Vec<Option<OptType>>,
     },

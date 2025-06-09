@@ -48,7 +48,7 @@ bitflags! {
         const SSA_LIKE = 0x1;
     }
 }
-#[derive(Clone)]
+#[derive(Clone,Debug)]
 pub struct TFunc {
     pub cfg: TCfg,
     pub entry: Id<TBlock>,
@@ -101,7 +101,7 @@ impl TryFrom<Function> for TFunc {
         return a.try_into();
     }
 }
-#[derive(Default, Clone)]
+#[derive(Default, Clone,Debug)]
 pub struct TCfg {
     pub blocks: Arena<TBlock>,
     pub regs: LAM<()>,
@@ -191,14 +191,14 @@ impl TCfg {
         }
     }
 }
-#[derive(Clone, Default)]
+#[derive(Clone, Default,Debug)]
 pub struct TBlock {
     pub stmts: Vec<(LId, ValFlags, Item, Span)>,
     pub catch: TCatch,
     pub term: TTerm,
     pub orig_span: Option<Span>,
 }
-#[derive(Clone, Default)]
+#[derive(Clone, Default,Debug)]
 pub enum TCatch {
     #[default]
     Throw,
@@ -207,7 +207,7 @@ pub enum TCatch {
         k: Id<TBlock>,
     },
 }
-#[derive(Clone, Default)]
+#[derive(Clone, Default,Debug)]
 pub enum TTerm {
     Return(Option<Ident>),
     Throw(Ident),
@@ -225,7 +225,7 @@ pub enum TTerm {
     #[default]
     Default,
 }
-#[derive(Clone, Ord, PartialEq, PartialOrd, Eq)]
+#[derive(Clone, Ord, PartialEq, PartialOrd, Eq,Debug)]
 pub enum PropKey<I = Ident> {
     Lit(Ident),
     Computed(I),
@@ -250,7 +250,7 @@ impl<I> PropKey<I> {
         })
     }
 }
-#[derive(Clone)]
+#[derive(Clone,Debug)]
 pub enum TCallee<I = Ident> {
     Val(I),
     Member { r#fn: I, member: I },
@@ -282,7 +282,7 @@ impl<I> TCallee<I> {
         })
     }
 }
-#[derive(Clone)]
+#[derive(Clone,Debug)]
 #[non_exhaustive]
 pub enum Item<I = Ident, F = TFunc> {
     Just { id: I },

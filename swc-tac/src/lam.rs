@@ -2,22 +2,24 @@ use std::{
     collections::HashMap,
     ops::{Index, IndexMut},
     sync::{Arc, OnceLock},
+    fmt::Debug,
 };
 
 use arena_traits::{Arena, IndexAlloc, IndexIter};
 use swc_atoms::Atom;
 use swc_common::{Mark, Span, SyntaxContext};
 use swc_ecma_ast::{Id, Ident};
-pub trait AtomResolver {
+pub trait AtomResolver: Debug {
     fn resolve(&self, len: usize) -> Atom;
 }
+#[derive(Debug,Default)]
 pub struct DefaultAtomResolver {}
 impl AtomResolver for DefaultAtomResolver {
     fn resolve(&self, len: usize) -> Atom {
         Atom::new(format!("${len}"))
     }
 }
-#[derive(Clone)]
+#[derive(Clone,Debug)]
 pub struct LAM<T> {
     pub map: HashMap<Id, T>,
     pub default: T,

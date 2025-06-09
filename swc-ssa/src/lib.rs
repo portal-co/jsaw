@@ -37,7 +37,7 @@ pub fn benj(a: &mut SwcFunc) {
         a.blocks[ki].postcedent = t;
     }
 }
-#[derive(Clone)]
+#[derive(Clone,Debug)]
 pub struct SFunc {
     pub cfg: SwcFunc,
     pub entry: Id<SBlock>,
@@ -106,7 +106,7 @@ impl TryFrom<TFunc> for SFunc {
         })
     }
 }
-#[derive(Default, Clone)]
+#[derive(Default, Clone,Debug)]
 pub struct SwcFunc {
     pub blocks: Arena<SBlock>,
     pub values: Arena<SValueW>,
@@ -115,13 +115,13 @@ pub struct SwcFunc {
     pub generics: Option<TsTypeParamDecl>,
     pub ts_retty: Option<TsTypeAnn>,
 }
-#[derive(Default, Clone)]
+#[derive(Default, Clone,Debug)]
 pub struct SBlock {
     pub params: Vec<(Id<SValueW>, ())>,
     pub stmts: Vec<Id<SValueW>>,
     pub postcedent: SPostcedent,
 }
-#[derive(Clone)]
+#[derive(Clone,Debug)]
 pub struct SPostcedent<I = Id<SValueW>, B = Id<SBlock>> {
     pub term: STerm<I, B>,
     pub catch: SCatch<I, B>,
@@ -135,7 +135,7 @@ impl<I, B> Default for SPostcedent<I, B> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone,Debug)]
 #[non_exhaustive]
 pub enum SValue<I = Id<SValueW>, B = Id<SBlock>, F = SFunc> {
     Param {
@@ -179,6 +179,105 @@ impl<I: Copy, B, F> SValue<I, B, F> {
     }
 }
 impl<I, B, F> SValue<I, B, F> {
+    pub fn as_ref(&self) -> SValue<&I, &B, &F> {
+        match self {
+            SValue::Param { block, idx, ty } => SValue::Param {
+                block,
+                idx: *idx,
+                ty: *ty,
+            },
+            SValue::Item { item, span } => SValue::Item {
+                item: item.as_ref(),
+                span: *span,
+            },
+            SValue::Assign { target, val } => SValue::Assign {
+                target: target
+                    .as_ref()
+                    .map2(&mut |a| Ok::<_, Infallible>(a), &mut |b| Ok([&b[0]]))
+                    .unwrap(),
+                val,
+            },
+            SValue::LoadId(v) => SValue::LoadId(v.clone()),
+            SValue::StoreId { target, val } => SValue::StoreId {
+                target: target.clone(),
+                val,
+            },
+            SValue::Benc(v) => SValue::Benc(v),
+        }
+    }
+    pub fn as_mut(&mut self) -> SValue<&mut I, &mut B, &mut F> {
+        match self {
+            SValue::Param { block, idx, ty } => SValue::Param {
+                block,
+                idx: *idx,
+                ty: *ty,
+            },
+            SValue::Item { item, span } => SValue::Item {
+                item: item.as_mut(),
+                span: *span,
+            },
+            SValue::Assign { target, val } => SValue::Assign {
+                target: target
+                    .as_mut()
+                    .map2(&mut |a| Ok::<_, Infallible>(a), &mut |b| Ok([&mut b[0]]))
+                    .unwrap(),
+                val,
+            },
+            SValue::LoadId(v) => SValue::LoadId(v.clone()),
+            SValue::StoreId { target, val } => SValue::StoreId {
+                target: target.clone(),
+                val,
+            },
+            SValue::Benc(v) => SValue::Benc(v),
+        }
+    }
+    pub fn map<J: Ord, C, G, X, E>(
+        self,
+        cx: &mut X,
+        ident: &mut (dyn FnMut(&mut X, I) -> Result<J, E> + '_),
+        block_: &mut (dyn FnMut(&mut X, B) -> Result<C, E> + '_),
+        fun: &mut (dyn FnMut(&mut X, F) -> Result<G, E> + '_),
+    ) -> Result<SValue<J, C, G>, E> {
+        Ok(match self {
+            SValue::Param { block, idx, ty } => SValue::Param {
+                block: block_(cx, block)?,
+                idx,
+                ty,
+            },
+            SValue::Item { item, span } => SValue::Item {
+                item: item.map2(cx, ident, fun)?,
+                span,
+            },
+            SValue::Assign { target, val } => SValue::Assign {
+                target: target.map(&mut |a| ident(cx, a))?,
+                val: ident(cx, val)?,
+            },
+            SValue::LoadId(a) => SValue::LoadId(a),
+            SValue::StoreId { target, val } => SValue::StoreId {
+                target,
+                val: ident(cx, val)?,
+            },
+            SValue::Benc(i) => SValue::Benc(ident(cx, i)?),
+        })
+    }
+    pub fn vals_ref<'a>(&'a self) -> Box<dyn Iterator<Item = &'a I> + 'a> {
+        match self {
+            SValue::Param { block, idx, ty } => Box::new(empty()),
+            SValue::Item { item, span } => Box::new(item.refs()),
+            SValue::Assign { target, val } => {
+                let v = once(val);
+                let w: Box<dyn Iterator<Item = &I> + '_> = match target {
+                    LId::Id { id } => todo!(),
+                    LId::Member { obj, mem } => Box::new([obj, &mem[0]].into_iter()),
+                    _ => todo!(),
+                };
+                Box::new(v.chain(w))
+            }
+            SValue::LoadId(_) => Box::new(empty()),
+            SValue::StoreId { target, val } => Box::new(once(val)),
+            SValue::Benc(a) => Box::new(once(a)),
+        }
+    }
     pub fn vals_mut<'a>(&'a mut self) -> Box<dyn Iterator<Item = &'a mut I> + 'a> {
         match self {
             SValue::Param { block, idx, ty } => Box::new(empty()),
@@ -199,7 +298,7 @@ impl<I, B, F> SValue<I, B, F> {
     }
 }
 #[repr(transparent)]
-#[derive(Clone)]
+#[derive(Clone,Debug)]
 pub struct SValueW(pub SValue);
 impl From<SValue> for SValueW {
     fn from(value: SValue) -> Self {
@@ -211,7 +310,7 @@ impl From<SValueW> for SValue {
         value.0
     }
 }
-#[derive(Clone)]
+#[derive(Clone,Debug)]
 #[non_exhaustive]
 pub enum SCatch<I = Id<SValueW>, B = Id<SBlock>> {
     Throw,
@@ -222,12 +321,12 @@ impl<I, B> Default for SCatch<I, B> {
         Self::Throw
     }
 }
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord,Debug)]
 pub struct STarget<I = Id<SValueW>, B = Id<SBlock>> {
     pub block: B,
     pub args: Vec<I>,
 }
-#[derive(Clone)]
+#[derive(Clone,Debug)]
 #[non_exhaustive]
 pub enum STerm<I = Id<SValueW>, B = Id<SBlock>> {
     Throw(I),

@@ -10,13 +10,13 @@ bitflags! {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash,Debug)]
 #[non_exhaustive]
 pub enum ObjType {
     Array,
     Object(Vec<String>),
 }
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash,Debug)]
 #[non_exhaustive]
 pub enum OptType {
     Number,

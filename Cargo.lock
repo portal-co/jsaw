@@ -670,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "portal-jsc-swc-opt-ssa"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "arena-traits",
@@ -694,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "portal-jsc-swc-ssa"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "arena-traits",
@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "portal-jsc-swc-tac"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "arena-traits",
@@ -740,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "portal-jsc-swc-util"
-version = "0.6.0"
+version = "0.6.2"
 dependencies = [
  "bitflags",
  "num-traits",

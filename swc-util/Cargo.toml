@@ -16,6 +16,8 @@ swc_ecma_parser.workspace = true
 swc_ecma_utils.workspace = true
 swc_ecma_visit.workspace = true
 portal-jsc-common = { version = "0.6.0", path = "../portal-jsc-common" }
+swc_ecma_transforms_optimization.workspace = true
+base64 = "0.22.1"
 
 [features]
 ty=[]

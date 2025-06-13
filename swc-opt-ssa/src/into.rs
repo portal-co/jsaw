@@ -421,7 +421,7 @@ impl Convert {
                                 .collect::<anyhow::Result<Vec<_>>>()?;
                             let ty = Some(OptType::Object {
                                 nest: crate::ObjType::Array,
-                                extensible: false,
+                                extended: false,
                                 elem_tys,
                             });
                             (
@@ -442,7 +442,7 @@ impl Convert {
                                 state.get(mem).cloned().context("in getting the val")?;
                             while let Some(OptType::Object {
                                 nest,
-                                extensible,
+                                extended: extensible,
                                 elem_tys,
                             }) = &oty
                             {

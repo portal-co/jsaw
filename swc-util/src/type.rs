@@ -33,8 +33,8 @@ pub enum OptType {
     },
     Object {
         nest: ObjType,
-        /// Represents whether an object type has been extended; may be changed to `extended` in 0.7
-        extensible: bool,
+        /// Represents whether an object type has been extended
+        extended: bool,
         elem_tys: Vec<Option<OptType>>,
     },
     Lit(Lit),
@@ -71,13 +71,13 @@ impl OptType {
             },
             OptType::Object {
                 nest,
-                extensible,
+                extended: extensible,
                 elem_tys,
             } => {
                 if !*extensible {
                     Some(OptType::Object {
                         nest: nest.clone(),
-                        extensible: true,
+                        extended: true,
                         elem_tys: elem_tys.clone(),
                     })
                 } else {
@@ -100,7 +100,7 @@ impl OptType {
                                     };
                                     return Some(OptType::Object {
                                         nest: ObjType::Array,
-                                        extensible: true,
+                                        extended: true,
                                         elem_tys,
                                     });
 
@@ -125,7 +125,7 @@ impl OptType {
                             };
                             Some(OptType::Object {
                                 nest: ObjType::Object(s),
-                                extensible: true,
+                                extended: true,
                                 elem_tys,
                             })
                         }

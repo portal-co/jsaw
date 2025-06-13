@@ -22,19 +22,19 @@ pub mod impls;
 pub mod rew;
 pub mod simplify;
 
-pub fn benj(a: &mut SwcFunc) {
-    for ki in a.blocks.iter().map(|a| a.0).collect::<Vec<_>>() {
-        let mut t = take(&mut a.blocks[ki].postcedent);
-        for r in t.targets_mut() {
-            if r.block.index() <= ki.index() {
-                for w in r.args.iter_mut() {
-                    let v = a.values.alloc(SValueW(SValue::Benc(*w)));
-                    a.blocks[ki].stmts.push(v);
-                    *w = v;
+pub fn benj(swc_func: &mut SwcFunc) {
+    for block_index in swc_func.blocks.iter().map(|a| a.0).collect::<Vec<_>>() {
+        let mut postcedent = take(&mut swc_func.blocks[block_index].postcedent);
+        for target in postcedent.targets_mut() {
+            if target.block.index() <= block_index.index() {
+                for arg in target.args.iter_mut() {
+                    let value = swc_func.values.alloc(SValueW(SValue::Benc(*arg)));
+                    swc_func.blocks[block_index].stmts.push(value);
+                    *arg = value;
                 }
             }
         }
-        a.blocks[ki].postcedent = t;
+        swc_func.blocks[block_index].postcedent = postcedent;
     }
 }
 #[derive(Clone, Debug)]

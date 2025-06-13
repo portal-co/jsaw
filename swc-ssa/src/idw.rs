@@ -12,22 +12,22 @@ impl Idw {
         &mut self,
         orig: &SwcFunc,
         new: &mut SwcFunc,
-        a: Id<SBlock>,
+        block_id: Id<SBlock>,
     ) -> anyhow::Result<Id<SBlock>> {
         loop {
-            if let Some(a) = self.map.get(&a).cloned() {
-                return Ok(a);
+            if let Some(mapped_id) = self.map.get(&block_id).cloned() {
+                return Ok(mapped_id);
             }
-            let n = new.blocks.alloc(Default::default());
-            self.map.insert(a, n);
-            let mut vals = orig.blocks[a]
+            let new_block_id = new.blocks.alloc(Default::default());
+            self.map.insert(block_id, new_block_id);
+            let mut param_map = orig.blocks[block_id]
                 .params
                 .iter()
                 .cloned()
-                .map(|a| a.0)
-                .map(|a| (a, new.add_blockparam(n)))
+                .map(|param| param.0)
+                .map(|param_id| (param_id, new.add_blockparam(new_block_id)))
                 .collect::<BTreeMap<_, _>>();
-            let c = match &orig.blocks[a].postcedent.catch {
+            let catch_clause = match &orig.blocks[block_id].postcedent.catch {
                 crate::SCatch::Throw => SCatch::Throw,
                 crate::SCatch::Just { target } => SCatch::Just {
                     target: crate::STarget {
@@ -35,7 +35,7 @@ impl Idw {
                         args: target
                             .args
                             .iter()
-                            .filter_map(|a| vals.get(a))
+                            .filter_map(|arg| param_map.get(arg))
                             .cloned()
                             .collect(),
                     },

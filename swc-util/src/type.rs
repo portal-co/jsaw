@@ -85,7 +85,7 @@ impl OptType {
                         ObjType::Array => {
                             let mut elem_tys = elem_tys.clone();
                             if elem_tys.len() != 0 {
-                                let Some(f) = elem_tys.iter().find_map(|a| a.clone()) else {
+                                let Some(first_type) = elem_tys.iter().find_map(|a| a.clone()) else {
                                     return Some(OptType::Array {
                                         elem_ty: Box::new(None),
                                     });
@@ -93,7 +93,7 @@ impl OptType {
                                 for t in elem_tys.iter_mut().rev() {
                                     // if *t != f{
                                     match &*t {
-                                        Some(a) if *a != f => *t = a.parent(flags),
+                                        Some(a) if *a != first_type => *t = a.parent(flags),
                                         _ => {
                                             continue;
                                         }
@@ -107,7 +107,7 @@ impl OptType {
                                     // }
                                 }
                                 return Some(OptType::Array {
-                                    elem_ty: Box::new(Some(f)),
+                                    elem_ty: Box::new(Some(first_type)),
                                 });
                             }
                             None

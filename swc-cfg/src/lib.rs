@@ -52,7 +52,7 @@ impl TryFrom<Function> for Func {
 impl Into<Function> for Func {
     fn into(self) -> Function {
         let k = ssa_reloop::go(&self, self.entry);
-        let x = Cfg::process_block(&self.cfg, &k, Span::dummy_with_cmt(), Default::default());
+        let stmts = Cfg::process_block(&self.cfg, &k, Span::dummy_with_cmt(), Default::default());
         return Function {
             params: self.params,
             decorators: vec![],
@@ -61,7 +61,7 @@ impl Into<Function> for Func {
             body: Some(BlockStmt {
                 span: Span::dummy_with_cmt(),
                 ctxt: Default::default(),
-                stmts: x,
+                stmts,
             }),
             is_generator: self.is_generator,
             is_async: self.is_async,
@@ -559,98 +559,98 @@ impl Ctx {
     pub fn transform_all(
         &self,
         cfg: &mut Cfg,
-        x: Vec<Stmt>,
+        statements: Vec<Stmt>,
         mut current: Id<Block>,
     ) -> anyhow::Result<Id<Block>> {
-        for x in x {
-            current = self.transform(cfg, x, current, None)?;
+        for statement in statements {
+            current = self.transform(cfg, statement, current, None)?;
         }
         Ok(current)
     }
     pub fn transform(
         &self,
         cfg: &mut Cfg,
-        x: Stmt,
+        statement: Stmt,
         current: Id<Block>,
         label: Option<Ident>,
     ) -> anyhow::Result<Id<Block>> {
-        if let Stmt::Throw(t) = x {
-            cfg.blocks[current].end.orig_span = Some(t.span());
-            cfg.blocks[current].end.term = Term::Throw(*t.arg);
+        if let Stmt::Throw(throw_stmt) = statement {
+            cfg.blocks[current].end.orig_span = Some(throw_stmt.span());
+            cfg.blocks[current].end.term = Term::Throw(*throw_stmt.arg);
             return Ok(self.new_block(cfg));
         }
-        if let Stmt::Return(r) = x {
-            cfg.blocks[current].end.orig_span = Some(r.span());
-            cfg.blocks[current].end.term = Term::Return(r.arg.map(|a| *a));
+        if let Stmt::Return(return_stmt) = statement {
+            cfg.blocks[current].end.orig_span = Some(return_stmt.span());
+            cfg.blocks[current].end.term = Term::Return(return_stmt.arg.map(|a| *a));
             return Ok(self.new_block(cfg));
         }
-        if let Stmt::Try(t) = x {
-            let s = t.span();
+        if let Stmt::Try(try_stmt) = statement {
+            let span = try_stmt.span();
             let next = self.new_block(cfg);
-            let catch = match t.handler {
+            let catch = match try_stmt.handler {
                 None => None,
-                Some(a) => Some({
-                    let x = self.new_block(cfg);
-                    let y = self.transform_all(cfg, a.body.stmts, x)?;
-                    cfg.blocks[y].end.term = Term::Jmp(next);
+                Some(catch_clause) => Some({
+                    let catch_block_id = self.new_block(cfg);
+                    let catch_end_id = self.transform_all(cfg, catch_clause.body.stmts, catch_block_id)?;
+                    cfg.blocks[catch_end_id].end.term = Term::Jmp(next);
                     (
-                        a.param.unwrap_or(Pat::Ident(BindingIdent {
-                            id: Ident::new(Atom::new("_error"), a.span, SyntaxContext::default()),
+                        catch_clause.param.unwrap_or(Pat::Ident(BindingIdent {
+                            id: Ident::new(Atom::new("_error"), catch_clause.span, SyntaxContext::default()),
                             type_ann: None,
                         })),
-                        x,
+                        catch_block_id,
                     )
                 }),
             };
             let mut new = self.clone();
-            if let Some((a, b)) = catch {
-                new.catch = Catch::Jump { pat: a, k: b };
+            if let Some((catch_param, catch_block_id)) = catch {
+                new.catch = Catch::Jump { pat: catch_param, k: catch_block_id };
             };
-            let a = new.transform_all(cfg, t.block.stmts, current)?;
-            cfg.blocks[a].end.term = Term::Jmp(next);
-            cfg.blocks[a].end.orig_span = Some(s);
-            let next = match t.finalizer {
-                Some(f) => self.transform_all(cfg, f.stmts, next)?,
+            let try_end_id = new.transform_all(cfg, try_stmt.block.stmts, current)?;
+            cfg.blocks[try_end_id].end.term = Term::Jmp(next);
+            cfg.blocks[try_end_id].end.orig_span = Some(span);
+            let next = match try_stmt.finalizer {
+                Some(finalizer) => self.transform_all(cfg, finalizer.stmts, next)?,
                 None => next,
             };
             return Ok(next);
         }
-        if let Stmt::Block(b) = x {
-            return self.transform_all(cfg, b.stmts, current);
+        if let Stmt::Block(block) = statement {
+            return self.transform_all(cfg, block.stmts, current);
         }
-        if let Stmt::If(i) = x {
-            let s = i.span();
+        if let Stmt::If(if_stmt) = statement {
+            let span = if_stmt.span();
             let next = self.new_block(cfg);
             let then = self.new_block(cfg);
             let then_end = self.transform(
                 cfg,
-                *i.cons,
+                *if_stmt.cons,
                 current,
-                match i.alt.as_ref() {
+                match if_stmt.alt.as_ref() {
                     None => label,
                     Some(_) => None,
                 },
             )?;
             cfg.blocks[then_end].end.term = Term::Jmp(next);
-            let els = match i.alt {
+            let els = match if_stmt.alt {
                 None => then,
-                Some(e) => {
+                Some(else_stmt) => {
                     let els = self.new_block(cfg);
-                    let els_end = self.transform(cfg, *e, current, None)?;
+                    let els_end = self.transform(cfg, *else_stmt, current, None)?;
                     cfg.blocks[els_end].end.term = Term::Jmp(next);
                     els
                 }
             };
             cfg.blocks[current].end.term = Term::CondJmp {
-                cond: *i.test,
+                cond: *if_stmt.test,
                 if_true: then,
                 if_false: els,
             };
-            cfg.blocks[current].end.orig_span = Some(s);
+            cfg.blocks[current].end.orig_span = Some(span);
             return Ok(next);
         }
-        if let Stmt::Switch(i) = x {
-            let s = i.span();
+        if let Stmt::Switch(switch_stmt) = statement {
+            let span = switch_stmt.span();
             let next = self.new_block(cfg);
             let mut target = self.clone();
             if let None = target.cur_loop {
@@ -663,31 +663,31 @@ impl Ctx {
             let mut cur = self.new_block(cfg);
             let mut default = next;
             let mut blocks = HashMap::new();
-            for c in i.cases {
-                match c.test {
+            for case in switch_stmt.cases {
+                match case.test {
                     None => {
                         default = cur;
-                        cur = target.transform_all(cfg, c.cons, cur)?;
+                        cur = target.transform_all(cfg, case.cons, cur)?;
                     }
-                    Some(t) => {
-                        blocks.insert(*t, cur);
-                        cur = target.transform_all(cfg, c.cons, cur)?;
+                    Some(test) => {
+                        blocks.insert(*test, cur);
+                        cur = target.transform_all(cfg, case.cons, cur)?;
                     }
                 }
             }
             cfg.blocks[cur].end.term = Term::Jmp(next);
             cfg.blocks[current].end.term = Term::Switch {
-                x: *i.discriminant,
+                x: *switch_stmt.discriminant,
                 blocks: blocks,
                 default: default,
             };
-            cfg.blocks[current].end.orig_span = Some(s);
+            cfg.blocks[current].end.orig_span = Some(span);
             return Ok(next);
         }
-        if let Stmt::Break(b) = x {
-            cfg.blocks[current].end.orig_span = Some(b.span());
+        if let Stmt::Break(break_stmt) = statement {
+            cfg.blocks[current].end.orig_span = Some(break_stmt.span());
             cfg.blocks[current].end.term = Term::Jmp(
-                match b.label {
+                match break_stmt.label {
                     Some(l) => self.labelled.get(&l),
                     None => self.cur_loop.as_ref(),
                 }
@@ -696,10 +696,10 @@ impl Ctx {
             );
             return Ok(self.new_block(cfg));
         }
-        if let Stmt::Continue(b) = x {
-            cfg.blocks[current].end.orig_span = Some(b.span());
+        if let Stmt::Continue(continue_stmt) = statement {
+            cfg.blocks[current].end.orig_span = Some(continue_stmt.span());
             cfg.blocks[current].end.term = Term::Jmp(
-                match b.label {
+                match continue_stmt.label {
                     Some(l) => self.labelled.get(&l),
                     None => self.cur_loop.as_ref(),
                 }
@@ -708,27 +708,27 @@ impl Ctx {
             );
             return Ok(self.new_block(cfg));
         }
-        if let Stmt::Labeled(l) = x {
+        if let Stmt::Labeled(labeled_stmt) = statement {
             let next = self.new_block(cfg);
             let cont = self.new_block(cfg);
-            cfg.blocks[current].end.orig_span = Some(l.span());
+            cfg.blocks[current].end.orig_span = Some(labeled_stmt.span());
             cfg.blocks[current].end.term = Term::Jmp(cont);
             let mut new = self.clone();
             new.labelled.insert(
-                l.label.clone(),
+                labeled_stmt.label.clone(),
                 Loop {
                     r#break: next,
                     r#continue: cont,
                 },
             );
-            let k = new.transform(cfg, *l.body, cont, Some(l.label))?;
+            let k = new.transform(cfg, *labeled_stmt.body, cont, Some(labeled_stmt.label))?;
             cfg.blocks[k].end.term = Term::Jmp(next);
             return Ok(next);
         }
-        if let Stmt::DoWhile(w) = x {
+        if let Stmt::DoWhile(do_while_stmt) = statement {
             let next = self.new_block(cfg);
             let cont = self.new_block(cfg);
-            cfg.blocks[current].end.orig_span = Some(w.span());
+            cfg.blocks[current].end.orig_span = Some(do_while_stmt.span());
             cfg.blocks[current].end.term = Term::Jmp(cont);
             let mut new = self.clone();
             new.cur_loop = Some(Loop {
@@ -739,34 +739,34 @@ impl Ctx {
                 new.labelled
                     .insert(l, new.cur_loop.as_ref().cloned().unwrap());
             }
-            let k = new.transform(cfg, *w.body, cont, None)?;
+            let k = new.transform(cfg, *do_while_stmt.body, cont, None)?;
             cfg.blocks[k].end.term = Term::CondJmp {
-                cond: *w.test,
+                cond: *do_while_stmt.test,
                 if_true: cont,
                 if_false: next,
             };
             return Ok(next);
         }
-        if let Stmt::While(w) = x {
+        if let Stmt::While(while_stmt) = statement {
             return self.transform(
                 cfg,
                 Stmt::If(IfStmt {
-                    span: w.span,
-                    test: w.test.clone(),
+                    span: while_stmt.span,
+                    test: while_stmt.test.clone(),
                     alt: None,
                     cons: Box::new(Stmt::DoWhile(DoWhileStmt {
-                        span: w.span,
-                        test: w.test,
-                        body: w.body,
+                        span: while_stmt.span,
+                        test: while_stmt.test,
+                        body: while_stmt.body,
                     })),
                 }),
                 current,
                 label,
             );
         }
-        if let Stmt::For(f) = x {
-            if let Some(i) = f.init {
-                cfg.blocks[current].stmts.push(match i {
+        if let Stmt::For(for_stmt) = statement {
+            if let Some(init) = for_stmt.init {
+                cfg.blocks[current].stmts.push(match init {
                     swc_ecma_ast::VarDeclOrExpr::VarDecl(var_decl) => {
                         Stmt::Decl(Decl::Var(var_decl))
                     }
@@ -779,20 +779,20 @@ impl Ctx {
             return self.transform(
                 cfg,
                 Stmt::While(WhileStmt {
-                    span: f.span,
-                    test: f.test.unwrap_or_else(|| {
+                    span: for_stmt.span,
+                    test: for_stmt.test.unwrap_or_else(|| {
                         Box::new(Expr::Lit(Lit::Bool(Bool {
-                            span: f.span,
+                            span: for_stmt.span,
                             value: true,
                         })))
                     }),
                     body: Box::new(Stmt::Block(BlockStmt {
-                        span: f.span,
+                        span: for_stmt.span,
                         ctxt: SyntaxContext::default(),
-                        stmts: vec![f.body]
+                        stmts: vec![for_stmt.body]
                             .into_iter()
                             .chain(
-                                f.update
+                                for_stmt.update
                                     .map(|a| {
                                         Box::new(Stmt::Expr(ExprStmt {
                                             span: a.span(),
@@ -809,7 +809,7 @@ impl Ctx {
                 label,
             );
         }
-        cfg.blocks[current].stmts.push(x);
+        cfg.blocks[current].stmts.push(statement);
         Ok(current)
     }
 }

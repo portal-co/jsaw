@@ -8,49 +8,49 @@ pub struct Recfg {
     pub map: BTreeMap<Id<Block>, Id<Block>>,
 }
 impl Recfg {
-    pub fn go(&mut self, i: &Cfg, o: &mut Cfg, k: Id<Block>) -> anyhow::Result<Id<Block>> {
+    pub fn go(&mut self, input_cfg: &Cfg, output_cfg: &mut Cfg, block_id: Id<Block>) -> anyhow::Result<Id<Block>> {
         loop {
-            if let Some(a) = self.map.get(&k) {
-                return Ok(*a);
+            if let Some(existing_block_id) = self.map.get(&block_id) {
+                return Ok(*existing_block_id);
             }
-            let l = o.blocks.alloc(Default::default());
-            o.blocks[l].end.orig_span = i.blocks[k].end.orig_span.clone();
-            self.map.insert(k, l);
-            let catch = match &i.blocks[k].end.catch {
+            let new_block_id = output_cfg.blocks.alloc(Default::default());
+            output_cfg.blocks[new_block_id].end.orig_span = input_cfg.blocks[block_id].end.orig_span.clone();
+            self.map.insert(block_id, new_block_id);
+            let catch = match &input_cfg.blocks[block_id].end.catch {
                 crate::Catch::Throw => Catch::Throw,
                 crate::Catch::Jump { pat, k } => Catch::Jump {
                     pat: pat.clone(),
-                    k: self.go(i, o, *k)?,
+                    k: self.go(input_cfg, output_cfg, *k)?,
                 },
             };
-            o.blocks[l].end.catch = catch.clone();
+            output_cfg.blocks[new_block_id].end.catch = catch.clone();
             let mut ctx = Ctx {
                 catch,
                 ..Default::default()
             };
-            let l = ctx.transform_all(o, i.blocks[k].stmts.clone(), l)?;
-            let term = match &i.blocks[k].end.term {
-                crate::Term::Jmp(id) => Term::Jmp(self.go(i, o, *id)?),
+            let new_block_id = ctx.transform_all(output_cfg, input_cfg.blocks[block_id].stmts.clone(), new_block_id)?;
+            let term = match &input_cfg.blocks[block_id].end.term {
+                crate::Term::Jmp(id) => Term::Jmp(self.go(input_cfg, output_cfg, *id)?),
                 crate::Term::CondJmp {
                     cond,
                     if_true,
                     if_false,
                 } => Term::CondJmp {
                     cond: cond.clone(),
-                    if_true: self.go(i, o, *if_true)?,
-                    if_false: self.go(i, o, *if_false)?,
+                    if_true: self.go(input_cfg, output_cfg, *if_true)?,
+                    if_false: self.go(input_cfg, output_cfg, *if_false)?,
                 },
                 crate::Term::Switch { x, blocks, default } => Term::Switch {
                     x: x.clone(),
                     blocks: blocks
                         .iter()
-                        .map(|(a, b)| Ok((a.clone(), self.go(i, o, *b)?)))
+                        .map(|(a, b)| Ok((a.clone(), self.go(input_cfg, output_cfg, *b)?)))
                         .collect::<anyhow::Result<HashMap<_, _>>>()?,
-                    default: self.go(i, o, *default)?,
+                    default: self.go(input_cfg, output_cfg, *default)?,
                 },
                 a => a.clone(),
             };
-            o.blocks[l].end.term = term;
+            output_cfg.blocks[new_block_id].end.term = term;
         }
     }
 }

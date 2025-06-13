@@ -109,16 +109,16 @@ impl Rew {
         &mut self,
         cfg: &mut Cfg,
         tcfg: &TCfg,
-        k: Id<TBlock>,
+        block_id: Id<TBlock>,
     ) -> anyhow::Result<Id<Block>> {
         loop {
-            if let Some(x) = self.all.get(&k) {
-                return Ok(*x);
+            if let Some(existing_block_id) = self.all.get(&block_id) {
+                return Ok(*existing_block_id);
             }
-            let l = cfg.blocks.alloc(Default::default());
-            cfg.blocks[l].end.orig_span = tcfg.blocks[k].orig_span.clone();
-            self.all.insert(k, l);
-            let catch = match &tcfg.blocks[k].catch {
+            let new_block_id = cfg.blocks.alloc(Default::default());
+            cfg.blocks[new_block_id].end.orig_span = tcfg.blocks[block_id].orig_span.clone();
+            self.all.insert(block_id, new_block_id);
+            let catch = match &tcfg.blocks[block_id].catch {
                 crate::TCatch::Throw => swc_cfg::Catch::Throw,
                 crate::TCatch::Jump { pat, k } => swc_cfg::Catch::Jump {
                     pat: Pat::Ident(swc_ecma_ast::BindingIdent {
@@ -128,10 +128,10 @@ impl Rew {
                     k: self.trans(cfg, tcfg, *k)?,
                 },
             };
-            cfg.blocks[l].end.catch = catch;
-            for i2 in tcfg.blocks[k].stmts.iter() {
-                let span = i2.3;
-                let left = match &i2.0 {
+            cfg.blocks[new_block_id].end.catch = catch;
+            for statement_data in tcfg.blocks[block_id].stmts.iter() {
+                let span = statement_data.3;
+                let left = match &statement_data.0 {
                     crate::LId::Id { id } => swc_ecma_ast::AssignTarget::Simple(
                         swc_ecma_ast::SimpleAssignTarget::Ident(swc_ecma_ast::BindingIdent {
                             id: i(id, span),
@@ -154,7 +154,7 @@ impl Rew {
                     }
                     _ => todo!(),
                 };
-                let right = Box::new(match &i2.2 {
+                let right = Box::new(match &statement_data.2 {
                     crate::Item::Just { id } => Expr::Ident(i(id, span)),
                     crate::Item::Bin { left, right, op } => Expr::Bin(BinExpr {
                         span: span,
@@ -264,7 +264,7 @@ impl Rew {
                     crate::Item::Yield { value, delegate } => {
                         Expr::Yield(swc_ecma_ast::YieldExpr {
                             span: span,
-                            arg: value.as_ref().map(|x| Box::new(Expr::Ident(i(x, span)))),
+                            arg: value.as_ref().map(|yielded_value| Box::new(Expr::Ident(i(yielded_value, span)))),
                             delegate: *delegate,
                         })
                     }
@@ -287,7 +287,7 @@ impl Rew {
                         _ => todo!(),
                     },
                 });
-                cfg.blocks[l].stmts.push(Stmt::Expr(ExprStmt {
+                cfg.blocks[new_block_id].stmts.push(Stmt::Expr(ExprStmt {
                     span: span,
                     expr: Box::new(Expr::Assign(AssignExpr {
                         span: span,
@@ -297,13 +297,13 @@ impl Rew {
                     })),
                 }));
             }
-            let term = match &tcfg.blocks[k].term {
+            let term = match &tcfg.blocks[block_id].term {
                 crate::TTerm::Return(r) => Term::Return(
                     r.as_ref()
-                        .map(|v| {
+                        .map(|returned_value| {
                             i(
-                                v,
-                                tcfg.blocks[k]
+                                returned_value,
+                                tcfg.blocks[block_id]
                                     .orig_span
                                     .clone()
                                     .unwrap_or(Span::dummy_with_cmt()),
@@ -313,7 +313,7 @@ impl Rew {
                 ),
                 crate::TTerm::Throw(x) => Term::Throw(Expr::Ident(i(
                     x,
-                    tcfg.blocks[k]
+                    tcfg.blocks[block_id]
                         .orig_span
                         .clone()
                         .unwrap_or(Span::dummy_with_cmt()),
@@ -326,7 +326,7 @@ impl Rew {
                 } => Term::CondJmp {
                     cond: Expr::Ident(i(
                         cond,
-                        tcfg.blocks[k]
+                        tcfg.blocks[block_id]
                             .orig_span
                             .clone()
                             .unwrap_or(Span::dummy_with_cmt()),
@@ -337,7 +337,7 @@ impl Rew {
                 crate::TTerm::Switch { x, blocks, default } => Term::Switch {
                     x: Expr::Ident(i(
                         x,
-                        tcfg.blocks[k]
+                        tcfg.blocks[block_id]
                             .orig_span
                             .clone()
                             .unwrap_or(Span::dummy_with_cmt()),
@@ -348,7 +348,7 @@ impl Rew {
                             anyhow::Ok((
                                 Expr::Ident(i(
                                     a.0,
-                                    tcfg.blocks[k]
+                                    tcfg.blocks[block_id]
                                         .orig_span
                                         .clone()
                                         .unwrap_or(Span::dummy_with_cmt()),
@@ -361,7 +361,7 @@ impl Rew {
                 },
                 crate::TTerm::Default => Term::Default,
             };
-            cfg.blocks[l].end.term = term;
+            cfg.blocks[new_block_id].end.term = term;
         }
     }
 }

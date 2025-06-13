@@ -27,11 +27,11 @@ pub struct LAM<T> {
     pub mark: OnceLock<Mark>,
 }
 impl<T: Default> LAM<T> {
-    pub fn new(a: impl AtomResolver + 'static) -> Self {
+    pub fn new(resolver: impl AtomResolver + 'static) -> Self {
         Self {
             map: HashMap::new(),
             default: T::default(),
-            resolver: Arc::new(a),
+            resolver: Arc::new(resolver),
             mark: Default::default(),
         }
     }
@@ -46,7 +46,7 @@ impl<T> Index<Id> for LAM<T> {
 
     fn index(&self, index: Id) -> &Self::Output {
         match self.map.get(&index) {
-            Some(a) => a,
+            Some(value) => value,
             None => &self.default,
         }
     }
@@ -62,13 +62,13 @@ impl<T: Default> IndexIter<Id> for LAM<T> {
     }
 }
 impl<T: Default> IndexAlloc<Id> for LAM<T> {
-    fn alloc(&mut self, a: Self::Output) -> Id {
+    fn alloc(&mut self, value: Self::Output) -> Id {
         let len = self.map.len();
         let root = (
             self.resolver.resolve(len),
             SyntaxContext::empty().apply_mark(*self.mark.get_or_init(|| Mark::fresh(Mark::root()))),
         );
-        self[root.clone()] = a;
+        self[root.clone()] = value;
         return root;
     }
 }

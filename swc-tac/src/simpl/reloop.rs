@@ -13,18 +13,18 @@ use super::*;
 
 pub fn reloop<D: TacDialect>(
     cfg: &TSimplCfg<D>,
-    k: &ShapedBlock<Id<TSimplBlock<D>>>,
+    shaped_block: &ShapedBlock<Id<TSimplBlock<D>>>,
     span: Span,
     cff: &swc_ecma_ast::Ident,
 ) -> Vec<SimplStmt<D>> {
-    match k {
+    match shaped_block {
         ShapedBlock::Simple(simple_block) => {
-            let k = &cfg.blocks[simple_block.label];
-            let span = match k.orig_span.clone() {
+            let block = &cfg.blocks[simple_block.label];
+            let span = match block.orig_span.clone() {
                 None => span,
                 Some(s) => s,
             };
-            let jmp = |k: Id<TSimplBlock<D>>| {
+            let generate_jump = |target_block_id: Id<TSimplBlock<D>>| {
                 vec![SimplStmt::<D>::Expr(MakeSpanned {
                     value: Box::new(SimplExpr::Assign(MakeSpanned {
                         span,
@@ -39,7 +39,7 @@ pub fn reloop<D: TacDialect>(
                             assign: AssignOp::Assign,
                             body: Box::new(SimplExpr::Lit(Lit::Num(Number {
                                 span: span,
-                                value: k.index() as u32 as f64,
+                                value: target_block_id.index() as u32 as f64,
                                 raw: None,
                             }))),
                         },
@@ -48,9 +48,9 @@ pub fn reloop<D: TacDialect>(
                 })]
                 .into_iter()
                 .chain(
-                    match simple_block.branches.get(&k) {
+                    match simple_block.branches.get(&target_block_id) {
                         None => vec![],
-                        Some(a) => match a {
+                        Some(branch_mode) => match branch_mode {
                             relooper::BranchMode::LoopBreak(l)
                             | relooper::BranchMode::LoopBreakIntoMulti(l) => {
                                 vec![SimplStmt::Break(swc_ecma_ast::Ident::new(
@@ -78,7 +78,7 @@ pub fn reloop<D: TacDialect>(
                 )
                 .collect::<Vec<_>>()
             };
-            let mut body = k
+            let mut body = block
                 .stmts
                 .iter()
                 .map(|(b, m, f, i, e)| {
@@ -190,7 +190,7 @@ pub fn reloop<D: TacDialect>(
                     })
                 })
                 .collect::<Vec<SimplStmt<D>>>();
-            match &k.term {
+            match &block.term {
                 TSimplTerm::Return(r) => {
                     let r = match r {
                         id => SimplExpr::<D>::Ident(D::span(id.1.clone(), id.0.clone().span(span))),
@@ -200,7 +200,7 @@ pub fn reloop<D: TacDialect>(
                         span: span,
                     }));
                 }
-                TSimplTerm::Jmp(id) => body.extend(jmp(*id)),
+                TSimplTerm::Jmp(id) => body.extend(generate_jump(*id)),
                 TSimplTerm::CondJmp {
                     cond,
                     if_true,
@@ -212,10 +212,10 @@ pub fn reloop<D: TacDialect>(
                     body.push(SimplStmt::If(MakeSpanned {
                         value: SimplIf {
                             kind: SimplIfKind::If {
-                                r#else: jmp(*if_false),
+                                r#else: generate_jump(*if_false),
                             },
                             cond: Box::new(cond),
-                            body: jmp(*if_true),
+                            body: generate_jump(*if_true),
                         },
                         span: span,
                     }))
@@ -234,7 +234,7 @@ pub fn reloop<D: TacDialect>(
                                     (
                                         a.clone(),
                                         (
-                                            jmp(*d),
+                                            generate_jump(*d),
                                             b.iter()
                                                 .map(|c| c.0.root.clone())
                                                 .map(|(a, b)| swc_ecma_ast::Ident {
@@ -273,7 +273,7 @@ pub fn reloop<D: TacDialect>(
                                             id.0.clone().span(span),
                                         )),
                                     };
-                                    (Box::new(cond), jmp(*k), BreakKind::BreakAfter)
+                                    (Box::new(cond), generate_jump(*k), BreakKind::BreakAfter)
                                 })
                                 .collect(),
                             label: swc_ecma_ast::Ident::new_private(Atom::new("$"), span),

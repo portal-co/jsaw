@@ -423,24 +423,24 @@ impl Idempotency for AssignTarget {
         }
     }
 }
-pub struct CondWrapping {}
+struct CondWrapping{}
 impl VisitMut for CondWrapping {
     fn visit_mut_expr(&mut self, node: &mut Expr) {
         *node = match take(node) {
-            Expr::Cond(c) => {
-                let mut x = Expr::Call(CallExpr {
-                    span: c.span,
+            Expr::Cond(cond_expr) => {
+                let mut call_expr = Expr::Call(CallExpr {
+                    span: cond_expr.span,
                     ctxt: Default::default(),
                     callee: Callee::Expr(Box::new(Expr::Arrow(ArrowExpr {
-                        span: c.span,
+                        span: cond_expr.span,
                         ctxt: Default::default(),
                         params: vec![],
                         body: Box::new(BlockStmtOrExpr::BlockStmt(BlockStmt {
-                            span: c.span,
+                            span: cond_expr.span,
                             ctxt: Default::default(),
                             stmts: vec![Stmt::Return(ReturnStmt {
-                                span: c.span,
-                                arg: Some(Box::new(Expr::Cond(c))),
+                                span: cond_expr.span,
+                                arg: Some(Box::new(Expr::Cond(cond_expr))),
                             })],
                         })),
                         is_async: false,
@@ -452,14 +452,14 @@ impl VisitMut for CondWrapping {
                     type_args: None,
                 });
                 match CondFolding::default() {
-                    mut y => {
-                        y.fold_stmts = true;
-                        x.visit_mut_with(&mut y);
+                    mut cond_folding => {
+                        cond_folding.fold_stmts = true;
+                        call_expr.visit_mut_with(&mut cond_folding);
                     }
                 };
-                x
+                call_expr
             }
-            node => node,
+            other => other,
         };
         node.visit_mut_children_with(self);
     }
@@ -471,49 +471,49 @@ pub struct CondFolding {
 }
 impl VisitMut for CondFolding {
     fn visit_mut_stmt(&mut self, node: &mut Stmt) {
-        let mut cont = true;
-        while take(&mut cont) {
+        let mut should_continue = true;
+        while take(&mut should_continue) {
             node.visit_mut_children_with(self);
             if self.fold_stmts {
                 *node = match take(node) {
-                    Stmt::Expr(e) if e.expr.is_cond() => {
-                        cont = true;
-                        let Expr::Cond(c) = *e.expr else {
+                    Stmt::Expr(expr_stmt) if expr_stmt.expr.is_cond() => {
+                        should_continue = true;
+                        let Expr::Cond(cond_expr) = *expr_stmt.expr else {
                             unreachable!()
                         };
                         Stmt::If(IfStmt {
-                            span: c.span,
-                            test: c.test,
+                            span: cond_expr.span,
+                            test: cond_expr.test,
                             cons: Box::new(Stmt::Expr(ExprStmt {
-                                span: e.span,
-                                expr: c.cons,
+                                span: expr_stmt.span,
+                                expr: cond_expr.cons,
                             })),
                             alt: Some(Box::new(Stmt::Expr(ExprStmt {
-                                span: e.span,
-                                expr: c.alt,
+                                span: expr_stmt.span,
+                                expr: cond_expr.alt,
                             }))),
                         })
                     }
-                    Stmt::Return(r) if r.arg.as_ref().is_some_and(|a| a.is_cond()) => {
-                        cont = true;
-                        let Expr::Cond(c) = *r.arg.unwrap() else {
+                    Stmt::Return(return_stmt) if return_stmt.arg.as_ref().is_some_and(|arg| arg.is_cond()) => {
+                        should_continue = true;
+                        let Expr::Cond(c) = *return_stmt.arg.unwrap() else {
                             unreachable!()
                         };
                         Stmt::If(IfStmt {
                             span: c.span,
                             test: c.test,
                             cons: Box::new(Stmt::Return(ReturnStmt {
-                                span: r.span,
+                                span: return_stmt.span,
                                 arg: Some(c.cons),
                             })),
                             alt: Some(Box::new(Stmt::Return(ReturnStmt {
-                                span: r.span,
+                                span: return_stmt.span,
                                 arg: Some(c.alt),
                             }))),
                         })
                     }
                     Stmt::Throw(e) if e.arg.is_cond() => {
-                        cont = true;
+                        should_continue = true;
                         let Expr::Cond(c) = *e.arg else {
                             unreachable!()
                         };
@@ -547,57 +547,57 @@ impl VisitMut for CondFolding {
                     cons,
                     alt,
                 }) => match *test {
-                    Expr::Seq(mut s) => {
-                        let last = take(&mut **s.exprs.last_mut().unwrap());
-                        **s.exprs.last_mut().unwrap() = Expr::Cond(CondExpr {
+                    Expr::Seq(mut sequence_expression) => {
+                        let last = take(&mut **sequence_expression.exprs.last_mut().unwrap());
+                        **sequence_expression.exprs.last_mut().unwrap() = Expr::Cond(CondExpr {
                             span,
                             test: Box::new(last),
                             cons,
                             alt,
                         });
                         cont = true;
-                        Expr::Seq(s)
+                        Expr::Seq(sequence_expression)
                     }
-                    Expr::Bin(b) if matches!(b.op, BinaryOp::LogicalAnd) => {
+                    Expr::Bin(binary_expression) if matches!(binary_expression.op, BinaryOp::LogicalAnd) => {
                         cont = true;
                         Expr::Cond(CondExpr {
                             span,
-                            test: b.left,
+                            test: binary_expression.left,
                             cons: Box::new(Expr::Cond(CondExpr {
                                 span,
-                                test: b.right,
+                                test: binary_expression.right,
                                 cons,
                                 alt: alt.clone(),
                             })),
                             alt,
                         })
                     }
-                    Expr::Bin(b) if matches!(b.op, BinaryOp::LogicalOr) => {
+                    Expr::Bin(binary_expression) if matches!(binary_expression.op, BinaryOp::LogicalOr) => {
                         cont = true;
                         Expr::Cond(CondExpr {
                             span,
-                            test: b.left,
+                            test: binary_expression.left,
                             cons: cons.clone(),
                             alt: Box::new(Expr::Cond(CondExpr {
                                 span,
-                                test: b.right,
+                                test: binary_expression.right,
                                 cons,
                                 alt,
                             })),
                         })
                     }
-                    Expr::Unary(u) if matches!(u.op, UnaryOp::Bang) => {
+                    Expr::Unary(unary_expression) if matches!(unary_expression.op, UnaryOp::Bang) => {
                         cont = true;
                         Expr::Cond(CondExpr {
                             span,
-                            test: u.arg,
+                            test: unary_expression.arg,
                             cons: alt,
                             alt: cons,
                         })
                     }
-                    Expr::Lit(Lit::Bool(b)) => {
+                    Expr::Lit(Lit::Bool(boolean_literal)) => {
                         // cont = true;
-                        match b.value {
+                        match boolean_literal.value {
                             true => *cons,
                             false => *alt,
                         }
@@ -611,75 +611,75 @@ impl VisitMut for CondFolding {
                         }),
                     },
                 },
-                Expr::Bin(b) if b.left.is_cond() => {
+                Expr::Bin(binary_expression) if binary_expression.left.is_cond() => {
                     cont = true;
-                    let Expr::Cond(c) = *b.left else {
+                    let Expr::Cond(conditional_expression) = *binary_expression.left else {
                         unreachable!()
                     };
                     Expr::Cond(CondExpr {
-                        span: c.span,
-                        test: c.test,
+                        span: conditional_expression.span,
+                        test: conditional_expression.test,
                         cons: Box::new(Expr::Bin(BinExpr {
-                            span: b.span,
-                            op: b.op,
-                            left: c.cons,
-                            right: b.right.clone(),
+                            span: binary_expression.span,
+                            op: binary_expression.op,
+                            left: conditional_expression.cons,
+                            right: binary_expression.right.clone(),
                         })),
                         alt: Box::new(Expr::Bin(BinExpr {
-                            span: b.span,
-                            op: b.op,
-                            left: c.alt,
-                            right: b.right,
+                            span: binary_expression.span,
+                            op: binary_expression.op,
+                            left: conditional_expression.alt,
+                            right: binary_expression.right,
                         })),
                     })
                 }
-                Expr::Bin(b) if b.right.is_cond() => {
+                Expr::Bin(binary_expression) if binary_expression.right.is_cond() => {
                     cont = true;
-                    let Expr::Cond(c) = *b.right else {
+                    let Expr::Cond(conditional_expression) = *binary_expression.right else {
                         unreachable!()
                     };
                     Expr::Cond(CondExpr {
-                        span: c.span,
-                        test: c.test,
+                        span: conditional_expression.span,
+                        test: conditional_expression.test,
                         cons: Box::new(Expr::Bin(BinExpr {
-                            span: b.span,
-                            op: b.op,
-                            right: c.cons,
-                            left: b.left.clone(),
+                            span: binary_expression.span,
+                            op: binary_expression.op,
+                            right: conditional_expression.cons,
+                            left: binary_expression.left.clone(),
                         })),
                         alt: Box::new(Expr::Bin(BinExpr {
-                            span: b.span,
-                            op: b.op,
-                            right: c.alt,
-                            left: b.left,
+                            span: binary_expression.span,
+                            op: binary_expression.op,
+                            right: conditional_expression.alt,
+                            left: binary_expression.left,
                         })),
                     })
                 }
-                Expr::Assign(a)
-                    if a.right.is_cond()
-                        && match a.left {
+                Expr::Assign(assign_expression)
+                    if assign_expression.right.is_cond()
+                        && match assign_expression.left {
                             AssignTarget::Simple(SimpleAssignTarget::Ident(_)) => true,
                             _ => false,
                         } =>
                 {
                     cont = true;
-                    let Expr::Cond(c) = *a.right else {
+                    let Expr::Cond(conditional_expression) = *assign_expression.right else {
                         unreachable!()
                     };
                     Expr::Cond(CondExpr {
-                        span: c.span,
-                        test: c.test,
+                        span: conditional_expression.span,
+                        test: conditional_expression.test,
                         cons: Box::new(Expr::Assign(AssignExpr {
-                            span: a.span,
-                            op: a.op,
-                            left: a.left.clone(),
-                            right: c.cons,
+                            span: assign_expression.span,
+                            op: assign_expression.op,
+                            left: assign_expression.left.clone(),
+                            right: conditional_expression.cons,
                         })),
                         alt: Box::new(Expr::Assign(AssignExpr {
-                            span: a.span,
-                            op: a.op,
-                            left: a.left,
-                            right: c.alt,
+                            span: assign_expression.span,
+                            op: assign_expression.op,
+                            left: assign_expression.left,
+                            right: conditional_expression.alt,
                         })),
                     })
                 }

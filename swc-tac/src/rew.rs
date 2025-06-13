@@ -4,7 +4,6 @@ use id_arena::Id;
 use swc_cfg::{Block, Cfg};
 use swc_cfg::{Func, Term};
 use swc_common::{Span, SyntaxContext};
-use swc_ecma_ast::ComputedPropName;
 use swc_ecma_ast::Expr;
 use swc_ecma_ast::ExprOrSpread;
 use swc_ecma_ast::ExprStmt;
@@ -23,6 +22,7 @@ use swc_ecma_ast::{AssignExpr, Decl, VarDecl, VarDeclarator};
 use swc_ecma_ast::{AssignTarget, Function};
 use swc_ecma_ast::{BinExpr, BindingIdent, TsTypeAnn};
 use swc_ecma_ast::{BinaryOp, CallExpr, Lit, Number};
+use swc_ecma_ast::{ComputedPropName, ThisExpr};
 
 use crate::{TBlock, TCallee, TCfg, TFunc};
 
@@ -264,7 +264,9 @@ impl Rew {
                     crate::Item::Yield { value, delegate } => {
                         Expr::Yield(swc_ecma_ast::YieldExpr {
                             span: span,
-                            arg: value.as_ref().map(|yielded_value| Box::new(Expr::Ident(i(yielded_value, span)))),
+                            arg: value
+                                .as_ref()
+                                .map(|yielded_value| Box::new(Expr::Ident(i(yielded_value, span)))),
                             delegate: *delegate,
                         })
                     }
@@ -286,6 +288,7 @@ impl Rew {
                         }),
                         _ => todo!(),
                     },
+                    crate::Item::This => Expr::This(ThisExpr { span }),
                 });
                 cfg.blocks[new_block_id].stmts.push(Stmt::Expr(ExprStmt {
                     span: span,

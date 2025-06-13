@@ -8,6 +8,7 @@ use bitflags::bitflags;
 use id_arena::{Arena, Id};
 use lam::LAM;
 use portal_jsc_common::Asm;
+use swc_atoms::Atom;
 use swc_cfg::{Block, Catch, Cfg, Func};
 use swc_common::pass::Either;
 use swc_common::{Span, Spanned};
@@ -48,7 +49,7 @@ bitflags! {
         const SSA_LIKE = 0x1;
     }
 }
-#[derive(Clone,Debug)]
+#[derive(Clone, Debug)]
 pub struct TFunc {
     pub cfg: TCfg,
     pub entry: Id<TBlock>,
@@ -67,6 +68,7 @@ impl TryFrom<Func> for TFunc {
             map: BTreeMap::new(),
             ret_to: None,
             recatch: TCatch::Throw,
+            this: None,
         }
         .trans(&value.cfg, &mut cfg, value.entry)?;
         cfg.ts_retty = value.cfg.ts_retty;
@@ -101,7 +103,7 @@ impl TryFrom<Function> for TFunc {
         return a.try_into();
     }
 }
-#[derive(Default, Clone,Debug)]
+#[derive(Default, Clone, Debug)]
 pub struct TCfg {
     pub blocks: Arena<TBlock>,
     pub regs: LAM<()>,
@@ -191,14 +193,14 @@ impl TCfg {
         }
     }
 }
-#[derive(Clone, Default,Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct TBlock {
     pub stmts: Vec<(LId, ValFlags, Item, Span)>,
     pub catch: TCatch,
     pub term: TTerm,
     pub orig_span: Option<Span>,
 }
-#[derive(Clone, Default,Debug)]
+#[derive(Clone, Default, Debug)]
 pub enum TCatch {
     #[default]
     Throw,
@@ -207,7 +209,7 @@ pub enum TCatch {
         k: Id<TBlock>,
     },
 }
-#[derive(Clone, Default,Debug)]
+#[derive(Clone, Default, Debug)]
 pub enum TTerm {
     Return(Option<Ident>),
     Throw(Ident),
@@ -225,7 +227,7 @@ pub enum TTerm {
     #[default]
     Default,
 }
-#[derive(Clone, Ord, PartialEq, PartialOrd, Eq,Debug)]
+#[derive(Clone, Ord, PartialEq, PartialOrd, Eq, Debug)]
 pub enum PropKey<I = Ident> {
     Lit(Ident),
     Computed(I),
@@ -250,7 +252,7 @@ impl<I> PropKey<I> {
         })
     }
 }
-#[derive(Clone,Debug)]
+#[derive(Clone, Debug)]
 pub enum TCallee<I = Ident> {
     Val(I),
     Member { r#fn: I, member: I },
@@ -282,7 +284,7 @@ impl<I> TCallee<I> {
         })
     }
 }
-#[derive(Clone,Debug)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum Item<I = Ident, F = TFunc> {
     Just { id: I },
@@ -298,6 +300,7 @@ pub enum Item<I = Ident, F = TFunc> {
     Await { value: I },
     Asm { value: Asm<I> },
     Undef,
+    This,
 }
 impl<I> Item<I> {
     pub fn map<J: Ord, E>(self, f: &mut (dyn FnMut(I) -> Result<J, E> + '_)) -> Result<Item<J>, E> {
@@ -336,6 +339,7 @@ impl<I, F> Item<I, F> {
                 value: value.as_ref(),
             },
             Item::Undef => Item::Undef,
+            Item::This => Item::This,
         }
     }
     pub fn as_mut(&mut self) -> Item<&mut I, &mut F> {
@@ -369,6 +373,7 @@ impl<I, F> Item<I, F> {
                 value: value.as_mut(),
             },
             Item::Undef => Item::Undef,
+            Item::This => Item::This,
         }
     }
     pub fn map2<J: Ord, G, E, C: ?Sized>(
@@ -427,6 +432,7 @@ impl<I, F> Item<I, F> {
             Item::Asm { value } => Item::Asm {
                 value: value.map(&mut |a| f(cx, a))?,
             },
+            Item::This => Item::This,
         })
     }
     pub fn refs<'a>(&'a self) -> Box<dyn Iterator<Item = &'a I> + 'a> {
@@ -458,7 +464,7 @@ impl<I, F> Item<I, F> {
             swc_tac::Item::Arr { members } => Box::new(members.iter()),
             swc_tac::Item::Yield { value, delegate } => Box::new(value.iter()),
             swc_tac::Item::Await { value } => Box::new(once(value)),
-            swc_tac::Item::Undef => Box::new(empty()),
+            swc_tac::Item::Undef | Item::This => Box::new(empty()),
             Item::Asm { value } => Box::new(value.refs()),
         }
     }
@@ -491,7 +497,7 @@ impl<I, F> Item<I, F> {
             swc_tac::Item::Arr { members } => Box::new(members.iter_mut()),
             swc_tac::Item::Yield { value, delegate } => Box::new(value.iter_mut()),
             swc_tac::Item::Await { value } => Box::new(once(value)),
-            swc_tac::Item::Undef => Box::new(empty()),
+            swc_tac::Item::Undef | Item::This => Box::new(empty()),
             Item::Asm { value } => Box::new(value.refs_mut()),
         }
     }
@@ -503,6 +509,7 @@ pub struct Trans {
     pub map: BTreeMap<Id<Block>, Id<TBlock>>,
     pub ret_to: Option<(Ident, Id<TBlock>)>,
     pub recatch: TCatch,
+    pub this: Option<Ident>,
 }
 impl Trans {
     pub fn trans(&mut self, i: &Cfg, o: &mut TCfg, b: Id<Block>) -> anyhow::Result<Id<TBlock>> {
@@ -699,6 +706,23 @@ impl Trans {
         s: &Expr,
     ) -> anyhow::Result<(Ident, Id<TBlock>)> {
         match s {
+            Expr::This(this) => {
+                let id = match self.this.clone() {
+                    Some(a) => a,
+                    None => {
+                        let tmp = o.regs.alloc(());
+                        o.blocks[t].stmts.push((
+                            LId::Id { id: tmp.clone() },
+                            ValFlags::SSA_LIKE,
+                            Item::This,
+                            this.span(),
+                        ));
+                        o.decls.insert(tmp.clone());
+                        tmp
+                    }
+                };
+                return Ok((id, t));
+            }
             Expr::Ident(i) => Ok((i.clone().into(), t)),
             Expr::Assign(a) => {
                 let mut right;
@@ -837,6 +861,7 @@ impl Trans {
                                 map: Default::default(),
                                 ret_to: Some((tmp.clone(), t2)),
                                 recatch: o.blocks[t].catch.clone(),
+                                this: Some((Atom::new("globalThis"), Default::default())),
                             };
                             let t3 = t4.trans(&cfg.cfg, o, cfg.entry)?;
                             o.blocks[t].term = TTerm::Jmp(t3);
@@ -877,6 +902,7 @@ impl Trans {
                                         map: Default::default(),
                                         ret_to: Some((tmp.clone(), t2)),
                                         recatch: o.blocks[t].catch.clone(),
+                                        this: Some((Atom::new("globalThis"), Default::default())),
                                     };
                                     let t3 = t4.trans(&cfg.cfg, o, cfg.entry)?;
                                     o.blocks[t].term = TTerm::Jmp(t3);

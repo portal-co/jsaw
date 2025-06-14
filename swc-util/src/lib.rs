@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fmt::Display};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt::Display,
+    mem::transmute,
+};
 
 pub use portal_jsc_common::ImportMap;
 use swc_atoms::Atom;
@@ -6,7 +10,7 @@ use swc_common::{
     errors::{ColorConfig, Handler},
     input::StringInput,
     sync::Lrc,
-    FileName, SourceFile, SourceMap, Span, Spanned,
+    FileName, Mark, SourceFile, SourceMap, Span, Spanned, SyntaxContext,
 };
 use swc_ecma_ast::{Expr, ExprStmt, Id, Ident, Lit, Module, ModuleDecl, ModuleItem, Stmt};
 use swc_ecma_parser::{lexer::Lexer, Parser, Syntax};

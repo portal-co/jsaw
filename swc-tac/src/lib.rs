@@ -176,8 +176,7 @@ impl TCfg {
                      right: b,
                      span: _,
                  }| {
-                    let a: Box<dyn Iterator<Item = Ident> + '_> =
-                        Box::new(a.as_ref().refs().cloned());
+                    let a = a.as_ref().refs().cloned();
                     let b = b.refs().cloned();
                     a.chain(b)
                 },

@@ -44,7 +44,7 @@ impl TryFrom<TFunc> for Func {
                 span: span,
                 decorators: vec![],
                 pat: Pat::Ident(BindingIdent {
-                    id: i(a, span),
+                    id: ident(a, span),
                     type_ann: t.as_ref().map(|a| {
                         Box::new(TsTypeAnn {
                             span: span,
@@ -66,7 +66,7 @@ impl TryFrom<TFunc> for Func {
                     decls: vec![VarDeclarator {
                         span: span,
                         name: Pat::Ident(BindingIdent {
-                            id: i(d, span),
+                            id: ident(d, span),
                             type_ann: value.cfg.type_annotations.get(d).map(|a| {
                                 Box::new(TsTypeAnn {
                                     span: span,
@@ -122,7 +122,7 @@ impl Rew {
                 crate::TCatch::Throw => swc_cfg::Catch::Throw,
                 crate::TCatch::Jump { pat, k } => swc_cfg::Catch::Jump {
                     pat: Pat::Ident(swc_ecma_ast::BindingIdent {
-                        id: i(pat, Span::dummy_with_cmt()),
+                        id: ident(pat, Span::dummy_with_cmt()),
                         type_ann: None,
                     }),
                     k: self.trans(cfg, tcfg, *k)?,
@@ -134,13 +134,13 @@ impl Rew {
                 let left = match &statement_data.left {
                     crate::LId::Id { id } => swc_ecma_ast::AssignTarget::Simple(
                         swc_ecma_ast::SimpleAssignTarget::Ident(swc_ecma_ast::BindingIdent {
-                            id: i(id, span),
+                            id: ident(id, span),
                             type_ann: None,
                         }),
                     ),
                     crate::LId::Member { obj, mem } => {
-                        let obj = i(obj, span);
-                        let mem = i(&mem[0], span);
+                        let obj = ident(obj, span);
+                        let mem = ident(&mem[0], span);
                         AssignTarget::Simple(swc_ecma_ast::SimpleAssignTarget::Member(MemberExpr {
                             span: span,
                             obj: Box::new(Expr::Ident(obj)),
@@ -155,21 +155,21 @@ impl Rew {
                     _ => todo!(),
                 };
                 let right = Box::new(match &statement_data.right {
-                    crate::Item::Just { id } => Expr::Ident(i(id, span)),
+                    crate::Item::Just { id } => Expr::Ident(ident(id, span)),
                     crate::Item::Bin { left, right, op } => Expr::Bin(BinExpr {
                         span: span,
                         op: *op,
-                        left: Box::new(Expr::Ident(i(left, span))),
-                        right: Box::new(Expr::Ident(i(right, span))),
+                        left: Box::new(Expr::Ident(ident(left, span))),
+                        right: Box::new(Expr::Ident(ident(right, span))),
                     }),
                     crate::Item::Un { arg, op } => Expr::Unary(UnaryExpr {
                         span: span,
                         op: *op,
-                        arg: Box::new(Expr::Ident(i(arg, span))),
+                        arg: Box::new(Expr::Ident(ident(arg, span))),
                     }),
                     crate::Item::Mem { obj, mem } => {
-                        let obj = i(obj, span);
-                        let mem = i(mem, span);
+                        let obj = ident(obj, span);
+                        let mem = ident(mem, span);
                         Expr::Member(MemberExpr {
                             span: span,
                             obj: Box::new(Expr::Ident(obj)),
@@ -191,18 +191,18 @@ impl Rew {
                         ctxt: SyntaxContext::empty(),
                         callee: swc_ecma_ast::Callee::Expr(match callee {
                             crate::TCallee::Member { r#fn, member } => {
-                                let f = Box::new(Expr::Ident(i(r#fn, span)));
+                                let f = Box::new(Expr::Ident(ident(r#fn, span)));
                                 Box::new(Expr::Member(MemberExpr {
                                     span: span,
                                     obj: f,
                                     prop: swc_ecma_ast::MemberProp::Computed(ComputedPropName {
                                         span: span,
-                                        expr: Box::new(Expr::Ident(i(member, span))),
+                                        expr: Box::new(Expr::Ident(ident(member, span))),
                                     }),
                                 }))
                             }
                             crate::TCallee::Static(r#fn) | TCallee::Val(r#fn) => {
-                                let f = Box::new(Expr::Ident(i(r#fn, span)));
+                                let f = Box::new(Expr::Ident(ident(r#fn, span)));
                                 f
                             }
                         }),
@@ -210,7 +210,7 @@ impl Rew {
                             .iter()
                             .map(|a| swc_ecma_ast::ExprOrSpread {
                                 spread: None,
-                                expr: Box::new(Expr::Ident(i(a, span))),
+                                expr: Box::new(Expr::Ident(ident(a, span))),
                             })
                             .collect(),
                         type_args: None,
@@ -221,7 +221,7 @@ impl Rew {
                             .iter()
                             .map(|a| {
                                 PropOrSpread::Prop({
-                                    let b = i(&a.1, span);
+                                    let b = ident(&a.1, span);
                                     let b = Box::new(Expr::Ident(b));
                                     Box::new(match &a.0 {
                                         crate::PropKey::Lit(l) => Prop::KeyValue(KeyValueProp {
@@ -238,7 +238,7 @@ impl Rew {
                                                 key: swc_ecma_ast::PropName::Computed(
                                                     ComputedPropName {
                                                         span: span,
-                                                        expr: Box::new(Expr::Ident(i(c, span))),
+                                                        expr: Box::new(Expr::Ident(ident(c, span))),
                                                     },
                                                 ),
                                                 value: b,
@@ -256,7 +256,7 @@ impl Rew {
                             .map(|a| {
                                 Some(ExprOrSpread {
                                     spread: None,
-                                    expr: Box::new(Expr::Ident(i(a, span))),
+                                    expr: Box::new(Expr::Ident(ident(a, span))),
                                 })
                             })
                             .collect(),
@@ -266,20 +266,20 @@ impl Rew {
                             span: span,
                             arg: value
                                 .as_ref()
-                                .map(|yielded_value| Box::new(Expr::Ident(i(yielded_value, span)))),
+                                .map(|yielded_value| Box::new(Expr::Ident(ident(yielded_value, span)))),
                             delegate: *delegate,
                         })
                     }
                     crate::Item::Await { value } => Expr::Await(swc_ecma_ast::AwaitExpr {
                         span: span,
-                        arg: Box::new(Expr::Ident(i(value, span))),
+                        arg: Box::new(Expr::Ident(ident(value, span))),
                     }),
                     crate::Item::Undef => *Expr::undefined(span),
                     crate::Item::Asm { value } => match value {
                         portal_jsc_common::Asm::OrZero(a) => Expr::Bin(BinExpr {
                             span,
                             op: BinaryOp::BitOr,
-                            left: Box::new(Expr::Ident(i(a, span))),
+                            left: Box::new(Expr::Ident(ident(a, span))),
                             right: Box::new(Expr::Lit(Lit::Num(Number {
                                 span,
                                 value: 0.0,
@@ -304,7 +304,7 @@ impl Rew {
                 crate::TTerm::Return(r) => Term::Return(
                     r.as_ref()
                         .map(|returned_value| {
-                            i(
+                            ident(
                                 returned_value,
                                 tcfg.blocks[block_id]
                                     .orig_span
@@ -314,7 +314,7 @@ impl Rew {
                         })
                         .map(Expr::Ident),
                 ),
-                crate::TTerm::Throw(x) => Term::Throw(Expr::Ident(i(
+                crate::TTerm::Throw(x) => Term::Throw(Expr::Ident(ident(
                     x,
                     tcfg.blocks[block_id]
                         .orig_span
@@ -327,7 +327,7 @@ impl Rew {
                     if_true,
                     if_false,
                 } => Term::CondJmp {
-                    cond: Expr::Ident(i(
+                    cond: Expr::Ident(ident(
                         cond,
                         tcfg.blocks[block_id]
                             .orig_span
@@ -338,7 +338,7 @@ impl Rew {
                     if_false: self.trans(cfg, tcfg, *if_false)?,
                 },
                 crate::TTerm::Switch { x, blocks, default } => Term::Switch {
-                    x: Expr::Ident(i(
+                    x: Expr::Ident(ident(
                         x,
                         tcfg.blocks[block_id]
                             .orig_span
@@ -349,7 +349,7 @@ impl Rew {
                         .iter()
                         .map(|a| {
                             anyhow::Ok((
-                                Expr::Ident(i(
+                                Expr::Ident(ident(
                                     a.0,
                                     tcfg.blocks[block_id]
                                         .orig_span
@@ -368,7 +368,7 @@ impl Rew {
         }
     }
 }
-pub fn i(a: &Ident, span: Span) -> swc_ecma_ast::Ident {
+fn ident(a: &Ident, span: Span) -> swc_ecma_ast::Ident {
     swc_ecma_ast::Ident {
         span: span,
         ctxt: a.1.clone(),

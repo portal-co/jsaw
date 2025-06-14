@@ -85,14 +85,9 @@ impl Rew {
                                     &mut |_, value| anyhow::Ok(mangle_value(func, value)),
                                     &mut |_, field| field.try_into(),
                                 )?;
-                                cfg.blocks[new_block_id].stmts.push(TStmt(
-                                    LId::Id {
+                                cfg.blocks[new_block_id].stmts.push(TStmt { left: LId::Id {
                                         id: mangle_value(func, *statement),
-                                    },
-                                    ValFlags::SSA_LIKE,
-                                    item_id,
-                                    span.clone().unwrap_or_else(|| Span::dummy_with_cmt()),
-                                ));
+                                    }, flags: ValFlags::SSA_LIKE, right: item_id, span: span.clone().unwrap_or_else(|| Span::dummy_with_cmt()) });
                                 cfg.decls.insert(mangle_value(func, *statement));
                             }
                             SValue::Assign { target, val } => {
@@ -101,47 +96,27 @@ impl Rew {
                                     cfg.decls.insert(mangled.clone());
                                     return anyhow::Ok(mangled);
                                 })?;
-                                cfg.blocks[new_block_id].stmts.push(TStmt(
-                                    target_id,
-                                    Default::default(),
-                                    Item::Just {
+                                cfg.blocks[new_block_id].stmts.push(TStmt { left: target_id, flags: Default::default(), right: Item::Just {
                                         id: mangle_value(func, *val),
-                                    },
-                                    Span::dummy_with_cmt(),
-                                ));
+                                    }, span: Span::dummy_with_cmt() });
                             }
                             SValue::LoadId(i) => {
-                                cfg.blocks[new_block_id].stmts.push(TStmt(
-                                    LId::Id {
+                                cfg.blocks[new_block_id].stmts.push(TStmt { left: LId::Id {
                                         id: mangle_value(func, *statement),
-                                    },
-                                    ValFlags::SSA_LIKE,
-                                    Item::Just { id: i.clone() },
-                                    Span::dummy_with_cmt(),
-                                ));
+                                    }, flags: ValFlags::SSA_LIKE, right: Item::Just { id: i.clone() }, span: Span::dummy_with_cmt() });
                                 cfg.decls.insert(mangle_value(func, *statement));
                             }
                             SValue::StoreId { target, val } => {
-                                cfg.blocks[new_block_id].stmts.push(TStmt(
-                                    LId::Id { id: target.clone() },
-                                    Default::default(),
-                                    Item::Just {
+                                cfg.blocks[new_block_id].stmts.push(TStmt { left: LId::Id { id: target.clone() }, flags: Default::default(), right: Item::Just {
                                         id: mangle_value(func, *val),
-                                    },
-                                    Span::dummy_with_cmt(),
-                                ));
+                                    }, span: Span::dummy_with_cmt() });
                             }
                             SValue::Benc(v) => {
-                                cfg.blocks[new_block_id].stmts.push(TStmt(
-                                    LId::Id {
+                                cfg.blocks[new_block_id].stmts.push(TStmt { left: LId::Id {
                                         id: mangle_value(func, *statement),
-                                    },
-                                    ValFlags::SSA_LIKE,
-                                    Item::Just {
+                                    }, flags: ValFlags::SSA_LIKE, right: Item::Just {
                                         id: mangle_value(func, *v),
-                                    },
-                                    Span::dummy_with_cmt(),
-                                ));
+                                    }, span: Span::dummy_with_cmt() });
                             }
                         }
                     }
@@ -199,14 +174,9 @@ impl Rew {
                         .chain(starget.args.iter().map(|b| mangle_value(func, *b)))
                         .enumerate()
                         .map(|(arg_index, arg_value)| {
-                           TStmt (
-                                LId::Id {
+                           TStmt { left: LId::Id {
                                     id: mangle_param(starget.block, arg_index),
-                                },
-                                Default::default(),
-                                Item::Just { id: arg_value },
-                                Span::dummy_with_cmt(),
-                            )
+                                }, flags: Default::default(), right: Item::Just { id: arg_value }, span: Span::dummy_with_cmt() }
                         });
                     cfg.blocks[new_block_id].stmts.extend(stmts);
                     let term =

@@ -478,12 +478,12 @@ impl Trans {
                 .collect::<BTreeMap<_, _>>();
             self.apply_shim(o, &state, &shim, t);
             let mut cache = BTreeMap::new();
-            for TStmt(a, flags, b, s) in i.blocks[k].stmts.iter() {
+            for TStmt { left: a, flags, right: b, span: s } in i.blocks[k].stmts.iter() {
                 let mut b = b.clone();
                 if let Item::Call { callee, args } = &mut b {
                     if let TCallee::Val(v) = callee {
                         if !i.blocks.iter().any(|k| {
-                            k.1.stmts.iter().any(|a| match &a.0 {
+                            k.1.stmts.iter().any(|a| match &a.left {
                                 LId::Id { id } => id == v,
                                 _ => false,
                             })

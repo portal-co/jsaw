@@ -116,7 +116,7 @@ impl TCfg {
     pub fn remark(&mut self) {
         let mut a: BTreeMap<LId, usize> = BTreeMap::new();
         for s in self.blocks.iter().flat_map(|a| &a.1.stmts) {
-            if match &s.0 {
+            if match &s.left {
                 LId::Id { id } => !self.decls.contains(&id),
                 LId::Member { obj, mem } => {
                     !self.decls.contains(&obj) || !self.decls.contains(&mem[0])
@@ -125,10 +125,10 @@ impl TCfg {
             } {
                 continue;
             }
-            *a.entry(s.0.clone()).or_default() += 1usize;
+            *a.entry(s.left.clone()).or_default() += 1usize;
         }
         for s in self.blocks.iter_mut().flat_map(|a| &mut a.1.stmts) {
-            if match &s.0 {
+            if match &s.left {
                 LId::Id { id } => !self.decls.contains(&id),
                 LId::Member { obj, mem } => {
                     !self.decls.contains(&obj) || !self.decls.contains(&mem[0])
@@ -137,17 +137,17 @@ impl TCfg {
             } {
                 continue;
             }
-            if a.remove(&s.0) == Some(1) {
-                s.1 |= ValFlags::SSA_LIKE
+            if a.remove(&s.left) == Some(1) {
+                s.flags |= ValFlags::SSA_LIKE
             } else {
-                s.1 &= !ValFlags::SSA_LIKE;
+                s.flags &= !ValFlags::SSA_LIKE;
             }
         }
     }
     pub fn def(&self, i: portal_jsc_common::LId<Ident>) -> Option<&Item> {
         self.blocks.iter().flat_map(|a| &a.1.stmts).find_map(|a| {
-            if a.0 == i && a.1.contains(ValFlags::SSA_LIKE) {
-                Some(&a.2)
+            if a.left == i && a.flags.contains(ValFlags::SSA_LIKE) {
+                Some(&a.right)
             } else {
                 None
             }
@@ -169,11 +169,19 @@ impl TCfg {
                 }
                 TTerm::Default => Box::new(std::iter::empty()),
             };
-            i.chain(k.1.stmts.iter().flat_map(|TStmt(a, _, b, _)| {
-                let a: Box<dyn Iterator<Item = Ident> + '_> = Box::new(a.as_ref().refs().cloned());
-                let b = b.refs().cloned();
-                a.chain(b)
-            }))
+            i.chain(k.1.stmts.iter().flat_map(
+                |TStmt {
+                     left: a,
+                     flags: _,
+                     right: b,
+                     span: _,
+                 }| {
+                    let a: Box<dyn Iterator<Item = Ident> + '_> =
+                        Box::new(a.as_ref().refs().cloned());
+                    let b = b.refs().cloned();
+                    a.chain(b)
+                },
+            ))
         });
         return a;
     }
@@ -183,7 +191,8 @@ impl TCfg {
     pub fn update(&mut self) {
         for x in self.blocks.iter() {
             for k in x.1.stmts.iter() {
-                k.0.clone()
+                k.left
+                    .clone()
                     .map(&mut |a| {
                         self.regs[a] = ();
                         Ok::<(), Infallible>(())
@@ -194,7 +203,12 @@ impl TCfg {
     }
 }
 #[derive(Clone, Debug)]
-pub struct TStmt(pub LId, pub ValFlags, pub Item, pub Span);
+pub struct TStmt {
+    pub left: LId,
+    pub flags: ValFlags,
+    pub right: Item,
+    pub span: Span,
+}
 #[derive(Clone, Default, Debug)]
 pub struct TBlock {
     pub stmts: Vec<TStmt>,
@@ -556,16 +570,16 @@ impl Trans {
                         if let Some(a) = expr {
                             let c;
                             (c, t) = self.expr(i, o, b, t, a)?;
-                            o.blocks[t].stmts.push(TStmt(
-                                LId::Id { id: i2.clone() },
-                                Default::default(),
-                                Item::Just { id: c },
-                                i.blocks[b]
+                            o.blocks[t].stmts.push(TStmt {
+                                left: LId::Id { id: i2.clone() },
+                                flags: Default::default(),
+                                right: Item::Just { id: c },
+                                span: i.blocks[b]
                                     .end
                                     .orig_span
                                     .clone()
                                     .unwrap_or_else(|| Span::dummy_with_cmt()),
-                            ));
+                            });
                         }
                         TTerm::Jmp(b2)
                     }
@@ -627,16 +641,16 @@ impl Trans {
             Stmt::Decl(d) => match d {
                 swc_ecma_ast::Decl::Class(class_decl) => todo!(),
                 swc_ecma_ast::Decl::Fn(f) => {
-                    o.blocks[t].stmts.push(TStmt(
-                        LId::Id {
+                    o.blocks[t].stmts.push(TStmt {
+                        left: LId::Id {
                             id: f.ident.clone().into(),
                         },
-                        Default::default(),
-                        Item::Func {
+                        flags: Default::default(),
+                        right: Item::Func {
                             func: f.function.as_ref().clone().try_into()?,
                         },
-                        f.span(),
-                    ));
+                        span: f.span(),
+                    });
                     o.decls.insert(f.ident.clone().into());
                     return Ok(t);
                 }
@@ -647,14 +661,14 @@ impl Trans {
                                 Pat::Ident(i2) => {
                                     let f;
                                     (f, t) = self.expr(i, o, b, t, e)?;
-                                    o.blocks[t].stmts.push(TStmt(
-                                        LId::Id {
+                                    o.blocks[t].stmts.push(TStmt {
+                                        left: LId::Id {
                                             id: i2.id.clone().into(),
                                         },
-                                        Default::default(),
-                                        Item::Just { id: f },
-                                        e.span(),
-                                    ));
+                                        flags: Default::default(),
+                                        right: Item::Just { id: f },
+                                        span: e.span(),
+                                    });
                                     o.decls.insert(i2.id.clone().into());
                                     if let Some(a) = i2.type_ann.as_ref().cloned() {
                                         o.type_annotations
@@ -690,12 +704,12 @@ impl Trans {
         // let e;
         (mem, t) = self.expr(i, o, b, t, &imp(s.prop.clone()))?;
         let v = o.regs.alloc(());
-        o.blocks[t].stmts.push(TStmt(
-            LId::Id { id: v.clone() },
-            ValFlags::SSA_LIKE,
-            Item::Mem { obj, mem },
-            s.span(),
-        ));
+        o.blocks[t].stmts.push(TStmt {
+            left: LId::Id { id: v.clone() },
+            flags: ValFlags::SSA_LIKE,
+            right: Item::Mem { obj, mem },
+            span: s.span(),
+        });
         o.decls.insert(v.clone());
         Ok((v, t))
     }
@@ -713,12 +727,12 @@ impl Trans {
                     Some(a) => a,
                     None => {
                         let tmp = o.regs.alloc(());
-                        o.blocks[t].stmts.push(TStmt(
-                            LId::Id { id: tmp.clone() },
-                            ValFlags::SSA_LIKE,
-                            Item::This,
-                            this.span(),
-                        ));
+                        o.blocks[t].stmts.push(TStmt {
+                            left: LId::Id { id: tmp.clone() },
+                            flags: ValFlags::SSA_LIKE,
+                            right: Item::This,
+                            span: this.span(),
+                        });
                         o.decls.insert(tmp.clone());
                         tmp
                     }
@@ -741,14 +755,14 @@ impl Trans {
                                         op: a,
                                     },
                                 };
-                                o.blocks[t].stmts.push(TStmt(
-                                    LId::Id {
+                                o.blocks[t].stmts.push(TStmt {
+                                    left: LId::Id {
                                         id: i.id.clone().into(),
                                     },
-                                    Default::default(),
-                                    item,
-                                    i.span(),
-                                ));
+                                    flags: Default::default(),
+                                    right: item,
+                                    span: i.span(),
+                                });
                                 right = i.id.clone().into();
                             }
                             SimpleAssignTarget::Member(m) => {
@@ -782,15 +796,15 @@ impl Trans {
                                     None => Item::Just { id: right },
                                     Some(a) => {
                                         let id = o.regs.alloc(());
-                                        o.blocks[t].stmts.push(TStmt(
-                                            LId::Id { id: id.clone() },
-                                            ValFlags::SSA_LIKE,
-                                            Item::Mem {
+                                        o.blocks[t].stmts.push(TStmt {
+                                            left: LId::Id { id: id.clone() },
+                                            flags: ValFlags::SSA_LIKE,
+                                            right: Item::Mem {
                                                 obj: obj.clone(),
                                                 mem: mem.clone(),
                                             },
-                                            m.span(),
-                                        ));
+                                            span: m.span(),
+                                        });
                                         Item::Bin {
                                             left: right,
                                             right: id,
@@ -798,22 +812,22 @@ impl Trans {
                                         }
                                     }
                                 };
-                                o.blocks[t].stmts.push(TStmt(
-                                    LId::Member {
+                                o.blocks[t].stmts.push(TStmt {
+                                    left: LId::Member {
                                         obj: obj.clone(),
                                         mem: [mem.clone()],
                                     },
-                                    Default::default(),
-                                    item,
-                                    m.span(),
-                                ));
+                                    flags: Default::default(),
+                                    right: item,
+                                    span: m.span(),
+                                });
                                 right = o.regs.alloc(());
-                                o.blocks[t].stmts.push(TStmt(
-                                    LId::Id { id: right.clone() },
-                                    ValFlags::SSA_LIKE,
-                                    Item::Mem { obj, mem },
-                                    m.span(),
-                                ));
+                                o.blocks[t].stmts.push(TStmt {
+                                    left: LId::Id { id: right.clone() },
+                                    flags: ValFlags::SSA_LIKE,
+                                    right: Item::Mem { obj, mem },
+                                    span: m.span(),
+                                });
                                 o.decls.insert(right.clone());
                             }
                             _ => anyhow::bail!("todo: {}:{}", file!(), line!()),
@@ -844,12 +858,12 @@ impl Trans {
                                 };
                                 let arg;
                                 (arg, t) = self.expr(i, o, b, t, &a.expr)?;
-                                o.blocks[t].stmts.push(TStmt(
-                                    LId::Id { id: id.to_id() },
-                                    Default::default(),
-                                    Item::Just { id: arg },
-                                    a.span(),
-                                ));
+                                o.blocks[t].stmts.push(TStmt {
+                                    left: LId::Id { id: id.to_id() },
+                                    flags: Default::default(),
+                                    right: Item::Just { id: arg },
+                                    span: a.span(),
+                                });
                             }
                             let tmp = o.regs.alloc(());
                             let t2 = o.blocks.alloc(TBlock {
@@ -885,12 +899,12 @@ impl Trans {
                                         // };
                                         let arg;
                                         (arg, t) = self.expr(i, o, b, t, &a.expr)?;
-                                        o.blocks[t].stmts.push(TStmt(
-                                            LId::Id { id: p.clone() },
-                                            Default::default(),
-                                            Item::Just { id: arg },
-                                            a.span(),
-                                        ));
+                                        o.blocks[t].stmts.push(TStmt {
+                                            left: LId::Id { id: p.clone() },
+                                            flags: Default::default(),
+                                            right: Item::Just { id: arg },
+                                            span: a.span(),
+                                        });
                                     }
                                     let tmp = o.regs.alloc(());
                                     let t2 = o.blocks.alloc(TBlock {
@@ -926,12 +940,12 @@ impl Trans {
                     })
                     .collect::<anyhow::Result<_>>()?;
                 let tmp = o.regs.alloc(());
-                o.blocks[t].stmts.push(TStmt(
-                    LId::Id { id: tmp.clone() },
-                    ValFlags::SSA_LIKE,
-                    Item::Call { callee: c, args },
-                    call.span(),
-                ));
+                o.blocks[t].stmts.push(TStmt {
+                    left: LId::Id { id: tmp.clone() },
+                    flags: ValFlags::SSA_LIKE,
+                    right: Item::Call { callee: c, args },
+                    span: call.span(),
+                });
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
             }
@@ -943,14 +957,14 @@ impl Trans {
                     (left, t) = self.expr(i, o, b, t, l)?;
                     // (right, t) = self.expr(i, o, b, t, r)?;
                     let tmp = o.regs.alloc(());
-                    o.blocks[t].stmts.push(TStmt(
-                        LId::Id { id: tmp.clone() },
-                        ValFlags::SSA_LIKE,
-                        Item::Asm {
+                    o.blocks[t].stmts.push(TStmt {
+                        left: LId::Id { id: tmp.clone() },
+                        flags: ValFlags::SSA_LIKE,
+                        right: Item::Asm {
                             value: Asm::OrZero(left),
                         },
-                        bin.span(),
-                    ));
+                        span: bin.span(),
+                    });
                     o.decls.insert(tmp.clone());
                     return Ok((tmp, t));
                 }
@@ -960,12 +974,12 @@ impl Trans {
                     (left, t) = self.expr(i, o, b, t, l)?;
                     (right, t) = self.expr(i, o, b, t, r)?;
                     let tmp = o.regs.alloc(());
-                    o.blocks[t].stmts.push(TStmt(
-                        LId::Id { id: tmp.clone() },
-                        ValFlags::SSA_LIKE,
-                        Item::Bin { left, right, op },
-                        bin.span(),
-                    ));
+                    o.blocks[t].stmts.push(TStmt {
+                        left: LId::Id { id: tmp.clone() },
+                        flags: ValFlags::SSA_LIKE,
+                        right: Item::Bin { left, right, op },
+                        span: bin.span(),
+                    });
                     o.decls.insert(tmp.clone());
                     return Ok((tmp, t));
                 }
@@ -973,12 +987,12 @@ impl Trans {
             Expr::Unary(un) => {
                 if un.op == UnaryOp::Void {
                     let tmp = o.regs.alloc(());
-                    o.blocks[t].stmts.push(TStmt(
-                        LId::Id { id: tmp.clone() },
-                        ValFlags::SSA_LIKE,
-                        Item::Undef,
-                        un.span(),
-                    ));
+                    o.blocks[t].stmts.push(TStmt {
+                        left: LId::Id { id: tmp.clone() },
+                        flags: ValFlags::SSA_LIKE,
+                        right: Item::Undef,
+                        span: un.span(),
+                    });
                     o.decls.insert(tmp.clone());
                     return Ok((tmp, t));
                 }
@@ -987,27 +1001,27 @@ impl Trans {
                 (arg, t) = self.expr(i, o, b, t, &un.arg)?;
                 // (right, t) = self.expr(i, o, b, t, &bin.right)?;
                 let tmp = o.regs.alloc(());
-                o.blocks[t].stmts.push(TStmt(
-                    LId::Id { id: tmp.clone() },
-                    ValFlags::SSA_LIKE,
-                    Item::Un {
+                o.blocks[t].stmts.push(TStmt {
+                    left: LId::Id { id: tmp.clone() },
+                    flags: ValFlags::SSA_LIKE,
+                    right: Item::Un {
                         arg,
                         op: un.op.clone(),
                     },
-                    un.span(),
-                ));
+                    span: un.span(),
+                });
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
             }
             Expr::Member(m) => return self.member_expr(i, o, b, t, m),
             Expr::Lit(l) => {
                 let tmp = o.regs.alloc(());
-                o.blocks[t].stmts.push(TStmt(
-                    LId::Id { id: tmp.clone() },
-                    ValFlags::SSA_LIKE,
-                    Item::Lit { lit: l.clone() },
-                    l.span(),
-                ));
+                o.blocks[t].stmts.push(TStmt {
+                    left: LId::Id { id: tmp.clone() },
+                    flags: ValFlags::SSA_LIKE,
+                    right: Item::Lit { lit: l.clone() },
+                    span: l.span(),
+                });
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
             }
@@ -1016,14 +1030,14 @@ impl Trans {
                     Some(a) => a.clone().into(),
                     None => o.regs.alloc(()),
                 };
-                o.blocks[t].stmts.push(TStmt(
-                    LId::Id { id: tmp.clone() },
-                    Default::default(),
-                    Item::Func {
+                o.blocks[t].stmts.push(TStmt {
+                    left: LId::Id { id: tmp.clone() },
+                    flags: Default::default(),
+                    right: Item::Func {
                         func: f.function.as_ref().clone().try_into()?,
                     },
-                    f.span(),
-                ));
+                    span: f.span(),
+                });
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
             }
@@ -1041,12 +1055,12 @@ impl Trans {
                     })
                     .collect::<anyhow::Result<_>>()?;
                 let tmp = o.regs.alloc(());
-                o.blocks[t].stmts.push(TStmt(
-                    LId::Id { id: tmp.clone() },
-                    ValFlags::SSA_LIKE,
-                    Item::Arr { members },
-                    arr.span(),
-                ));
+                o.blocks[t].stmts.push(TStmt {
+                    left: LId::Id { id: tmp.clone() },
+                    flags: ValFlags::SSA_LIKE,
+                    right: Item::Arr { members },
+                    span: arr.span(),
+                });
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
             }
@@ -1113,24 +1127,24 @@ impl Trans {
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
                 let tmp = o.regs.alloc(());
-                o.blocks[t].stmts.push(TStmt(
-                    LId::Id { id: tmp.clone() },
-                    ValFlags::SSA_LIKE,
-                    Item::Obj { members },
-                    obj.span(),
-                ));
+                o.blocks[t].stmts.push(TStmt {
+                    left: LId::Id { id: tmp.clone() },
+                    flags: ValFlags::SSA_LIKE,
+                    right: Item::Obj { members },
+                    span: obj.span(),
+                });
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
             }
             Expr::Await(x) => {
                 let (a, t) = self.expr(i, o, b, t, &x.arg)?;
                 let tmp = o.regs.alloc(());
-                o.blocks[t].stmts.push(TStmt(
-                    LId::Id { id: tmp.clone() },
-                    ValFlags::SSA_LIKE,
-                    Item::Await { value: a.clone() },
-                    x.span(),
-                ));
+                o.blocks[t].stmts.push(TStmt {
+                    left: LId::Id { id: tmp.clone() },
+                    flags: ValFlags::SSA_LIKE,
+                    right: Item::Await { value: a.clone() },
+                    span: x.span(),
+                });
                 return Ok((tmp, t));
             }
             Expr::Yield(y) => {
@@ -1143,15 +1157,15 @@ impl Trans {
                     }
                 };
                 let tmp = o.regs.alloc(());
-                o.blocks[t].stmts.push(TStmt(
-                    LId::Id { id: tmp.clone() },
-                    ValFlags::SSA_LIKE,
-                    Item::Yield {
+                o.blocks[t].stmts.push(TStmt {
+                    left: LId::Id { id: tmp.clone() },
+                    flags: ValFlags::SSA_LIKE,
+                    right: Item::Yield {
                         value: y2,
                         delegate: y.delegate,
                     },
-                    y.span(),
-                ));
+                    span: y.span(),
+                });
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
             }

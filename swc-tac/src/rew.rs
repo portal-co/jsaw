@@ -130,8 +130,8 @@ impl Rew {
             };
             cfg.blocks[new_block_id].end.catch = catch;
             for statement_data in tcfg.blocks[block_id].stmts.iter() {
-                let span = statement_data.3;
-                let left = match &statement_data.0 {
+                let span = statement_data.span;
+                let left = match &statement_data.left {
                     crate::LId::Id { id } => swc_ecma_ast::AssignTarget::Simple(
                         swc_ecma_ast::SimpleAssignTarget::Ident(swc_ecma_ast::BindingIdent {
                             id: i(id, span),
@@ -154,7 +154,7 @@ impl Rew {
                     }
                     _ => todo!(),
                 };
-                let right = Box::new(match &statement_data.2 {
+                let right = Box::new(match &statement_data.right {
                     crate::Item::Just { id } => Expr::Ident(i(id, span)),
                     crate::Item::Bin { left, right, op } => Expr::Bin(BinExpr {
                         span: span,

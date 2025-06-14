@@ -18,7 +18,7 @@ pub struct CH {
     pub all: BTreeMap<Id<SBlock>, HashMap<(Vec<Option<ConstVal>>), Id<SBlock>>>,
 }
 pub fn ch(a: &SFunc) -> anyhow::Result<SFunc> {
-    let mut n = SwcFunc::default();
+    let mut n = SCfg::default();
     let entry = CH {
         all: BTreeMap::new(),
     }
@@ -37,8 +37,8 @@ pub fn ch(a: &SFunc) -> anyhow::Result<SFunc> {
 impl CH {
     pub fn init(
         &mut self,
-        inp: &SwcFunc,
-        out: &mut SwcFunc,
+        inp: &SCfg,
+        out: &mut SCfg,
         k: Id<SBlock>,
     ) -> anyhow::Result<Id<SBlock>> {
         let lits = inp.blocks[k].params.iter().map(|_| None).collect();
@@ -46,8 +46,8 @@ impl CH {
     }
     pub fn go(
         &mut self,
-        inp: &SwcFunc,
-        out: &mut SwcFunc,
+        inp: &SCfg,
+        out: &mut SCfg,
         k: Id<SBlock>,
         lits: Vec<Option<ConstVal>>,
         // lsk: &BTreeMap<Id<SBlock>, NonZeroUsize>,
@@ -145,8 +145,8 @@ impl CH {
                 params.insert(s, v);
             }
             let tgt = |this: &mut Self,
-                       inp: &SwcFunc,
-                       out: &mut SwcFunc,
+                       inp: &SCfg,
+                       out: &mut SCfg,
                        t: &STarget,
                        p: usize|
              -> anyhow::Result<STarget> {

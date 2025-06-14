@@ -4,7 +4,7 @@ use swc_common::{EqIgnoreSpan, Spanned, SyntaxContext};
 use swc_ecma_ast::{op, BinaryOp, Bool, Expr, Number, Str, UnaryOp};
 use swc_ecma_utils::{ExprCtx, ExprExt, Value};
 
-impl SwcFunc {
+impl SCfg {
     pub fn simplify(&mut self) {
         for (k, kd) in self.blocks.iter_mut() {
             if let STerm::CondJmp {
@@ -31,7 +31,7 @@ impl SwcFunc {
 pub trait SValGetter<I: Copy, B,F = SFunc> {
     fn val(&self, id: I) -> Option<&SValue<I, B,F>>;
 }
-impl SValGetter<Id<SValueW>, Id<SBlock>> for SwcFunc {
+impl SValGetter<Id<SValueW>, Id<SBlock>> for SCfg {
     fn val(&self, id: Id<SValueW>) -> Option<&SValue<Id<SValueW>, Id<SBlock>>> {
         Some(&self.values[id].0)
     }

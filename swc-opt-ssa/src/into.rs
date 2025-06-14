@@ -6,7 +6,7 @@ use std::{
 use anyhow::Context;
 use id_arena::Id;
 use swc_ecma_ast::{BinaryOp, Lit, UnaryOp};
-use swc_ssa::{simplify::SValGetter, SBlock, SCatch, SFunc, STarget, STerm, SValue, SwcFunc};
+use swc_ssa::{simplify::SValGetter, SBlock, SCatch, SFunc, STarget, STerm, SValue, SCfg};
 use swc_tac::Item;
 
 use crate::{OptBlock, OptCfg, OptFunc, OptType, OptValue, OptValueW};
@@ -57,7 +57,7 @@ fn bi_id_deopt(
 impl Convert {
     pub fn transform(
         &mut self,
-        inp: &SwcFunc,
+        inp: &SCfg,
         out: &mut OptCfg,
         i: Id<SBlock>,
         tys: Vec<Option<OptType>>,

@@ -22,7 +22,7 @@ pub mod impls;
 pub mod rew;
 pub mod simplify;
 
-pub fn benj(swc_func: &mut SwcFunc) {
+pub fn benj(swc_func: &mut SCfg) {
     for block_index in swc_func.blocks.iter().map(|a| a.0).collect::<Vec<_>>() {
         let mut postcedent = take(&mut swc_func.blocks[block_index].postcedent);
         for target in postcedent.targets_mut() {
@@ -39,7 +39,7 @@ pub fn benj(swc_func: &mut SwcFunc) {
 }
 #[derive(Clone, Debug)]
 pub struct SFunc {
-    pub cfg: SwcFunc,
+    pub cfg: SCfg,
     pub entry: Id<SBlock>,
     pub is_generator: bool,
     pub is_async: bool,
@@ -55,7 +55,7 @@ impl TryFrom<TFunc> for SFunc {
             decls.remove(&e);
             d.insert(e);
         }
-        let mut cfg = SwcFunc {
+        let mut cfg = SCfg {
             blocks: Default::default(),
             values: Default::default(),
             ts: Default::default(),
@@ -107,13 +107,38 @@ impl TryFrom<TFunc> for SFunc {
     }
 }
 #[derive(Default, Clone, Debug)]
-pub struct SwcFunc {
+pub struct SCfg {
     pub blocks: Arena<SBlock>,
     pub values: Arena<SValueW>,
     pub ts: BTreeMap<Id<SValueW>, TsType>,
     pub decls: BTreeSet<Ident>,
     pub generics: Option<TsTypeParamDecl>,
     pub ts_retty: Option<TsTypeAnn>,
+}
+impl SCfg {
+    pub fn refs(&self) -> BTreeSet<Ident> {
+        return self
+            .values
+            .iter()
+            .flat_map(|(a, b)| match &b.0 {
+                SValue::LoadId(target) | SValue::StoreId { target, val: _ } => {
+                    [target.clone()].into_iter().collect::<BTreeSet<Ident>>()
+                }
+                SValue::Item {
+                    item: Item::Func { func },
+                    span,
+                } => func.cfg.externals(),
+                _ => Default::default(),
+            })
+            .collect();
+    }
+    pub fn externals(&self) -> BTreeSet<Ident> {
+        return self
+            .refs()
+            .into_iter()
+            .filter(|a| !self.decls.contains(&*a))
+            .collect();
+    }
 }
 #[derive(Default, Clone, Debug)]
 pub struct SBlock {
@@ -349,7 +374,7 @@ impl<I, B> Default for STerm<I, B> {
         Self::Default
     }
 }
-impl SwcFunc {
+impl SCfg {
     pub fn add_blockparam(&mut self, k: Id<SBlock>) -> Id<SValueW> {
         let val = SValue::Param {
             block: k,
@@ -378,7 +403,7 @@ impl Trans {
     }
     pub fn apply_shim(
         &self,
-        o: &mut SwcFunc,
+        o: &mut SCfg,
         state: &BTreeMap<Ident, (Id<SValueW>, ValFlags)>,
         s: &Option<(Id<SBlock>, Vec<Ident>)>,
         x: Id<SBlock>,
@@ -404,7 +429,7 @@ impl Trans {
         &self,
         state: &BTreeMap<Ident, (Id<SValueW>, ValFlags)>,
         i: &TCfg,
-        o: &mut SwcFunc,
+        o: &mut SCfg,
         t: Id<SBlock>,
         a: Ident,
         cache: &BTreeMap<Ident, Id<SValueW>>,
@@ -425,12 +450,7 @@ impl Trans {
         };
         x
     }
-    pub fn trans(
-        &mut self,
-        i: &TCfg,
-        o: &mut SwcFunc,
-        k: Id<TBlock>,
-    ) -> anyhow::Result<Id<SBlock>> {
+    pub fn trans(&mut self, i: &TCfg, o: &mut SCfg, k: Id<TBlock>) -> anyhow::Result<Id<SBlock>> {
         loop {
             if let Some(a) = self.map.get(&k) {
                 return Ok(*a);
@@ -478,7 +498,13 @@ impl Trans {
                 .collect::<BTreeMap<_, _>>();
             self.apply_shim(o, &state, &shim, t);
             let mut cache = BTreeMap::new();
-            for TStmt { left: a, flags, right: b, span: s } in i.blocks[k].stmts.iter() {
+            for TStmt {
+                left: a,
+                flags,
+                right: b,
+                span: s,
+            } in i.blocks[k].stmts.iter()
+            {
                 let mut b = b.clone();
                 if let Item::Call { callee, args } = &mut b {
                     if let TCallee::Val(v) = callee {

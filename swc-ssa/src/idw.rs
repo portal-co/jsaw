@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use id_arena::Id;
 
-use crate::{SBlock, SCatch, SFunc, SwcFunc};
+use crate::{SBlock, SCatch, SFunc, SCfg};
 
 pub struct Idw {
     pub map: BTreeMap<Id<SBlock>, Id<SBlock>>,
@@ -10,8 +10,8 @@ pub struct Idw {
 impl Idw {
     pub fn trans(
         &mut self,
-        orig: &SwcFunc,
-        new: &mut SwcFunc,
+        orig: &SCfg,
+        new: &mut SCfg,
         block_id: Id<SBlock>,
     ) -> anyhow::Result<Id<SBlock>> {
         loop {

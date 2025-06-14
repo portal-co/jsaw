@@ -53,7 +53,7 @@ impl<I: Copy, B,F> SValue<I, B,F> {
                     let left = k.val(*left)?.const_in(k)?;
                     let right = k.val(*right)?.const_in(k)?;
                     macro_rules! op2 {
-                        ($left:expr => {$($op:tt)*} $right:expr) => {
+                        ($left:expr_2021 => {$($op:tt)*} $right:expr_2021) => {
                             match (
                                 Expr::Lit($left.clone()).as_pure_number(default_ctx()),
                                 Expr::Lit($right.clone()).as_pure_number(default_ctx()),
@@ -77,7 +77,7 @@ impl<I: Copy, B,F> SValue<I, B,F> {
                         };
                     }
                     macro_rules! bop2 {
-                        ($left:expr => {$($op:tt)*} $right:expr) => {
+                        ($left:expr_2021 => {$($op:tt)*} $right:expr_2021) => {
                             match (
                                 Expr::Lit($left.clone()).as_pure_number(default_ctx()),
                                 Expr::Lit($right.clone()).as_pure_number(default_ctx()),
@@ -96,7 +96,7 @@ impl<I: Copy, B,F> SValue<I, B,F> {
                         };
                     }
                     macro_rules! iop2 {
-                        ($left:expr => {$($op:tt)*} $right:expr) => {
+                        ($left:expr_2021 => {$($op:tt)*} $right:expr_2021) => {
                             match (
                                 Expr::Lit($left.clone()).as_pure_number(default_ctx()),
                                 Expr::Lit($right.clone()).as_pure_number(default_ctx()),

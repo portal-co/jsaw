@@ -15,7 +15,7 @@ use swc_atoms::Atom;
 use swc_cfg::Catch;
 use swc_common::Span;
 use swc_ecma_ast::{Id as Ident, Lit, Null, TsType, TsTypeAnn, TsTypeParamDecl};
-use swc_tac::{Item, TBlock, TCallee, TCfg, TFunc, ValFlags};
+use swc_tac::{Item, TBlock, TCallee, TCfg, TFunc, TStmt, ValFlags};
 pub mod ch;
 pub mod idw;
 pub mod impls;
@@ -478,7 +478,7 @@ impl Trans {
                 .collect::<BTreeMap<_, _>>();
             self.apply_shim(o, &state, &shim, t);
             let mut cache = BTreeMap::new();
-            for (a, flags, b, s) in i.blocks[k].stmts.iter() {
+            for TStmt(a, flags, b, s) in i.blocks[k].stmts.iter() {
                 let mut b = b.clone();
                 if let Item::Call { callee, args } = &mut b {
                     if let TCallee::Val(v) = callee {

@@ -4,7 +4,7 @@ use id_arena::Id;
 use swc_atoms::Atom;
 use swc_common::Span;
 use swc_ecma_ast::Id as Ident;
-use swc_tac::{Item, LId, TBlock, TCatch, TCfg, TFunc, TTerm, ValFlags};
+use swc_tac::{Item, LId, TBlock, TCatch, TCfg, TFunc, TStmt, TTerm, ValFlags};
 
 use crate::{SBlock, SFunc, STarget, SValue, SValueW};
 
@@ -85,7 +85,7 @@ impl Rew {
                                     &mut |_, value| anyhow::Ok(mangle_value(func, value)),
                                     &mut |_, field| field.try_into(),
                                 )?;
-                                cfg.blocks[new_block_id].stmts.push((
+                                cfg.blocks[new_block_id].stmts.push(TStmt(
                                     LId::Id {
                                         id: mangle_value(func, *statement),
                                     },
@@ -101,7 +101,7 @@ impl Rew {
                                     cfg.decls.insert(mangled.clone());
                                     return anyhow::Ok(mangled);
                                 })?;
-                                cfg.blocks[new_block_id].stmts.push((
+                                cfg.blocks[new_block_id].stmts.push(TStmt(
                                     target_id,
                                     Default::default(),
                                     Item::Just {
@@ -111,7 +111,7 @@ impl Rew {
                                 ));
                             }
                             SValue::LoadId(i) => {
-                                cfg.blocks[new_block_id].stmts.push((
+                                cfg.blocks[new_block_id].stmts.push(TStmt(
                                     LId::Id {
                                         id: mangle_value(func, *statement),
                                     },
@@ -122,7 +122,7 @@ impl Rew {
                                 cfg.decls.insert(mangle_value(func, *statement));
                             }
                             SValue::StoreId { target, val } => {
-                                cfg.blocks[new_block_id].stmts.push((
+                                cfg.blocks[new_block_id].stmts.push(TStmt(
                                     LId::Id { id: target.clone() },
                                     Default::default(),
                                     Item::Just {
@@ -132,7 +132,7 @@ impl Rew {
                                 ));
                             }
                             SValue::Benc(v) => {
-                                cfg.blocks[new_block_id].stmts.push((
+                                cfg.blocks[new_block_id].stmts.push(TStmt(
                                     LId::Id {
                                         id: mangle_value(func, *statement),
                                     },
@@ -199,7 +199,7 @@ impl Rew {
                         .chain(starget.args.iter().map(|b| mangle_value(func, *b)))
                         .enumerate()
                         .map(|(arg_index, arg_value)| {
-                            (
+                           TStmt (
                                 LId::Id {
                                     id: mangle_param(starget.block, arg_index),
                                 },

@@ -1,4 +1,5 @@
 use id_arena::{Arena, Id};
+use swc_atoms::Atom;
 use swc_common::{Span, Spanned};
 
 use crate::WithSpan;
@@ -7,6 +8,11 @@ use crate::WithSpan;
 pub enum Size {
     Bits { bits: usize },
     Ptr,
+}
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Storage {
+    Static,
+    Extern,
 }
 #[derive(Clone, Default)]
 pub struct LLCfg {
@@ -59,31 +65,31 @@ pub struct LLValue {
 }
 #[derive(Clone)]
 #[non_exhaustive]
-pub enum LLValueInternal {
+pub enum LLValueInternal<I = Id<LLValue>> {
     ArithOp {
         size: Size,
-        lhs: Id<LLValue>,
+        lhs: I,
         op: portal_pc_asm_common::types::Arith,
-        rhs: Id<LLValue>,
+        rhs: I,
     },
     CmpOp {
         size: Size,
-        lhs: Id<LLValue>,
+        lhs: I,
         op: portal_pc_asm_common::types::Cmp,
-        rhs: Id<LLValue>,
+        rhs: I,
     },
     Load {
         size: Size,
-        val: Id<LLValue>,
+        val: I,
     },
     Store {
         size: Size,
-        ptr: Id<LLValue>,
-        val: Id<LLValue>,
+        ptr: I,
+        val: I,
     },
     ExtOrTrunc {
         extension: portal_pc_asm_common::types::Ext,
-        val: Id<LLValue>,
+        val: I,
         target: Size,
     },
     Param {
@@ -94,6 +100,15 @@ pub enum LLValueInternal {
     Const {
         size: Size,
         val: bitvec::vec::BitVec,
+    },
+    Ref {
+        func: Atom,
+        storage: Storage,
+    },
+    Call {
+        r#fn: I,
+        args: Vec<I>,
+        retty: Size,
     },
 }
 #[derive(Clone)]

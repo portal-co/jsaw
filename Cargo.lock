@@ -697,6 +697,9 @@ dependencies = [
 name = "portal-jsc-out-ir-core"
 version = "0.1.0"
 dependencies = [
+ "id-arena",
+ "portal-pc-asm-common",
+ "swc_atoms",
  "swc_common",
 ]
 

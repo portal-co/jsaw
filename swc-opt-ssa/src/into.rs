@@ -21,7 +21,7 @@ fn deopt(
     mut ty: Option<OptType>,
 ) -> anyhow::Result<Id<OptValueW>> {
     while let Some(t) = ty {
-        let w = out.values.alloc(OptValueW(OptValue::Deopt(v)));
+        let w = out.values.alloc(OptValueW(OptValue::Deopt { value: v, deoptimizer: () }));
         out.blocks[k].insts.push(w);
         v = w;
         ty = t.parent(Default::default());
@@ -39,7 +39,7 @@ fn bi_id_deopt(
     let mut s = false;
     while ty1 != ty2 {
         if let Some(t) = ty1 {
-            let w = out.values.alloc(OptValueW(OptValue::Deopt(v1)));
+            let w = out.values.alloc(OptValueW(OptValue::Deopt { value: v1, deoptimizer: ()  }));
             out.blocks[k].insts.push(w);
             v1 = w;
             ty1 = t.parent(Default::default());
@@ -446,7 +446,7 @@ impl Convert {
                                 elem_tys,
                             }) = &oty
                             {
-                                let w = out.values.alloc(OptValueW(OptValue::Deopt(obj)));
+                                let w = out.values.alloc(OptValueW(OptValue::Deopt { value: obj, deoptimizer: ()  }));
                                 out.blocks[k].insts.push(w);
                                 obj = w;
                                 oty = oty.unwrap().parent(Default::default());
@@ -545,7 +545,7 @@ impl Convert {
                         let (mut val, mut tag) =
                             state.get(val).cloned().context("in getting the val")?;
                         while let Some(OptType::Lit(_)) = &tag {
-                            let w = out.values.alloc(OptValueW(OptValue::Deopt(val)));
+                            let w = out.values.alloc(OptValueW(OptValue::Deopt { value: val, deoptimizer: ()  }));
                             out.blocks[k].insts.push(w);
                             val = w;
                             tag = tag.unwrap().parent(Default::default());
@@ -636,7 +636,7 @@ impl Convert {
                         .collect::<anyhow::Result<Vec<_>>>()?;
                     for (m, _) in blocks.iter_mut() {
                         while out.values[*m].ty(&out) != ty {
-                            let n = out.values.alloc(OptValueW(OptValue::Deopt(*m)));
+                            let n = out.values.alloc(OptValueW(OptValue::Deopt { value: *m, deoptimizer: () }));
                             out.blocks[k].insts.push(n);
                             *m = n;
                         }

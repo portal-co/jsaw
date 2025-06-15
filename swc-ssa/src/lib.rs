@@ -218,7 +218,9 @@ impl<I, B, F> SValue<I, B, F> {
             SValue::Assign { target, val } => SValue::Assign {
                 target: target
                     .as_ref()
-                    .map2(&mut |a| Ok::<_, Infallible>(a), &mut |b| Ok([&b[0]]))
+                    .map2(&mut (), &mut |_, a| Ok::<_, Infallible>(a), &mut |_, b| {
+                        Ok([&b[0]])
+                    })
                     .unwrap(),
                 val,
             },
@@ -244,7 +246,9 @@ impl<I, B, F> SValue<I, B, F> {
             SValue::Assign { target, val } => SValue::Assign {
                 target: target
                     .as_mut()
-                    .map2(&mut |a| Ok::<_, Infallible>(a), &mut |b| Ok([&mut b[0]]))
+                    .map2(&mut (), &mut |_, a| Ok::<_, Infallible>(a), &mut |_, b| {
+                        Ok([&mut b[0]])
+                    })
                     .unwrap(),
                 val,
             },

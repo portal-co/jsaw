@@ -1,5 +1,5 @@
 use id_arena::{Arena, Id};
-use swc_common::Span;
+use swc_common::{Span, Spanned};
 
 use crate::WithSpan;
 
@@ -15,13 +15,15 @@ pub struct LLCfg {
 }
 impl LLCfg {
     pub fn add_blockparam(&mut self, k: Id<LLBlock>, ty: Size) -> Id<LLValue> {
-        let v = self.values.alloc(crate::WithSpan {
-            wrap: LLValueInternal::Param {
-                block: k,
-                size: ty,
-                index: self.blocks[k].params.len(),
+        let v = self.values.alloc(LLValue {
+            internal: crate::WithSpan {
+                wrap: LLValueInternal::Param {
+                    block: k,
+                    size: ty,
+                    index: self.blocks[k].params.len(),
+                },
+                item: Span::dummy_with_cmt(),
             },
-            item: Span::dummy_with_cmt(),
         });
         self.blocks[k].params.push((v, ty));
         return v;
@@ -50,8 +52,13 @@ pub struct LLBlock {
     pub stmts: Vec<Id<LLValue>>,
     pub term: WithSpan<LLTerm>,
 }
-pub type LLValue = WithSpan<LLValueInternal>;
+#[derive(Clone, Spanned)]
+pub struct LLValue {
+    #[span]
+    pub internal: WithSpan<LLValueInternal>,
+}
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum LLValueInternal {
     ArithOp {
         size: Size,
@@ -83,6 +90,10 @@ pub enum LLValueInternal {
         block: Id<LLBlock>,
         size: Size,
         index: usize,
+    },
+    Const {
+        size: Size,
+        val: bitvec::vec::BitVec,
     },
 }
 #[derive(Clone)]

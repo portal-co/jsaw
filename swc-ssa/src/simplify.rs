@@ -16,7 +16,7 @@ impl SCfg {
                 if let SValue::Item {
                     item: Item::Lit { lit: Lit::Bool(b) },
                     span,
-                } = &self.values[*cond].0
+                } = &self.values[*cond].value
                 {
                     kd.postcedent.term = STerm::Jmp(if b.value {
                         if_true.clone()
@@ -33,7 +33,7 @@ pub trait SValGetter<I: Copy, B,F = SFunc> {
 }
 impl SValGetter<Id<SValueW>, Id<SBlock>> for SCfg {
     fn val(&self, id: Id<SValueW>) -> Option<&SValue<Id<SValueW>, Id<SBlock>>> {
-        Some(&self.values[id].0)
+        Some(&self.values[id].value)
     }
 }
 pub(crate) fn default_ctx() -> ExprCtx {

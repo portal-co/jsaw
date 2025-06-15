@@ -108,7 +108,7 @@ impl CH {
                 })
                 .collect::<BTreeMap<_, _>>();
             for s in inp.blocks[k].stmts.iter().cloned() {
-                let v = match inp.values[s].0.clone() {
+                let v = match inp.values[s].value.clone() {
                     SValue::Param { block, idx, ty } => todo!(),
                     SValue::Item { item, span } => SValue::Item {
                         item: item.map2(
@@ -160,7 +160,7 @@ impl CH {
                             if let SValue::Item {
                                 item: Item::Lit { lit },
                                 span,
-                            } = &out.values[*b].0
+                            } = &out.values[*b].value
                             {
                                 funcs.push(Some(ConstVal::Lit(lit.clone())));
                                 return None;
@@ -168,7 +168,7 @@ impl CH {
                             if let SValue::Item {
                                 item: Item::Undef,
                                 span,
-                            } = &out.values[*b].0
+                            } = &out.values[*b].value
                             {
                                 funcs.push(Some(ConstVal::Undef));
                                 return None;
@@ -214,7 +214,7 @@ impl CH {
                     if_false,
                 } => {
                     let cond = params.get(cond).cloned().context("in getting the cond")?;
-                    match &out.values[cond].0 {
+                    match &out.values[cond].value {
                         SValue::Item {
                             item: Item::Lit { lit },
                             span,

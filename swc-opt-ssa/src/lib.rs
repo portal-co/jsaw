@@ -75,7 +75,7 @@ impl<I, B, F, D> OptValue<I, B, F, D> {
     }
 }
 #[derive(Clone, Debug)]
-pub struct OptValueW(pub OptValue);
+pub struct OptValueW { pub value: OptValue }
 #[derive(Default, Clone, Debug)]
 pub struct OptBlock {
     pub params: Vec<(Id<OptValueW>, Option<OptType>)>,
@@ -94,7 +94,7 @@ pub struct OptCfg {
 }
 impl OptValueW {
     pub fn ty(&self, cfg: &OptCfg) -> Option<OptType> {
-        match &self.0 {
+        match &self.value {
             OptValue::Deopt { value: d, .. } => {
                 let x = cfg.values[*d].ty(cfg);
                 x.and_then(|y| y.parent(Default::default()))
@@ -104,7 +104,7 @@ impl OptValueW {
         }
     }
     pub fn constant(&self, cfg: &OptCfg) -> Option<Lit> {
-        match &self.0 {
+        match &self.value {
             OptValue::Deopt { value: a, .. } => cfg.values[*a].constant(cfg),
             OptValue::Assert { val, ty } => cfg.values[*val].constant(cfg),
             OptValue::Emit { val, ty } => match val {
@@ -119,7 +119,7 @@ impl OptValueW {
 }
 impl SValGetter<Id<OptValueW>, Id<OptBlock>, OptFunc> for OptCfg {
     fn val(&self, id: Id<OptValueW>) -> Option<&SValue<Id<OptValueW>, Id<OptBlock>, OptFunc>> {
-        match &self.values[id].0 {
+        match &self.values[id].value {
             OptValue::Deopt { value: a, .. } => self.val(*a),
             OptValue::Assert { val, ty } => self.val(*val),
             OptValue::Emit { val, ty } => Some(val),
@@ -135,14 +135,14 @@ pub struct OptFunc {
 }
 impl OptCfg {
     pub fn add_blockparam(&mut self, k: Id<OptBlock>, ty: Option<OptType>) -> Id<OptValueW> {
-        let v = self.values.alloc(OptValueW(OptValue::Emit {
+        let v = self.values.alloc(OptValueW { value: OptValue::Emit {
             val: SValue::Param {
                 block: k,
                 idx: self.blocks[k].params.len(),
                 ty: (),
             },
             ty: ty.clone(),
-        }));
+        } });
         self.blocks[k].params.push((v, ty));
         return v;
     }

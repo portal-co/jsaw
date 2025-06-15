@@ -28,7 +28,7 @@ pub fn benj(swc_func: &mut SCfg) {
         for target in postcedent.targets_mut() {
             if target.block.index() <= block_index.index() {
                 for arg in target.args.iter_mut() {
-                    let value = swc_func.values.alloc(SValueW(SValue::Benc(*arg)));
+                    let value = swc_func.values.alloc(SValueW { value: SValue::Benc(*arg) });
                     swc_func.blocks[block_index].stmts.push(value);
                     *arg = value;
                 }
@@ -120,7 +120,7 @@ impl SCfg {
         return self
             .values
             .iter()
-            .flat_map(|(a, b)| match &b.0 {
+            .flat_map(|(a, b)| match &b.value {
                 SValue::LoadId(target) | SValue::StoreId { target, val: _ } => {
                     [target.clone()].into_iter().collect::<BTreeSet<Ident>>()
                 }
@@ -328,15 +328,15 @@ impl<I, B, F> SValue<I, B, F> {
 }
 #[repr(transparent)]
 #[derive(Clone, Debug)]
-pub struct SValueW(pub SValue);
+pub struct SValueW { pub value: SValue }
 impl From<SValue> for SValueW {
     fn from(value: SValue) -> Self {
-        Self(value)
+        Self { value }
     }
 }
 impl From<SValueW> for SValue {
     fn from(value: SValueW) -> Self {
-        value.0
+        value.value
     }
 }
 #[derive(Clone, Debug)]

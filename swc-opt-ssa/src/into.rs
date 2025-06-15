@@ -21,7 +21,7 @@ fn deopt(
     mut ty: Option<OptType>,
 ) -> anyhow::Result<Id<OptValueW>> {
     while let Some(t) = ty {
-        let w = out.values.alloc(OptValueW(OptValue::Deopt { value: v, deoptimizer: () }));
+        let w = out.values.alloc(OptValueW { value: OptValue::Deopt { value: v, deoptimizer: () } });
         out.blocks[k].insts.push(w);
         v = w;
         ty = t.parent(Default::default());
@@ -39,7 +39,7 @@ fn bi_id_deopt(
     let mut s = false;
     while ty1 != ty2 {
         if let Some(t) = ty1 {
-            let w = out.values.alloc(OptValueW(OptValue::Deopt { value: v1, deoptimizer: ()  }));
+            let w = out.values.alloc(OptValueW { value: OptValue::Deopt { value: v1, deoptimizer: ()  } });
             out.blocks[k].insts.push(w);
             v1 = w;
             ty1 = t.parent(Default::default());
@@ -103,7 +103,7 @@ impl Convert {
             };
             out.blocks[k].postcedent.catch = catch;
             for i in inp.blocks[i].stmts.iter().cloned() {
-                let (j, tag) = match &inp.values[i].0 {
+                let (j, tag) = match &inp.values[i].value {
                     SValue::Param { block, idx, ty } => todo!(),
                     SValue::Item { item, span } => match item {
                         swc_tac::Item::Just { id } => {
@@ -366,10 +366,10 @@ impl Convert {
                                         };
                                         match op {
                                             UnaryOp::Plus => {
-                                                let val = OptValueW(OptValue::Emit {
+                                                let val = OptValueW { value: OptValue::Emit {
                                                     val: result,
                                                     ty: None,
-                                                });
+                                                } };
                                                 let val = out.values.alloc(val);
                                                 out.blocks[k].insts.push(val);
                                                 (
@@ -446,7 +446,7 @@ impl Convert {
                                 elem_tys,
                             }) = &oty
                             {
-                                let w = out.values.alloc(OptValueW(OptValue::Deopt { value: obj, deoptimizer: ()  }));
+                                let w = out.values.alloc(OptValueW { value: OptValue::Deopt { value: obj, deoptimizer: ()  } });
                                 out.blocks[k].insts.push(w);
                                 obj = w;
                                 oty = oty.unwrap().parent(Default::default());
@@ -545,7 +545,7 @@ impl Convert {
                         let (mut val, mut tag) =
                             state.get(val).cloned().context("in getting the val")?;
                         while let Some(OptType::Lit(_)) = &tag {
-                            let w = out.values.alloc(OptValueW(OptValue::Deopt { value: val, deoptimizer: ()  }));
+                            let w = out.values.alloc(OptValueW { value: OptValue::Deopt { value: val, deoptimizer: ()  } });
                             out.blocks[k].insts.push(w);
                             val = w;
                             tag = tag.unwrap().parent(Default::default());
@@ -560,7 +560,7 @@ impl Convert {
                     }
                     _ => todo!(),
                 };
-                let j = crate::OptValueW(j);
+                let j = crate::OptValueW { value: j };
                 let j = out.values.alloc(j);
                 out.blocks[k].insts.push(j);
                 state.insert(i, (j, tag));
@@ -611,7 +611,7 @@ impl Convert {
                             val: cond,
                             ty: Some(OptType::Bool),
                         };
-                        let cond = out.values.alloc(OptValueW(cond));
+                        let cond = out.values.alloc(OptValueW { value: cond });
                         out.blocks[k].insts.push(cond);
                         cond
                     };
@@ -636,7 +636,7 @@ impl Convert {
                         .collect::<anyhow::Result<Vec<_>>>()?;
                     for (m, _) in blocks.iter_mut() {
                         while out.values[*m].ty(&out) != ty {
-                            let n = out.values.alloc(OptValueW(OptValue::Deopt { value: *m, deoptimizer: () }));
+                            let n = out.values.alloc(OptValueW { value: OptValue::Deopt { value: *m, deoptimizer: () } });
                             out.blocks[k].insts.push(n);
                             *m = n;
                         }

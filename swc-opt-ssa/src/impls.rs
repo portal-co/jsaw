@@ -168,7 +168,7 @@ impl ssa_traits::HasChainableValues<OptFunc> for OptValueW {
     fn values_chain<'a>(
         &'a self,
     ) -> Box<dyn Iterator<Item = <OptFunc as ssa_traits::Func>::Value> + 'a> {
-        match &self.0 {
+        match &self.value {
             OptValue::Emit { val, ty } => val.vals(),
             OptValue::Deopt { value: a,.. } => Box::new(once(*a)),
             OptValue::Assert { val, ty } => Box::new(once(*val)),
@@ -182,7 +182,7 @@ impl ssa_traits::HasChainableValues<OptFunc> for OptValueW {
     where
         OptFunc: 'a,
     {
-        match &mut self.0 {
+        match &mut self.value {
             OptValue::Emit { val, ty } => val.vals_mut(),
             OptValue::Deopt { value: a,.. } => Box::new(once(a)),
             OptValue::Assert { val, ty } => Box::new(once(val)),

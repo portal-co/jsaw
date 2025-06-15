@@ -164,7 +164,7 @@ impl ssa_traits::HasChainableValues<SFunc> for SValueW {
     fn values_chain<'a>(
         &'a self,
     ) -> Box<dyn Iterator<Item = <SFunc as ssa_traits::Func>::Value> + 'a> {
-        self.0.vals()
+        self.value.vals()
     }
 
     fn values_chain_mut<'a>(
@@ -174,7 +174,7 @@ impl ssa_traits::HasChainableValues<SFunc> for SValueW {
     where
         SFunc: 'a,
     {
-        self.0.vals_mut()
+        self.value.vals_mut()
     }
 }
 impl HasValues<SFunc> for SValueW {

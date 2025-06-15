@@ -93,7 +93,7 @@ impl Rew {
                     };
                     cfg.blocks[new_block_id].catch = catch_clause;
                     for statement in func.cfg.blocks[*block_id].stmts.iter() {
-                        match &func.cfg.values[*statement].0 {
+                        match &func.cfg.values[*statement].value {
                             SValue::Param { block, idx, ty } => todo!(),
                             SValue::Item { item, span } => {
                                 let item_id = item.clone().map2(
@@ -244,7 +244,7 @@ pub fn mangle_param(ctxt: SyntaxContext, block_id: Id<SBlock>, index: usize) -> 
     (Atom::new(format!("k{}p{}", block_id.index(), index)), ctxt)
 }
 pub fn mangle_value(ctxt: SyntaxContext, func: &SFunc, value_id: Id<SValueW>) -> Ident {
-    if let SValue::Param { block, idx, ty } = &func.cfg.values[value_id].0 {
+    if let SValue::Param { block, idx, ty } = &func.cfg.values[value_id].value {
         return mangle_param(ctxt, *block, *idx);
     }
     return (Atom::new(format!("v{}", value_id.index())), ctxt);

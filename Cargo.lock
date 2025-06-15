@@ -694,6 +694,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "portal-jsc-out-ir-core"
+version = "0.1.0"
+dependencies = [
+ "swc_common",
+]
+
+[[package]]
 name = "portal-jsc-simpl-js"
 version = "0.6.0"
 dependencies = [

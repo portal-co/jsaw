@@ -2,7 +2,7 @@
 name = "portal-jsc-swc-cfg"
 version = "0.6.0"
 edition = "2024"
-license = "CC0-1.0"
+license = "MPL-2.0"
 description = "ECMAScript IR"
 
 [lib]

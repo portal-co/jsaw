@@ -1,0 +1,14 @@
+[package]
+name = "portal-jsc-out-ir-core"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+description = "ECMAScript IR"
+
+[dependencies]
+swc_common.workspace = true
+
+[features]
+llir=[]
+mobir=[]
+soup=[]

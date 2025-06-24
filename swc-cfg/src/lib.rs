@@ -31,7 +31,7 @@ impl TryFrom<Function> for Func {
     fn try_from(value: Function) -> Result<Self, Self::Error> {
         let mut cfg = Cfg::default();
         let entry = cfg.blocks.alloc(Default::default());
-        let exit = Ctx::default().transform_all(
+        let exit = ToCfgConversionCtx::default().transform_all(
             &mut cfg,
             value.body.map(|a| a.stmts).unwrap_or_else(Vec::new),
             entry,
@@ -540,12 +540,12 @@ pub struct Loop<T = Id<Block>> {
     pub r#continue: T,
 }
 #[derive(Clone, Default)]
-pub struct Ctx {
+pub struct ToCfgConversionCtx {
     pub catch: Catch,
     pub cur_loop: Option<Loop>,
     pub labelled: HashMap<Ident, Loop>,
 }
-impl Ctx {
+impl ToCfgConversionCtx {
     pub fn new_block(&self, cfg: &mut Cfg) -> Id<Block> {
         return cfg.blocks.alloc(Block {
             stmts: vec![],

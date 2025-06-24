@@ -866,7 +866,12 @@ version = "0.6.0"
 dependencies = [
  "either",
  "itertools",
+ "portal-jsc-mob-backend-common",
 ]
+
+[[package]]
+name = "portal-jsc-mob-backend-common"
+version = "0.1.0"
 
 [[package]]
 name = "portal-jsc-out-ir-core"
@@ -1034,6 +1039,7 @@ version = "0.7.0"
 dependencies = [
  "either",
  "itertools",
+ "portal-jsc-mob-backend-common",
  "symbolism",
 ]
 

@@ -1,5 +1,5 @@
 [workspace]
-members=[ "jacon", "portal-jsc-common", "portal-jsc-out-ir-core", "portal-jsc-swift-backend",  "simpl-js", "simpl-js-rust", "swc-batch","swc-cfg",  "swc-opt-ssa", "swc-ssa", "swc-tac", "swc-util"]
+members=[ "jacon", "portal-jsc-common", "portal-jsc-mob-backend-common", "portal-jsc-out-ir-core", "portal-jsc-swift-backend",  "simpl-js", "simpl-js-rust", "swc-batch","swc-cfg",  "swc-opt-ssa", "swc-ssa", "swc-tac", "swc-util"]
 
 # "js-runtime-lib","swc-emit-rust","swc-waffle"
 

@@ -8,3 +8,4 @@ description = "Java backend for ECMAScript"
 [dependencies]
 either = { version = "^1.15.0", default-features = false }
 itertools = { version = "^0.14.0", default-features = false, features = ["use_alloc"] }
+portal-jsc-mob-backend-common = { version = "0.1.0", path = "../portal-jsc-mob-backend-common" }

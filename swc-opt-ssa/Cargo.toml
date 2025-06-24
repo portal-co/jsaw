@@ -5,8 +5,6 @@ edition = "2024"
 license = "MPL-2.0"
 description = "ECMAScript IR"
 
-[lib]
-name = "swc_opt_ssa"
 
 [dependencies]
 anyhow.workspace = true
@@ -16,8 +14,9 @@ id-arena.workspace = true
 cfg-traits.workspace = true
 
 ssa-traits.workspace = true
-portal-jsc-swc-cfg = { version = "0.7.0", path = "../swc-cfg" }
-portal-jsc-swc-tac = { version = "0.7.0", path = "../swc-tac" }
+swc-cfg = { version = "0.7.0", path = "../swc-cfg", package = "portal-jsc-swc-cfg" }
+swc-tac = { version = "0.7.0", path = "../swc-tac", package = "portal-jsc-swc-tac" }
+swc-ssa = { version = "0.7.0", path = "../swc-ssa", package = "portal-jsc-swc-ssa" }
 portal-jsc-swc-util = { version = "0.7.0", path = "../swc-util", features = ["ty"] }
 portal-jsc-simpl-js = { version = "0.7.0", path = "../simpl-js", optional = true }
 swc_atoms.workspace = true
@@ -25,10 +24,9 @@ swc_common.workspace = true
 swc_ecma_ast.workspace = true
 swc_ecma_utils.workspace = true
 swc_ecma_visit.workspace = true
-portal-jsc-swc-ssa = { version = "0.7.0", path = "../swc-ssa" }
 paste = "1.0.15"
 ssa-impls.workspace = true
 num-traits = "0.2.19"
 
 [features]
-simpl=["dep:portal-jsc-simpl-js","portal-jsc-swc-tac/simpl","portal-jsc-swc-ssa/simpl"]
+simpl=["dep:portal-jsc-simpl-js","swc-tac/simpl","swc-ssa/simpl"]

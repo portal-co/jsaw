@@ -1,8 +1,8 @@
 use std::{
     collections::HashMap,
+    fmt::Debug,
     ops::{Index, IndexMut},
     sync::{Arc, OnceLock},
-    fmt::Debug,
 };
 
 use arena_traits::{Arena, IndexAlloc, IndexIter};
@@ -12,19 +12,19 @@ use swc_ecma_ast::{Id, Ident};
 pub trait AtomResolver: Debug {
     fn resolve(&self, len: usize) -> Atom;
 }
-#[derive(Debug,Default)]
+#[derive(Debug, Default)]
 pub struct DefaultAtomResolver {}
 impl AtomResolver for DefaultAtomResolver {
     fn resolve(&self, len: usize) -> Atom {
         Atom::new(format!("${len}"))
     }
 }
-#[derive(Clone,Debug)]
+#[derive(Clone, Debug)]
 pub struct LAM<T> {
-    pub map: HashMap<Id, T>,
-    pub default: T,
+    map: HashMap<Id, T>,
+    default: T,
     pub resolver: Arc<dyn AtomResolver>,
-    pub mark: OnceLock<Mark>,
+    ctxt: OnceLock<SyntaxContext>,
 }
 impl<T: Default> LAM<T> {
     pub fn new(resolver: impl AtomResolver + 'static) -> Self {
@@ -32,7 +32,7 @@ impl<T: Default> LAM<T> {
             map: HashMap::new(),
             default: T::default(),
             resolver: Arc::new(resolver),
-            mark: Default::default(),
+            ctxt: Default::default(),
         }
     }
 }
@@ -66,7 +66,9 @@ impl<T: Default> IndexAlloc<Id> for LAM<T> {
         let len = self.map.len();
         let root = (
             self.resolver.resolve(len),
-            SyntaxContext::empty().apply_mark(*self.mark.get_or_init(|| Mark::fresh(Mark::root()))),
+            *self
+                .ctxt
+                .get_or_init(|| SyntaxContext::empty().apply_mark(Mark::fresh(Mark::root()))),
         );
         self[root.clone()] = value;
         return root;

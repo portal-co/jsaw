@@ -3,6 +3,7 @@ use std::convert::Infallible;
 use std::default;
 use std::iter::{empty, once};
 
+use anyhow::Context;
 use arena_traits::{Arena as TArena, IndexAlloc};
 use bitflags::bitflags;
 use id_arena::{Arena, Id};
@@ -1167,6 +1168,15 @@ impl Trans {
                 });
                 o.decls.insert(tmp.clone());
                 return Ok((tmp, t));
+            }
+            Expr::Seq(s) => {
+                let mut r = None;
+                for a in s.exprs.iter() {
+                    let c;
+                    (c, t) = self.expr(i, o, b, t, a)?;
+                    r = Some(c)
+                }
+                return Ok((r.context("in getting the last one")?, t));
             }
             _ => anyhow::bail!("todo: {}:{}", file!(), line!()),
         }

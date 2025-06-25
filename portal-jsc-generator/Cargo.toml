@@ -1,0 +1,9 @@
+[package]
+name = "portal-jsc-generator"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+itertools = "0.14.0"
+portal-jsc-common = { version = "0.7.0", path = "../portal-jsc-common" }

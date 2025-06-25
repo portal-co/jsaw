@@ -19,6 +19,36 @@ pub enum Native<E> {
     FastShl { lhs: E, rhs: E },
 }
 impl Native<()> {
+    pub fn all() -> impl Iterator<Item = Self> {
+        [
+            "fast_add",
+            "fast_and",
+            "fast_or",
+            "fast_eq",
+            "fast_sub",
+            "fast_shl",
+            "fast_mul",
+            "fast_imul",
+        ]
+        .into_iter()
+        .filter_map(|a| Self::of(a))
+        .chain([true, false].into_iter().flat_map(|a| {
+            [
+                Self::AssertNumber {
+                    value: (),
+                    comptime: a,
+                },
+                Self::AssertStaticFn {
+                    value: (),
+                    comptime: a,
+                },
+                Self::AssertString {
+                    value: (),
+                    comptime: a,
+                },
+            ]
+        }))
+    }
     pub fn of(a: &str) -> Option<Self> {
         Some(match a {
             "assert_string" => Self::AssertString {
@@ -158,7 +188,10 @@ impl<E> Native<E> {
             Native::FastShl { lhs, rhs } => Native::FastShl { lhs, rhs },
         }
     }
-    pub fn map<E2, Er>(self, f: &mut impl FnMut(E) -> Result<E2, Er>) -> Result<Native<E2>, Er> {
+    pub fn map<E2, Er>(
+        self,
+        f: &mut (dyn FnMut(E) -> Result<E2, Er> + '_),
+    ) -> Result<Native<E2>, Er> {
         Ok(match self {
             Native::AssertString { value, comptime } => Native::AssertString {
                 value: f(value)?,

@@ -861,6 +861,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "portal-jsc-generator"
+version = "0.1.0"
+dependencies = [
+ "itertools",
+ "portal-jsc-common",
+]
+
+[[package]]
 name = "portal-jsc-jacon-backend"
 version = "0.6.0"
 dependencies = [

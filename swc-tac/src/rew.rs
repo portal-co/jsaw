@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
+use std::convert::Infallible;
 use std::mem::take;
 
 use id_arena::Id;
+use swc_atoms::Atom;
 use swc_cfg::{Block, Cfg};
 use swc_cfg::{Func, Term};
 use swc_common::{Span, Spanned, SyntaxContext};
-use swc_ecma_ast::ExprStmt;
 use swc_ecma_ast::FnExpr;
 use swc_ecma_ast::Id as Ident;
 use swc_ecma_ast::KeyValueProp;
@@ -24,8 +25,9 @@ use swc_ecma_ast::{BinExpr, BindingIdent, TsTypeAnn};
 use swc_ecma_ast::{BinaryOp, CallExpr, Lit, Number};
 use swc_ecma_ast::{ComputedPropName, ThisExpr};
 use swc_ecma_ast::{Expr, SimpleAssignTarget};
+use swc_ecma_ast::{ExprStmt, Str};
 
-use crate::{TBlock, TCallee, TCfg, TFunc};
+use crate::{Item, TBlock, TCallee, TCfg, TFunc};
 
 impl TryFrom<TFunc> for Func {
     type Error = anyhow::Error;
@@ -346,6 +348,42 @@ impl Rew {
                         _ => todo!(),
                     },
                     crate::Item::This => Expr::This(ThisExpr { span }),
+                    Item::Intrinsic { value } => {
+                        let mut v = Vec::default();
+                        let x = value
+                            .as_ref()
+                            .map(&mut |a| Ok::<_, Infallible>(v.push(sr(a))))
+                            .unwrap();
+                        Expr::Call(CallExpr {
+                            span,
+                            ctxt: Default::default(),
+                            callee: swc_ecma_ast::Callee::Expr(Box::new(Expr::Member(
+                                MemberExpr {
+                                    span,
+                                    obj: Box::new(Expr::Ident(ident(
+                                        &(Atom::new("globalThis"), Default::default()),
+                                        span,
+                                    ))),
+                                    prop: swc_ecma_ast::MemberProp::Computed(ComputedPropName {
+                                        span,
+                                        expr: Box::new(Expr::Lit(Lit::Str(Str {
+                                            span,
+                                            raw: None,
+                                            value: Atom::new(x.key()),
+                                        }))),
+                                    }),
+                                },
+                            ))),
+                            args: v
+                                .into_iter()
+                                .map(|a| ExprOrSpread {
+                                    expr: a,
+                                    spread: None,
+                                })
+                                .collect(),
+                            type_args: None,
+                        })
+                    }
                 });
                 if !mark {
                     if let AssignTarget::Simple(SimpleAssignTarget::Ident(i)) = &left {

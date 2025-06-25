@@ -15,15 +15,15 @@ use swc_common::{
     sync::Lrc,
 };
 use swc_ecma_ast::{
-    CallExpr, Expr, ExprStmt, Id, Ident, Lit, MemberExpr, MemberProp, Module, ModuleDecl,
-    ModuleItem, Stmt,
+    BinaryOp, CallExpr, Expr, ExprStmt, Id, Ident, Lit, MemberExpr, MemberProp, Module, ModuleDecl,
+    ModuleItem, OptChainBase, Stmt,
 };
 use swc_ecma_parser::{Parser, Syntax, lexer::Lexer};
 pub trait ResolveNatives {
-    fn resolve_natives(&self, import_map: &impl ImportMapper) -> Option<Native<&Expr>>;
+    fn resolve_natives(&self, import_map: &(dyn ImportMapper + '_)) -> Option<Native<&Expr>>;
 }
 impl ResolveNatives for Expr {
-    fn resolve_natives(&self, import_map: &impl ImportMapper) -> Option<Native<&Expr>> {
+    fn resolve_natives(&self, import_map: &(dyn ImportMapper + '_)) -> Option<Native<&Expr>> {
         fn member<'a>(c: &'a CallExpr, m: &'a MemberExpr) -> Option<Native<&'a Expr>> {
             match &*m.obj {
                 Expr::Ident(i) if i.sym == "globalThis" => match &m.prop {
@@ -47,8 +47,12 @@ impl ResolveNatives for Expr {
                 _ => None,
             }
         }
-        match self {
-            Expr::Call(c) => match &**(c.callee.as_expr()?) {
+        fn expr<'a>(
+            c: &'a CallExpr,
+            e: &'a Expr,
+            import_map: &(dyn ImportMapper + '_),
+        ) -> Option<Native<&'a Expr>> {
+            match e {
                 Expr::Ident(i) => match import_map.import_of(&i.to_id())? {
                     (a, ImportMap::Named { name })
                         if a == "@portal-solutions/jsaw-intrinsics-base" =>
@@ -67,12 +71,18 @@ impl ResolveNatives for Expr {
                     _ => None,
                 },
                 Expr::Member(m) => member(c, m),
+                Expr::Bin(b) if matches!(b.op, BinaryOp::NullishCoalescing) => {
+                    expr(c, &*b.left, import_map)
+                }
                 Expr::OptChain(o) => match &*o.base {
                     swc_ecma_ast::OptChainBase::Member(m) => member(c, m),
                     _ => None,
                 },
                 _ => None,
-            },
+            }
+        }
+        match self {
+            Expr::Call(c) => expr(c, &**(c.callee.as_expr()?), import_map),
             _ => None,
         }
     }

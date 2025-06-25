@@ -1067,9 +1067,9 @@ dependencies = [
 
 [[package]]
 name = "portal-solutions-swibb"
-version = "0.2.0"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec84c725f29204007fe39d67ad79c7f8c276c799a1c531f2606c2e7174885acf"
+checksum = "633f8dfaef754b3b90ccd92b9bd41c1c8832034428006a805d1cc5f8255a7f4e"
 dependencies = [
  "swc_atoms",
  "swc_bundler",

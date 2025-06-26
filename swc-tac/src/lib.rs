@@ -783,6 +783,52 @@ impl Trans<'_> {
             }
         }
         match s {
+            Expr::Cond(c) => {
+                let v;
+                (v, t) = self.expr(i, o, b, t, &c.test)?;
+                let then = o.blocks.alloc(TBlock {
+                    stmts: vec![],
+                    catch: o.blocks[t].catch.clone(),
+                    term: Default::default(),
+                    orig_span: Some(c.span),
+                });
+                let els = o.blocks.alloc(TBlock {
+                    stmts: vec![],
+                    catch: o.blocks[t].catch.clone(),
+                    term: Default::default(),
+                    orig_span: Some(c.span),
+                });
+                let done = o.blocks.alloc(TBlock {
+                    stmts: vec![],
+                    catch: o.blocks[t].catch.clone(),
+                    term: Default::default(),
+                    orig_span: Some(c.span),
+                });
+                o.blocks[t].term = TTerm::CondJmp {
+                    cond: v,
+                    if_true: then,
+                    if_false: els,
+                };
+                let tmp = o.regs.alloc(());
+                o.decls.insert(tmp.clone());
+                let (a, then) = self.expr(i, o, b, then, &c.cons)?;
+                o.blocks[then].stmts.push(TStmt {
+                    left: LId::Id { id: tmp.clone() },
+                    flags: ValFlags::SSA_LIKE,
+                    right: Item::Just { id: a },
+                    span: s.span(),
+                });
+                o.blocks[then].term = TTerm::Jmp(done);
+                let (a, els) = self.expr(i, o, b, els, &c.alt)?;
+                o.blocks[els].stmts.push(TStmt {
+                    left: LId::Id { id: tmp.clone() },
+                    flags: ValFlags::SSA_LIKE,
+                    right: Item::Just { id: a },
+                    span: s.span(),
+                });
+                o.blocks[els].term = TTerm::Jmp(done);
+                return Ok((tmp, done));
+            }
             Expr::This(this) => {
                 let id = match self.this.clone() {
                     Some(a) => a,

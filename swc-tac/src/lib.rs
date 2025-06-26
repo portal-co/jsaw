@@ -8,6 +8,7 @@ use arena_traits::{Arena as TArena, IndexAlloc};
 use bitflags::bitflags;
 use id_arena::{Arena, Id};
 use lam::LAM;
+use linearize::{StaticMap, static_map};
 use portal_jsc_common::{Asm, Native};
 use portal_jsc_swc_util::{ImportMapper, NoImportMapper, ResolveNatives};
 use swc_atoms::Atom;
@@ -27,6 +28,12 @@ pub type LId = portal_jsc_common::LId<Ident>;
 
 #[cfg(feature = "simpl")]
 pub mod simpl;
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, linearize::Linearize)]
+#[non_exhaustive]
+pub enum ImportMapperReq {
+    Native,
+}
 
 pub fn imp(a: MemberProp) -> Expr {
     match a {
@@ -61,9 +68,9 @@ pub struct TFunc {
     pub is_async: bool,
 }
 impl TFunc {
-    pub fn try_from_with_mapper(
+    pub fn try_from_with_mapper<'a>(
         value: Func,
-        import_mapper: Option<&(dyn ImportMapper + '_)>,
+        import_mapper: StaticMap<ImportMapperReq, Option<&'a (dyn ImportMapper + 'a)>>,
     ) -> anyhow::Result<Self> {
         let mut cfg = TCfg::default();
         let entry = Trans {
@@ -102,7 +109,7 @@ impl TryFrom<Func> for TFunc {
     type Error = anyhow::Error;
 
     fn try_from(value: Func) -> Result<Self, Self::Error> {
-        TFunc::try_from_with_mapper(value, None)
+        TFunc::try_from_with_mapper(value, linearize::static_map! {_ => None})
     }
 }
 impl TryFrom<Function> for TFunc {
@@ -561,7 +568,7 @@ pub struct Trans<'a> {
     pub ret_to: Option<(Ident, Id<TBlock>)>,
     pub recatch: TCatch,
     pub this: Option<Ident>,
-    pub import_mapper: Option<&'a (dyn ImportMapper + 'a)>,
+    pub import_mapper: StaticMap<ImportMapperReq, Option<&'a (dyn ImportMapper + 'a)>>,
 }
 impl Trans<'_> {
     pub fn trans(&mut self, i: &Cfg, o: &mut TCfg, b: Id<Block>) -> anyhow::Result<Id<TBlock>> {
@@ -757,7 +764,7 @@ impl Trans<'_> {
         mut t: Id<TBlock>,
         s: &Expr,
     ) -> anyhow::Result<(Ident, Id<TBlock>)> {
-        if let Some(i2) = self.import_mapper.as_deref() {
+        if let Some(i2) = self.import_mapper[ImportMapperReq::Native].as_deref() {
             if let Some(n) = s.resolve_natives(i2) {
                 let arg = n.map(&mut |e| {
                     let x;
@@ -932,7 +939,7 @@ impl Trans<'_> {
                                 ret_to: Some((tmp.clone(), t2)),
                                 recatch: o.blocks[t].catch.clone(),
                                 this: Some((Atom::new("globalThis"), Default::default())),
-                                import_mapper: self.import_mapper.as_deref(),
+                                import_mapper: static_map! {a => self.import_mapper[a].as_deref()},
                             };
                             let t3 = t4.trans(&cfg.cfg, o, cfg.entry)?;
                             o.blocks[t].term = TTerm::Jmp(t3);
@@ -974,7 +981,7 @@ impl Trans<'_> {
                                         ret_to: Some((tmp.clone(), t2)),
                                         recatch: o.blocks[t].catch.clone(),
                                         this: Some((Atom::new("globalThis"), Default::default())),
-                                        import_mapper: self.import_mapper.as_deref(),
+                                        import_mapper: static_map! {a => self.import_mapper[a].as_deref()},
                                     };
                                     let t3 = t4.trans(&cfg.cfg, o, cfg.entry)?;
                                     o.blocks[t].term = TTerm::Jmp(t3);

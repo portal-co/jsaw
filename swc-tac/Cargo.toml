@@ -27,6 +27,9 @@ swc_ecma_utils.workspace = true
 swc_ecma_visit.workspace = true
 bitflags.workspace = true
 portal-jsc-common = { version = "0.7.0", path = "../portal-jsc-common" }
+linearize = { workspace = true, features = ["derive"] }
+linearize-derive.workspace = true
+
 
 [features]
 simpl=["dep:portal-jsc-simpl-js"]

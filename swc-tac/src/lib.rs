@@ -9,7 +9,7 @@ use bitflags::bitflags;
 use id_arena::{Arena, Id};
 use lam::LAM;
 use portal_jsc_common::{Asm, Native};
-use portal_jsc_swc_util::{NoImportMapper, ResolveNatives};
+use portal_jsc_swc_util::{ImportMapper, NoImportMapper, ResolveNatives};
 use swc_atoms::Atom;
 use swc_cfg::{Block, Catch, Cfg, Func};
 use swc_common::pass::Either;
@@ -60,17 +60,18 @@ pub struct TFunc {
     pub is_generator: bool,
     pub is_async: bool,
 }
-
-impl TryFrom<Func> for TFunc {
-    type Error = anyhow::Error;
-
-    fn try_from(value: Func) -> Result<Self, Self::Error> {
+impl TFunc {
+    pub fn try_from_with_mapper(
+        value: Func,
+        import_mapper: Option<&(dyn ImportMapper + '_)>,
+    ) -> anyhow::Result<Self> {
         let mut cfg = TCfg::default();
         let entry = Trans {
             map: BTreeMap::new(),
             ret_to: None,
             recatch: TCatch::Throw,
             this: None,
+            import_mapper,
         }
         .trans(&value.cfg, &mut cfg, value.entry)?;
         cfg.ts_retty = value.cfg.ts_retty;
@@ -95,6 +96,13 @@ impl TryFrom<Func> for TFunc {
             is_async: value.is_async,
             ts_params,
         })
+    }
+}
+impl TryFrom<Func> for TFunc {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Func) -> Result<Self, Self::Error> {
+        TFunc::try_from_with_mapper(value, None)
     }
 }
 impl TryFrom<Function> for TFunc {
@@ -548,13 +556,14 @@ impl<I, F> Item<I, F> {
 
 #[derive(Default)]
 #[non_exhaustive]
-pub struct Trans {
+pub struct Trans<'a> {
     pub map: BTreeMap<Id<Block>, Id<TBlock>>,
     pub ret_to: Option<(Ident, Id<TBlock>)>,
     pub recatch: TCatch,
     pub this: Option<Ident>,
+    pub import_mapper: Option<&'a (dyn ImportMapper + 'a)>,
 }
-impl Trans {
+impl Trans<'_> {
     pub fn trans(&mut self, i: &Cfg, o: &mut TCfg, b: Id<Block>) -> anyhow::Result<Id<TBlock>> {
         loop {
             if let Some(a) = self.map.get(&b) {
@@ -748,21 +757,23 @@ impl Trans {
         mut t: Id<TBlock>,
         s: &Expr,
     ) -> anyhow::Result<(Ident, Id<TBlock>)> {
-        if let Some(n) = s.resolve_natives(&NoImportMapper {}) {
-            let arg = n.map(&mut |e| {
-                let x;
-                (x, t) = self.expr(i, o, b, t, e)?;
-                anyhow::Ok(x)
-            })?;
-            let tmp = o.regs.alloc(());
-            o.blocks[t].stmts.push(TStmt {
-                left: LId::Id { id: tmp.clone() },
-                flags: ValFlags::SSA_LIKE,
-                right: Item::Intrinsic { value: arg },
-                span: s.span(),
-            });
-            o.decls.insert(tmp.clone());
-            return Ok((tmp, t));
+        if let Some(i2) = self.import_mapper.as_deref() {
+            if let Some(n) = s.resolve_natives(i2) {
+                let arg = n.map(&mut |e| {
+                    let x;
+                    (x, t) = self.expr(i, o, b, t, e)?;
+                    anyhow::Ok(x)
+                })?;
+                let tmp = o.regs.alloc(());
+                o.blocks[t].stmts.push(TStmt {
+                    left: LId::Id { id: tmp.clone() },
+                    flags: ValFlags::SSA_LIKE,
+                    right: Item::Intrinsic { value: arg },
+                    span: s.span(),
+                });
+                o.decls.insert(tmp.clone());
+                return Ok((tmp, t));
+            }
         }
         match s {
             Expr::This(this) => {
@@ -921,6 +932,7 @@ impl Trans {
                                 ret_to: Some((tmp.clone(), t2)),
                                 recatch: o.blocks[t].catch.clone(),
                                 this: Some((Atom::new("globalThis"), Default::default())),
+                                import_mapper: self.import_mapper.as_deref(),
                             };
                             let t3 = t4.trans(&cfg.cfg, o, cfg.entry)?;
                             o.blocks[t].term = TTerm::Jmp(t3);
@@ -962,6 +974,7 @@ impl Trans {
                                         ret_to: Some((tmp.clone(), t2)),
                                         recatch: o.blocks[t].catch.clone(),
                                         this: Some((Atom::new("globalThis"), Default::default())),
+                                        import_mapper: self.import_mapper.as_deref(),
                                     };
                                     let t3 = t4.trans(&cfg.cfg, o, cfg.entry)?;
                                     o.blocks[t].term = TTerm::Jmp(t3);

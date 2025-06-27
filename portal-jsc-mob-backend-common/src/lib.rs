@@ -57,7 +57,7 @@ impl<K> Term<K> {
             }),
         }
     }
-    pub fn map<U, E>(self, f: impl FnMut(K) -> Result<U, E>) -> Result<Term<U>, E> {
+    pub fn map<U, E>(self, f: &mut (dyn FnMut(K) -> Result<U, E> + '_)) -> Result<Term<U>, E> {
         Ok(Term {
             blocks: self.blocks.into_iter().map(f).collect::<Result<_, E>>()?,
             term: self.term,

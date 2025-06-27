@@ -1,6 +1,6 @@
 [package]
 name = "portal-jsc-jacon-backend"
-version = "0.6.0"
+version = "0.8.0-pre.0"
 edition = "2024"
 license = "MPL-2.0"
 description = "Java backend for ECMAScript"
@@ -8,4 +8,4 @@ description = "Java backend for ECMAScript"
 [dependencies]
 either = { version = "^1.15.0", default-features = false }
 itertools = { version = "^0.14.0", default-features = false, features = ["use_alloc"] }
-portal-jsc-mob-backend-common = { version = "0.1.0", path = "../portal-jsc-mob-backend-common" }
+portal-jsc-mob-backend-common = { version = "0.8.0-pre.0", path = "../portal-jsc-mob-backend-common" }

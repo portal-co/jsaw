@@ -6,4 +6,4 @@ publish = false
 
 [dependencies]
 itertools = "0.14.0"
-portal-jsc-common = { version = "0.7.0", path = "../portal-jsc-common" }
+portal-jsc-common = { version = "0.8.0-pre.0", path = "../portal-jsc-common" }

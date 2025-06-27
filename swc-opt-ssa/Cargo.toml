@@ -1,6 +1,6 @@
 [package]
 name = "portal-jsc-swc-opt-ssa"
-version = "0.7.0"
+version = "0.8.0-pre.0"
 edition = "2024"
 license = "MPL-2.0"
 description = "ECMAScript IR"
@@ -14,11 +14,11 @@ id-arena.workspace = true
 cfg-traits.workspace = true
 
 ssa-traits.workspace = true
-swc-cfg = { version = "0.7.0", path = "../swc-cfg", package = "portal-jsc-swc-cfg" }
-swc-tac = { version = "0.7.0", path = "../swc-tac", package = "portal-jsc-swc-tac" }
-swc-ssa = { version = "0.7.0", path = "../swc-ssa", package = "portal-jsc-swc-ssa" }
-portal-jsc-swc-util = { version = "0.7.0", path = "../swc-util", features = ["ty"] }
-portal-jsc-simpl-js = { version = "0.7.0", path = "../simpl-js", optional = true }
+swc-cfg = { version = "0.8.0-pre.0", path = "../swc-cfg", package = "portal-jsc-swc-cfg" }
+swc-tac = { version = "0.8.0-pre.0", path = "../swc-tac", package = "portal-jsc-swc-tac" }
+swc-ssa = { version = "0.8.0-pre.0", path = "../swc-ssa", package = "portal-jsc-swc-ssa" }
+portal-jsc-swc-util = { version = "0.8.0-pre.0", path = "../swc-util", features = ["ty"] }
+portal-jsc-simpl-js = { version = "0.8.0-pre.0", path = "../simpl-js", optional = true }
 swc_atoms.workspace = true
 swc_common.workspace = true
 swc_ecma_ast.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "portal-jsc-swc-tac"
-version = "0.7.0"
+version = "0.8.0-pre.0"
 edition = "2024"
 license = "MPL-2.0"
 description = "ECMAScript IR"
@@ -17,16 +17,16 @@ ssa-reloop.workspace = true
 relooper.workspace = true
 either = "1.13.0"
 id-arena.workspace = true
-swc-cfg = { version = "0.7.0", path = "../swc-cfg", package = "portal-jsc-swc-cfg" }
-portal-jsc-swc-util = { version = "0.7.0", path = "../swc-util" }
-portal-jsc-simpl-js = { version = "0.7.0", path = "../simpl-js", optional = true }
+swc-cfg = { version = "0.8.0-pre.0", path = "../swc-cfg", package = "portal-jsc-swc-cfg" }
+portal-jsc-swc-util = { version = "0.8.0-pre.0", path = "../swc-util" }
+portal-jsc-simpl-js = { version = "0.8.0-pre.0", path = "../simpl-js", optional = true }
 swc_atoms.workspace = true
 swc_common.workspace = true
 swc_ecma_ast.workspace = true
 swc_ecma_utils.workspace = true
 swc_ecma_visit.workspace = true
 bitflags.workspace = true
-portal-jsc-common = { version = "0.7.0", path = "../portal-jsc-common" }
+portal-jsc-common = { version = "0.8.0-pre.0", path = "../portal-jsc-common" }
 linearize = { workspace = true, features = ["derive"] }
 linearize-derive.workspace = true
 

@@ -1,16 +1,17 @@
-export const fast_add: any;
-export const fast_and: any;
-export const fast_or: any;
-export const fast_eq: any;
-export const fast_sub: any;
-export const fast_shl: any;
-export const fast_mul: any;
-export const fast_imul: any;
-export const assert_string: any;
-export const assert_number: any;
-export const assert_static_fn: any;
-export const comptime_string: any;
-export const comptime_number: any;
-export const comptime_static_fn: any;
+export const fast_add: (a: number, b: number) => number;
+export const fast_and: (a: number, b: number) => number;
+export const fast_or: (a: number, b: number) => number;
+export const fast_eq: (a: number, b: number) => boolean;
+export const fast_sub: (a: number, b: number) => number;
+export const fast_shl: (a: number, b: number) => number;
+export const fast_mul: (a: number, b: number) => number;
+export const fast_imul: (a: number, b: number) => number;
+export const assert_string: (a: string) => string;
+export const assert_number: (a: number) => number;
+export const assert_static_fn: (a: Function) => Function;
+export const comptime_string: (a: string) => string;
+export const comptime_number: (a: number) => number;
+export const comptime_static_fn: (a: Function) => Function;
+export const inlineme: () => void;
 
 //# sourceMappingURL=index.d.ts.map

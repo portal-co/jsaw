@@ -1,12 +1,13 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fmt::Display,
-    mem::transmute,
+    mem::{take, transmute},
 };
 
 pub use portal_jsc_common as common;
 pub use portal_jsc_common::ImportMap;
 use portal_jsc_common::Native;
+use portal_solutions_swibb::ConstCollector;
 use swc_atoms::Atom;
 use swc_common::{
     FileName, Mark, SourceFile, SourceMap, Span, Spanned, SyntaxContext,
@@ -16,9 +17,10 @@ use swc_common::{
 };
 use swc_ecma_ast::{
     BinaryOp, CallExpr, Expr, ExprStmt, Id, Ident, Lit, MemberExpr, MemberProp, Module, ModuleDecl,
-    ModuleItem, OptChainBase, Stmt,
+    ModuleItem, OptChainBase, Stmt, UnaryExpr,
 };
 use swc_ecma_parser::{Parser, Syntax, lexer::Lexer};
+use swc_ecma_visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 pub trait ResolveNatives {
     fn resolve_natives(&self, import_map: &(dyn ImportMapper + '_)) -> Option<Native<&Expr>>;
 }
@@ -84,6 +86,44 @@ impl ResolveNatives for Expr {
         match self {
             Expr::Call(c) => expr(c, &**(c.callee.as_expr()?), import_map),
             _ => None,
+        }
+    }
+}
+pub struct InlineTracer<'a> {
+    pub mapper: &'a (dyn ImportMapper + 'a),
+    pub inlinable: bool,
+}
+impl<'a> VisitMut for InlineTracer<'a> {
+    fn visit_mut_expr(&mut self, node: &mut Expr) {
+        node.visit_mut_children_with(self);
+        if let Some(Native::InlineMe) = node.resolve_natives(&*self.mapper) {
+            self.inlinable = true;
+            *node = *Expr::undefined(node.span());
+        }
+    }
+}
+pub struct InlineHintInliner<'a> {
+    pub consts: &'a ConstCollector,
+    pub mapper: &'a (dyn ImportMapper + 'a),
+}
+impl VisitMut for InlineHintInliner<'_> {
+    fn visit_mut_expr(&mut self, node: &mut Expr) {
+        let mut not_done = true;
+        while take(&mut not_done) {
+            if let Expr::Ident(i) = node {
+                if let Some(mut b) = self.consts.map.get(&i.to_id()).cloned() {
+                    let mut t = InlineTracer {
+                        mapper: &*self.mapper,
+                        inlinable: false,
+                    };
+                    b.visit_mut_with(&mut t);
+                    if t.inlinable {
+                        not_done = true;
+                        *node = *b;
+                    }
+                }
+            }
+            node.visit_mut_children_with(self);
         }
     }
 }

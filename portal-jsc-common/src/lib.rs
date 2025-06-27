@@ -17,6 +17,7 @@ pub enum Native<E> {
     FastSub { lhs: E, rhs: E },
     FastMul { lhs: E, rhs: E, imul: bool },
     FastShl { lhs: E, rhs: E },
+    InlineMe,
 }
 impl Native<()> {
     pub fn all() -> impl Iterator<Item = Self> {
@@ -29,6 +30,7 @@ impl Native<()> {
             "fast_shl",
             "fast_mul",
             "fast_imul",
+            "inlineme",
         ]
         .into_iter()
         .filter_map(|a| Self::of(a))
@@ -91,6 +93,7 @@ impl Native<()> {
                 rhs: (),
                 imul: true,
             },
+            "inlineme" => Self::InlineMe,
             _ => return None,
         })
     }
@@ -132,6 +135,7 @@ impl<E> Native<E> {
                 }
             }
             Native::FastShl { lhs, rhs } => "fast_shl",
+            Native::InlineMe => "inlineme",
         }
     }
     pub fn as_ref<'a>(&'a self) -> Native<&'a E> {
@@ -159,6 +163,7 @@ impl<E> Native<E> {
                 imul: *imul,
             },
             Native::FastShl { lhs, rhs } => Native::FastShl { lhs, rhs },
+            Native::InlineMe => Native::InlineMe,
         }
     }
     pub fn as_mut<'a>(&'a mut self) -> Native<&'a mut E> {
@@ -186,6 +191,7 @@ impl<E> Native<E> {
                 imul: *imul,
             },
             Native::FastShl { lhs, rhs } => Native::FastShl { lhs, rhs },
+            Native::InlineMe => Native::InlineMe,
         }
     }
     pub fn map<E2, Er>(
@@ -234,6 +240,7 @@ impl<E> Native<E> {
                 lhs: f(lhs)?,
                 rhs: f(rhs)?,
             },
+            Native::InlineMe => Native::InlineMe,
         })
     }
 }

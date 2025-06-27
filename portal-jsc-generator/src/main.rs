@@ -14,22 +14,22 @@ fn emit_base_intrinsics(a: &str) {
 {}
     ",
             [
-                ("a + b", "fast_add"),
-                ("a & b", "fast_and"),
-                ("a | b", "fast_or"),
-                ("a === b", "fast_eq"),
-                ("a - b", "fast_sub"),
-                ("a << b", "fast_shl"),
-                ("a * b", "fast_mul"),
-                ("Math.imul(a,b)", "fast_imul"),
+                ("a + b", "fast_add","number"),
+                ("a & b", "fast_and","number"),
+                ("a | b", "fast_or","number"),
+                ("a === b", "fast_eq","boolean"),
+                ("a - b", "fast_sub","number"),
+                ("a << b", "fast_shl","number"),
+                ("a * b", "fast_mul","number"),
+                ("Math.imul(a,b)", "fast_imul","number"),
             ]
             .into_iter()
-            .map(|(a, b)| format!("export const {b} = (globalThis as any)['~Natives_{b}'] ?? ((a: any, b: any) => {a});"))
+            .map(|(a, b,c)| format!("export const {b}: (a: number,b: number) => {c} = (globalThis as any)['~Natives_{b}'] ?? ((a: any, b: any) => {a});"))
             .chain(["assert", "comptime"].into_iter().flat_map(|a| [
-                format!("export const {a}_string =  (globalThis as any)['~Natives_{a}_string'] ?? ((a: string) => a)"),
-                format!("export const {a}_number = (globalThis as any)['~Natives_{a}_number'] ??( (a: number) => a)"),
-                format!("export const {a}_static_fn = (globalThis as any)['~Natives_{a}_static_fn'] ?? ((a: Function) => a)"),
-            ]))
+                format!("export const {a}_string: (a: string) => string =  (globalThis as any)['~Natives_{a}_string'] ?? ((a: string) => a)"),
+                format!("export const {a}_number: (a: number) => number = (globalThis as any)['~Natives_{a}_number'] ??( (a: number) => a)"),
+                format!("export const {a}_static_fn: (a: Function) => Function = (globalThis as any)['~Natives_{a}_static_fn'] ?? ((a: Function) => a)"),
+            ])).chain([format!("export const inlineme: () => void = (globalThis as any)['~Natives_inlineme'] ?? (()=>{{}})")])
             .join("\n")
         ),
     )

@@ -13,5 +13,6 @@ export const comptime_string: (a: string) => string;
 export const comptime_number: (a: number) => number;
 export const comptime_static_fn: (a: Function) => Function;
 export const inlineme: () => void;
+export const inlineme_n: (n: number) => void;
 
 //# sourceMappingURL=index.d.ts.map

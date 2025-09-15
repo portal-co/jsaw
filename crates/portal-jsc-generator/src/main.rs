@@ -29,7 +29,10 @@ fn emit_base_intrinsics(a: &str) {
                 format!("export const {a}_string: (a: string) => string =  (globalThis as any)['~Natives_{a}_string'] ?? ((a: string) => a)"),
                 format!("export const {a}_number: (a: number) => number = (globalThis as any)['~Natives_{a}_number'] ??( (a: number) => a)"),
                 format!("export const {a}_static_fn: (a: Function) => Function = (globalThis as any)['~Natives_{a}_static_fn'] ?? ((a: Function) => a)"),
-            ])).chain([format!("export const inlineme: () => void = (globalThis as any)['~Natives_inlineme'] ?? (()=>{{}})")])
+            ])).chain([
+                format!("export const inlineme: () => void = (globalThis as any)['~Natives_inlineme'] ?? (()=>{{}})"),
+                format!("export const inlineme_n: (n: number) => void = (globalThis as any)['~Natives_inlineme_n'] ?? ((n: number)=>{{}})")
+            ])
             .join("\n")
         ),
     )

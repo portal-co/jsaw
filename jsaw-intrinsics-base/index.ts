@@ -14,4 +14,5 @@ export const comptime_string: (a: string) => string =  (globalThis as any)['~Nat
 export const comptime_number: (a: number) => number = (globalThis as any)['~Natives_comptime_number'] ??( (a: number) => a)
 export const comptime_static_fn: (a: Function) => Function = (globalThis as any)['~Natives_comptime_static_fn'] ?? ((a: Function) => a)
 export const inlineme: () => void = (globalThis as any)['~Natives_inlineme'] ?? (()=>{})
+export const inlineme_n: (n: number) => void = (globalThis as any)['~Natives_inlineme_n'] ?? ((n: number)=>{})
     

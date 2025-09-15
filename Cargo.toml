@@ -1,33 +1,52 @@
 [workspace]
-members=[ "jacon", "portal-jsc-common", "portal-jsc-generator", "portal-jsc-mob-backend-common", "portal-jsc-out-ir-core", "portal-jsc-swift-backend",  "simpl-js", "simpl-js-rust", "swc-batch","swc-cfg",  "swc-opt-ssa", "swc-ssa", "swc-tac", "swc-util"]
+members=[ "jacon",  "portal-jsc-generator", "portal-jsc-mob-backend-common", "portal-jsc-out-ir-core", "portal-jsc-swift-backend",   "swc-batch"]
 
 # "js-runtime-lib","swc-emit-rust","swc-waffle"
 
 resolver="2"
 
 [workspace.dependencies]
+
+portal-jsc-common =   {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.9"}
+portal-jsc-swc-cfg =  {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.9"}
+portal-jsc-swc-tac =  {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.9"}
+portal-jsc-swc-ssa =  {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.9"}
+portal-jsc-swc-opt-ssa =  {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.9"}
+portal-jsc-swc-util = {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.9"}
+
+portal-pc-waffle = {version="^0.5.5"}
+
+id-arena = "^2.2.1"
+arena-traits = {version="^0.2.3",features=["id-arena"]}
+ssa-traits = "^0.2.3"
+cfg-traits = "^0.2.3"
+ssa-impls =  "^0.2.3"
+ssa-reloop = "^0.2.3"
+
+
+
+swc_atoms = "^7.0.0"
+swc_common = "^14.0.0"
+swc_ecma_ast = "^15.0.0"
+swc_ecma_compat_es2015 = "^26.0.0"
+swc_ecma_minifier = "^30.0.0"
+swc_ecma_transforms_base = "^25.0.0"
+swc_ecma_transforms_optimization = "^26.0.0"
+swc_ecma_utils = "^21.0.0"
+swc_ecma_visit = "^15.0.0"
+swc_bundler = "^29.0.0"
+swc_ecma_loader = "^14.0.0"
+swc_ecma_parser = "^23.0.0"
+swc_ecma_codegen = "^17"
+
+
+
+portal-solutions-swibb = {version="^0.4.0",git="https://github.com/portal-co/swibb.git"}
+
+
 anyhow = "^1.0.87"
 bimap = "^0.6.3"
-id-arena = "^2.2.1"
-arena-traits = {version="^0.2.1",features=["id-arena"]}
-ssa-traits = "^0.2.1"
-cfg-traits = "^0.2.1"
-ssa-impls = "^0.2.1"
-ssa-reloop = "^0.2.1"
-swc_atoms = "^6.0.0"
-swc_common = "^13.0.0"
-swc_ecma_ast = "^13.0.0"
-swc_ecma_compat_es2015 = "^19.0.0"
-swc_ecma_minifier = "^23.0.0"
-swc_ecma_transforms_base = "^18.0.0"
-swc_ecma_transforms_optimization = "^19.0.0"
-swc_ecma_utils = "^18.0.0"
-swc_ecma_visit = "^13.0.0"
-swc_bundler = "^22.0.0"
-swc_ecma_loader = "^13.0.0"
-swc_ecma_parser = "^17.0.0"
-swc_ecma_codegen = "^15"
-swc_ecma_quote = "^17"
+
 
 
 proc-macro2 = "^1.0.88"
@@ -40,11 +59,11 @@ bitflags = "^2.8.0"
 relooper = "^0.1.0"
 cityhasher = "^0.1.0"
 
-portal-pc-waffle="^0.5.4"
+
 px-llvm-codegen-utils-core="^0.1.4"
 px-llvm-codegen-utils-info="^0.1.4"
 portal-pc-asm-common = "^0.1.0"
-portal-solutions-swibb="^0.2.4"
+
 bitvec = "^1.0.1"
 instability = "^0.3.7"
 linearize = "^0.1.4"

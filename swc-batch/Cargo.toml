@@ -12,4 +12,4 @@ swc_ecma_ast.workspace = true
 swc_ecma_utils.workspace = true
 swc_ecma_visit.workspace = true
 
-portal-jsc-swc-util = { version = "0.8.0-pre.0", path = "../swc-util" }
+portal-jsc-swc-util.workspace = true

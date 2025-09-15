@@ -1,7 +1,7 @@
 {
     "name": "@portal-solutions/jsaw",
     "workspaces": [
-        "jsaw-intrinsics-base"
+        
     ],
     "devDependencies": {
         "@parcel/packager-ts": "^2.15.4",

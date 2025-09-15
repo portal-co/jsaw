@@ -1,9 +1,0 @@
-[package]
-name = "portal-jsc-generator"
-version = "0.1.0"
-edition = "2024"
-publish = false
-
-[dependencies]
-itertools = "0.14.0"
-portal-jsc-common.workspace = true

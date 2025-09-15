@@ -6,4 +6,4 @@
  */
 
 rootProject.name = "jsaw"
-include(":jacon")
+include(":crates/jacon")

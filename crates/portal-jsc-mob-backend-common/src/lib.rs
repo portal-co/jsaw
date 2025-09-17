@@ -52,7 +52,7 @@ impl<K> Term<K> {
             term: Arc::new(move |s| {
                 let (a, d) = s.split_at(a);
                 let b = b(a);
-                let c = c(a);
+                let c = c(d);
                 alloc::format!("if({cond}){{{b}}}else{{{c}}}")
             }),
         }

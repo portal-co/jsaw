@@ -6,4 +6,5 @@
  */
 
 rootProject.name = "jsaw"
-include(":crates/jacon")
+include("jacon")
+project(":jacon").projectDir = file("crates/jacon")

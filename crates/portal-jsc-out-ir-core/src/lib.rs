@@ -4,9 +4,7 @@ pub mod llir;
 pub mod mobir;
 #[cfg(feature = "soup")]
 pub mod soup;
-
 use std::convert::Infallible;
-
 pub use swc_atoms::Atom;
 pub use swc_common::{Mark, Span, Spanned, SyntaxContext};
 macro_rules! withs {

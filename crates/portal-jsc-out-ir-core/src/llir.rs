@@ -1,9 +1,7 @@
 use id_arena::{Arena, Id};
 use swc_atoms::Atom;
 use swc_common::{Span, Spanned};
-
 use crate::WithSpan;
-
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Size {
     Bits { bits: usize },

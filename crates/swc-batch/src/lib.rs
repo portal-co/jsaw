@@ -1,5 +1,4 @@
 use std::{collections::BTreeMap, sync::Arc};
-
 use portal_jsc_swc_util::{ImportMap, ImportMapper, ModuleMapper};
 use swc_atoms::Atom;
 use swc_common::{sync::Lrc, Mark, Spanned, SyntaxContext};
@@ -14,7 +13,6 @@ pub fn setup(mut module: Module) -> (ImportMapping, ModuleMapping) {
     module.visit_mut_with(&mut i);
     (i, ModuleMapping::new(module))
 }
-
 #[derive(Default)]
 pub struct ImportMapping {
     pub mapping: BTreeMap<(Atom, SyntaxContext), (Atom, ImportMap<Atom>)>,

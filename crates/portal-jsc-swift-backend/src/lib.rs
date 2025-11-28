@@ -1,7 +1,5 @@
 #![no_std]
-
 use core::fmt::Display;
-
 use alloc::{
     collections::btree_map::BTreeMap,
     format,
@@ -51,7 +49,6 @@ impl<T: Display> Display for Return<T> {
         write!(f, "return {};", &self.value)
     }
 }
-
 #[derive(Clone)]
 pub struct Blocks<K> {
     pub map: BTreeMap<TargetBlock, Term<K>>,

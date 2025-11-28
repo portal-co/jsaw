@@ -1,7 +1,5 @@
 #![no_std]
-
 use core::fmt::Display;
-
 use alloc::{
     collections::btree_map::BTreeMap,
     string::{String, ToString},
@@ -10,7 +8,6 @@ use alloc::{
 };
 // use itertools::Itertools;
 extern crate alloc;
-
 #[derive(Clone)]
 pub struct Term<K> {
     pub blocks: Vec<K>,

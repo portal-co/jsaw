@@ -1,7 +1,5 @@
 #![no_std]
-
 use core::fmt::Display;
-
 use alloc::{
     collections::btree_map::BTreeMap,
     string::{String, ToString},
@@ -46,7 +44,6 @@ impl<K: Display> Display for Blocks<K> {
                     let Some(a) = self.map.get(&TargetBlock { id: a }) else {
                         return alloc::format!("null");
                     };
-
                     alloc::format!("(() -> {{{a}}})")
                 })
                 .join(",")

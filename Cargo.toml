@@ -18,10 +18,15 @@ portal-pc-waffle = {version="^0.5.5"}
 
 id-arena = "^2.2.1"
 arena-traits = {version="^0.2.3",features=["id-arena"]}
-ssa-traits = "^0.2.3"
-cfg-traits = "^0.2.3"
-ssa-impls =  "^0.2.3"
-ssa-reloop = "^0.2.3"
+ssa-traits = {version="^0.2.3",git="https://github.com/portal-co/codegen-utils.git",branch="master"}
+cfg-traits = {version="^0.2.3",git="https://github.com/portal-co/codegen-utils.git",branch="master"}
+ssa-impls =  {version="^0.2.3",git="https://github.com/portal-co/codegen-utils.git",branch="master"}
+ssa-reloop = {version="^0.2.3",git="https://github.com/portal-co/codegen-utils.git",branch="master"}
+
+ssa-traits-03 = { version = "0.3.0-alpha.2", package = "ssa-traits" ,git="https://github.com/portal-co/codegen-utils.git",branch="dev/0.3"}
+cfg-traits-03 = { version = "0.3.0-alpha.2", package = "cfg-traits" ,git="https://github.com/portal-co/codegen-utils.git",branch="dev/0.3"}
+ssa-impls-03 =  { version = "0.3.0-alpha.2", package = "ssa-impls"  ,git="https://github.com/portal-co/codegen-utils.git",branch="dev/0.3"}
+ssa-reloop-03 = { version = "0.3.0-alpha.2", package = "ssa-reloop" ,git="https://github.com/portal-co/codegen-utils.git",branch="dev/0.3"}
 
 
 

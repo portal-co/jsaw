@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 use portal_jsc_swc_util::{ImportMap, ImportMapper, ModuleMapper};
-use swc_atoms::Atom;
+use swc_atoms::{Atom, Wtf8Atom};
 use swc_common::{sync::Lrc, Mark, Spanned, SyntaxContext};
 use swc_ecma_ast::{
     BlockStmt, CallExpr, Decl, Expr, ExprOrSpread, FnDecl, FnExpr, Function, Id, Ident, IdentName,
@@ -15,7 +15,7 @@ pub fn setup(mut module: Module) -> (ImportMapping, ModuleMapping) {
 }
 #[derive(Default)]
 pub struct ImportMapping {
-    pub mapping: BTreeMap<(Atom, SyntaxContext), (Atom, ImportMap<Atom>)>,
+    pub mapping: BTreeMap<(Atom, SyntaxContext), (Wtf8Atom, ImportMap<Atom>)>,
 }
 impl VisitMut for ImportMapping {
     fn visit_mut_import_decl(&mut self, a: &mut ImportDecl) {
@@ -29,7 +29,7 @@ impl VisitMut for ImportMapping {
                             (
                                 src.clone(),
                                 ImportMap::Named {
-                                    name: module.atom().clone(),
+                                    name: (&*module.atom()).clone(),
                                 },
                             ),
                         );
@@ -70,7 +70,7 @@ impl VisitMut for ImportMapping {
     }
 }
 impl ImportMapper for ImportMapping {
-    fn import_of(&self, cx: &Id) -> Option<(Atom, ImportMap<Atom>)> {
+    fn import_of(&self, cx: &Id) -> Option<(Wtf8Atom, ImportMap<Atom>)> {
         if let Some(a) = self.mapping.get(cx) {
             return Some(a.clone());
         }

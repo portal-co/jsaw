@@ -577,7 +577,7 @@ checksum = "3b3cff922bd51709b605d9ead9aa71031d81447142d828eb4a6eba76fe619f9b"
 [[package]]
 name = "portal-jsc-common"
 version = "0.8.0-pre.10"
-source = "git+https://github.com/portal-co/jsaw-core.git#a3432aa71433f82e3c09f2f06615db30b0fed8e6"
+source = "git+https://github.com/portal-co/jsaw-core.git#739ae23749ecd63fc81f4fa19cf2d75bfc45fd4e"
 dependencies = [
  "bitflags",
  "either",
@@ -623,7 +623,7 @@ dependencies = [
 [[package]]
 name = "portal-jsc-swc-util"
 version = "0.8.0-pre.10"
-source = "git+https://github.com/portal-co/jsaw-core.git#a3432aa71433f82e3c09f2f06615db30b0fed8e6"
+source = "git+https://github.com/portal-co/jsaw-core.git#739ae23749ecd63fc81f4fa19cf2d75bfc45fd4e"
 dependencies = [
  "base64",
  "bitflags",

@@ -1,13 +1,14 @@
 # @portal-solutions/jsaw
 
 ## Description
-Project jsaw
+Compiler workspace (`jsaw`) related to `jsaw-core`, containing backend implementations like "swift-backend" and "mob-backend".
 
 ## Goals
-- [ ] Add project goals
+- [ ] Implement specific backends for `jsaw`
+- [ ] Integrate with `jsaw-core` IR
 
 ## Progress
-- [ ] Initial setup
+- [ ] Workspace setup with backend crates
 
 ---
 *AI assisted*

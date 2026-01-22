@@ -588,7 +588,7 @@ checksum = "3b3cff922bd51709b605d9ead9aa71031d81447142d828eb4a6eba76fe619f9b"
 [[package]]
 name = "portal-jsc-common"
 version = "0.8.0-pre.10"
-source = "git+https://github.com/portal-co/jsaw-core.git#bb56c18cd42b37496c85f54216b0fb06bcf29782"
+source = "git+https://github.com/portal-co/jsaw-core.git#f5790ba2f48c7ef420798a7a51f142b099a5f037"
 dependencies = [
  "bitflags",
  "either",
@@ -634,7 +634,7 @@ dependencies = [
 [[package]]
 name = "portal-jsc-swc-util"
 version = "0.8.0-pre.10"
-source = "git+https://github.com/portal-co/jsaw-core.git#bb56c18cd42b37496c85f54216b0fb06bcf29782"
+source = "git+https://github.com/portal-co/jsaw-core.git#f5790ba2f48c7ef420798a7a51f142b099a5f037"
 dependencies = [
  "base64",
  "bitflags",
@@ -678,7 +678,7 @@ dependencies = [
 [[package]]
 name = "portal-solutions-swibb"
 version = "0.5.0"
-source = "git+https://github.com/portal-co/swibb.git#fec19991b8182ab154142d1b2118714aa2deb85a"
+source = "git+https://github.com/portal-co/swibb.git#855e84cfb1aee5e6e8233a6bb9e32b6e3e3d3a61"
 dependencies = [
  "impl-trait-for-tuples",
  "swc_atoms",

@@ -67,7 +67,13 @@ cityhasher = "^0.1.0"
 
 px-llvm-codegen-utils-core="^0.1.4"
 px-llvm-codegen-utils-info="^0.1.4"
-portal-pc-asm-common = "^0.1.0"
+
+
+portal-pc-asm-common = {version = "0.1.1",git = "https://github.com/portal-co/asm-common.git"}
+portal-solutions-asm-x86-64 = {version = "0.1.0",git = "https://github.com/portal-co/asm-arch.git"}
+portal-solutions-asm-riscv64 = {version = "0.1.0",git = "https://github.com/portal-co/asm-arch.git"}
+portal-solutions-asm-jvm = {version = "0.1.0",git = "https://github.com/portal-co/asm-arch.git"}
+portal-solutions-asm-regalloc = { git = "https://github.com/portal-co/asm-arch", package = "portal-solutions-asm-regalloc" }
 
 bitvec = "^1.0.1"
 instability = "^0.3.7"

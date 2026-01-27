@@ -65,8 +65,8 @@ relooper = "^0.1.0"
 cityhasher = "^0.1.0"
 
 
-px-llvm-codegen-utils-core="^0.1.4"
-px-llvm-codegen-utils-info="^0.1.4"
+px-llvm-codegen-utils-core={version="^0.1.4",git="https://github.com/portal-co/llvm-codegen-utils.git"}
+px-llvm-codegen-utils-info={version="^0.1.4",git="https://github.com/portal-co/llvm-codegen-utils.git"}
 
 
 portal-pc-asm-common = {version = "0.1.1",git = "https://github.com/portal-co/asm-common.git"}

@@ -193,7 +193,7 @@ impl VisitMut for SourceMapper {
                                     arg: Some(Box::new(Expr::Lit(Lit::Str(Str {
                                         span: f.span(),
                                         raw: None,
-                                        value: Atom::new(self.sm.span_to_string(f.span())),
+                                        value: Wtf8Atom::new(self.sm.span_to_string(f.span())),
                                     })))),
                                 })],
                             }),

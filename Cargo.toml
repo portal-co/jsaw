@@ -14,7 +14,7 @@ portal-jsc-swc-ssa =      {git="https://github.com/portal-co/jsaw-core.git",vers
 portal-jsc-swc-opt-ssa =  {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.10"}
 portal-jsc-swc-util =     {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.10"}
 
-portal-pc-waffle = {version="^0.5.5"}
+portal-pc-waffle = {version="^0.6.0-alpha.1",git="https://github.com/portal-co/waffle-.git"}
 
 id-arena = "^2.2.1"
 arena-traits = {version="^0.2.3",features=["id-arena"]}

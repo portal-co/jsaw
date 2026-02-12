@@ -329,12 +329,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "id-arena"
-version = "2.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
-
-[[package]]
 name = "idna"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -592,7 +586,7 @@ source = "git+https://github.com/portal-co/jsaw-core.git#5251542ddd2358cf5b0013e
 dependencies = [
  "bitflags",
  "either",
- "portal-pc-asm-common 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "portal-pc-asm-common",
 ]
 
 [[package]]
@@ -607,17 +601,6 @@ dependencies = [
 [[package]]
 name = "portal-jsc-mob-backend-common"
 version = "0.8.0-pre.0"
-
-[[package]]
-name = "portal-jsc-out-ir-core"
-version = "0.8.0-pre.0"
-dependencies = [
- "bitvec",
- "id-arena",
- "portal-pc-asm-common 0.1.1 (git+https://github.com/portal-co/asm-common.git)",
- "swc_atoms",
- "swc_common",
-]
 
 [[package]]
 name = "portal-jsc-swc-batch"
@@ -666,19 +649,6 @@ name = "portal-pc-asm-common"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5580ae62b9e0c004c4c7e5402d9b89dceec0d9d30dba2e614323e0348293576d"
-dependencies = [
- "array-init",
- "bitvec",
- "either",
- "embedded-io",
- "itertools",
- "no-error-type",
-]
-
-[[package]]
-name = "portal-pc-asm-common"
-version = "0.1.1"
-source = "git+https://github.com/portal-co/asm-common.git#4d12dff5ef42455a06f46b0b5e5eeaf033ba1398"
 dependencies = [
  "array-init",
  "bitvec",

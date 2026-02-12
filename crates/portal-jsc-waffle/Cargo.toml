@@ -1,0 +1,12 @@
+[package]
+name = "portal-jsc-waffle"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+portal-jsc-swc-cfg.workspace = true
+portal-jsc-swc-ssa.workspace = true
+portal-jsc-swc-tac.workspace = true
+portal-jsc-swc-util.workspace = true
+
+portal-pc-waffle.workspace = true

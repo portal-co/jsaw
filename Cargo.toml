@@ -1,5 +1,5 @@
 [workspace]
-members=[ "crates/mobile/jacon",   "crates/mobile/portal-jsc-mob-backend-common", "crates/mobile/portal-jsc-swift-backend",   "crates/swc-batch"]
+members=[ "crates/mobile/jacon",   "crates/mobile/portal-jsc-mob-backend-common", "crates/mobile/portal-jsc-swift-backend", "crates/portal-jsc-waffle",   "crates/swc-batch"]
 
 # "js-runtime-lib","swc-emit-rust","swc-waffle"
 

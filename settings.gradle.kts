@@ -7,4 +7,4 @@
 
 rootProject.name = "jsaw"
 include("jacon")
-project(":jacon").projectDir = file("crates/jacon")
+project(":jacon").projectDir = file("crates/mobile/jacon")

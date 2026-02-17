@@ -48,7 +48,7 @@ fn new_trie_getter(module: &mut Module, trie: Signature) -> Func {
             let val = func.add_op(
                 k,
                 Operator::StructGet {
-                    sig,
+                    sig: trie,
                     idx: (a as usize) + 1,
                 },
                 &[obj],
@@ -112,7 +112,7 @@ fn new_trie_setter(module: &mut Module, trie: Signature) -> Func {
             let val = func.add_op(
                 k,
                 Operator::StructSet {
-                    sig,
+                    sig: trie,
                     idx: (a as usize) + 1,
                 },
                 &[obj, val],

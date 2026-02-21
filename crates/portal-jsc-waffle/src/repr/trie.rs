@@ -1,3 +1,5 @@
+use portal_pc_waffle::Terminator;
+
 use super::*;
 
 fn new_trie(module: &mut Module, val: Type) -> Signature {
@@ -42,6 +44,29 @@ fn new_trie_getter(module: &mut Module, trie: Signature) -> Func {
     let mut func = FunctionBody::new(module, sig);
     let obj = func.blocks[func.entry].params[0].1;
     let idx = func.blocks[func.entry].params[1].1;
+    let k = func.add_block();
+    let f = func.add_block();
+    func.set_terminator(
+        f,
+        Terminator::Return {
+            values: [obj].into_iter().collect(),
+        },
+    );
+    let c = func.add_op(func.entry, Operator::RefIsNull, &[obj], &[Type::I32]);
+    func.set_terminator(
+        func.entry,
+        Terminator::CondBr {
+            cond: c,
+            if_true: BlockTarget {
+                block: f,
+                args: Default::default(),
+            },
+            if_false: BlockTarget {
+                block: k,
+                args: Default::default(),
+            },
+        },
+    );
     let targets = (0..=0xffu8)
         .map(|a| {
             let k = func.add_block();
@@ -77,7 +102,7 @@ fn new_trie_getter(module: &mut Module, trie: Signature) -> Func {
             args: [obj, idx].into_iter().collect(),
         },
     };
-    func.set_terminator(func.entry, t);
+    func.set_terminator(k, t);
     return module.funcs.push(portal_pc_waffle::FuncDecl::Body(
         sig,
         format!("get_trie"),

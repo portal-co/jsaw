@@ -7,12 +7,12 @@ resolver="2"
 
 [workspace.dependencies]
 
-portal-jsc-common =       {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.10"}
-portal-jsc-swc-cfg =      {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.10"}
-portal-jsc-swc-tac =      {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.10"}
-portal-jsc-swc-ssa =      {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.10"}
-portal-jsc-swc-opt-ssa =  {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.10"}
-portal-jsc-swc-util =     {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.10"}
+portal-jsc-common =       {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.11"}
+portal-jsc-swc-cfg =      {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.11"}
+portal-jsc-swc-tac =      {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.11"}
+portal-jsc-swc-ssa =      {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.11"}
+portal-jsc-swc-opt-ssa =  {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.11"}
+portal-jsc-swc-util =     {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.11"}
 
 portal-pc-waffle = {version="^0.6.0-alpha.1",git="https://github.com/portal-co/waffle-.git"}
 
@@ -30,23 +30,22 @@ ssa-reloop-03 = { version = "0.3.0-alpha.2", package = "ssa-reloop" ,git="https:
 
 
 
-swc_atoms = "^8.0.0"
-swc_common = "^16.0.0"
-swc_ecma_ast = "^17.0.0"
-swc_ecma_compat_es2015 = "^32.0.0"
-swc_ecma_minifier = "^35.0.0"
-swc_ecma_transforms_base = "^29.0.0"
-swc_ecma_transforms_optimization = "^31.0.0"
-swc_ecma_utils = "^23.0.0"
-swc_ecma_visit = "^17.0.0"
-swc_bundler = "^34.0.0"
-swc_ecma_loader = "^16.0.0"
-swc_ecma_parser = "^26.0.0"
-swc_ecma_codegen = "^19"
+swc_atoms = "^9.0.0"
+swc_common = "^19.0.0"
+swc_ecma_ast = "^21.0.0"
+swc_ecma_compat_es2015 = "^43.0.0"
+swc_ecma_minifier = "^46.0.0"
+swc_ecma_transforms_base = "^38.0.0"
+swc_ecma_transforms_optimization = "^40.0.0"
+swc_ecma_utils = "^27.0.0"
+swc_ecma_visit = "^21.0.0"
+swc_bundler = "^44.0.0"
+swc_ecma_loader = "^19.0.0"
+swc_ecma_parser = "^35.0.0"
+swc_ecma_codegen = "^24"
 
 
-
-portal-solutions-swibb={version="^0.5.0",git="https://github.com/portal-co/swibb.git"}
+portal-solutions-swibb = {version="^0.6.0-alpha.1",git="https://github.com/portal-co/swibb.git"}
 
 
 anyhow = "^1.0.87"

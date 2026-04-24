@@ -7,6 +7,8 @@ resolver="2"
 
 [workspace.dependencies]
 
+rayoff = { version = "0.1.0", git = "https://github.com/portal-co/rayoff.git" }
+
 portal-jsc-common =       {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.11"}
 portal-jsc-swc-cfg =      {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.11"}
 portal-jsc-swc-tac =      {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.11"}

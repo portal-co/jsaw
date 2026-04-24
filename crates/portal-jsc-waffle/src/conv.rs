@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
+    mem::take,
+};
 
 use portal_jsc_swc_ssa::SFunc;
 use portal_pc_waffle::{Module, Type, WithNullable};
@@ -63,7 +66,7 @@ pub fn convert<'a>(root: &'a SFunc, module: &mut Module) {
     while let Some((sfunc, sblock)) = workqueue.pop_front() {
         let (func, cache) = fcache!(sfunc);
         let func = *func;
-        let block = *cache.entry(sblock).or_insert_with(|| {
+        let mut block = *cache.entry(sblock).or_insert_with(|| {
             let func = module
                 .funcs
                 .get_mut(func)
@@ -91,12 +94,22 @@ pub fn convert<'a>(root: &'a SFunc, module: &mut Module) {
                     .iter()
                     .map(|a| a.1),
             )
-            .collect::<BTreeMap<_, _    >>();
-        for stmt in sfunc.cfg.blocks[sblock].stmts.iter().cloned(){
-            let val: portal_pc_waffle::Value = match &sfunc.cfg.values[stmt].value{
-                _ => todo!("unsupported statement: {:?}", sfunc.cfg.values[stmt].value),
+            .collect::<BTreeMap<_, _>>();
+        let mut blkset = [(block, vals)].into_iter().collect::<BTreeMap<_, _>>();
+        for stmt in sfunc.cfg.blocks[sblock].stmts.iter().cloned() {
+            for (mut block, mut vals) in take(&mut blkset) {
+                let val: portal_pc_waffle::Value = match &sfunc.cfg.values[stmt].value {
+                    _ => todo!("unsupported statement: {:?}", sfunc.cfg.values[stmt].value),
+                };
+                vals.insert(stmt, val);
+                blkset.insert(block, vals);
+            }
+        }
+        for (block,vals) in blkset{
+            let terminator = match &sfunc.cfg.blocks[sblock].postcedent.term{
+                _ => todo!("unsupported terminator")
             };
-            vals.insert(stmt,val);
+            module.funcs[func].body_mut().unwrap().set_terminator(block, terminator);
         }
     }
 }

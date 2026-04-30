@@ -141,6 +141,18 @@ pub fn convert<'a>(root: &'a SFunc, module: &mut Module) {
                             Item::Just { id } => vals.get(id).cloned().unwrap_or_else(|| {
                                 panic!("undefined value: {:?} at {:?}", id, span)
                             }),
+                            Item::Undef => {
+                                let ty = Type::Heap(WithNullable {
+                                    nullable: true,
+                                    value: portal_pc_waffle::HeapType::Sig { sig_index: object },
+                                });
+                                module.funcs[func].body_mut().unwrap().add_op(
+                                    block,
+                                    Operator::RefNull { ty: ty.clone() },
+                                    &[],
+                                    &[ty],
+                                )
+                            }
                             _ => todo!("unsupported item: {:?}", item),
                         },
                         _ => todo!("unsupported statement: {:?}", sfunc.cfg.values[stmt].value),

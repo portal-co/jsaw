@@ -7,7 +7,7 @@ use std::{
 use portal_jsc_swc_ssa::{SFunc, SValue};
 use portal_jsc_swc_tac::{Item, TTerm};
 use portal_jsc_swc_util::common::asm::types::Sign;
-use portal_pc_waffle::{Module, Operator, Type, Value, WithMutablility, WithNullable};
+use portal_pc_waffle::{Module, Operator, StorageType, Type, Value, WithMutablility, WithNullable};
 
 use crate::repr::trie::Tries;
 
@@ -43,7 +43,15 @@ pub fn convert<'a>(root: &'a SFunc, module: &mut Module) {
     let ctx = module
         .signatures
         .push(portal_pc_waffle::SignatureData::Struct {
-            fields: vec![],
+            fields: vec![WithMutablility {
+                mutable: true,
+                value: StorageType::Val(Type::Heap(WithNullable {
+                    nullable: true,
+                    value: portal_pc_waffle::HeapType::Sig {
+                        sig_index: obj_trie,
+                    },
+                })),
+            }],
             shared: false,
         });
 
@@ -187,6 +195,48 @@ pub fn convert<'a>(root: &'a SFunc, module: &mut Module) {
                             }
                             _ => todo!("unsupported item: {:?}", item),
                         },
+                        SValue::LoadId(i) => {
+                            let mut scopev = module.funcs[func].body_mut().unwrap().add_op(
+                                block,
+                                Operator::StructGet { sig: ctx, idx: 0 },
+                                &[ctxv],
+                                &[Type::Heap(WithNullable {
+                                    nullable: true,
+                                    value: portal_pc_waffle::HeapType::Sig {
+                                        sig_index: obj_trie,
+                                    },
+                                })],
+                            );
+                            for n in i.0.as_bytes().iter().cloned() {
+                                //TODO: support null tries
+                                scopev = module.funcs[func].body_mut().unwrap().add_op(
+                                    block,
+                                    Operator::StructGet {
+                                        sig: obj_trie,
+                                        idx: (n as usize) + 1,
+                                    },
+                                    &[scopev],
+                                    &[Type::Heap(WithNullable {
+                                        nullable: true,
+                                        value: portal_pc_waffle::HeapType::Sig {
+                                            sig_index: obj_trie,
+                                        },
+                                    })],
+                                );
+                            }
+                            module.funcs[func].body_mut().unwrap().add_op(
+                                block,
+                                Operator::StructGet {
+                                    sig: obj_trie,
+                                    idx: 0,
+                                },
+                                &[scopev],
+                                &[Type::Heap(WithNullable {
+                                    nullable: true,
+                                    value: portal_pc_waffle::HeapType::Sig { sig_index: object },
+                                })],
+                            )
+                        }
                         _ => todo!("unsupported statement: {:?}", sfunc.cfg.values[stmt].value),
                     };
                     vals.insert(stmt, val);

@@ -9,4 +9,11 @@ portal-jsc-swc-ssa.workspace = true
 portal-jsc-swc-tac.workspace = true
 portal-jsc-swc-util.workspace = true
 
-portal-pc-waffle.workspace = true
+portal-pc-waffle = { workspace = true, features = ["backend"] }
+ryu-js = "1"
+swc_ecma_ast.workspace = true
+
+[dev-dependencies]
+swc_common.workspace = true
+swc_ecma_parser.workspace = true
+wasmparser = { version = "0.240", features = ["validate"] }

@@ -1,296 +1,1864 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
-    iter::once,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     mem::take,
 };
 
-use portal_jsc_swc_ssa::{SFunc, SValue};
-use portal_jsc_swc_tac::{Item, TTerm};
-use portal_jsc_swc_util::common::asm::types::Sign;
-use portal_pc_waffle::{Module, Operator, StorageType, Type, Value, WithMutablility, WithNullable};
+use portal_jsc_swc_ssa::{SBlockId, SFunc, SValue, SValueId};
+use portal_jsc_swc_tac::{Item, LId, PropKey, PropVal, TCallee, TTerm};
+use portal_pc_waffle::{
+    Block, BlockTarget, Func, FuncDecl, FunctionBody, HeapType, Module, Operator, SignatureData,
+    Table, TableData, Terminator, Type, Value, WithNullable,
+};
+use swc_ecma_ast::{BinaryOp, Lit, UnaryOp};
 
-use crate::repr::trie::Tries;
+use crate::repr::{ConvertError, Repr, ref_sig};
 
-pub fn convert<'a>(root: &'a SFunc, module: &mut Module) {
-    let mut t = Tries::default();
-    let object = module
-        .signatures
-        .push(portal_pc_waffle::SignatureData::Struct {
-            fields: vec![],
-            shared: false,
-        });
-    let obj_trie = t.get(
+/// Convert jsaw-core SSA into a WasmGC module.
+///
+/// The generated module intentionally has no exports yet: callers own the
+/// embedding ABI. Every generated JavaScript function nevertheless has a
+/// complete typed WasmGC body and callable function-object adapter.
+pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result<(), ConvertError> {
+    let repr = Repr::new(module);
+    let mut converter = Converter {
         module,
-        Type::Heap(WithNullable {
-            value: portal_pc_waffle::HeapType::Sig { sig_index: object },
-            nullable: true,
-        }),
-    );
-    let obj_trie_get = t.get_getter(
-        module,
-        Type::Heap(WithNullable {
-            value: portal_pc_waffle::HeapType::Sig { sig_index: object },
-            nullable: true,
-        }),
-    );
-    let obj_trie_set = t.get_setter(
-        module,
-        Type::Heap(WithNullable {
-            value: portal_pc_waffle::HeapType::Sig { sig_index: object },
-            nullable: true,
-        }),
-    );
-    let ctx = module
-        .signatures
-        .push(portal_pc_waffle::SignatureData::Struct {
-            fields: vec![WithMutablility {
-                mutable: true,
-                value: StorageType::Val(Type::Heap(WithNullable {
-                    nullable: true,
-                    value: portal_pc_waffle::HeapType::Sig {
-                        sig_index: obj_trie,
-                    },
-                })),
-            }],
-            shared: false,
-        });
-
-    module.signatures[object] = portal_pc_waffle::SignatureData::Struct {
-        fields: vec![WithMutablility {
-            mutable: true,
-            value: portal_pc_waffle::StorageType::Val(Type::Heap(WithNullable {
-                nullable: true,
-                value: portal_pc_waffle::HeapType::Sig {
-                    sig_index: obj_trie,
-                },
-            })),
-        }],
-        shared: false,
+        repr,
+        functions: BTreeMap::new(),
+        pending: VecDeque::new(),
+        lowered: BTreeSet::new(),
+        ref_table: None,
     };
-    let mut workqueue = VecDeque::new();
-    workqueue.push_back((root, root.entry));
-    let mut fcache: BTreeMap<
-        usize,
-        (
-            portal_pc_waffle::Func,
-            BTreeMap<portal_jsc_swc_ssa::SBlockId, portal_pc_waffle::Block>,
-        ),
-    > = BTreeMap::new();
-    macro_rules! fcache {
-        ($sfunc:expr) => {
-            match $sfunc {
-                //HACK: pointers to SFunc are stable, so we can use them as keys in the cache
-                sfunc => fcache
-                    .entry(sfunc as *const SFunc as usize)
-                    .or_insert_with(|| {
-                        let sig = module
-                            .signatures
-                            .push(portal_pc_waffle::SignatureData::Func {
-                                params: once(Type::Heap(WithNullable {
-                                    nullable: true,
-                                    value: portal_pc_waffle::HeapType::Sig { sig_index: ctx },
-                                }))
-                                .chain(sfunc.cfg.blocks[sfunc.entry].params.iter().map(|_| {
-                                    Type::Heap(WithNullable {
-                                        nullable: true,
-                                        value: portal_pc_waffle::HeapType::Sig {
-                                            sig_index: object,
-                                        },
-                                    })
-                                }))
-                                .collect(),
-                                returns: vec![Type::Heap(WithNullable {
-                                    nullable: true,
-                                    value: portal_pc_waffle::HeapType::Sig { sig_index: object },
-                                })],
-                                shared: false,
-                            });
-                        let func = portal_pc_waffle::FunctionBody::new(module, sig);
-                        let mut map = BTreeMap::new();
-                        map.insert(sfunc.entry, func.entry);
-                        let func = module.funcs.push(portal_pc_waffle::FuncDecl::Body(
-                            sig,
-                            format!("func_{}", module.funcs.len()),
-                            func,
-                        ));
-                        (func, map)
-                    }),
-            }
-        };
+    converter.ensure_function(root)?;
+    converter.lower_all()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FunctionInfo {
+    native: Func,
+    adapter: Func,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ValueKind {
+    /// A raw Wasm f64 JavaScript number.
+    Number,
+    /// A raw Wasm i32 JavaScript boolean.
+    Boolean,
+    /// A raw Wasm i32 resulting from an integer/bitwise computation.
+    Integer,
+    /// A nullable WasmGC reference at a JavaScript value boundary.
+    Reference,
+}
+
+/// A source block together with the representation of its incoming phi
+/// values. The same SSA block can be lowered more than once when its callers
+/// disagree, preserving raw f64/i32 paths whenever they agree.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct BlkSet {
+    source: SBlockId,
+    params: Vec<ValueKind>,
+}
+
+#[derive(Clone, Debug)]
+enum LowerValue {
+    Wasm {
+        value: Value,
+        kind: ValueKind,
+    },
+    /// A context lookup that can still be used as a static member-key. The
+    /// jsaw TAC represents both `obj.name` and an identifier lookup as a
+    /// `LoadId`; retaining the identifier here disambiguates it at the use.
+    ReferenceKey {
+        value: Value,
+        key: String,
+    },
+    /// A raw numeric literal, retained long enough to be used as an
+    /// ECMAScript-formatted static property key as well as a number.
+    NumberLiteral {
+        value: Value,
+        key: String,
+    },
+    /// String literals are retained solely for static property-key lowering.
+    StaticKey(String),
+}
+
+impl LowerValue {
+    fn wasm(&self) -> Result<(Value, ValueKind), ConvertError> {
+        match self {
+            Self::Wasm { value, kind } => Ok((*value, *kind)),
+            Self::ReferenceKey { value, .. } => Ok((*value, ValueKind::Reference)),
+            Self::NumberLiteral { value, .. } => Ok((*value, ValueKind::Number)),
+            Self::StaticKey(_) => Err(ConvertError::invalid(
+                "a property key was used as a runtime value",
+            )),
+        }
     }
-    macro_rules! bcache {
-        ($func:expr, $cache:expr, $sblock:expr, $sfunc:expr) => {
-            match $func {
-                func => match $cache {
-                    cache => match $sblock {
-                        sblock => match $sfunc {
-                            sfunc => *cache.entry(sblock).or_insert_with(|| {
-                                let func = module
-                                    .funcs
-                                    .get_mut(func)
-                                    .and_then(|a| a.body_mut())
-                                    .unwrap();
-                                let b = func.add_block();
-                                func.add_blockparam(
-                                    b,
-                                    Type::Heap(WithNullable {
-                                        nullable: true,
-                                        value: portal_pc_waffle::HeapType::Sig { sig_index: ctx },
-                                    }),
-                                );
-                                for _ in &sfunc.cfg.blocks[sblock].params {
-                                    func.add_blockparam(
-                                        b,
-                                        Type::Heap(WithNullable {
-                                            nullable: true,
-                                            value: portal_pc_waffle::HeapType::Sig {
-                                                sig_index: object,
-                                            },
-                                        }),
-                                    );
-                                }
-                                b
-                            }),
-                        },
+
+    /// An alias is a runtime JavaScript value, not syntax in a member-key
+    /// position. Drop any source-only static-key metadata at that boundary.
+    fn runtime(self) -> Self {
+        match self {
+            Self::NumberLiteral { value, .. } => Self::Wasm {
+                value,
+                kind: ValueKind::Number,
+            },
+            Self::ReferenceKey { value, .. } => Self::Wasm {
+                value,
+                kind: ValueKind::Reference,
+            },
+            value => value,
+        }
+    }
+
+    fn kind(&self) -> Result<ValueKind, ConvertError> {
+        self.wasm().map(|(_, kind)| kind)
+    }
+}
+
+struct Converter<'a, 'module, 'wasm> {
+    module: &'module mut Module<'wasm>,
+    repr: Repr,
+    functions: BTreeMap<usize, FunctionInfo>,
+    pending: VecDeque<&'a SFunc>,
+    lowered: BTreeSet<usize>,
+    /// A declaration-only table makes every adapter legal as a `ref.func`
+    /// target under Wasm's typed-function-reference validation rules.
+    ref_table: Option<Table>,
+}
+
+impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
+    fn key(func: &SFunc) -> usize {
+        func as *const SFunc as usize
+    }
+
+    fn ensure_function(&mut self, sfunc: &'a SFunc) -> Result<FunctionInfo, ConvertError> {
+        let key = Self::key(sfunc);
+        if let Some(info) = self.functions.get(&key) {
+            return Ok(*info);
+        }
+
+        let native_sig = self.module.signatures.push(SignatureData::Func {
+            params: std::iter::once(self.repr.object_ty())
+                .chain(std::iter::once(self.repr.value))
+                .chain(std::iter::repeat_n(
+                    self.repr.value,
+                    sfunc.cfg.blocks[sfunc.entry].params.len(),
+                ))
+                .collect(),
+            returns: vec![self.repr.value],
+            shared: false,
+        });
+        let native_body = FunctionBody::new(self.module, native_sig);
+        let native = self.module.funcs.push(FuncDecl::Body(
+            native_sig,
+            format!("js_body_{}", self.module.funcs.len()),
+            native_body,
+        ));
+        let adapter = self.make_adapter(native, sfunc.cfg.blocks[sfunc.entry].params.len())?;
+
+        let info = FunctionInfo { native, adapter };
+        self.functions.insert(key, info);
+        self.pending.push_back(sfunc);
+        Ok(info)
+    }
+
+    fn make_adapter(&mut self, native: Func, arity: usize) -> Result<Func, ConvertError> {
+        let mut body = FunctionBody::new(self.module, self.repr.adapter);
+        let context = body.blocks[body.entry].params[0].1;
+        let this = body.blocks[body.entry].params[1].1;
+        let args = body.blocks[body.entry].params[2].1;
+        let mut block = body.entry;
+        let mut formals = Vec::with_capacity(arity);
+
+        // Read each formal lazily. The conditional avoids an out-of-bounds
+        // array.get and implements ordinary missing-argument semantics.
+        for index in 0..arity {
+            let len = body.add_op(block, Operator::ArrayLen, &[args], &[Type::I32]);
+            let idx = body.add_op(
+                block,
+                Operator::I32Const {
+                    value: u32::try_from(index)
+                        .map_err(|_| ConvertError::invalid("too many formals"))?,
+                },
+                &[],
+                &[Type::I32],
+            );
+            let present = body.add_op(block, Operator::I32LtU, &[idx, len], &[Type::I32]);
+            let get = body.add_block();
+            let missing = body.add_block();
+            let join = body.add_block();
+            let formal = body.add_blockparam(join, self.repr.value);
+            body.set_terminator(
+                block,
+                Terminator::CondBr {
+                    cond: present,
+                    if_true: BlockTarget {
+                        block: get,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: missing,
+                        args: vec![],
                     },
                 },
-            }
-        };
+            );
+            let value = body.add_op(
+                get,
+                Operator::ArrayGet {
+                    sig: self.repr.arguments,
+                },
+                &[args, idx],
+                &[self.repr.value],
+            );
+            body.set_terminator(
+                get,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![value],
+                    },
+                },
+            );
+            let undef = body.add_op(
+                missing,
+                Operator::RefNull {
+                    ty: self.repr.value,
+                },
+                &[],
+                &[self.repr.value],
+            );
+            body.set_terminator(
+                missing,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![undef],
+                    },
+                },
+            );
+            block = join;
+            formals.push(formal);
+        }
+
+        let mut call_args = vec![context, this];
+        call_args.extend(formals);
+        let result = body.add_op(
+            block,
+            Operator::Call {
+                function_index: native,
+            },
+            &call_args,
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            block,
+            Terminator::Return {
+                values: vec![result],
+            },
+        );
+
+        let adapter = self.module.funcs.push(FuncDecl::Body(
+            self.repr.adapter,
+            format!("js_adapter_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.declare_function_reference(adapter);
+        Ok(adapter)
     }
-    while let Some((sfunc, mut sblock)) = workqueue.pop_front() {
-        let (func, cache) = fcache!(sfunc);
-        let func = *func;
-        let mut block = bcache!(func, cache, sblock, &sfunc);
-        let mut vals = sfunc.cfg.blocks[sblock]
+
+    fn declare_function_reference(&mut self, func: Func) {
+        if let Some(table) = self.ref_table {
+            let table = &mut self.module.tables[table];
+            let elements = table
+                .func_elements
+                .as_mut()
+                .expect("generated ref-function table should have elements");
+            elements.push(func);
+            table.initial = elements.len() as u64;
+            return;
+        }
+        let table = self.module.tables.push(TableData {
+            ty: Type::Heap(WithNullable {
+                value: HeapType::FuncRef,
+                nullable: true,
+            }),
+            initial: 1,
+            max: None,
+            func_elements: Some(vec![func]),
+            table64: false,
+        });
+        self.ref_table = Some(table);
+    }
+
+    fn lower_all(&mut self) -> Result<(), ConvertError> {
+        while let Some(sfunc) = self.pending.pop_front() {
+            let key = Self::key(sfunc);
+            if !self.lowered.insert(key) {
+                continue;
+            }
+            let info = *self
+                .functions
+                .get(&key)
+                .ok_or_else(|| ConvertError::invalid("missing function cache entry"))?;
+            let mut decl = take(&mut self.module.funcs[info.native]);
+            let result = {
+                let body = decl.body_mut().ok_or_else(|| {
+                    ConvertError::invalid("generated native function has no body")
+                })?;
+                self.lower_function(sfunc, body)
+            };
+            self.module.funcs[info.native] = decl;
+            result?;
+        }
+        Ok(())
+    }
+
+    fn lower_function(
+        &mut self,
+        sfunc: &'a SFunc,
+        body: &mut FunctionBody,
+    ) -> Result<(), ConvertError> {
+        let mut blocks = BTreeMap::new();
+        let entry_state = BlkSet {
+            source: sfunc.entry,
+            params: vec![ValueKind::Reference; sfunc.cfg.blocks[sfunc.entry].params.len()],
+        };
+        blocks.insert(entry_state.clone(), body.entry);
+        let mut pending = VecDeque::from([entry_state]);
+        let mut lowered = BTreeSet::new();
+        let context = body.blocks[body.entry].params[0].1;
+        let this = LowerValue::Wasm {
+            value: body.blocks[body.entry].params[1].1,
+            kind: ValueKind::Reference,
+        };
+        // jsaw's entry shim parameters may be referenced directly from later
+        // blocks without being explicit jump arguments. Keep them available
+        // while lowering every source block.
+        let entry_values = sfunc.cfg.blocks[sfunc.entry]
             .params
             .iter()
-            .map(|a| a.0)
-            .zip(
-                module.funcs[func].body().unwrap().blocks[block].params[1..]
-                    .iter()
-                    .map(|a| a.1),
-            )
+            .zip(body.blocks[body.entry].params.iter().skip(2))
+            .map(|((source, _), (_, value))| {
+                (
+                    *source,
+                    LowerValue::Wasm {
+                        value: *value,
+                        kind: ValueKind::Reference,
+                    },
+                )
+            })
             .collect::<BTreeMap<_, _>>();
-        let mut ctxv = module.funcs[func].body().unwrap().blocks[block].params[0].1;
-        let mut blkset = [(block, vals)].into_iter().collect::<BTreeMap<_, _>>();
-        loop {
-            for stmt in sfunc.cfg.blocks[sblock].stmts.iter().cloned() {
-                for (mut block, mut vals) in take(&mut blkset) {
-                    let val: portal_pc_waffle::Value = match &sfunc.cfg.values[stmt].value {
-                        SValue::Item { item, span } => match item {
-                            Item::Just { id } => vals.get(id).cloned().unwrap_or_else(|| {
-                                panic!("undefined value: {:?} at {:?}", id, span)
-                            }),
-                            Item::Undef => {
-                                let ty = Type::Heap(WithNullable {
-                                    nullable: true,
-                                    value: portal_pc_waffle::HeapType::Sig { sig_index: object },
-                                });
-                                module.funcs[func].body_mut().unwrap().add_op(
-                                    block,
-                                    Operator::RefNull { ty: ty.clone() },
-                                    &[],
-                                    &[ty],
-                                )
-                            }
-                            _ => todo!("unsupported item: {:?}", item),
-                        },
-                        SValue::LoadId(i) => {
-                            let mut scopev = module.funcs[func].body_mut().unwrap().add_op(
-                                block,
-                                Operator::StructGet { sig: ctx, idx: 0 },
-                                &[ctxv],
-                                &[Type::Heap(WithNullable {
-                                    nullable: true,
-                                    value: portal_pc_waffle::HeapType::Sig {
-                                        sig_index: obj_trie,
-                                    },
-                                })],
-                            );
-                            for n in i.0.as_bytes().iter().cloned() {
-                                //TODO: support null tries
-                                scopev = module.funcs[func].body_mut().unwrap().add_op(
-                                    block,
-                                    Operator::StructGet {
-                                        sig: obj_trie,
-                                        idx: (n as usize) + 1,
-                                    },
-                                    &[scopev],
-                                    &[Type::Heap(WithNullable {
-                                        nullable: true,
-                                        value: portal_pc_waffle::HeapType::Sig {
-                                            sig_index: obj_trie,
-                                        },
-                                    })],
-                                );
-                            }
-                            module.funcs[func].body_mut().unwrap().add_op(
-                                block,
-                                Operator::StructGet {
-                                    sig: obj_trie,
-                                    idx: 0,
-                                },
-                                &[scopev],
-                                &[Type::Heap(WithNullable {
-                                    nullable: true,
-                                    value: portal_pc_waffle::HeapType::Sig { sig_index: object },
-                                })],
-                            )
-                        }
-                        _ => todo!("unsupported statement: {:?}", sfunc.cfg.values[stmt].value),
+
+        while let Some(state) = pending.pop_front() {
+            if !lowered.insert(state.clone()) {
+                continue;
+            }
+            let sblock = state.source;
+            let original_block = *blocks
+                .get(&state)
+                .ok_or_else(|| ConvertError::invalid("missing source block mapping"))?;
+            let mut block = original_block;
+            let mut values = entry_values.clone();
+            // Native bodies prepend the captured lexical context and the
+            // effective receiver. Source SSA parameters begin after those two
+            // ABI-only parameters in the entry shim.
+            let target_params = body.blocks[original_block].params.iter();
+            let target_params = if sblock == sfunc.entry {
+                target_params.skip(2)
+            } else {
+                target_params.skip(0)
+            };
+            for (((source, _), (_, wasm)), kind) in sfunc.cfg.blocks[sblock]
+                .params
+                .iter()
+                .zip(target_params)
+                .zip(state.params.iter().copied())
+            {
+                values.insert(*source, LowerValue::Wasm { value: *wasm, kind });
+            }
+
+            for stmt in sfunc.cfg.blocks[sblock].stmts.iter().copied() {
+                let (next, value) = self.lower_statement(
+                    body,
+                    block,
+                    context,
+                    this.clone(),
+                    &values,
+                    &sfunc.cfg.values[stmt].value,
+                )?;
+                block = next;
+                values.insert(stmt, value);
+            }
+
+            match &sfunc.cfg.blocks[sblock].postcedent.term {
+                TTerm::Return(value) => {
+                    let value = match value {
+                        Some(value) => values.get(value).cloned().ok_or_else(|| {
+                            ConvertError::invalid(format!("undefined return value {value:?}"))
+                        })?,
+                        None => self.undef(body, block),
                     };
-                    vals.insert(stmt, val);
-                    blkset.insert(block, vals);
+                    let value = self.box_value(body, block, &value)?;
+                    body.set_terminator(
+                        block,
+                        Terminator::Return {
+                            values: vec![value],
+                        },
+                    );
+                }
+                TTerm::Jmp(target) => {
+                    let args = target
+                        .args
+                        .iter()
+                        .map(|value| {
+                            values
+                                .get(value)
+                                .ok_or_else(|| ConvertError::invalid("undefined jump argument"))
+                                .cloned()
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let target_block = self.target_block(
+                        sfunc,
+                        body,
+                        &mut blocks,
+                        &mut pending,
+                        target.block,
+                        &args,
+                    )?;
+                    let args = self.lower_block_args(body, block, args)?;
+                    body.set_terminator(
+                        block,
+                        Terminator::Br {
+                            target: BlockTarget {
+                                block: target_block,
+                                args,
+                            },
+                        },
+                    );
+                }
+                TTerm::CondJmp {
+                    cond,
+                    if_true,
+                    if_false,
+                } => {
+                    let cond = values
+                        .get(cond)
+                        .ok_or_else(|| ConvertError::invalid("undefined branch condition"))?;
+                    let cond = self.as_condition(body, block, cond)?;
+                    let true_args = if_true
+                        .args
+                        .iter()
+                        .map(|value| {
+                            values
+                                .get(value)
+                                .ok_or_else(|| ConvertError::invalid("undefined branch argument"))
+                        })
+                        .map(|value| value.cloned())
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let false_args = if_false
+                        .args
+                        .iter()
+                        .map(|value| {
+                            values
+                                .get(value)
+                                .ok_or_else(|| ConvertError::invalid("undefined branch argument"))
+                        })
+                        .map(|value| value.cloned())
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let true_block = self.target_block(
+                        sfunc,
+                        body,
+                        &mut blocks,
+                        &mut pending,
+                        if_true.block,
+                        &true_args,
+                    )?;
+                    let false_block = self.target_block(
+                        sfunc,
+                        body,
+                        &mut blocks,
+                        &mut pending,
+                        if_false.block,
+                        &false_args,
+                    )?;
+                    let true_args = self.lower_block_args(body, block, true_args)?;
+                    let false_args = self.lower_block_args(body, block, false_args)?;
+                    body.set_terminator(
+                        block,
+                        Terminator::CondBr {
+                            cond,
+                            if_true: BlockTarget {
+                                block: true_block,
+                                args: true_args,
+                            },
+                            if_false: BlockTarget {
+                                block: false_block,
+                                args: false_args,
+                            },
+                        },
+                    );
+                }
+                TTerm::Tail { callee, args } => {
+                    let (block, context, receiver, array, code) = self.lower_call_parts(
+                        body,
+                        block,
+                        context,
+                        this.clone(),
+                        &values,
+                        callee,
+                        args,
+                    )?;
+                    body.set_terminator(
+                        block,
+                        Terminator::ReturnCallRef {
+                            sig: self.repr.adapter,
+                            args: vec![context, receiver, array, code],
+                        },
+                    );
+                }
+                // The jsaw pipeline leaves a `Default` terminator on an
+                // implicit JavaScript fallthrough. Its observable result is
+                // `undefined`, not an unreachable Wasm edge.
+                TTerm::Default => {
+                    let undef = self.undef(body, block);
+                    let value = self.box_value(body, block, &undef)?;
+                    body.set_terminator(
+                        block,
+                        Terminator::Return {
+                            values: vec![value],
+                        },
+                    );
+                }
+                TTerm::Throw(_) | TTerm::Switch { .. } => {
+                    return Err(ConvertError::unsupported("throw or switch terminator", ()));
                 }
             }
-            let mut needs_break = true;
-            for (block, vals) in take(&mut blkset) {
-                let terminator = match &sfunc.cfg.blocks[sblock].postcedent.term {
-                    TTerm::Jmp(t) => {
-                        needs_break = false;
-                        sblock = t.block;
-                        blkset.insert(
-                            block,
-                            sfunc.cfg.blocks[sblock]
-                                .params
-                                .iter()
-                                .map(|a| a.0)
-                                .zip(t.args.iter().filter_map(|a| vals.get(a)).cloned())
-                                .collect::<BTreeMap<_, _>>(),
-                        );
-                        continue;
-                    }
-                    TTerm::Return(r) => match r {
-                        Some(r) => portal_pc_waffle::Terminator::Return {
-                            values: vec![vals.get(r).cloned().unwrap_or_else(|| {
-                                panic!("undefined return value: {:?} at block {:?}", r, block)
-                            })],
-                        },
-                        None => {
-                            let ty = Type::Heap(WithNullable {
-                                nullable: true,
-                                value: portal_pc_waffle::HeapType::Sig { sig_index: object },
-                            });
-                            portal_pc_waffle::Terminator::Return {
-                                values: vec![module.funcs[func].body_mut().unwrap().add_op(
-                                    block,
-                                    Operator::RefNull { ty: ty.clone() },
-                                    &[],
-                                    &[ty],
-                                )],
-                            }
-                        }
-                    },
-                    _ => todo!("unsupported terminator"),
-                };
-                module.funcs[func]
-                    .body_mut()
-                    .unwrap()
-                    .set_terminator(block, terminator);
-            }
-            if needs_break {
-                break;
-            }
         }
+        Ok(())
+    }
+
+    fn target_block(
+        &self,
+        sfunc: &SFunc,
+        body: &mut FunctionBody,
+        blocks: &mut BTreeMap<BlkSet, Block>,
+        pending: &mut VecDeque<BlkSet>,
+        source: SBlockId,
+        args: &[LowerValue],
+    ) -> Result<Block, ConvertError> {
+        let state = BlkSet {
+            source,
+            params: args
+                .iter()
+                .map(LowerValue::kind)
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        if state.params.len() != sfunc.cfg.blocks[source].params.len() {
+            return Err(ConvertError::invalid(
+                "jump argument count did not match its target",
+            ));
+        }
+        if let Some(block) = blocks.get(&state) {
+            return Ok(*block);
+        }
+        let block = body.add_block();
+        for kind in &state.params {
+            body.add_blockparam(block, self.wasm_type(*kind));
+        }
+        blocks.insert(state.clone(), block);
+        pending.push_back(state);
+        Ok(block)
+    }
+
+    fn wasm_type(&self, kind: ValueKind) -> Type {
+        match kind {
+            ValueKind::Number => Type::F64,
+            ValueKind::Boolean | ValueKind::Integer => Type::I32,
+            ValueKind::Reference => self.repr.value,
+        }
+    }
+
+    fn lower_block_args(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        args: Vec<LowerValue>,
+    ) -> Result<Vec<Value>, ConvertError> {
+        args.into_iter()
+            .map(|value| match value.kind()? {
+                ValueKind::Reference => self.box_value(body, block, &value),
+                ValueKind::Number => self.as_f64(body, block, &value),
+                ValueKind::Boolean => self.as_condition(body, block, &value),
+                ValueKind::Integer => self.as_i32(body, block, &value),
+            })
+            .collect()
+    }
+
+    fn lower_statement(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        context: Value,
+        this: LowerValue,
+        values: &BTreeMap<SValueId, LowerValue>,
+        source: &'a SValue,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        match source {
+            SValue::Item { item, span } => {
+                self.lower_item(body, block, context, this, values, item, span)
+            }
+            SValue::LoadId(id) => {
+                let key = id.0.to_string();
+                let (block, value) = self.get_property(body, block, context, &key)?;
+                let (value, _) = value.wasm()?;
+                Ok((block, LowerValue::ReferenceKey { value, key }))
+            }
+            SValue::StoreId { target, val } => {
+                let value = values
+                    .get(val)
+                    .ok_or_else(|| ConvertError::invalid("undefined stored value"))?;
+                let block =
+                    self.set_property(body, block, context, &target.0.to_string(), value)?;
+                Ok((block, value.clone()))
+            }
+            SValue::Assign { target, val } => {
+                let value = values
+                    .get(val)
+                    .ok_or_else(|| ConvertError::invalid("undefined assignment value"))?;
+                match target {
+                    LId::Member { obj, mem } => {
+                        let object = values
+                            .get(obj)
+                            .ok_or_else(|| ConvertError::invalid("undefined assignment object"))?;
+                        let key = self.key_of(values.get(&mem[0]).ok_or_else(|| {
+                            ConvertError::invalid("undefined assignment property key")
+                        })?)?;
+                        let block = self.set_property_value(body, block, object, &key, value)?;
+                        Ok((block, value.clone()))
+                    }
+                    _ => Err(ConvertError::unsupported("non-member assignment", ())),
+                }
+            }
+            SValue::EdgeBlocker { value, .. } => Ok((
+                block,
+                values
+                    .get(value)
+                    .cloned()
+                    .ok_or_else(|| ConvertError::invalid("undefined edge-blocker value"))?,
+            )),
+            SValue::Param { .. } => {
+                Err(ConvertError::invalid("block parameter used as a statement"))
+            }
+            _ => Err(ConvertError::unsupported("new SSA value form", ())),
+        }
+    }
+
+    fn lower_item(
+        &mut self,
+        body: &mut FunctionBody,
+        mut block: Block,
+        context: Value,
+        this: LowerValue,
+        values: &BTreeMap<SValueId, LowerValue>,
+        item: &'a Item<SValueId, SFunc>,
+        span: &impl std::fmt::Debug,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        let value = match item {
+            Item::Just { id } => values
+                .get(id)
+                .cloned()
+                .ok_or_else(|| ConvertError::invalid("undefined alias value"))?
+                .runtime(),
+            Item::Undef => self.undef(body, block),
+            Item::Lit { lit } => self.literal(body, block, lit, span)?,
+            Item::This => this,
+            Item::Func { func, arrow } => {
+                self.function_object(body, block, context, this, func, *arrow)?
+            }
+            Item::Obj { members } => self.object_literal(
+                body,
+                &mut block,
+                context,
+                this.clone(),
+                values,
+                members,
+                span,
+            )?,
+            Item::Mem { obj, mem } => {
+                let object = values
+                    .get(obj)
+                    .ok_or_else(|| ConvertError::invalid("undefined member object"))?;
+                let key = self.key_of(
+                    values
+                        .get(mem)
+                        .ok_or_else(|| ConvertError::invalid("undefined member key"))?,
+                )?;
+                let (next, value) = self.get_property_value(body, block, object, &key)?;
+                block = next;
+                value
+            }
+            Item::Call { callee, args } => {
+                let (next, ctx, receiver, array, code) = self.lower_call_parts(
+                    body,
+                    block,
+                    context,
+                    this.clone(),
+                    values,
+                    callee,
+                    args,
+                )?;
+                block = next;
+                let value = body.add_op(
+                    block,
+                    Operator::CallRef {
+                        sig_index: self.repr.adapter,
+                    },
+                    &[ctx, receiver, array, code],
+                    &[self.repr.value],
+                );
+                LowerValue::Wasm {
+                    value,
+                    kind: ValueKind::Reference,
+                }
+            }
+            Item::New { class, args } => {
+                let callee = values
+                    .get(class)
+                    .ok_or_else(|| ConvertError::invalid("undefined constructor"))?;
+                let receiver = self.new_object(body, block)?;
+                let (ctx, _default_this, code, arrow) =
+                    self.callable_parts(body, block, callee, this.clone())?;
+                let is_arrow = arrow;
+                // A construct of an arrow function is invalid JavaScript. The
+                // generated trap also keeps a dynamic callable from silently
+                // acquiring constructor semantics.
+                let reject = body.add_block();
+                let invoke = body.add_block();
+                let join = body.add_block();
+                let joined = body.add_blockparam(join, self.repr.value);
+                body.set_terminator(
+                    block,
+                    Terminator::CondBr {
+                        cond: is_arrow,
+                        if_true: BlockTarget {
+                            block: reject,
+                            args: vec![],
+                        },
+                        if_false: BlockTarget {
+                            block: invoke,
+                            args: vec![],
+                        },
+                    },
+                );
+                body.set_terminator(reject, Terminator::Unreachable);
+                let array = self.make_plain_arguments(body, invoke, values, args)?;
+                let receiver_value = self.box_value(body, invoke, &receiver)?;
+                let result = body.add_op(
+                    invoke,
+                    Operator::CallRef {
+                        sig_index: self.repr.adapter,
+                    },
+                    &[ctx, receiver_value, array, code],
+                    &[self.repr.value],
+                );
+                let object = body.add_op(
+                    invoke,
+                    Operator::RefTest {
+                        ty: self.repr.object_ty(),
+                    },
+                    &[result],
+                    &[Type::I32],
+                );
+                let function = body.add_op(
+                    invoke,
+                    Operator::RefTest {
+                        ty: self.repr.function_ty(),
+                    },
+                    &[result],
+                    &[Type::I32],
+                );
+                let override_result =
+                    body.add_op(invoke, Operator::I32Or, &[object, function], &[Type::I32]);
+                let explicit = body.add_block();
+                let implicit = body.add_block();
+                body.set_terminator(
+                    invoke,
+                    Terminator::CondBr {
+                        cond: override_result,
+                        if_true: BlockTarget {
+                            block: explicit,
+                            args: vec![],
+                        },
+                        if_false: BlockTarget {
+                            block: implicit,
+                            args: vec![],
+                        },
+                    },
+                );
+                body.set_terminator(
+                    explicit,
+                    Terminator::Br {
+                        target: BlockTarget {
+                            block: join,
+                            args: vec![result],
+                        },
+                    },
+                );
+                let receiver_result = self.box_value(body, implicit, &receiver)?;
+                body.set_terminator(
+                    implicit,
+                    Terminator::Br {
+                        target: BlockTarget {
+                            block: join,
+                            args: vec![receiver_result],
+                        },
+                    },
+                );
+                block = join;
+                LowerValue::Wasm {
+                    value: joined,
+                    kind: ValueKind::Reference,
+                }
+            }
+            Item::Bin { left, right, op } => self.binary(
+                body,
+                block,
+                values
+                    .get(left)
+                    .ok_or_else(|| ConvertError::invalid("undefined binary lhs"))?,
+                values
+                    .get(right)
+                    .ok_or_else(|| ConvertError::invalid("undefined binary rhs"))?,
+                *op,
+                span,
+            )?,
+            Item::Un { arg, op } => self.unary(
+                body,
+                block,
+                values
+                    .get(arg)
+                    .ok_or_else(|| ConvertError::invalid("undefined unary operand"))?,
+                *op,
+                span,
+            )?,
+            Item::Select {
+                cond,
+                then,
+                otherwise,
+            } => {
+                let cond = self.as_condition(
+                    body,
+                    block,
+                    values
+                        .get(cond)
+                        .ok_or_else(|| ConvertError::invalid("undefined select condition"))?,
+                )?;
+                let then = self.box_value(
+                    body,
+                    block,
+                    values
+                        .get(then)
+                        .ok_or_else(|| ConvertError::invalid("undefined select value"))?,
+                )?;
+                let otherwise = self.box_value(
+                    body,
+                    block,
+                    values
+                        .get(otherwise)
+                        .ok_or_else(|| ConvertError::invalid("undefined select value"))?,
+                )?;
+                let value = body.add_op(
+                    block,
+                    Operator::TypedSelect {
+                        ty: self.repr.value,
+                    },
+                    &[then, otherwise, cond],
+                    &[self.repr.value],
+                );
+                LowerValue::Wasm {
+                    value,
+                    kind: ValueKind::Reference,
+                }
+            }
+            Item::PrivateMem { .. }
+            | Item::HasPrivateMem { .. }
+            | Item::Class(_)
+            | Item::Arr { .. }
+            | Item::StaticSubArray { .. }
+            | Item::StaticSubObject { .. }
+            | Item::Yield { .. }
+            | Item::Await { .. }
+            | Item::Asm { .. }
+            | Item::Arguments
+            | Item::Meta { .. } => {
+                return Err(ConvertError::unsupported(format!("{item:?}"), span));
+            }
+            _ => return Err(ConvertError::unsupported("new item form", span)),
+        };
+        Ok((block, value))
+    }
+
+    fn literal(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        lit: &Lit,
+        span: &impl std::fmt::Debug,
+    ) -> Result<LowerValue, ConvertError> {
+        Ok(match lit {
+            Lit::Num(number) => {
+                let value = body.add_op(
+                    block,
+                    Operator::F64Const {
+                        value: number.value.to_bits(),
+                    },
+                    &[],
+                    &[Type::F64],
+                );
+                let mut key = ryu_js::Buffer::new();
+                LowerValue::NumberLiteral {
+                    value,
+                    key: key.format(number.value).to_owned(),
+                }
+            }
+            Lit::Bool(boolean) => LowerValue::Wasm {
+                value: body.add_op(
+                    block,
+                    Operator::I32Const {
+                        value: u32::from(boolean.value),
+                    },
+                    &[],
+                    &[Type::I32],
+                ),
+                kind: ValueKind::Boolean,
+            },
+            Lit::Null(_) => self.undef(body, block),
+            Lit::Str(string) => LowerValue::StaticKey(string.value.to_string_lossy().into_owned()),
+            _ => return Err(ConvertError::unsupported(format!("literal {lit:?}"), span)),
+        })
+    }
+
+    fn binary(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        left: &LowerValue,
+        right: &LowerValue,
+        op: BinaryOp,
+        span: &impl std::fmt::Debug,
+    ) -> Result<LowerValue, ConvertError> {
+        use BinaryOp::*;
+        match op {
+            Add => self.f64_binary(body, block, left, right, Operator::F64Add),
+            Sub => self.f64_binary(body, block, left, right, Operator::F64Sub),
+            Mul => self.f64_binary(body, block, left, right, Operator::F64Mul),
+            Div => self.f64_binary(body, block, left, right, Operator::F64Div),
+            Mod => {
+                let left = self.as_f64(body, block, left)?;
+                let right = self.as_f64(body, block, right)?;
+                let div = body.add_op(block, Operator::F64Div, &[left, right], &[Type::F64]);
+                let trunc = body.add_op(block, Operator::F64Trunc, &[div], &[Type::F64]);
+                let product = body.add_op(block, Operator::F64Mul, &[trunc, right], &[Type::F64]);
+                Ok(LowerValue::Wasm {
+                    value: body.add_op(block, Operator::F64Sub, &[left, product], &[Type::F64]),
+                    kind: ValueKind::Number,
+                })
+            }
+            Lt => self.f64_compare(body, block, left, right, Operator::F64Lt),
+            LtEq => self.f64_compare(body, block, left, right, Operator::F64Le),
+            Gt => self.f64_compare(body, block, left, right, Operator::F64Gt),
+            GtEq => self.f64_compare(body, block, left, right, Operator::F64Ge),
+            EqEq | EqEqEq | NotEq | NotEqEq => {
+                self.equality(body, block, left, right, matches!(op, NotEq | NotEqEq))
+            }
+            BitAnd | BitOr | BitXor | LShift | RShift | ZeroFillRShift => {
+                let left = self.as_i32(body, block, left)?;
+                let right = self.as_i32(body, block, right)?;
+                let operator = match op {
+                    BitAnd => Operator::I32And,
+                    BitOr => Operator::I32Or,
+                    BitXor => Operator::I32Xor,
+                    LShift => Operator::I32Shl,
+                    RShift => Operator::I32ShrS,
+                    ZeroFillRShift => Operator::I32ShrU,
+                    _ => unreachable!(),
+                };
+                Ok(LowerValue::Wasm {
+                    value: body.add_op(block, operator, &[left, right], &[Type::I32]),
+                    kind: ValueKind::Integer,
+                })
+            }
+            LogicalAnd | LogicalOr => {
+                let cond = self.as_condition(body, block, left)?;
+                let left = self.box_value(body, block, left)?;
+                let right = self.box_value(body, block, right)?;
+                let args = if op == LogicalAnd {
+                    [right, left, cond]
+                } else {
+                    [left, right, cond]
+                };
+                Ok(LowerValue::Wasm {
+                    value: body.add_op(
+                        block,
+                        Operator::TypedSelect {
+                            ty: self.repr.value,
+                        },
+                        &args,
+                        &[self.repr.value],
+                    ),
+                    kind: ValueKind::Reference,
+                })
+            }
+            NullishCoalescing => {
+                let (left_value, left_kind) = left.wasm()?;
+                if left_kind != ValueKind::Reference {
+                    return Ok(left.clone());
+                }
+                let null = body.add_op(block, Operator::RefIsNull, &[left_value], &[Type::I32]);
+                let left = self.box_value(body, block, left)?;
+                let right = self.box_value(body, block, right)?;
+                Ok(LowerValue::Wasm {
+                    value: body.add_op(
+                        block,
+                        Operator::TypedSelect {
+                            ty: self.repr.value,
+                        },
+                        &[right, left, null],
+                        &[self.repr.value],
+                    ),
+                    kind: ValueKind::Reference,
+                })
+            }
+            Exp | In | InstanceOf => Err(ConvertError::unsupported(
+                format!("binary operator {op:?}"),
+                span,
+            )),
+        }
+    }
+
+    fn f64_binary(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        left: &LowerValue,
+        right: &LowerValue,
+        operator: Operator,
+    ) -> Result<LowerValue, ConvertError> {
+        let left = self.as_f64(body, block, left)?;
+        let right = self.as_f64(body, block, right)?;
+        Ok(LowerValue::Wasm {
+            value: body.add_op(block, operator, &[left, right], &[Type::F64]),
+            kind: ValueKind::Number,
+        })
+    }
+
+    fn f64_compare(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        left: &LowerValue,
+        right: &LowerValue,
+        operator: Operator,
+    ) -> Result<LowerValue, ConvertError> {
+        let left = self.as_f64(body, block, left)?;
+        let right = self.as_f64(body, block, right)?;
+        Ok(LowerValue::Wasm {
+            value: body.add_op(block, operator, &[left, right], &[Type::I32]),
+            kind: ValueKind::Boolean,
+        })
+    }
+
+    fn unary(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        arg: &LowerValue,
+        op: UnaryOp,
+        span: &impl std::fmt::Debug,
+    ) -> Result<LowerValue, ConvertError> {
+        Ok(match op {
+            UnaryOp::Plus => LowerValue::Wasm {
+                value: self.as_f64(body, block, arg)?,
+                kind: ValueKind::Number,
+            },
+            UnaryOp::Minus => {
+                let arg = self.as_f64(body, block, arg)?;
+                LowerValue::Wasm {
+                    value: body.add_op(block, Operator::F64Neg, &[arg], &[Type::F64]),
+                    kind: ValueKind::Number,
+                }
+            }
+            UnaryOp::Bang => {
+                let arg = self.as_condition(body, block, arg)?;
+                LowerValue::Wasm {
+                    value: body.add_op(block, Operator::I32Eqz, &[arg], &[Type::I32]),
+                    kind: ValueKind::Boolean,
+                }
+            }
+            UnaryOp::Tilde => {
+                let arg = self.as_i32(body, block, arg)?;
+                let all = body.add_op(
+                    block,
+                    Operator::I32Const { value: u32::MAX },
+                    &[],
+                    &[Type::I32],
+                );
+                LowerValue::Wasm {
+                    value: body.add_op(block, Operator::I32Xor, &[arg, all], &[Type::I32]),
+                    kind: ValueKind::Integer,
+                }
+            }
+            UnaryOp::Void => self.undef(body, block),
+            UnaryOp::TypeOf | UnaryOp::Delete => {
+                return Err(ConvertError::unsupported(
+                    format!("unary operator {op:?}"),
+                    span,
+                ));
+            }
+        })
+    }
+
+    fn equality(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        left: &LowerValue,
+        right: &LowerValue,
+        negated: bool,
+    ) -> Result<LowerValue, ConvertError> {
+        let (left_value, left_kind) = left.wasm()?;
+        let (right_value, right_kind) = right.wasm()?;
+        let value = match (left_kind, right_kind) {
+            (ValueKind::Number, ValueKind::Number) => body.add_op(
+                block,
+                if negated {
+                    Operator::F64Ne
+                } else {
+                    Operator::F64Eq
+                },
+                &[left_value, right_value],
+                &[Type::I32],
+            ),
+            (ValueKind::Boolean | ValueKind::Integer, ValueKind::Boolean | ValueKind::Integer) => {
+                body.add_op(
+                    block,
+                    if negated {
+                        Operator::I32Ne
+                    } else {
+                        Operator::I32Eq
+                    },
+                    &[left_value, right_value],
+                    &[Type::I32],
+                )
+            }
+            _ => {
+                let left = self.box_value(body, block, left)?;
+                let right = self.box_value(body, block, right)?;
+                let equal = body.add_op(block, Operator::RefEq, &[left, right], &[Type::I32]);
+                if negated {
+                    body.add_op(block, Operator::I32Eqz, &[equal], &[Type::I32])
+                } else {
+                    equal
+                }
+            }
+        };
+        Ok(LowerValue::Wasm {
+            value,
+            kind: ValueKind::Boolean,
+        })
+    }
+
+    fn as_f64(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        value: &LowerValue,
+    ) -> Result<Value, ConvertError> {
+        let (value, kind) = value.wasm()?;
+        Ok(match kind {
+            ValueKind::Number => value,
+            ValueKind::Boolean | ValueKind::Integer => {
+                body.add_op(block, Operator::F64ConvertI32S, &[value], &[Type::F64])
+            }
+            ValueKind::Reference => {
+                let boxed = body.add_op(
+                    block,
+                    Operator::RefCast {
+                        ty: self.repr.number_ty(),
+                    },
+                    &[value],
+                    &[self.repr.number_ty()],
+                );
+                body.add_op(
+                    block,
+                    Operator::StructGet {
+                        sig: self.repr.number,
+                        idx: 0,
+                    },
+                    &[boxed],
+                    &[Type::F64],
+                )
+            }
+        })
+    }
+
+    fn as_i32(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        value: &LowerValue,
+    ) -> Result<Value, ConvertError> {
+        let (value, kind) = value.wasm()?;
+        Ok(match kind {
+            ValueKind::Boolean | ValueKind::Integer => value,
+            ValueKind::Number => body.add_op(block, Operator::I32TruncF64S, &[value], &[Type::I32]),
+            ValueKind::Reference => {
+                let boxed = LowerValue::Wasm { value, kind };
+                let number = self.as_f64(body, block, &boxed)?;
+                body.add_op(block, Operator::I32TruncF64S, &[number], &[Type::I32])
+            }
+        })
+    }
+
+    fn as_condition(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        value: &LowerValue,
+    ) -> Result<Value, ConvertError> {
+        let (value, kind) = value.wasm()?;
+        Ok(match kind {
+            ValueKind::Boolean | ValueKind::Integer => value,
+            ValueKind::Number => {
+                let zero = body.add_op(
+                    block,
+                    Operator::F64Const {
+                        value: 0.0f64.to_bits(),
+                    },
+                    &[],
+                    &[Type::F64],
+                );
+                body.add_op(block, Operator::F64Ne, &[value, zero], &[Type::I32])
+            }
+            ValueKind::Reference => {
+                let null = body.add_op(block, Operator::RefIsNull, &[value], &[Type::I32]);
+                body.add_op(block, Operator::I32Eqz, &[null], &[Type::I32])
+            }
+        })
+    }
+
+    fn undef(&self, body: &mut FunctionBody, block: Block) -> LowerValue {
+        LowerValue::Wasm {
+            value: body.add_op(
+                block,
+                Operator::RefNull {
+                    ty: self.repr.value,
+                },
+                &[],
+                &[self.repr.value],
+            ),
+            kind: ValueKind::Reference,
+        }
+    }
+
+    fn box_value(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        value: &LowerValue,
+    ) -> Result<Value, ConvertError> {
+        let (value, kind) = value.wasm()?;
+        let value = match kind {
+            ValueKind::Reference => value,
+            ValueKind::Number => body.add_op(
+                block,
+                Operator::StructNew {
+                    sig: self.repr.number,
+                },
+                &[value],
+                &[self.repr.number_ty()],
+            ),
+            ValueKind::Boolean => body.add_op(
+                block,
+                Operator::StructNew {
+                    sig: self.repr.boolean,
+                },
+                &[value],
+                &[self.repr.boolean_ty()],
+            ),
+            ValueKind::Integer => {
+                let number = body.add_op(block, Operator::F64ConvertI32S, &[value], &[Type::F64]);
+                body.add_op(
+                    block,
+                    Operator::StructNew {
+                        sig: self.repr.number,
+                    },
+                    &[number],
+                    &[self.repr.number_ty()],
+                )
+            }
+        };
+        // Waffle's reducer requires exact block/call argument types. Normalize
+        // every heap escape to the ABI's nullable `anyref`, even when the
+        // underlying value is a more precise object, function, or box type.
+        Ok(body.add_op(
+            block,
+            Operator::RefCast {
+                ty: self.repr.value,
+            },
+            &[value],
+            &[self.repr.value],
+        ))
+    }
+
+    fn new_trie(&self, body: &mut FunctionBody, block: Block) -> Result<Value, ConvertError> {
+        Ok(body.add_op(
+            block,
+            Operator::StructNewDefault {
+                sig: self.repr.trie,
+            },
+            &[],
+            &[self.repr.trie_ty()],
+        ))
+    }
+
+    fn new_object(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+    ) -> Result<LowerValue, ConvertError> {
+        let trie = self.new_trie(body, block)?;
+        let object = body.add_op(
+            block,
+            Operator::StructNew {
+                sig: self.repr.object,
+            },
+            &[trie],
+            &[self.repr.object_ty()],
+        );
+        Ok(LowerValue::Wasm {
+            value: object,
+            kind: ValueKind::Reference,
+        })
+    }
+
+    fn function_object(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        context: Value,
+        this: LowerValue,
+        func: &'a SFunc,
+        arrow: bool,
+    ) -> Result<LowerValue, ConvertError> {
+        let info = self.ensure_function(func)?;
+        let trie = self.new_trie(body, block)?;
+        let code = body.add_op(
+            block,
+            Operator::RefFunc {
+                func_index: info.adapter,
+            },
+            &[],
+            &[ref_sig(self.repr.adapter)],
+        );
+        let arrow = body.add_op(
+            block,
+            Operator::I32Const {
+                value: u32::from(arrow),
+            },
+            &[],
+            &[Type::I32],
+        );
+        let captured_this = self.box_value(body, block, &this)?;
+        let value = body.add_op(
+            block,
+            Operator::StructNew {
+                sig: self.repr.function,
+            },
+            &[trie, code, context, captured_this, arrow],
+            &[self.repr.function_ty()],
+        );
+        Ok(LowerValue::Wasm {
+            value,
+            kind: ValueKind::Reference,
+        })
+    }
+
+    fn object_literal(
+        &mut self,
+        body: &mut FunctionBody,
+        block: &mut Block,
+        context: Value,
+        this: LowerValue,
+        values: &BTreeMap<SValueId, LowerValue>,
+        members: &'a [(PropKey<SValueId>, PropVal<SValueId, SFunc>)],
+        span: &impl std::fmt::Debug,
+    ) -> Result<LowerValue, ConvertError> {
+        let object = self.new_object(body, *block)?;
+        for (key, property) in members {
+            let key = match key {
+                PropKey::Lit(key) => key.sym.to_string(),
+                PropKey::Computed(value) => self.key_of(
+                    values
+                        .get(value)
+                        .ok_or_else(|| ConvertError::invalid("undefined object property key"))?,
+                )?,
+                _ => return Err(ConvertError::unsupported("object property key", span)),
+            };
+            let value = match property {
+                PropVal::Item(value) => values
+                    .get(value)
+                    .cloned()
+                    .ok_or_else(|| ConvertError::invalid("undefined object property value"))?,
+                PropVal::Method(func) => {
+                    self.function_object(body, *block, context, this.clone(), func, false)?
+                }
+                PropVal::Getter(_) | PropVal::Setter(_) => {
+                    return Err(ConvertError::unsupported("object accessor", span));
+                }
+                _ => return Err(ConvertError::unsupported("object property", span)),
+            };
+            *block = self.set_property_value(body, *block, &object, &key, &value)?;
+        }
+        Ok(object)
+    }
+
+    fn key_of(&self, value: &LowerValue) -> Result<String, ConvertError> {
+        match value {
+            LowerValue::StaticKey(key) => Ok(key.clone()),
+            LowerValue::ReferenceKey { key, .. } => Ok(key.clone()),
+            LowerValue::NumberLiteral { key, .. } => Ok(key.clone()),
+            _ => Err(ConvertError::invalid(
+                "dynamic property keys are unsupported",
+            )),
+        }
+    }
+
+    fn object_and_trie(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+    ) -> Result<(Block, Value), ConvertError> {
+        let (object, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return Err(ConvertError::invalid("a primitive was used as an object"));
+        }
+        let is_function = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.function_ty(),
+            },
+            &[object],
+            &[Type::I32],
+        );
+        let function = body.add_block();
+        let plain = body.add_block();
+        let join = body.add_block();
+        let trie = body.add_blockparam(join, self.repr.trie_ty());
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_function,
+                if_true: BlockTarget {
+                    block: function,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: plain,
+                    args: vec![],
+                },
+            },
+        );
+        let function_value = body.add_op(
+            function,
+            Operator::RefCast {
+                ty: self.repr.function_ty(),
+            },
+            &[object],
+            &[self.repr.function_ty()],
+        );
+        let function_trie = body.add_op(
+            function,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: 0,
+            },
+            &[function_value],
+            &[self.repr.trie_ty()],
+        );
+        body.set_terminator(
+            function,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![function_trie],
+                },
+            },
+        );
+        let object_value = body.add_op(
+            plain,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[object],
+            &[self.repr.object_ty()],
+        );
+        let object_trie = body.add_op(
+            plain,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 0,
+            },
+            &[object_value],
+            &[self.repr.trie_ty()],
+        );
+        body.set_terminator(
+            plain,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![object_trie],
+                },
+            },
+        );
+        Ok((join, trie))
+    }
+
+    fn get_property(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        context: Value,
+        key: &str,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        self.get_property_value(
+            body,
+            block,
+            &LowerValue::Wasm {
+                value: context,
+                kind: ValueKind::Reference,
+            },
+            key,
+        )
+    }
+
+    fn get_property_value(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &str,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        let (block, mut trie) = self.object_and_trie(body, block, object)?;
+        for byte in key.as_bytes() {
+            let child = body.add_op(
+                block,
+                Operator::StructGet {
+                    sig: self.repr.trie,
+                    idx: usize::from(*byte) + 1,
+                },
+                &[trie],
+                &[self.repr.value],
+            );
+            trie = body.add_op(
+                block,
+                Operator::RefCast {
+                    ty: self.repr.trie_ty(),
+                },
+                &[child],
+                &[self.repr.trie_ty()],
+            );
+        }
+        let value = body.add_op(
+            block,
+            Operator::StructGet {
+                sig: self.repr.trie,
+                idx: 0,
+            },
+            &[trie],
+            &[self.repr.value],
+        );
+        Ok((
+            block,
+            LowerValue::Wasm {
+                value,
+                kind: ValueKind::Reference,
+            },
+        ))
+    }
+
+    fn set_property(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        context: Value,
+        key: &str,
+        value: &LowerValue,
+    ) -> Result<Block, ConvertError> {
+        self.set_property_value(
+            body,
+            block,
+            &LowerValue::Wasm {
+                value: context,
+                kind: ValueKind::Reference,
+            },
+            key,
+            value,
+        )
+    }
+
+    fn set_property_value(
+        &self,
+        body: &mut FunctionBody,
+        mut block: Block,
+        object: &LowerValue,
+        key: &str,
+        value: &LowerValue,
+    ) -> Result<Block, ConvertError> {
+        let (next, mut trie) = self.object_and_trie(body, block, object)?;
+        block = next;
+        for byte in key.as_bytes() {
+            let child = body.add_op(
+                block,
+                Operator::StructGet {
+                    sig: self.repr.trie,
+                    idx: usize::from(*byte) + 1,
+                },
+                &[trie],
+                &[self.repr.value],
+            );
+            let is_null = body.add_op(block, Operator::RefIsNull, &[child], &[Type::I32]);
+            let allocate = body.add_block();
+            let present = body.add_block();
+            let join = body.add_block();
+            let next = body.add_blockparam(join, self.repr.trie_ty());
+            body.set_terminator(
+                block,
+                Terminator::CondBr {
+                    cond: is_null,
+                    if_true: BlockTarget {
+                        block: allocate,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: present,
+                        args: vec![],
+                    },
+                },
+            );
+            let allocated = self.new_trie(body, allocate)?;
+            body.add_op(
+                allocate,
+                Operator::StructSet {
+                    sig: self.repr.trie,
+                    idx: usize::from(*byte) + 1,
+                },
+                &[trie, allocated],
+                &[],
+            );
+            body.set_terminator(
+                allocate,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![allocated],
+                    },
+                },
+            );
+            let existing = body.add_op(
+                present,
+                Operator::RefCast {
+                    ty: self.repr.trie_ty(),
+                },
+                &[child],
+                &[self.repr.trie_ty()],
+            );
+            body.set_terminator(
+                present,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![existing],
+                    },
+                },
+            );
+            block = join;
+            trie = next;
+        }
+        let value = self.box_value(body, block, value)?;
+        body.add_op(
+            block,
+            Operator::StructSet {
+                sig: self.repr.trie,
+                idx: 0,
+            },
+            &[trie, value],
+            &[],
+        );
+        Ok(block)
+    }
+
+    fn make_arguments(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        values: &BTreeMap<SValueId, LowerValue>,
+        args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
+    ) -> Result<Value, ConvertError> {
+        let values = args
+            .iter()
+            .map(|arg| {
+                if arg.is_spread {
+                    return Err(ConvertError::unsupported("spread argument", ()));
+                }
+                values
+                    .get(&arg.value)
+                    .ok_or_else(|| ConvertError::invalid("undefined call argument"))
+                    .and_then(|value| self.box_value(body, block, value))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(body.add_op(
+            block,
+            Operator::ArrayNewFixed {
+                sig: self.repr.arguments,
+                num: values.len(),
+            },
+            &values,
+            &[self.repr.arguments_ty()],
+        ))
+    }
+
+    fn make_plain_arguments(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        values: &BTreeMap<SValueId, LowerValue>,
+        args: &[SValueId],
+    ) -> Result<Value, ConvertError> {
+        let values = args
+            .iter()
+            .map(|arg| {
+                values
+                    .get(arg)
+                    .ok_or_else(|| ConvertError::invalid("undefined constructor argument"))
+                    .and_then(|value| self.box_value(body, block, value))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(body.add_op(
+            block,
+            Operator::ArrayNewFixed {
+                sig: self.repr.arguments,
+                num: values.len(),
+            },
+            &values,
+            &[self.repr.arguments_ty()],
+        ))
+    }
+
+    fn lower_call_parts(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        context: Value,
+        this: LowerValue,
+        values: &BTreeMap<SValueId, LowerValue>,
+        callee: &TCallee<SValueId>,
+        args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
+    ) -> Result<(Block, Value, Value, Value, Value), ConvertError> {
+        let mut block = block;
+        let (callee, receiver) = match callee {
+            TCallee::Val(value) => (
+                values
+                    .get(value)
+                    .cloned()
+                    .ok_or_else(|| ConvertError::invalid("undefined callee"))?,
+                self.undef(body, block),
+            ),
+            TCallee::Member { func, member } => {
+                let receiver = values
+                    .get(func)
+                    .ok_or_else(|| ConvertError::invalid("undefined member receiver"))?;
+                let key = self.key_of(
+                    values
+                        .get(member)
+                        .ok_or_else(|| ConvertError::invalid("undefined member key"))?,
+                )?;
+                let (next, callee) = self.get_property_value(body, block, receiver, &key)?;
+                block = next;
+                (callee, receiver.clone())
+            }
+            _ => return Err(ConvertError::unsupported(format!("callee {callee:?}"), ())),
+        };
+        let (captured_context, effective_this, code, _) =
+            self.callable_parts(body, block, &callee, receiver)?;
+        let array = self.make_arguments(body, block, values, args)?;
+        let _ = context;
+        let _ = this;
+        Ok((block, captured_context, effective_this, array, code))
+    }
+
+    fn callable_parts(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        callee: &LowerValue,
+        receiver: LowerValue,
+    ) -> Result<(Value, Value, Value, Value), ConvertError> {
+        let (callee, _) = callee.wasm()?;
+        let function = body.add_op(
+            block,
+            Operator::RefCast {
+                ty: self.repr.function_ty(),
+            },
+            &[callee],
+            &[self.repr.function_ty()],
+        );
+        let code = body.add_op(
+            block,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: 1,
+            },
+            &[function],
+            &[ref_sig(self.repr.adapter)],
+        );
+        let context = body.add_op(
+            block,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: 2,
+            },
+            &[function],
+            &[self.repr.object_ty()],
+        );
+        let captured_this = body.add_op(
+            block,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: 3,
+            },
+            &[function],
+            &[self.repr.value],
+        );
+        let arrow = body.add_op(
+            block,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: 4,
+            },
+            &[function],
+            &[Type::I32],
+        );
+        let receiver = self.box_value(body, block, &receiver)?;
+        let this = body.add_op(
+            block,
+            Operator::TypedSelect {
+                ty: self.repr.value,
+            },
+            &[captured_this, receiver, arrow],
+            &[self.repr.value],
+        );
+        Ok((context, this, code, arrow))
     }
 }

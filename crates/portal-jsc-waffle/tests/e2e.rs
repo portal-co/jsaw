@@ -1,7 +1,7 @@
 use portal_jsc_swc_cfg::module::CfgModule;
 use portal_jsc_swc_ssa::{SFunc, SValue, module::SModule};
 use portal_jsc_swc_tac::{Item, module::TModule};
-use portal_pc_waffle::{ExportKind, FuncDecl, Module, Operator, Type, ValueDef};
+use portal_pc_waffle::{ExportKind, FuncDecl, Module, Operator, Terminator, Type, ValueDef};
 use swc_common::{FileName, GLOBALS, Globals, SourceMap, sync::Lrc};
 use swc_ecma_ast::{EsVersion, Module as SwcModule, ModuleItem};
 use swc_ecma_parser::{EsSyntax, Syntax, parse_file_as_module, parse_file_as_script};
@@ -358,6 +358,14 @@ fn executes_object_mutation_shape_changes_and_polymorphic_paths() {
                 if (flag > 0) return 7;
                 return 3;
             }
+
+            export function shaped_dynamic() {
+                let object = { left: 2, right: 3 };
+                let key = 'left';
+                object[key] = 5;
+                object.extra = 7;
+                return object.left * 100 + object.right * 10 + object.extra;
+            }
         ",
     );
     validate(&module);
@@ -366,6 +374,7 @@ fn executes_object_mutation_shape_changes_and_polymorphic_paths() {
     assert_executes_in_all_runtimes(&module, "reshape", &[], 10.0);
     assert_executes_in_all_runtimes(&module, "polymorphic", &[1.0], 7.0);
     assert_executes_in_all_runtimes(&module, "polymorphic", &[0.0], 3.0);
+    assert_executes_in_all_runtimes(&module, "shaped_dynamic", &[], 537.0);
 
     let reference_tests = module
         .funcs
@@ -382,6 +391,19 @@ fn executes_object_mutation_shape_changes_and_polymorphic_paths() {
     assert!(
         reference_tests >= 2,
         "object lowering should refine anyref values with ref.test before ref.cast"
+    );
+    assert!(
+        module.funcs.entries().any(|(_, declaration)| {
+            matches!(
+                declaration,
+                FuncDecl::Body(_, name, body)
+                    if name.starts_with("js_shape_lookup_")
+                        && body.blocks.entries().any(|(_, block)| {
+                            matches!(block.terminator.terminator, Terminator::ReturnCall { .. })
+                        })
+            )
+        }),
+        "shape lookup should tail-call its in-shape trie fallback"
     );
 }
 
@@ -574,6 +596,26 @@ fn executes_utf8_strings_with_utf16_length() {
     validate(&module);
     assert_executes_in_all_runtimes(&module, "ascii_length", &[], 3.0);
     assert_executes_in_all_runtimes(&module, "unicode_length", &[], 3.0);
+}
+
+#[test]
+fn executes_utf8_string_concatenation_with_lazy_utf16_cache() {
+    let module = compile_module(
+        "
+            export function aliases() {
+                let left = 'ab';
+                let right = 'cd';
+                return (left + right).length;
+            }
+            export function astral() {
+                let value = 'a😀' + 'b';
+                return value.length + value[1].length + value[2].length;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "aliases", &[], 4.0);
+    assert_executes_in_all_runtimes(&module, "astral", &[], 6.0);
 }
 
 #[test]

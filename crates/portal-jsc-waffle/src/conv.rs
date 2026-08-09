@@ -9,12 +9,12 @@ use portal_jsc_swc_ssa::{
 };
 use portal_jsc_swc_tac::{Item, LId, PropKey, PropVal, TCallee, TTerm};
 use portal_pc_waffle::{
-    Block, BlockTarget, Export, ExportKind, Func, FuncDecl, FunctionBody, HeapType, Module,
+    Block, BlockTarget, EntityRef, Export, ExportKind, Func, FuncDecl, FunctionBody, HeapType, Module,
     Operator, SignatureData, Table, TableData, Terminator, Type, Value, WithNullable,
 };
 use swc_ecma_ast::{BinaryOp, Lit, UnaryOp};
 
-use crate::repr::{ConvertError, Repr, ref_sig};
+use crate::repr::{ConvertError, Repr, field, ref_sig};
 
 /// Convert jsaw-core SSA into a WasmGC module.
 ///
@@ -30,10 +30,14 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
         lowered: BTreeSet::new(),
         ref_table: None,
         string_equal: None,
+        string_concat: None,
         string_utf16: None,
         string_index: None,
         trie_clone: None,
+        shapes: Vec::new(),
+        property_helpers: None,
     };
+    converter.collect_shapes(root)?;
     converter.ensure_function(root)?;
     converter.lower_all()
 }
@@ -114,12 +118,16 @@ pub fn convert_module<'a, 'wasm>(
         lowered: BTreeSet::new(),
         ref_table: None,
         string_equal: None,
+        string_concat: None,
         string_utf16: None,
         string_index: None,
         trie_clone: None,
+        shapes: Vec::new(),
+        property_helpers: None,
     };
     let mut exports = Vec::with_capacity(exported.len());
     for export in exported {
+        converter.collect_shapes(export.function)?;
         exports.push((export.name, converter.ensure_function(export.function)?));
     }
     converter.lower_all()?;
@@ -197,6 +205,25 @@ struct FunctionInfo {
     native: Func,
     adapter: Func,
     arity: usize,
+}
+
+/// A fixed object layout selected from the statically-known property names of
+/// an object literal. Field zero is always the generic trie used for keys the
+/// shape does not own; subsequent fields mirror `keys` in sorted order.
+#[derive(Clone, Debug)]
+struct ShapeInfo {
+    keys: Vec<String>,
+    sig: portal_pc_waffle::Signature,
+    lookup: Option<Func>,
+    set: Option<Func>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PropertyHelpers {
+    lookup: Func,
+    trie_lookup: Func,
+    set: Func,
+    trie_set: Func,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -281,10 +308,9 @@ impl LowerValue {
                 value,
                 kind: ValueKind::Reference,
             },
-            Self::String { value, .. } => Self::Wasm {
-                value,
-                kind: ValueKind::Reference,
-            },
+            // Strings are immutable, so retaining their byte identity across
+            // an alias remains sound and lets `+` use the UTF-8 concat path.
+            value @ Self::String { .. } => value,
             value => value,
         }
     }
@@ -303,21 +329,97 @@ struct Converter<'a, 'module, 'wasm> {
     /// A declaration-only table makes every adapter legal as a `ref.func`
     /// target under Wasm's typed-function-reference validation rules.
     ref_table: Option<Table>,
-    /// Bytewise WTF-8 string equality used by the persistent dynamic property
-    /// store. It is generated only when a member lookup needs it.
+    /// Bytewise WTF-8 string equality used for shape-key checks and runtime
+    /// property lookup. It is generated only when a member lookup needs it.
     string_equal: Option<Func>,
+    /// UTF-8 byte-array concatenation. Its result intentionally starts with
+    /// no UTF-16 cache so existing indexing/length machinery owns caching.
+    string_concat: Option<Func>,
     /// Lazy UTF-16 cache initializer for string indexing and length.
     string_utf16: Option<Func>,
     /// Canonical JavaScript array-index parser for runtime string keys.
     string_index: Option<Func>,
     /// Temporary compatibility helper for static object-rest lowering.  The
-    /// dynamic property store supersedes this as its call sites are migrated.
+    /// helper copies generic fallback tries used by shape materialization.
     trie_clone: Option<Func>,
+    /// Every statically-known object-literal layout. These are registered
+    /// before lowering so generic dispatch can test the complete set.
+    shapes: Vec<ShapeInfo>,
+    /// The small deep module shared by static and computed property access.
+    property_helpers: Option<PropertyHelpers>,
 }
 
 impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     fn key(func: &SFunc) -> usize {
         func as *const SFunc as usize
+    }
+
+    /// Discover every layout whose key set is known without evaluating user
+    /// code. A computed key is deliberately left generic: its value may be
+    /// observable and the existing lowering already treats it as a runtime
+    /// property access.
+    fn collect_shapes(&mut self, func: &'a SFunc) -> Result<(), ConvertError> {
+        let mut visited = BTreeSet::new();
+        self.collect_shapes_from_function(func, &mut visited)
+    }
+
+    fn collect_shapes_from_function(
+        &mut self,
+        func: &'a SFunc,
+        visited: &mut BTreeSet<usize>,
+    ) -> Result<(), ConvertError> {
+        if !visited.insert(Self::key(func)) {
+            return Ok(());
+        }
+        for (_, value) in func.cfg.values.iter() {
+            let SValue::Item { item, .. } = &value.value else {
+                continue;
+            };
+            if let Item::Obj { members } = item {
+                let Some(keys) = members
+                    .iter()
+                    .map(|(key, _)| match key {
+                        PropKey::Lit(key) => Some(key.sym.to_string()),
+                        PropKey::Computed(_) => None,
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    continue;
+                };
+                self.register_shape(keys);
+            }
+            for nested in item.funcs() {
+                self.collect_shapes_from_function(nested, visited)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn register_shape(&mut self, mut keys: Vec<String>) {
+        keys.sort();
+        keys.dedup();
+        // An empty literal has no direct-field win; its generic trie remains
+        // the shallowest representation.
+        if keys.is_empty() || self.shapes.iter().any(|shape| shape.keys == keys) {
+            return;
+        }
+        let sig = self.module.signatures.push(SignatureData::Struct {
+            fields: std::iter::once(field(self.repr.trie_ty()))
+                .chain(keys.iter().map(|_| field(self.repr.value)))
+                .collect(),
+            shared: false,
+        });
+        self.shapes.push(ShapeInfo {
+            keys,
+            sig,
+            lookup: None,
+            set: None,
+        });
+    }
+
+    fn shape_index(&self, keys: &[String]) -> Option<usize> {
+        self.shapes.iter().position(|shape| shape.keys == keys)
     }
 
     fn ensure_function(&mut self, sfunc: &'a SFunc) -> Result<FunctionInfo, ConvertError> {
@@ -1408,7 +1510,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn binary(
-        &self,
+        &mut self,
         body: &mut FunctionBody,
         block: Block,
         left: &LowerValue,
@@ -1418,6 +1520,26 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     ) -> Result<LowerValue, ConvertError> {
         use BinaryOp::*;
         match op {
+            Add
+                if matches!(left, LowerValue::String { .. })
+                    && matches!(right, LowerValue::String { .. }) =>
+            {
+                let (left, _) = left.wasm()?;
+                let (right, _) = right.wasm()?;
+                let concat = self.ensure_string_concat()?;
+                let string = body.add_op(
+                    block,
+                    Operator::Call {
+                        function_index: concat,
+                    },
+                    &[left, right],
+                    &[self.repr.string_ty()],
+                );
+                Ok(LowerValue::Wasm {
+                    value: self.anyref(body, block, string),
+                    kind: ValueKind::Reference,
+                })
+            }
             Add => self.f64_binary(body, block, left, right, Operator::F64Add),
             Sub => self.f64_binary(body, block, left, right, Operator::F64Sub),
             Mul => self.f64_binary(body, block, left, right, Operator::F64Mul),
@@ -1780,6 +1902,17 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         ))
     }
 
+    fn anyref(&self, body: &mut FunctionBody, block: Block, value: Value) -> Value {
+        body.add_op(
+            block,
+            Operator::RefCast {
+                ty: self.repr.value,
+            },
+            &[value],
+            &[self.repr.value],
+        )
+    }
+
     fn new_trie(&self, body: &mut FunctionBody, block: Block) -> Result<Value, ConvertError> {
         Ok(body.add_op(
             block,
@@ -1955,6 +2088,16 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         block: Block,
     ) -> Result<LowerValue, ConvertError> {
         let trie = self.new_trie(body, block)?;
+        let root = self.anyref(body, block, trie);
+        self.new_object_with_root(body, block, root)
+    }
+
+    fn new_object_with_root(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        root: Value,
+    ) -> Result<LowerValue, ConvertError> {
         let elements = body.add_op(
             block,
             Operator::RefNull {
@@ -1974,13 +2117,40 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             Operator::StructNew {
                 sig: self.repr.object,
             },
-            &[trie, elements, properties],
+            &[root, elements, properties],
             &[self.repr.object_ty()],
         );
         Ok(LowerValue::Wasm {
             value: object,
             kind: ValueKind::Reference,
         })
+    }
+
+    fn new_shape(&self, body: &mut FunctionBody, block: Block, index: usize) -> Result<Value, ConvertError> {
+        let shape = self
+            .shapes
+            .get(index)
+            .ok_or_else(|| ConvertError::invalid("unknown generated object shape"))?;
+        let fallback = self.new_trie(body, block)?;
+        let mut fields = Vec::with_capacity(shape.keys.len() + 1);
+        fields.push(fallback);
+        for _ in &shape.keys {
+            fields.push(body.add_op(
+                block,
+                Operator::RefNull {
+                    ty: self.repr.value,
+                },
+                &[],
+                &[self.repr.value],
+            ));
+        }
+        let shape = body.add_op(
+            block,
+            Operator::StructNew { sig: shape.sig },
+            &fields,
+            &[ref_sig(shape.sig)],
+        );
+        Ok(self.anyref(body, block, shape))
     }
 
     /// Arrays are ordinary objects whose second header field carries the
@@ -1993,6 +2163,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         elements: Value,
     ) -> Result<Value, ConvertError> {
         let trie = self.new_trie(body, block)?;
+        let trie = self.anyref(body, block, trie);
         let properties = body.add_op(
             block,
             Operator::RefNull { ty: self.repr.value },
@@ -2053,6 +2224,83 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[bytes, cache],
             &[self.repr.string_ty()],
         ))
+    }
+
+    fn ensure_string_concat(&mut self) -> Result<Func, ConvertError> {
+        if let Some(function) = self.string_concat {
+            return Ok(function);
+        }
+        let signature = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.string_ty(), self.repr.string_ty()],
+            returns: vec![self.repr.string_ty()],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let left = body.blocks[entry].params[0].1;
+        let right = body.blocks[entry].params[1].1;
+        let left_bytes = body.add_op(
+            entry,
+            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            &[left],
+            &[self.repr.utf8_ty()],
+        );
+        let right_bytes = body.add_op(
+            entry,
+            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            &[right],
+            &[self.repr.utf8_ty()],
+        );
+        let left_len = body.add_op(entry, Operator::ArrayLen, &[left_bytes], &[Type::I32]);
+        let right_len = body.add_op(entry, Operator::ArrayLen, &[right_bytes], &[Type::I32]);
+        let total = body.add_op(entry, Operator::I32Add, &[left_len, right_len], &[Type::I32]);
+        let bytes = body.add_op(
+            entry,
+            Operator::ArrayNewDefault { sig: self.repr.utf8 },
+            &[total],
+            &[self.repr.utf8_ty()],
+        );
+        let zero = body.add_op(entry, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        body.add_op(
+            entry,
+            Operator::ArrayCopy {
+                dest: self.repr.utf8,
+                src: self.repr.utf8,
+            },
+            &[bytes, zero, left_bytes, zero, left_len],
+            &[],
+        );
+        body.add_op(
+            entry,
+            Operator::ArrayCopy {
+                dest: self.repr.utf8,
+                src: self.repr.utf8,
+            },
+            &[bytes, left_len, right_bytes, zero, right_len],
+            &[],
+        );
+        let cache = body.add_op(
+            entry,
+            Operator::RefNull {
+                ty: self.repr.utf16_ty(),
+            },
+            &[],
+            &[self.repr.utf16_ty()],
+        );
+        let string = body.add_op(
+            entry,
+            Operator::StructNew { sig: self.repr.string },
+            &[bytes, cache],
+            &[self.repr.string_ty()],
+        );
+        body.set_terminator(entry, Terminator::Return { values: vec![string] });
+        let function = self.module.funcs.push(FuncDecl::Body(
+            signature,
+            format!("js_string_concat_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.string_concat = Some(function);
+        Ok(function)
     }
 
     fn utf16_unit_from_wtf8(bytes: &[u8], target: u32) -> Option<u16> {
@@ -3740,6 +3988,670 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         Ok(function)
     }
 
+    /// Generate the complete property-dispatch module after shape discovery.
+    /// `lookup` and `set` accept an `anyref` root; their concrete trie
+    /// counterparts keep byte traversal small, while every shape hand-off is
+    /// a Wasm tail call.
+    fn ensure_property_helpers(&mut self) -> Result<PropertyHelpers, ConvertError> {
+        if let Some(helpers) = self.property_helpers {
+            return Ok(helpers);
+        }
+
+        let equal = self.ensure_string_equal()?;
+        let lookup_sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.value, self.repr.string_ty(), Type::I32],
+            returns: vec![self.repr.value],
+            shared: false,
+        });
+        let trie_lookup_sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.trie_ty(), self.repr.string_ty(), Type::I32],
+            returns: vec![self.repr.value],
+            shared: false,
+        });
+        let set_sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.value, self.repr.string_ty(), self.repr.value, Type::I32],
+            returns: vec![],
+            shared: false,
+        });
+        let trie_set_sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![
+                self.repr.trie_ty(),
+                self.repr.string_ty(),
+                self.repr.value,
+                Type::I32,
+            ],
+            returns: vec![],
+            shared: false,
+        });
+
+        // Allocate every declaration first: generic trie helpers and the
+        // shape helpers tail-call each other.
+        let lookup = self.module.funcs.push(FuncDecl::Body(
+            lookup_sig,
+            format!("js_property_lookup_{}", self.module.funcs.len()),
+            FunctionBody::new(self.module, lookup_sig),
+        ));
+        let trie_lookup = self.module.funcs.push(FuncDecl::Body(
+            trie_lookup_sig,
+            format!("js_property_trie_lookup_{}", self.module.funcs.len()),
+            FunctionBody::new(self.module, trie_lookup_sig),
+        ));
+        let set = self.module.funcs.push(FuncDecl::Body(
+            set_sig,
+            format!("js_property_set_{}", self.module.funcs.len()),
+            FunctionBody::new(self.module, set_sig),
+        ));
+        let trie_set = self.module.funcs.push(FuncDecl::Body(
+            trie_set_sig,
+            format!("js_property_trie_set_{}", self.module.funcs.len()),
+            FunctionBody::new(self.module, trie_set_sig),
+        ));
+        let helpers = PropertyHelpers {
+            lookup,
+            trie_lookup,
+            set,
+            trie_set,
+        };
+
+        for index in 0..self.shapes.len() {
+            let shape = self.shapes[index].clone();
+            let lookup_sig = self.module.signatures.push(SignatureData::Func {
+                params: vec![ref_sig(shape.sig), self.repr.string_ty(), Type::I32],
+                returns: vec![self.repr.value],
+                shared: false,
+            });
+            let set_sig = self.module.signatures.push(SignatureData::Func {
+                params: vec![
+                    ref_sig(shape.sig),
+                    self.repr.string_ty(),
+                    self.repr.value,
+                    Type::I32,
+                ],
+                returns: vec![],
+                shared: false,
+            });
+            let lookup_func = self.module.funcs.push(FuncDecl::Body(
+                lookup_sig,
+                format!("js_shape_lookup_{}", index),
+                FunctionBody::new(self.module, lookup_sig),
+            ));
+            let set_func = self.module.funcs.push(FuncDecl::Body(
+                set_sig,
+                format!("js_shape_set_{}", index),
+                FunctionBody::new(self.module, set_sig),
+            ));
+            self.shapes[index].lookup = Some(lookup_func);
+            self.shapes[index].set = Some(set_func);
+        }
+        self.property_helpers = Some(helpers);
+
+        for index in 0..self.shapes.len() {
+            let shape = self.shapes[index].clone();
+            self.emit_shape_lookup(index, &shape, helpers, equal)?;
+            self.emit_shape_set(index, &shape, helpers, equal)?;
+        }
+        self.emit_property_lookup(helpers)?;
+        self.emit_property_set(helpers)?;
+        self.emit_trie_lookup(helpers)?;
+        self.emit_trie_set(helpers)?;
+        Ok(helpers)
+    }
+
+    fn emit_shape_lookup(
+        &mut self,
+        index: usize,
+        shape: &ShapeInfo,
+        helpers: PropertyHelpers,
+        equal: Func,
+    ) -> Result<(), ConvertError> {
+        let function = shape
+            .lookup
+            .ok_or_else(|| ConvertError::invalid("shape lookup declaration missing"))?;
+        let signature = self.module.funcs[function].sig();
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let instance = body.blocks[entry].params[0].1;
+        let key = body.blocks[entry].params[1].1;
+        let offset = body.blocks[entry].params[2].1;
+        let mut current = entry;
+        for (field, name) in shape.keys.iter().enumerate() {
+            let candidate = self.new_string(&mut body, current, name.as_bytes())?;
+            let matches = body.add_op(
+                current,
+                Operator::Call {
+                    function_index: equal,
+                },
+                &[key, candidate],
+                &[Type::I32],
+            );
+            let found = body.add_block();
+            let next = body.add_block();
+            body.set_terminator(
+                current,
+                Terminator::CondBr {
+                    cond: matches,
+                    if_true: BlockTarget { block: found, args: vec![] },
+                    if_false: BlockTarget { block: next, args: vec![] },
+                },
+            );
+            let value = body.add_op(
+                found,
+                Operator::StructGet {
+                    sig: shape.sig,
+                    idx: field + 1,
+                },
+                &[instance],
+                &[self.repr.value],
+            );
+            body.set_terminator(found, Terminator::Return { values: vec![value] });
+            current = next;
+        }
+        let fallback = body.add_op(
+            current,
+            Operator::StructGet { sig: shape.sig, idx: 0 },
+            &[instance],
+            &[self.repr.trie_ty()],
+        );
+        body.set_terminator(
+            current,
+            Terminator::ReturnCall {
+                func: helpers.trie_lookup,
+                args: vec![fallback, key, offset],
+            },
+        );
+        self.module.funcs[function] = FuncDecl::Body(
+            signature,
+            format!("js_shape_lookup_{index}"),
+            body,
+        );
+        Ok(())
+    }
+
+    fn emit_shape_set(
+        &mut self,
+        index: usize,
+        shape: &ShapeInfo,
+        helpers: PropertyHelpers,
+        equal: Func,
+    ) -> Result<(), ConvertError> {
+        let function = shape
+            .set
+            .ok_or_else(|| ConvertError::invalid("shape setter declaration missing"))?;
+        let signature = self.module.funcs[function].sig();
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let instance = body.blocks[entry].params[0].1;
+        let key = body.blocks[entry].params[1].1;
+        let value = body.blocks[entry].params[2].1;
+        let offset = body.blocks[entry].params[3].1;
+        let mut current = entry;
+        for (field, name) in shape.keys.iter().enumerate() {
+            let candidate = self.new_string(&mut body, current, name.as_bytes())?;
+            let matches = body.add_op(
+                current,
+                Operator::Call {
+                    function_index: equal,
+                },
+                &[key, candidate],
+                &[Type::I32],
+            );
+            let found = body.add_block();
+            let next = body.add_block();
+            body.set_terminator(
+                current,
+                Terminator::CondBr {
+                    cond: matches,
+                    if_true: BlockTarget { block: found, args: vec![] },
+                    if_false: BlockTarget { block: next, args: vec![] },
+                },
+            );
+            body.add_op(
+                found,
+                Operator::StructSet {
+                    sig: shape.sig,
+                    idx: field + 1,
+                },
+                &[instance, value],
+                &[],
+            );
+            body.set_terminator(found, Terminator::Return { values: vec![] });
+            current = next;
+        }
+        let fallback = body.add_op(
+            current,
+            Operator::StructGet { sig: shape.sig, idx: 0 },
+            &[instance],
+            &[self.repr.trie_ty()],
+        );
+        body.set_terminator(
+            current,
+            Terminator::ReturnCall {
+                func: helpers.trie_set,
+                args: vec![fallback, key, value, offset],
+            },
+        );
+        self.module.funcs[function] = FuncDecl::Body(
+            signature,
+            format!("js_shape_set_{index}"),
+            body,
+        );
+        Ok(())
+    }
+
+    fn emit_property_lookup(&mut self, helpers: PropertyHelpers) -> Result<(), ConvertError> {
+        let signature = self.module.funcs[helpers.lookup].sig();
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let root = body.blocks[entry].params[0].1;
+        let key = body.blocks[entry].params[1].1;
+        let offset = body.blocks[entry].params[2].1;
+        let mut current = entry;
+        for shape in &self.shapes {
+            let matches = body.add_op(
+                current,
+                Operator::RefTest {
+                    ty: ref_sig(shape.sig),
+                },
+                &[root],
+                &[Type::I32],
+            );
+            let found = body.add_block();
+            let next = body.add_block();
+            body.set_terminator(
+                current,
+                Terminator::CondBr {
+                    cond: matches,
+                    if_true: BlockTarget { block: found, args: vec![] },
+                    if_false: BlockTarget { block: next, args: vec![] },
+                },
+            );
+            let shape_value = body.add_op(
+                found,
+                Operator::RefCast { ty: ref_sig(shape.sig) },
+                &[root],
+                &[ref_sig(shape.sig)],
+            );
+            body.set_terminator(
+                found,
+                Terminator::ReturnCall {
+                    func: shape.lookup.ok_or_else(|| ConvertError::invalid("shape lookup missing"))?,
+                    args: vec![shape_value, key, offset],
+                },
+            );
+            current = next;
+        }
+        let trie = body.add_op(
+            current,
+            Operator::RefCast {
+                ty: self.repr.trie_ty(),
+            },
+            &[root],
+            &[self.repr.trie_ty()],
+        );
+        body.set_terminator(
+            current,
+            Terminator::ReturnCall {
+                func: helpers.trie_lookup,
+                args: vec![trie, key, offset],
+            },
+        );
+        self.module.funcs[helpers.lookup] = FuncDecl::Body(
+            signature,
+            format!("js_property_lookup_{}", helpers.lookup.index()),
+            body,
+        );
+        Ok(())
+    }
+
+    fn emit_property_set(&mut self, helpers: PropertyHelpers) -> Result<(), ConvertError> {
+        let signature = self.module.funcs[helpers.set].sig();
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let root = body.blocks[entry].params[0].1;
+        let key = body.blocks[entry].params[1].1;
+        let value = body.blocks[entry].params[2].1;
+        let offset = body.blocks[entry].params[3].1;
+        let mut current = entry;
+        for shape in &self.shapes {
+            let matches = body.add_op(
+                current,
+                Operator::RefTest {
+                    ty: ref_sig(shape.sig),
+                },
+                &[root],
+                &[Type::I32],
+            );
+            let found = body.add_block();
+            let next = body.add_block();
+            body.set_terminator(
+                current,
+                Terminator::CondBr {
+                    cond: matches,
+                    if_true: BlockTarget { block: found, args: vec![] },
+                    if_false: BlockTarget { block: next, args: vec![] },
+                },
+            );
+            let shape_value = body.add_op(
+                found,
+                Operator::RefCast { ty: ref_sig(shape.sig) },
+                &[root],
+                &[ref_sig(shape.sig)],
+            );
+            body.set_terminator(
+                found,
+                Terminator::ReturnCall {
+                    func: shape.set.ok_or_else(|| ConvertError::invalid("shape setter missing"))?,
+                    args: vec![shape_value, key, value, offset],
+                },
+            );
+            current = next;
+        }
+        let trie = body.add_op(
+            current,
+            Operator::RefCast {
+                ty: self.repr.trie_ty(),
+            },
+            &[root],
+            &[self.repr.trie_ty()],
+        );
+        body.set_terminator(
+            current,
+            Terminator::ReturnCall {
+                func: helpers.trie_set,
+                args: vec![trie, key, value, offset],
+            },
+        );
+        self.module.funcs[helpers.set] = FuncDecl::Body(
+            signature,
+            format!("js_property_set_{}", helpers.set.index()),
+            body,
+        );
+        Ok(())
+    }
+
+    fn emit_trie_lookup(&mut self, helpers: PropertyHelpers) -> Result<(), ConvertError> {
+        let signature = self.module.funcs[helpers.trie_lookup].sig();
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let trie = body.blocks[entry].params[0].1;
+        let key = body.blocks[entry].params[1].1;
+        let offset = body.blocks[entry].params[2].1;
+        let bytes = body.add_op(
+            entry,
+            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            &[key],
+            &[self.repr.utf8_ty()],
+        );
+        let length = body.add_op(entry, Operator::ArrayLen, &[bytes], &[Type::I32]);
+        let complete = body.add_op(entry, Operator::I32GeU, &[offset, length], &[Type::I32]);
+        let terminal = body.add_block();
+        let step = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: complete,
+                if_true: BlockTarget { block: terminal, args: vec![] },
+                if_false: BlockTarget { block: step, args: vec![] },
+            },
+        );
+        let result = body.add_op(
+            terminal,
+            Operator::StructGet { sig: self.repr.trie, idx: 0 },
+            &[trie],
+            &[self.repr.value],
+        );
+        body.set_terminator(terminal, Terminator::Return { values: vec![result] });
+        let byte = body.add_op(
+            step,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, offset],
+            &[Type::I32],
+        );
+        let one = body.add_op(step, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        let next_offset = body.add_op(step, Operator::I32Add, &[offset, one], &[Type::I32]);
+        self.emit_trie_lookup_byte_chain(&mut body, step, trie, key, next_offset, byte, helpers);
+        self.module.funcs[helpers.trie_lookup] = FuncDecl::Body(
+            signature,
+            format!("js_property_trie_lookup_{}", helpers.trie_lookup.index()),
+            body,
+        );
+        Ok(())
+    }
+
+    fn emit_trie_lookup_byte_chain(
+        &self,
+        body: &mut FunctionBody,
+        start: Block,
+        trie: Value,
+        key: Value,
+        next_offset: Value,
+        byte: Value,
+        helpers: PropertyHelpers,
+    ) {
+        let mut current = start;
+        for raw in 0..=u8::MAX {
+            let selected = if raw == u8::MAX {
+                current
+            } else {
+                let candidate = body.add_op(
+                    current,
+                    Operator::I32Const {
+                        value: u32::from(raw),
+                    },
+                    &[],
+                    &[Type::I32],
+                );
+                let matches = body.add_op(
+                    current,
+                    Operator::I32Eq,
+                    &[byte, candidate],
+                    &[Type::I32],
+                );
+                let selected = body.add_block();
+                let next = body.add_block();
+                body.set_terminator(
+                    current,
+                    Terminator::CondBr {
+                        cond: matches,
+                        if_true: BlockTarget { block: selected, args: vec![] },
+                        if_false: BlockTarget { block: next, args: vec![] },
+                    },
+                );
+                current = next;
+                selected
+            };
+            let child = body.add_op(
+                selected,
+                Operator::StructGet {
+                    sig: self.repr.trie,
+                    idx: usize::from(raw) + 1,
+                },
+                &[trie],
+                &[self.repr.value],
+            );
+            let missing = body.add_op(selected, Operator::RefIsNull, &[child], &[Type::I32]);
+            let absent = body.add_block();
+            let present = body.add_block();
+            body.set_terminator(
+                selected,
+                Terminator::CondBr {
+                    cond: missing,
+                    if_true: BlockTarget { block: absent, args: vec![] },
+                    if_false: BlockTarget { block: present, args: vec![] },
+                },
+            );
+            let undef = body.add_op(
+                absent,
+                Operator::RefNull { ty: self.repr.value },
+                &[],
+                &[self.repr.value],
+            );
+            body.set_terminator(absent, Terminator::Return { values: vec![undef] });
+            body.set_terminator(
+                present,
+                Terminator::ReturnCall {
+                    func: helpers.lookup,
+                    args: vec![child, key, next_offset],
+                },
+            );
+        }
+    }
+
+    fn emit_trie_set(&mut self, helpers: PropertyHelpers) -> Result<(), ConvertError> {
+        let signature = self.module.funcs[helpers.trie_set].sig();
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let trie = body.blocks[entry].params[0].1;
+        let key = body.blocks[entry].params[1].1;
+        let value = body.blocks[entry].params[2].1;
+        let offset = body.blocks[entry].params[3].1;
+        let bytes = body.add_op(
+            entry,
+            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            &[key],
+            &[self.repr.utf8_ty()],
+        );
+        let length = body.add_op(entry, Operator::ArrayLen, &[bytes], &[Type::I32]);
+        let complete = body.add_op(entry, Operator::I32GeU, &[offset, length], &[Type::I32]);
+        let terminal = body.add_block();
+        let step = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: complete,
+                if_true: BlockTarget { block: terminal, args: vec![] },
+                if_false: BlockTarget { block: step, args: vec![] },
+            },
+        );
+        body.add_op(
+            terminal,
+            Operator::StructSet { sig: self.repr.trie, idx: 0 },
+            &[trie, value],
+            &[],
+        );
+        body.set_terminator(terminal, Terminator::Return { values: vec![] });
+        let byte = body.add_op(
+            step,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, offset],
+            &[Type::I32],
+        );
+        let one = body.add_op(step, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        let next_offset = body.add_op(step, Operator::I32Add, &[offset, one], &[Type::I32]);
+        self.emit_trie_set_byte_chain(
+            &mut body,
+            step,
+            trie,
+            key,
+            value,
+            next_offset,
+            byte,
+            helpers,
+        );
+        self.module.funcs[helpers.trie_set] = FuncDecl::Body(
+            signature,
+            format!("js_property_trie_set_{}", helpers.trie_set.index()),
+            body,
+        );
+        Ok(())
+    }
+
+    fn emit_trie_set_byte_chain(
+        &self,
+        body: &mut FunctionBody,
+        start: Block,
+        trie: Value,
+        key: Value,
+        value: Value,
+        next_offset: Value,
+        byte: Value,
+        helpers: PropertyHelpers,
+    ) {
+        let mut current = start;
+        for raw in 0..=u8::MAX {
+            let selected = if raw == u8::MAX {
+                current
+            } else {
+                let candidate = body.add_op(
+                    current,
+                    Operator::I32Const {
+                        value: u32::from(raw),
+                    },
+                    &[],
+                    &[Type::I32],
+                );
+                let matches = body.add_op(
+                    current,
+                    Operator::I32Eq,
+                    &[byte, candidate],
+                    &[Type::I32],
+                );
+                let selected = body.add_block();
+                let next = body.add_block();
+                body.set_terminator(
+                    current,
+                    Terminator::CondBr {
+                        cond: matches,
+                        if_true: BlockTarget { block: selected, args: vec![] },
+                        if_false: BlockTarget { block: next, args: vec![] },
+                    },
+                );
+                current = next;
+                selected
+            };
+            let child = body.add_op(
+                selected,
+                Operator::StructGet {
+                    sig: self.repr.trie,
+                    idx: usize::from(raw) + 1,
+                },
+                &[trie],
+                &[self.repr.value],
+            );
+            let missing = body.add_op(selected, Operator::RefIsNull, &[child], &[Type::I32]);
+            let allocate = body.add_block();
+            let present = body.add_block();
+            body.set_terminator(
+                selected,
+                Terminator::CondBr {
+                    cond: missing,
+                    if_true: BlockTarget { block: allocate, args: vec![] },
+                    if_false: BlockTarget { block: present, args: vec![] },
+                },
+            );
+            let allocated = body.add_op(
+                allocate,
+                Operator::StructNewDefault { sig: self.repr.trie },
+                &[],
+                &[self.repr.trie_ty()],
+            );
+            let allocated_ref = self.anyref(body, allocate, allocated);
+            body.add_op(
+                allocate,
+                Operator::StructSet {
+                    sig: self.repr.trie,
+                    idx: usize::from(raw) + 1,
+                },
+                &[trie, allocated_ref],
+                &[],
+            );
+            body.set_terminator(
+                allocate,
+                Terminator::ReturnCall {
+                    func: helpers.set,
+                    args: vec![allocated_ref, key, value, next_offset],
+                },
+            );
+            body.set_terminator(
+                present,
+                Terminator::ReturnCall {
+                    func: helpers.set,
+                    args: vec![child, key, value, next_offset],
+                },
+            );
+        }
+    }
+
     fn function_object(
         &mut self,
         body: &mut FunctionBody,
@@ -3794,6 +4706,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[Type::I32],
         );
         let captured_this = self.box_value(body, block, &this)?;
+        let trie = self.anyref(body, block, trie);
         let value = body.add_op(
             block,
             Operator::StructNew {
@@ -3818,7 +4731,27 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         members: &'a [(PropKey<SValueId>, PropVal<SValueId, SFunc>)],
         span: &impl std::fmt::Debug,
     ) -> Result<LowerValue, ConvertError> {
-        let object = self.new_object(body, *block)?;
+        let shape = members
+            .iter()
+            .map(|(key, _)| match key {
+                PropKey::Lit(key) => Some(key.sym.to_string()),
+                PropKey::Computed(_) => None,
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|mut keys| {
+                keys.sort();
+                keys.dedup();
+                keys
+            })
+            .and_then(|keys| self.shape_index(&keys));
+        let object = match shape {
+            Some(shape) => {
+                let root = self.new_shape(body, *block, shape)?;
+                self.new_object_with_root(body, *block, root)?
+            }
+            None => self.new_object(body, *block)?,
+        };
         for (key, property) in members {
             let key = match key {
                 PropKey::Lit(key) => key.sym.to_string(),
@@ -3871,7 +4804,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         (value != u32::MAX).then_some(value)
     }
 
-    fn object_and_trie(
+    fn object_and_root(
         &self,
         body: &mut FunctionBody,
         block: Block,
@@ -3880,10 +4813,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let (object, kind) = object.wasm()?;
         if kind != ValueKind::Reference {
             // JavaScript permits property stores on primitives (they are
-            // discarded).  Give that path an unaliased trie so the ordinary
-            // store lowering can run without accidentally mutating an object
-            // continuation.
-            return Ok((block, self.new_trie(body, block)?));
+            // discarded). Give that path an unaliased generic root so the
+            // ordinary store lowering cannot mutate an object continuation.
+            let trie = self.new_trie(body, block)?;
+            return Ok((block, self.anyref(body, block, trie)));
         }
         let is_function = body.add_op(
             block,
@@ -3898,7 +4831,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let plain = body.add_block();
         let primitive = body.add_block();
         let join = body.add_block();
-        let trie = body.add_blockparam(join, self.repr.trie_ty());
+        let root = body.add_blockparam(join, self.repr.value);
         body.set_terminator(
             block,
             Terminator::CondBr {
@@ -3921,21 +4854,21 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[object],
             &[self.repr.function_ty()],
         );
-        let function_trie = body.add_op(
+        let function_root = body.add_op(
             function,
             Operator::StructGet {
                 sig: self.repr.function,
                 idx: 0,
             },
             &[function_value],
-            &[self.repr.trie_ty()],
+            &[self.repr.value],
         );
         body.set_terminator(
             function,
             Terminator::Br {
                 target: BlockTarget {
                     block: join,
-                    args: vec![function_trie],
+                    args: vec![function_root],
                 },
             },
         );
@@ -3969,35 +4902,36 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[object],
             &[self.repr.object_ty()],
         );
-        let object_trie = body.add_op(
+        let object_root = body.add_op(
             plain,
             Operator::StructGet {
                 sig: self.repr.object,
                 idx: 0,
             },
             &[object_value],
-            &[self.repr.trie_ty()],
+            &[self.repr.value],
         );
         body.set_terminator(
             plain,
             Terminator::Br {
                 target: BlockTarget {
                     block: join,
-                    args: vec![object_trie],
+                    args: vec![object_root],
                 },
             },
         );
         let primitive_trie = self.new_trie(body, primitive)?;
+        let primitive_root = self.anyref(body, primitive, primitive_trie);
         body.set_terminator(
             primitive,
             Terminator::Br {
                 target: BlockTarget {
                     block: join,
-                    args: vec![primitive_trie],
+                    args: vec![primitive_root],
                 },
             },
         );
-        Ok((join, trie))
+        Ok((join, root))
     }
 
     fn get_property(
@@ -4757,162 +5691,24 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         object: &LowerValue,
         key: Value,
     ) -> Result<(Block, LowerValue), ConvertError> {
-        let (object, kind) = object.wasm()?;
-        if kind != ValueKind::Reference {
-            return Ok((block, self.undef(body, block)));
-        }
-        let equal = self.ensure_string_equal()?;
-        let is_function = body.add_op(
+        let (block, root) = self.object_and_root(body, block, object)?;
+        let helpers = self.ensure_property_helpers()?;
+        let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let value = body.add_op(
             block,
-            Operator::RefTest { ty: self.repr.function_ty() },
-            &[object],
-            &[Type::I32],
+            Operator::Call {
+                function_index: helpers.lookup,
+            },
+            &[root, key, zero],
+            &[self.repr.value],
         );
-        let function = body.add_block();
-        let non_function = body.add_block();
-        let head_join = body.add_block();
-        let head = body.add_blockparam(head_join, self.repr.value);
-        let missing = body.add_block();
-        body.set_terminator(
+        Ok((
             block,
-            Terminator::CondBr {
-                cond: is_function,
-                if_true: BlockTarget { block: function, args: vec![] },
-                if_false: BlockTarget { block: non_function, args: vec![] },
+            LowerValue::Wasm {
+                value,
+                kind: ValueKind::Reference,
             },
-        );
-        let function_value = body.add_op(
-            function,
-            Operator::RefCast { ty: self.repr.function_ty() },
-            &[object],
-            &[self.repr.function_ty()],
-        );
-        let function_head = body.add_op(
-            function,
-            Operator::StructGet { sig: self.repr.function, idx: 2 },
-            &[function_value],
-            &[self.repr.value],
-        );
-        body.set_terminator(
-            function,
-            Terminator::Br {
-                target: BlockTarget { block: head_join, args: vec![function_head] },
-            },
-        );
-        let is_object = body.add_op(
-            non_function,
-            Operator::RefTest { ty: self.repr.object_ty() },
-            &[object],
-            &[Type::I32],
-        );
-        let plain = body.add_block();
-        body.set_terminator(
-            non_function,
-            Terminator::CondBr {
-                cond: is_object,
-                if_true: BlockTarget { block: plain, args: vec![] },
-                if_false: BlockTarget { block: missing, args: vec![] },
-            },
-        );
-        let plain_value = body.add_op(
-            plain,
-            Operator::RefCast { ty: self.repr.object_ty() },
-            &[object],
-            &[self.repr.object_ty()],
-        );
-        let plain_head = body.add_op(
-            plain,
-            Operator::StructGet { sig: self.repr.object, idx: 2 },
-            &[plain_value],
-            &[self.repr.value],
-        );
-        body.set_terminator(
-            plain,
-            Terminator::Br {
-                target: BlockTarget { block: head_join, args: vec![plain_head] },
-            },
-        );
-        let scan = body.add_block();
-        let current = body.add_blockparam(scan, self.repr.value);
-        body.set_terminator(
-            head_join,
-            Terminator::Br {
-                target: BlockTarget { block: scan, args: vec![head] },
-            },
-        );
-        let absent = body.add_op(scan, Operator::RefIsNull, &[current], &[Type::I32]);
-        let entry = body.add_block();
-        body.set_terminator(
-            scan,
-            Terminator::CondBr {
-                cond: absent,
-                if_true: BlockTarget { block: missing, args: vec![] },
-                if_false: BlockTarget { block: entry, args: vec![] },
-            },
-        );
-        let entry_value = body.add_op(
-            entry,
-            Operator::RefCast { ty: self.repr.property_ty() },
-            &[current],
-            &[self.repr.property_ty()],
-        );
-        let entry_key = body.add_op(
-            entry,
-            Operator::StructGet { sig: self.repr.property, idx: 0 },
-            &[entry_value],
-            &[self.repr.string_ty()],
-        );
-        let matches = body.add_op(
-            entry,
-            Operator::Call { function_index: equal },
-            &[key, entry_key],
-            &[Type::I32],
-        );
-        let found = body.add_block();
-        let next = body.add_block();
-        body.set_terminator(
-            entry,
-            Terminator::CondBr {
-                cond: matches,
-                if_true: BlockTarget { block: found, args: vec![] },
-                if_false: BlockTarget { block: next, args: vec![] },
-            },
-        );
-        let result_join = body.add_block();
-        let result = body.add_blockparam(result_join, self.repr.value);
-        let found_value = body.add_op(
-            found,
-            Operator::StructGet { sig: self.repr.property, idx: 1 },
-            &[entry_value],
-            &[self.repr.value],
-        );
-        body.set_terminator(
-            found,
-            Terminator::Br {
-                target: BlockTarget { block: result_join, args: vec![found_value] },
-            },
-        );
-        let next_link = body.add_op(
-            next,
-            Operator::StructGet { sig: self.repr.property, idx: 2 },
-            &[entry_value],
-            &[self.repr.value],
-        );
-        body.set_terminator(
-            next,
-            Terminator::Br {
-                target: BlockTarget { block: scan, args: vec![next_link] },
-            },
-        );
-        let undef = self.undef(body, missing);
-        let undef = self.box_value(body, missing, &undef)?;
-        body.set_terminator(
-            missing,
-            Terminator::Br {
-                target: BlockTarget { block: result_join, args: vec![undef] },
-            },
-        );
-        Ok((result_join, LowerValue::Wasm { value: result, kind: ValueKind::Reference }))
+        ))
     }
 
     fn set_string_member(
@@ -5087,113 +5883,26 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn set_dynamic_property(
-        &self,
+        &mut self,
         body: &mut FunctionBody,
         block: Block,
         object: &LowerValue,
         key: Value,
         value: &LowerValue,
     ) -> Result<Block, ConvertError> {
-        let (object, kind) = object.wasm()?;
-        if kind != ValueKind::Reference {
-            return Ok(block);
-        }
+        let (block, root) = self.object_and_root(body, block, object)?;
         let boxed_value = self.box_value(body, block, value)?;
-        let is_function = body.add_op(
-            block,
-            Operator::RefTest { ty: self.repr.function_ty() },
-            &[object],
-            &[Type::I32],
-        );
-        let function = body.add_block();
-        let non_function = body.add_block();
-        let done = body.add_block();
-        body.set_terminator(
-            block,
-            Terminator::CondBr {
-                cond: is_function,
-                if_true: BlockTarget { block: function, args: vec![] },
-                if_false: BlockTarget { block: non_function, args: vec![] },
-            },
-        );
-        let function_value = body.add_op(
-            function,
-            Operator::RefCast { ty: self.repr.function_ty() },
-            &[object],
-            &[self.repr.function_ty()],
-        );
-        let function_head = body.add_op(
-            function,
-            Operator::StructGet { sig: self.repr.function, idx: 2 },
-            &[function_value],
-            &[self.repr.value],
-        );
-        let function_entry = body.add_op(
-            function,
-            Operator::StructNew { sig: self.repr.property },
-            &[key, boxed_value, function_head],
-            &[self.repr.property_ty()],
-        );
-        let function_entry = body.add_op(
-            function,
-            Operator::RefCast { ty: self.repr.value },
-            &[function_entry],
-            &[self.repr.value],
-        );
+        let helpers = self.ensure_property_helpers()?;
+        let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
         body.add_op(
-            function,
-            Operator::StructSet { sig: self.repr.function, idx: 2 },
-            &[function_value, function_entry],
+            block,
+            Operator::Call {
+                function_index: helpers.set,
+            },
+            &[root, key, boxed_value, zero],
             &[],
         );
-        body.set_terminator(function, Terminator::Br { target: BlockTarget { block: done, args: vec![] } });
-        let is_object = body.add_op(
-            non_function,
-            Operator::RefTest { ty: self.repr.object_ty() },
-            &[object],
-            &[Type::I32],
-        );
-        let plain = body.add_block();
-        body.set_terminator(
-            non_function,
-            Terminator::CondBr {
-                cond: is_object,
-                if_true: BlockTarget { block: plain, args: vec![] },
-                if_false: BlockTarget { block: done, args: vec![] },
-            },
-        );
-        let plain_value = body.add_op(
-            plain,
-            Operator::RefCast { ty: self.repr.object_ty() },
-            &[object],
-            &[self.repr.object_ty()],
-        );
-        let plain_head = body.add_op(
-            plain,
-            Operator::StructGet { sig: self.repr.object, idx: 2 },
-            &[plain_value],
-            &[self.repr.value],
-        );
-        let plain_entry = body.add_op(
-            plain,
-            Operator::StructNew { sig: self.repr.property },
-            &[key, boxed_value, plain_head],
-            &[self.repr.property_ty()],
-        );
-        let plain_entry = body.add_op(
-            plain,
-            Operator::RefCast { ty: self.repr.value },
-            &[plain_entry],
-            &[self.repr.value],
-        );
-        body.add_op(
-            plain,
-            Operator::StructSet { sig: self.repr.object, idx: 2 },
-            &[plain_value, plain_entry],
-            &[],
-        );
-        body.set_terminator(plain, Terminator::Br { target: BlockTarget { block: done, args: vec![] } });
-        Ok(done)
+        Ok(block)
     }
 
     fn set_numeric_member(
@@ -5408,12 +6117,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         wrapped: &LowerValue,
         keys: &[PropKey<SValueId>],
     ) -> Result<(Block, LowerValue), ConvertError> {
-        // Object-rest must be independent from its source.  The object
-        // representation has no key enumeration table, so clone the complete
-        // trie (including keys that are unknown to this lowering site) before
-        // clearing the statically excluded keys.
-        let (mut block, trie) = self.object_and_trie(body, block, wrapped)?;
-        let trie = self.clone_trie(body, block, trie)?;
+        // Object-rest must be independent from its source. Materialize shape
+        // fields into a generic trie, clone its unknown-key fallback, then
+        // clear the statically excluded names from that private copy.
+        let (mut block, root) = self.object_and_root(body, block, wrapped)?;
+        let (next, trie) = self.clone_property_root(body, block, root)?;
+        block = next;
         for key in keys {
             let key = match key {
                 PropKey::Lit(key) => key.sym.to_string(),
@@ -5426,6 +6135,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             };
             block = self.clear_property(body, block, trie, &key)?;
         }
+        let generic_root = self.anyref(body, block, trie);
         let elements = body.add_op(
             block,
             Operator::RefNull { ty: self.repr.arguments_ty() },
@@ -5443,7 +6153,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             Operator::StructNew {
                 sig: self.repr.object,
             },
-            &[trie, elements, properties],
+            &[generic_root, elements, properties],
             &[self.repr.object_ty()],
         );
         Ok((
@@ -5453,6 +6163,108 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 kind: ValueKind::Reference,
             },
         ))
+    }
+
+    fn clone_property_root(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        root: Value,
+    ) -> Result<(Block, Value), ConvertError> {
+        let helpers = self.ensure_property_helpers()?;
+        let done = body.add_block();
+        let result = body.add_blockparam(done, self.repr.trie_ty());
+        let mut current = block;
+        for shape in self.shapes.clone() {
+            let matches = body.add_op(
+                current,
+                Operator::RefTest {
+                    ty: ref_sig(shape.sig),
+                },
+                &[root],
+                &[Type::I32],
+            );
+            let matched = body.add_block();
+            let next = body.add_block();
+            body.set_terminator(
+                current,
+                Terminator::CondBr {
+                    cond: matches,
+                    if_true: BlockTarget { block: matched, args: vec![] },
+                    if_false: BlockTarget { block: next, args: vec![] },
+                },
+            );
+            let instance = body.add_op(
+                matched,
+                Operator::RefCast { ty: ref_sig(shape.sig) },
+                &[root],
+                &[ref_sig(shape.sig)],
+            );
+            let fallback = body.add_op(
+                matched,
+                Operator::StructGet { sig: shape.sig, idx: 0 },
+                &[instance],
+                &[self.repr.trie_ty()],
+            );
+            let copied_block = matched;
+            let copied = self.clone_trie(body, copied_block, fallback)?;
+            let copied_root = self.anyref(body, copied_block, copied);
+            for (field, name) in shape.keys.iter().enumerate() {
+                let value = body.add_op(
+                    copied_block,
+                    Operator::StructGet {
+                        sig: shape.sig,
+                        idx: field + 1,
+                    },
+                    &[instance],
+                    &[self.repr.value],
+                );
+                let key = self.new_string(body, copied_block, name.as_bytes())?;
+                let zero = body.add_op(
+                    copied_block,
+                    Operator::I32Const { value: 0 },
+                    &[],
+                    &[Type::I32],
+                );
+                body.add_op(
+                    copied_block,
+                    Operator::Call {
+                        function_index: helpers.set,
+                    },
+                    &[copied_root, key, value, zero],
+                    &[],
+                );
+            }
+            body.set_terminator(
+                copied_block,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: done,
+                        args: vec![copied],
+                    },
+                },
+            );
+            current = next;
+        }
+        let trie = body.add_op(
+            current,
+            Operator::RefCast {
+                ty: self.repr.trie_ty(),
+            },
+            &[root],
+            &[self.repr.trie_ty()],
+        );
+        let copied = self.clone_trie(body, current, trie)?;
+        body.set_terminator(
+            current,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: done,
+                    args: vec![copied],
+                },
+            },
+        );
+        Ok((done, result))
     }
 
     fn clear_property(
@@ -5529,90 +6341,28 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn get_object_property_value(
-        &self,
+        &mut self,
         body: &mut FunctionBody,
-        mut block: Block,
+        block: Block,
         object: &LowerValue,
         key: &str,
     ) -> Result<(Block, LowerValue), ConvertError> {
-        let (next, mut trie) = self.object_and_trie(body, block, object)?;
-        block = next;
-        // Every trie edge is an `anyref`.  A missing key therefore must
-        // branch before a `ref.cast`/`struct.get`; otherwise an ordinary
-        // unresolved identifier used as a static member key traps while we
-        // evaluate its inert context lookup.
-        let missing = body.add_block();
-        let join = body.add_block();
-        let result = body.add_blockparam(join, self.repr.value);
-        for byte in key.as_bytes() {
-            let child = body.add_op(
-                block,
-                Operator::StructGet {
-                    sig: self.repr.trie,
-                    idx: usize::from(*byte) + 1,
-                },
-                &[trie],
-                &[self.repr.value],
-            );
-            let is_missing = body.add_op(block, Operator::RefIsNull, &[child], &[Type::I32]);
-            let present = body.add_block();
-            body.set_terminator(
-                block,
-                Terminator::CondBr {
-                    cond: is_missing,
-                    if_true: BlockTarget {
-                        block: missing,
-                        args: vec![],
-                    },
-                    if_false: BlockTarget {
-                        block: present,
-                        args: vec![],
-                    },
-                },
-            );
-            trie = body.add_op(
-                present,
-                Operator::RefCast {
-                    ty: self.repr.trie_ty(),
-                },
-                &[child],
-                &[self.repr.trie_ty()],
-            );
-            block = present;
-        }
+        let (block, root) = self.object_and_root(body, block, object)?;
+        let helpers = self.ensure_property_helpers()?;
+        let key = self.new_string(body, block, key.as_bytes())?;
+        let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
         let value = body.add_op(
             block,
-            Operator::StructGet {
-                sig: self.repr.trie,
-                idx: 0,
+            Operator::Call {
+                function_index: helpers.lookup,
             },
-            &[trie],
+            &[root, key, zero],
             &[self.repr.value],
         );
-        body.set_terminator(
-            block,
-            Terminator::Br {
-                target: BlockTarget {
-                    block: join,
-                    args: vec![value],
-                },
-            },
-        );
-        let undef = self.undef(body, missing);
-        let undef = self.box_value(body, missing, &undef)?;
-        body.set_terminator(
-            missing,
-            Terminator::Br {
-                target: BlockTarget {
-                    block: join,
-                    args: vec![undef],
-                },
-            },
-        );
         Ok((
-            join,
+            block,
             LowerValue::Wasm {
-                value: result,
+                value,
                 kind: ValueKind::Reference,
             },
         ))
@@ -5658,93 +6408,25 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     fn set_static_property_value(
         &mut self,
         body: &mut FunctionBody,
-        mut block: Block,
+        block: Block,
         object: &LowerValue,
         key: &str,
         value: &LowerValue,
     ) -> Result<Block, ConvertError> {
-        let (next, mut trie) = self.object_and_trie(body, block, object)?;
-        block = next;
-        for byte in key.as_bytes() {
-            let child = body.add_op(
-                block,
-                Operator::StructGet {
-                    sig: self.repr.trie,
-                    idx: usize::from(*byte) + 1,
-                },
-                &[trie],
-                &[self.repr.value],
-            );
-            let is_null = body.add_op(block, Operator::RefIsNull, &[child], &[Type::I32]);
-            let allocate = body.add_block();
-            let present = body.add_block();
-            let join = body.add_block();
-            let next = body.add_blockparam(join, self.repr.trie_ty());
-            body.set_terminator(
-                block,
-                Terminator::CondBr {
-                    cond: is_null,
-                    if_true: BlockTarget {
-                        block: allocate,
-                        args: vec![],
-                    },
-                    if_false: BlockTarget {
-                        block: present,
-                        args: vec![],
-                    },
-                },
-            );
-            let allocated = self.new_trie(body, allocate)?;
-            body.add_op(
-                allocate,
-                Operator::StructSet {
-                    sig: self.repr.trie,
-                    idx: usize::from(*byte) + 1,
-                },
-                &[trie, allocated],
-                &[],
-            );
-            body.set_terminator(
-                allocate,
-                Terminator::Br {
-                    target: BlockTarget {
-                        block: join,
-                        args: vec![allocated],
-                    },
-                },
-            );
-            let existing = body.add_op(
-                present,
-                Operator::RefCast {
-                    ty: self.repr.trie_ty(),
-                },
-                &[child],
-                &[self.repr.trie_ty()],
-            );
-            body.set_terminator(
-                present,
-                Terminator::Br {
-                    target: BlockTarget {
-                        block: join,
-                        args: vec![existing],
-                    },
-                },
-            );
-            block = join;
-            trie = next;
-        }
+        let (block, root) = self.object_and_root(body, block, object)?;
         let boxed_value = self.box_value(body, block, value)?;
+        let key = self.new_string(body, block, key.as_bytes())?;
+        let helpers = self.ensure_property_helpers()?;
+        let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
         body.add_op(
             block,
-            Operator::StructSet {
-                sig: self.repr.trie,
-                idx: 0,
+            Operator::Call {
+                function_index: helpers.set,
             },
-            &[trie, boxed_value],
+            &[root, key, boxed_value, zero],
             &[],
         );
-        let key = self.new_string(body, block, key.as_bytes())?;
-        self.set_dynamic_property(body, block, object, key, value)
+        Ok(block)
     }
 
     fn set_static_array_index(

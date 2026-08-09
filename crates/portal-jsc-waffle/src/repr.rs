@@ -26,9 +26,6 @@ pub(crate) struct Repr {
     /// Lazily materialized UTF-16 code units used by JavaScript indexing.
     pub(crate) utf16: Signature,
     pub(crate) string: Signature,
-    /// Runtime-keyed property entries are a persistent linked chain. The
-    /// `next` link remains `anyref` to avoid a recursive type group.
-    pub(crate) property: Signature,
     pub(crate) arguments: Signature,
     pub(crate) adapter: Signature,
 }
@@ -40,9 +37,9 @@ impl Repr {
             nullable: true,
         });
 
-        // The static-key trie remains the fast property representation.  A
-        // dynamic property component is introduced alongside it below; child
-        // links use `anyref` to avoid requiring a recursive Wasm type group.
+        // Generic property tries use nullable `anyref` child links so nodes
+        // can dispatch to a generated shape or continue through the trie
+        // without requiring a recursive Wasm type group.
         let mut tries = Tries::default();
         let trie = tries.get(module, value);
         // GC type references outside a recursive group must point backward.
@@ -74,10 +71,6 @@ impl Repr {
             fields: vec![],
             shared: false,
         });
-        let property = module.signatures.push(SignatureData::Struct {
-            fields: vec![],
-            shared: false,
-        });
         let object = module.signatures.push(SignatureData::Struct {
             fields: vec![],
             shared: false,
@@ -104,20 +97,19 @@ impl Repr {
             // Every ordinary object has the same header.  `elements` being
             // non-null is the sole distinction between an object and an
             // array, which is exactly what a future `Array.isArray` needs.
-            fields: vec![field(ref_sig(trie)), field(ref_sig(arguments)), field(value)],
+            // The property root is either a generic trie or a generated
+            // shape instance. Both are carried as `anyref` so a lookup can
+            // refine with `ref.test` before continuing through a trie.
+            fields: vec![field(value), field(ref_sig(arguments)), field(value)],
             shared: false,
         };
         module.signatures[string] = SignatureData::Struct {
             fields: vec![field(ref_sig(utf8)), field(ref_sig(utf16))],
             shared: false,
         };
-        module.signatures[property] = SignatureData::Struct {
-            fields: vec![field(ref_sig(string)), field(value), field(value)],
-            shared: false,
-        };
         module.signatures[function] = SignatureData::Struct {
             fields: vec![
-                field(ref_sig(trie)),
+                field(value),
                 field(ref_sig(arguments)),
                 field(value),
                 field(ref_sig(adapter)),
@@ -138,7 +130,6 @@ impl Repr {
             utf8,
             utf16,
             string,
-            property,
             arguments,
             adapter,
         }
@@ -174,10 +165,6 @@ impl Repr {
 
     pub(crate) fn string_ty(self) -> Type {
         ref_sig(self.string)
-    }
-
-    pub(crate) fn property_ty(self) -> Type {
-        ref_sig(self.property)
     }
 
     pub(crate) fn arguments_ty(self) -> Type {

@@ -330,6 +330,58 @@ fn executes_numeric_module_exports_in_wasmtime_and_node() {
 }
 
 #[test]
+fn executes_object_mutation_shape_changes_and_polymorphic_paths() {
+    let module = compile_module(
+        "
+            export function mutate() {
+                let object = {};
+                object.count = 1;
+                object.count = object.count + 2;
+                object.extra = 4;
+                return object.count + object.extra;
+            }
+
+            export function reshape() {
+                let object = { slot: 1 };
+                object.slot = {};
+                object.slot.count = 4;
+                object.slot.extra = 6;
+                return object.slot.count + object.slot.extra;
+            }
+
+            export function polymorphic(flag) {
+                let value = flag > 0 ? {} : 2;
+                if (flag > 0) return 7;
+                return 3;
+            }
+        ",
+    );
+    validate(&module);
+
+    assert_executes_in_all_runtimes(&module, "mutate", &[], 7.0);
+    assert_executes_in_all_runtimes(&module, "reshape", &[], 10.0);
+    assert_executes_in_all_runtimes(&module, "polymorphic", &[1.0], 7.0);
+    assert_executes_in_all_runtimes(&module, "polymorphic", &[0.0], 3.0);
+
+    let reference_tests = module
+        .funcs
+        .entries()
+        .filter_map(|(_, declaration)| declaration.body())
+        .flat_map(|body| body.values.entries())
+        .filter(|(_, definition)| {
+            matches!(
+                definition,
+                ValueDef::Operator(Operator::RefTest { .. }, _, _)
+            )
+        })
+        .count();
+    assert!(
+        reference_tests >= 2,
+        "object lowering should refine anyref values with ref.test before ref.cast"
+    );
+}
+
+#[test]
 fn rejects_colliding_internal_gc_export_names() {
     let error = lower_module(
         "

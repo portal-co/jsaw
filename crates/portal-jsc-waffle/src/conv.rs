@@ -235,6 +235,17 @@ enum LowerValue {
     StaticKey(String),
 }
 
+/// One Wasm control-flow continuation while lowering a source SSA block.
+///
+/// A source value may split into distinct raw primitive and reference paths.
+/// Keeping a separate value map for each path lets subsequent source
+/// statements be emitted with the representation refined by that split.
+#[derive(Clone, Debug)]
+struct Continuation {
+    block: Block,
+    values: BTreeMap<SValueId, LowerValue>,
+}
+
 impl LowerValue {
     fn wasm(&self) -> Result<(Value, ValueKind), ConvertError> {
         match self {
@@ -593,7 +604,6 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             let original_block = *blocks
                 .get(&state)
                 .ok_or_else(|| ConvertError::invalid("missing source block mapping"))?;
-            let mut block = original_block;
             let mut values = entry_values.clone();
             // Native bodies prepend the captured lexical context and the
             // effective receiver. Source SSA parameters begin after those two
@@ -613,157 +623,184 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 values.insert(*source, LowerValue::Wasm { value: *wasm, kind });
             }
 
+            let mut continuations = vec![Continuation {
+                block: original_block,
+                values,
+            }];
+
             for stmt in sfunc.cfg.blocks[sblock].stmts.iter().copied() {
-                let (next, value) = self.lower_statement(
-                    body,
-                    block,
-                    context,
-                    this.clone(),
-                    &values,
-                    &sfunc.cfg.values[stmt].value,
-                )?;
-                block = next;
-                values.insert(stmt, value);
+                let mut next = Vec::new();
+                for continuation in continuations {
+                    for (block, value) in self.lower_statement(
+                        body,
+                        continuation.block,
+                        context,
+                        this.clone(),
+                        &continuation.values,
+                        &sfunc.cfg.values[stmt].value,
+                    )? {
+                        let mut values = continuation.values.clone();
+                        values.insert(stmt, value);
+                        next.push(Continuation { block, values });
+                    }
+                }
+                continuations = next;
             }
 
             match &sfunc.cfg.blocks[sblock].postcedent.term {
                 TTerm::Return(value) => {
-                    let value = match value {
-                        Some(value) => values.get(value).cloned().ok_or_else(|| {
-                            ConvertError::invalid(format!("undefined return value {value:?}"))
-                        })?,
-                        None => self.undef(body, block),
-                    };
-                    let value = self.box_value(body, block, &value)?;
-                    body.set_terminator(
-                        block,
-                        Terminator::Return {
-                            values: vec![value],
-                        },
-                    );
+                    for continuation in continuations {
+                        let value = match value {
+                            Some(value) => {
+                                continuation.values.get(value).cloned().ok_or_else(|| {
+                                    ConvertError::invalid(format!(
+                                        "undefined return value {value:?}"
+                                    ))
+                                })?
+                            }
+                            None => self.undef(body, continuation.block),
+                        };
+                        let value = self.box_value(body, continuation.block, &value)?;
+                        body.set_terminator(
+                            continuation.block,
+                            Terminator::Return {
+                                values: vec![value],
+                            },
+                        );
+                    }
                 }
                 TTerm::Jmp(target) => {
-                    let args = target
-                        .args
-                        .iter()
-                        .map(|value| {
-                            values
-                                .get(value)
-                                .ok_or_else(|| ConvertError::invalid("undefined jump argument"))
-                                .cloned()
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let target_block = self.target_block(
-                        sfunc,
-                        body,
-                        &mut blocks,
-                        &mut pending,
-                        target.block,
-                        &args,
-                    )?;
-                    let args = self.lower_block_args(body, block, args)?;
-                    body.set_terminator(
-                        block,
-                        Terminator::Br {
-                            target: BlockTarget {
-                                block: target_block,
-                                args,
+                    for continuation in continuations {
+                        let args = target
+                            .args
+                            .iter()
+                            .map(|value| {
+                                continuation
+                                    .values
+                                    .get(value)
+                                    .ok_or_else(|| ConvertError::invalid("undefined jump argument"))
+                                    .cloned()
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let target_block = self.target_block(
+                            sfunc,
+                            body,
+                            &mut blocks,
+                            &mut pending,
+                            target.block,
+                            &args,
+                        )?;
+                        let args = self.lower_block_args(body, continuation.block, args)?;
+                        body.set_terminator(
+                            continuation.block,
+                            Terminator::Br {
+                                target: BlockTarget {
+                                    block: target_block,
+                                    args,
+                                },
                             },
-                        },
-                    );
+                        );
+                    }
                 }
                 TTerm::CondJmp {
                     cond,
                     if_true,
                     if_false,
                 } => {
-                    let cond = values
-                        .get(cond)
-                        .ok_or_else(|| ConvertError::invalid("undefined branch condition"))?;
-                    let cond = self.as_condition(body, block, cond)?;
-                    let true_args = if_true
-                        .args
-                        .iter()
-                        .map(|value| {
-                            values
-                                .get(value)
-                                .ok_or_else(|| ConvertError::invalid("undefined branch argument"))
-                        })
-                        .map(|value| value.cloned())
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let false_args = if_false
-                        .args
-                        .iter()
-                        .map(|value| {
-                            values
-                                .get(value)
-                                .ok_or_else(|| ConvertError::invalid("undefined branch argument"))
-                        })
-                        .map(|value| value.cloned())
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let true_block = self.target_block(
-                        sfunc,
-                        body,
-                        &mut blocks,
-                        &mut pending,
-                        if_true.block,
-                        &true_args,
-                    )?;
-                    let false_block = self.target_block(
-                        sfunc,
-                        body,
-                        &mut blocks,
-                        &mut pending,
-                        if_false.block,
-                        &false_args,
-                    )?;
-                    let true_args = self.lower_block_args(body, block, true_args)?;
-                    let false_args = self.lower_block_args(body, block, false_args)?;
-                    body.set_terminator(
-                        block,
-                        Terminator::CondBr {
-                            cond,
-                            if_true: BlockTarget {
-                                block: true_block,
-                                args: true_args,
+                    for continuation in continuations {
+                        let cond = continuation
+                            .values
+                            .get(cond)
+                            .ok_or_else(|| ConvertError::invalid("undefined branch condition"))?;
+                        let cond = self.as_condition(body, continuation.block, cond)?;
+                        let true_args = if_true
+                            .args
+                            .iter()
+                            .map(|value| {
+                                continuation.values.get(value).cloned().ok_or_else(|| {
+                                    ConvertError::invalid("undefined branch argument")
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let false_args = if_false
+                            .args
+                            .iter()
+                            .map(|value| {
+                                continuation.values.get(value).cloned().ok_or_else(|| {
+                                    ConvertError::invalid("undefined branch argument")
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let true_block = self.target_block(
+                            sfunc,
+                            body,
+                            &mut blocks,
+                            &mut pending,
+                            if_true.block,
+                            &true_args,
+                        )?;
+                        let false_block = self.target_block(
+                            sfunc,
+                            body,
+                            &mut blocks,
+                            &mut pending,
+                            if_false.block,
+                            &false_args,
+                        )?;
+                        let true_args =
+                            self.lower_block_args(body, continuation.block, true_args)?;
+                        let false_args =
+                            self.lower_block_args(body, continuation.block, false_args)?;
+                        body.set_terminator(
+                            continuation.block,
+                            Terminator::CondBr {
+                                cond,
+                                if_true: BlockTarget {
+                                    block: true_block,
+                                    args: true_args,
+                                },
+                                if_false: BlockTarget {
+                                    block: false_block,
+                                    args: false_args,
+                                },
                             },
-                            if_false: BlockTarget {
-                                block: false_block,
-                                args: false_args,
-                            },
-                        },
-                    );
+                        );
+                    }
                 }
                 TTerm::Tail { callee, args } => {
-                    let (block, context, receiver, array, code) = self.lower_call_parts(
-                        body,
-                        block,
-                        context,
-                        this.clone(),
-                        &values,
-                        callee,
-                        args,
-                    )?;
-                    body.set_terminator(
-                        block,
-                        Terminator::ReturnCallRef {
-                            sig: self.repr.adapter,
-                            args: vec![context, receiver, array, code],
-                        },
-                    );
+                    for continuation in continuations {
+                        let (block, context, receiver, array, code) = self.lower_call_parts(
+                            body,
+                            continuation.block,
+                            context,
+                            this.clone(),
+                            &continuation.values,
+                            callee,
+                            args,
+                        )?;
+                        body.set_terminator(
+                            block,
+                            Terminator::ReturnCallRef {
+                                sig: self.repr.adapter,
+                                args: vec![context, receiver, array, code],
+                            },
+                        );
+                    }
                 }
                 // The jsaw pipeline leaves a `Default` terminator on an
                 // implicit JavaScript fallthrough. Its observable result is
                 // `undefined`, not an unreachable Wasm edge.
                 TTerm::Default => {
-                    let undef = self.undef(body, block);
-                    let value = self.box_value(body, block, &undef)?;
-                    body.set_terminator(
-                        block,
-                        Terminator::Return {
-                            values: vec![value],
-                        },
-                    );
+                    for continuation in continuations {
+                        let undef = self.undef(body, continuation.block);
+                        let value = self.box_value(body, continuation.block, &undef)?;
+                        body.set_terminator(
+                            continuation.block,
+                            Terminator::Return {
+                                values: vec![value],
+                            },
+                        );
+                    }
                 }
                 TTerm::Throw(_) | TTerm::Switch { .. } => {
                     return Err(ConvertError::unsupported("throw or switch terminator", ()));
@@ -838,7 +875,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         this: LowerValue,
         values: &BTreeMap<SValueId, LowerValue>,
         source: &'a SValue,
-    ) -> Result<(Block, LowerValue), ConvertError> {
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
         match source {
             SValue::Item { item, span } => {
                 self.lower_item(body, block, context, this, values, item, span)
@@ -847,7 +884,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 let key = id.0.to_string();
                 let (block, value) = self.get_property(body, block, context, &key)?;
                 let (value, _) = value.wasm()?;
-                Ok((block, LowerValue::ReferenceKey { value, key }))
+                Ok(vec![(block, LowerValue::ReferenceKey { value, key })])
             }
             SValue::StoreId { target, val } => {
                 let value = values
@@ -855,7 +892,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     .ok_or_else(|| ConvertError::invalid("undefined stored value"))?;
                 let block =
                     self.set_property(body, block, context, &target.0.to_string(), value)?;
-                Ok((block, value.clone()))
+                Ok(vec![(block, value.clone())])
             }
             SValue::Assign { target, val } => {
                 let value = values
@@ -870,18 +907,18 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                             ConvertError::invalid("undefined assignment property key")
                         })?)?;
                         let block = self.set_property_value(body, block, object, &key, value)?;
-                        Ok((block, value.clone()))
+                        Ok(vec![(block, value.clone())])
                     }
                     _ => Err(ConvertError::unsupported("non-member assignment", ())),
                 }
             }
-            SValue::EdgeBlocker { value, .. } => Ok((
+            SValue::EdgeBlocker { value, .. } => Ok(vec![(
                 block,
                 values
                     .get(value)
                     .cloned()
                     .ok_or_else(|| ConvertError::invalid("undefined edge-blocker value"))?,
-            )),
+            )]),
             SValue::Param { .. } => {
                 Err(ConvertError::invalid("block parameter used as a statement"))
             }
@@ -898,7 +935,47 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         values: &BTreeMap<SValueId, LowerValue>,
         item: &'a Item<SValueId, SFunc>,
         span: &impl std::fmt::Debug,
-    ) -> Result<(Block, LowerValue), ConvertError> {
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        if let Item::Select {
+            cond,
+            then,
+            otherwise,
+        } = item
+        {
+            let cond = values
+                .get(cond)
+                .ok_or_else(|| ConvertError::invalid("undefined select condition"))?;
+            let then = values
+                .get(then)
+                .cloned()
+                .ok_or_else(|| ConvertError::invalid("undefined select value"))?
+                .runtime();
+            let otherwise = values
+                .get(otherwise)
+                .cloned()
+                .ok_or_else(|| ConvertError::invalid("undefined select value"))?
+                .runtime();
+            return self.select_continuations(body, block, cond, then, otherwise);
+        }
+        if let Item::Bin { left, right, op } = item {
+            if matches!(
+                op,
+                BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::NullishCoalescing
+            ) {
+                let left = values
+                    .get(left)
+                    .cloned()
+                    .ok_or_else(|| ConvertError::invalid("undefined binary lhs"))?
+                    .runtime();
+                let right = values
+                    .get(right)
+                    .cloned()
+                    .ok_or_else(|| ConvertError::invalid("undefined binary rhs"))?
+                    .runtime();
+                return self.logical_continuations(body, block, left, right, *op);
+            }
+        }
+
         let value = match item {
             Item::Just { id } => values
                 .get(id)
@@ -1077,45 +1154,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 *op,
                 span,
             )?,
-            Item::Select {
-                cond,
-                then,
-                otherwise,
-            } => {
-                let cond = self.as_condition(
-                    body,
-                    block,
-                    values
-                        .get(cond)
-                        .ok_or_else(|| ConvertError::invalid("undefined select condition"))?,
-                )?;
-                let then = self.box_value(
-                    body,
-                    block,
-                    values
-                        .get(then)
-                        .ok_or_else(|| ConvertError::invalid("undefined select value"))?,
-                )?;
-                let otherwise = self.box_value(
-                    body,
-                    block,
-                    values
-                        .get(otherwise)
-                        .ok_or_else(|| ConvertError::invalid("undefined select value"))?,
-                )?;
-                let value = body.add_op(
-                    block,
-                    Operator::TypedSelect {
-                        ty: self.repr.value,
-                    },
-                    &[then, otherwise, cond],
-                    &[self.repr.value],
-                );
-                LowerValue::Wasm {
-                    value,
-                    kind: ValueKind::Reference,
-                }
-            }
+            Item::Select { .. } => unreachable!("select was handled above"),
             Item::PrivateMem { .. }
             | Item::HasPrivateMem { .. }
             | Item::Class(_)
@@ -1131,7 +1170,103 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             }
             _ => return Err(ConvertError::unsupported("new item form", span)),
         };
-        Ok((block, value))
+        Ok(vec![(block, value)])
+    }
+
+    /// Preserve raw Wasm representations across a reference/primitive select.
+    ///
+    /// An `anyref` select would box the primitive arm and lose the fact that
+    /// later statements must treat the two arms differently.  Split the Wasm
+    /// control flow instead; `lower_function` subsequently emits the source
+    /// block's remaining statements for each refined continuation.
+    fn select_continuations(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        cond: &LowerValue,
+        then: LowerValue,
+        otherwise: LowerValue,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let cond = self.as_condition(body, block, cond)?;
+        self.select_continuations_for_condition(body, block, cond, then, otherwise)
+    }
+
+    fn logical_continuations(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        left: LowerValue,
+        right: LowerValue,
+        op: BinaryOp,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        match op {
+            BinaryOp::LogicalAnd => {
+                let cond = self.as_condition(body, block, &left)?;
+                self.select_continuations_for_condition(body, block, cond, right, left)
+            }
+            BinaryOp::LogicalOr => {
+                let cond = self.as_condition(body, block, &left)?;
+                self.select_continuations_for_condition(body, block, cond, left, right)
+            }
+            BinaryOp::NullishCoalescing => {
+                let (value, kind) = left.wasm()?;
+                if kind != ValueKind::Reference {
+                    return Ok(vec![(block, left)]);
+                }
+                let is_null = body.add_op(block, Operator::RefIsNull, &[value], &[Type::I32]);
+                self.select_continuations_for_condition(body, block, is_null, right, left)
+            }
+            _ => unreachable!("only logical binary operators are routed here"),
+        }
+    }
+
+    fn select_continuations_for_condition(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        cond: Value,
+        then: LowerValue,
+        otherwise: LowerValue,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let then_kind = then.kind()?;
+        let otherwise_kind = otherwise.kind()?;
+        if (then_kind == ValueKind::Reference) != (otherwise_kind == ValueKind::Reference) {
+            let if_true = body.add_block();
+            let if_false = body.add_block();
+            body.set_terminator(
+                block,
+                Terminator::CondBr {
+                    cond,
+                    if_true: BlockTarget {
+                        block: if_true,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: if_false,
+                        args: vec![],
+                    },
+                },
+            );
+            return Ok(vec![(if_true, then), (if_false, otherwise)]);
+        }
+
+        let then = self.box_value(body, block, &then)?;
+        let otherwise = self.box_value(body, block, &otherwise)?;
+        let value = body.add_op(
+            block,
+            Operator::TypedSelect {
+                ty: self.repr.value,
+            },
+            &[then, otherwise, cond],
+            &[self.repr.value],
+        );
+        Ok(vec![(
+            block,
+            LowerValue::Wasm {
+                value,
+                kind: ValueKind::Reference,
+            },
+        )])
     }
 
     fn literal(
@@ -1690,7 +1825,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     ) -> Result<(Block, Value), ConvertError> {
         let (object, kind) = object.wasm()?;
         if kind != ValueKind::Reference {
-            return Err(ConvertError::invalid("a primitive was used as an object"));
+            // JavaScript permits property stores on primitives (they are
+            // discarded).  Give that path an unaliased trie so the ordinary
+            // store lowering can run without accidentally mutating an object
+            // continuation.
+            return Ok((block, self.new_trie(body, block)?));
         }
         let is_function = body.add_op(
             block,
@@ -1701,7 +1840,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[Type::I32],
         );
         let function = body.add_block();
+        let non_function = body.add_block();
         let plain = body.add_block();
+        let primitive = body.add_block();
         let join = body.add_block();
         let trie = body.add_blockparam(join, self.repr.trie_ty());
         body.set_terminator(
@@ -1713,7 +1854,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     args: vec![],
                 },
                 if_false: BlockTarget {
-                    block: plain,
+                    block: non_function,
                     args: vec![],
                 },
             },
@@ -1744,6 +1885,28 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 },
             },
         );
+        let is_object = body.add_op(
+            non_function,
+            Operator::RefTest {
+                ty: self.repr.object_ty(),
+            },
+            &[object],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            non_function,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget {
+                    block: plain,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: primitive,
+                    args: vec![],
+                },
+            },
+        );
         let object_value = body.add_op(
             plain,
             Operator::RefCast {
@@ -1767,6 +1930,16 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 target: BlockTarget {
                     block: join,
                     args: vec![object_trie],
+                },
+            },
+        );
+        let primitive_trie = self.new_trie(body, primitive)?;
+        body.set_terminator(
+            primitive,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![primitive_trie],
                 },
             },
         );
@@ -1794,11 +1967,19 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     fn get_property_value(
         &self,
         body: &mut FunctionBody,
-        block: Block,
+        mut block: Block,
         object: &LowerValue,
         key: &str,
     ) -> Result<(Block, LowerValue), ConvertError> {
-        let (block, mut trie) = self.object_and_trie(body, block, object)?;
+        let (next, mut trie) = self.object_and_trie(body, block, object)?;
+        block = next;
+        // Every trie edge is an `anyref`.  A missing key therefore must
+        // branch before a `ref.cast`/`struct.get`; otherwise an ordinary
+        // unresolved identifier used as a static member key traps while we
+        // evaluate its inert context lookup.
+        let missing = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
         for byte in key.as_bytes() {
             let child = body.add_op(
                 block,
@@ -1809,14 +1990,31 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 &[trie],
                 &[self.repr.value],
             );
-            trie = body.add_op(
+            let is_missing = body.add_op(block, Operator::RefIsNull, &[child], &[Type::I32]);
+            let present = body.add_block();
+            body.set_terminator(
                 block,
+                Terminator::CondBr {
+                    cond: is_missing,
+                    if_true: BlockTarget {
+                        block: missing,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: present,
+                        args: vec![],
+                    },
+                },
+            );
+            trie = body.add_op(
+                present,
                 Operator::RefCast {
                     ty: self.repr.trie_ty(),
                 },
                 &[child],
                 &[self.repr.trie_ty()],
             );
+            block = present;
         }
         let value = body.add_op(
             block,
@@ -1827,10 +2025,30 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[trie],
             &[self.repr.value],
         );
-        Ok((
+        body.set_terminator(
             block,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![value],
+                },
+            },
+        );
+        let undef = self.undef(body, missing);
+        let undef = self.box_value(body, missing, &undef)?;
+        body.set_terminator(
+            missing,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![undef],
+                },
+            },
+        );
+        Ok((
+            join,
             LowerValue::Wasm {
-                value,
+                value: result,
                 kind: ValueKind::Reference,
             },
         ))

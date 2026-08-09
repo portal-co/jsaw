@@ -1,10 +1,11 @@
 use portal_jsc_swc_cfg::module::CfgModule;
-use portal_jsc_swc_ssa::SFunc;
+use portal_jsc_swc_ssa::{module::SModule, SFunc};
 use portal_jsc_swc_tac::module::TModule;
-use portal_pc_waffle::{FuncDecl, Module, Operator, ValueDef};
-use swc_common::{FileName, GLOBALS, Globals, SourceMap, sync::Lrc};
+use portal_pc_waffle::{ExportKind, FuncDecl, Module, Operator, Type, ValueDef};
+use swc_common::{sync::Lrc, FileName, Globals, SourceMap, GLOBALS};
 use swc_ecma_ast::{EsVersion, Module as SwcModule, ModuleItem};
-use swc_ecma_parser::{EsSyntax, Syntax, parse_file_as_script};
+use swc_ecma_parser::{parse_file_as_module, parse_file_as_script, EsSyntax, Syntax};
+use wasmtime::{Config, Engine, Instance, Module as WasmtimeModule, Store, Val};
 
 fn lower(source: &str) -> Result<Module<'static>, portal_jsc_waffle::ConvertError> {
     GLOBALS.set(&Globals::default(), || {
@@ -41,6 +42,40 @@ fn compile(source: &str) -> Module<'static> {
     lower(source).expect("WasmGC lowering should succeed")
 }
 
+fn lower_module(
+    source: &str,
+    options: &portal_jsc_waffle::ConvertOptions,
+) -> Result<Module<'static>, portal_jsc_waffle::ConvertError> {
+    GLOBALS.set(&Globals::default(), || {
+        let cm: Lrc<SourceMap> = Lrc::new(SourceMap::default());
+        let file = cm.new_source_file(
+            Lrc::new(FileName::Custom("fixture.mjs".into())),
+            source.to_owned(),
+        );
+        let mut errors = vec![];
+        let source = parse_file_as_module(
+            &file,
+            Syntax::Es(EsSyntax::default()),
+            EsVersion::Es2022,
+            None,
+            &mut errors,
+        )
+        .expect("module fixture should parse");
+        assert!(errors.is_empty(), "parser diagnostics: {errors:?}");
+        let cfg = CfgModule::try_from(source).expect("CFG lowering should succeed");
+        let tac = TModule::try_from(cfg).expect("TAC lowering should succeed");
+        let ssa = SModule::try_from(tac).expect("SSA lowering should succeed");
+        let mut wasm = Module::empty();
+        portal_jsc_waffle::convert_module(&ssa, &mut wasm, options)?;
+        Ok(wasm)
+    })
+}
+
+fn compile_module(source: &str) -> Module<'static> {
+    lower_module(source, &portal_jsc_waffle::ConvertOptions::default())
+        .expect("WasmGC module lowering should succeed")
+}
+
 fn validate(module: &Module<'_>) {
     for (_, declaration) in module.funcs.entries() {
         if let FuncDecl::Body(_, _, body) = declaration {
@@ -54,6 +89,91 @@ fn validate(module: &Module<'_>) {
     wasmparser::Validator::new_with_features(features)
         .validate_all(&bytes)
         .expect("emitted WasmGC should validate");
+}
+
+fn wasm_bytes(module: &Module<'_>) -> Vec<u8> {
+    portal_pc_waffle::to_wasm_bytes(module).expect("Wasm emission should succeed")
+}
+
+fn execute_in_wasmtime(bytes: &[u8], name: &str, args: &[f64]) -> f64 {
+    let mut config = Config::new();
+    config.wasm_gc(true);
+    config.wasm_function_references(true);
+    let engine = Engine::new(&config).expect("Wasmtime engine should support WasmGC");
+    let module = WasmtimeModule::new(&engine, bytes).expect("Wasmtime should compile emitted Wasm");
+    let mut store = Store::new(&engine, ());
+    let instance =
+        Instance::new(&mut store, &module, &[]).expect("Wasmtime should instantiate emitted Wasm");
+    let function = instance
+        .get_func(&mut store, name)
+        .unwrap_or_else(|| panic!("missing Wasmtime export {name:?}"));
+    let inputs = args
+        .iter()
+        .copied()
+        .map(|value| Val::F64(value.to_bits()))
+        .collect::<Vec<_>>();
+    let mut outputs = [Val::F64(0)];
+    function
+        .call(&mut store, &inputs, &mut outputs)
+        .unwrap_or_else(|error| panic!("Wasmtime call {name:?} failed: {error:#}"));
+    match outputs[0] {
+        Val::F64(bits) => f64::from_bits(bits),
+        ref value => panic!("numeric export returned {value:?}, expected f64"),
+    }
+}
+
+fn execute_in_node(bytes: &[u8], name: &str, args: &[f64]) -> f64 {
+    use std::{
+        fs,
+        process::{id, Command},
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+    let fixture = std::env::temp_dir().join(format!(
+        "portal-jsc-waffle-{}-{}.wasm",
+        id(),
+        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
+    ));
+    fs::write(&fixture, bytes).expect("should write temporary Wasm fixture");
+    let script = r#"
+        import { readFile } from 'node:fs/promises';
+        const [path, name, ...args] = process.argv.slice(1);
+        const bytes = await readFile(path);
+        const { instance } = await WebAssembly.instantiate(bytes);
+        const value = instance.exports[name](...args.map(Number));
+        process.stdout.write(String(value));
+    "#;
+    let result = Command::new("node")
+        .args(["--input-type=module", "-e", script])
+        .arg(&fixture)
+        .arg(name)
+        .args(args.iter().map(ToString::to_string))
+        .output();
+    let _ = fs::remove_file(&fixture);
+    let output = result.expect("Node.js is required for WasmGC execution tests");
+    assert!(
+        output.status.success(),
+        "Node.js instantiation/call failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("Node output should be UTF-8")
+        .parse()
+        .expect("Node numeric result should parse as f64")
+}
+
+fn assert_executes_in_all_runtimes(module: &Module<'_>, name: &str, args: &[f64], expected: f64) {
+    let bytes = wasm_bytes(module);
+    for (runtime, result) in [
+        ("Wasmtime", execute_in_wasmtime(&bytes, name, args)),
+        ("Node.js", execute_in_node(&bytes, name, args)),
+    ] {
+        assert!(
+            (result - expected).abs() < f64::EPSILON,
+            "{runtime} returned {result} from {name:?}; expected {expected}",
+        );
+    }
 }
 
 #[test]
@@ -141,6 +261,88 @@ fn compiles_numeric_operators_and_cfg_with_raw_values() {
         raw_phi,
         "compatible CFG joins should retain raw f64/i32 block parameters"
     );
+}
+
+#[test]
+fn exports_es_module_functions_with_numeric_and_gc_abis() {
+    let source = "
+        export function add(a, b) { return a + b; }
+        export { add as sum };
+        export default function twice(value) { return value * 2; }
+        export const ignored = 1;
+    ";
+    let options = portal_jsc_waffle::ConvertOptions {
+        gc_export_suffix: Some("$gc".to_owned()),
+        ..Default::default()
+    };
+    let module = lower_module(source, &options).expect("module lowering should succeed");
+    validate(&module);
+
+    let exports = module
+        .exports
+        .iter()
+        .map(|export| (export.name.as_str(), &export.kind))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        exports.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        vec!["add", "add$gc", "sum", "sum$gc", "default", "default$gc"],
+    );
+    assert!(
+        !exports.iter().any(|(name, _)| *name == "ignored"),
+        "non-function exports must not receive a numeric wrapper"
+    );
+    for (name, kind) in exports {
+        let ExportKind::Func(function) = kind else {
+            panic!("{name:?} should be a function export");
+        };
+        let signature = match &module.funcs[*function] {
+            FuncDecl::Body(signature, _, _) => signature,
+            declaration => panic!("{name:?} should have a function body, got {declaration:?}"),
+        };
+        let portal_pc_waffle::SignatureData::Func {
+            params, returns, ..
+        } = &module.signatures[*signature]
+        else {
+            panic!("{name:?} should have a function signature");
+        };
+        if !name.ends_with("$gc") {
+            assert!(params.iter().all(|ty| *ty == Type::F64));
+            assert_eq!(returns, &vec![Type::F64]);
+        }
+    }
+}
+
+#[test]
+fn executes_numeric_module_exports_in_wasmtime_and_node() {
+    let module = compile_module(
+        "
+            export function compute(value) {
+                if (value > 2) return value * 2;
+                return value - 1;
+            }
+            export default function add(a, b) { return a + b; }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "compute", &[4.0], 8.0);
+    assert_executes_in_all_runtimes(&module, "compute", &[1.0], 0.0);
+    assert_executes_in_all_runtimes(&module, "default", &[2.5, 4.0], 6.5);
+}
+
+#[test]
+fn rejects_colliding_internal_gc_export_names() {
+    let error = lower_module(
+        "
+            export function value(input) { return input; }
+            export const value$gc = 1;
+        ",
+        &portal_jsc_waffle::ConvertOptions {
+            gc_export_suffix: Some("$gc".to_owned()),
+            ..Default::default()
+        },
+    )
+    .expect_err("a generated internal export must not collide with a source export");
+    assert!(error.to_string().contains("value$gc"));
 }
 
 #[test]

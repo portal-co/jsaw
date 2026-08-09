@@ -496,6 +496,149 @@ fn executes_arrays_arguments_and_static_destructuring_helpers() {
 }
 
 #[test]
+fn executes_arrays_as_objects_with_named_fields() {
+    let module = compile_module(
+        "
+            export function array_fields() {
+                let values = [3, 4];
+                values.label = 7;
+                return values.label * 100 + values[0] * 10 + values[1] + values.length;
+            }
+
+            export function object_length_field() {
+                let value = { length: 4 };
+                value.length = 7;
+                return value.length;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "array_fields", &[], 736.0);
+    assert_executes_in_all_runtimes(&module, "object_length_field", &[], 7.0);
+}
+
+#[test]
+fn executes_computed_array_writes_growth_and_length_resize() {
+    let module = compile_module(
+        "
+            export function grow() {
+                let values = [3];
+                let index = 3;
+                values[index] = 7;
+                return values.length * 100 + values[3];
+            }
+
+            export function resize() {
+                let values = [3, 4, 5];
+                values.length = 1;
+                return values.length * 10 + values[0];
+            }
+
+            export function static_index() {
+                let values = [3];
+                values[2] = 6;
+                return values.length * 10 + values[2];
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "grow", &[], 407.0);
+    assert_executes_in_all_runtimes(&module, "resize", &[], 13.0);
+    assert_executes_in_all_runtimes(&module, "static_index", &[], 36.0);
+}
+
+#[test]
+fn executes_arguments_as_unified_arrays() {
+    let module = compile_module(
+        "
+            export function arguments_object(first) {
+                arguments.label = 4;
+                let index = 1;
+                arguments[index] = first + 2;
+                return arguments.label * 100 + arguments.length * 10 + arguments[index];
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "arguments_object", &[3.0], 425.0);
+}
+
+#[test]
+fn executes_utf8_strings_with_utf16_length() {
+    let module = compile_module(
+        "
+            export function ascii_length() { return 'abc'.length; }
+            export function unicode_length() { return 'a😀'.length; }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "ascii_length", &[], 3.0);
+    assert_executes_in_all_runtimes(&module, "unicode_length", &[], 3.0);
+}
+
+#[test]
+fn executes_dynamic_string_fields_and_computed_calls() {
+    let module = compile_module(
+        "
+            export function fields() {
+                let key = 'score';
+                let object = {};
+                object[key] = 7;
+                return object[key];
+            }
+
+            export function call() {
+                let key = 'run';
+                let object = { value: 4, run: function(add) { return this.value + add; } };
+                return object[key](3);
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "fields", &[], 7.0);
+    assert_executes_in_all_runtimes(&module, "call", &[], 7.0);
+}
+
+#[test]
+fn executes_runtime_string_array_indices_before_named_fields() {
+    let module = compile_module(
+        "
+            export function string_keys() {
+                let values = [2];
+                let index = '2';
+                let length = 'length';
+                let name = '02';
+                values[index] = 7;
+                values[name] = 5;
+                return values[index] * 100 + values[length] * 10 + values[name];
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "string_keys", &[], 735.0);
+}
+
+#[test]
+fn executes_utf16_string_indices() {
+    let module = compile_module(
+        "
+            export function ascii() { return 'abc'[1].length; }
+            export function astral() { return 'a😀'[1].length + 'a😀'[2].length; }
+            export function aliased_astral() {
+                let value = 'a😀';
+                return value[1].length + value[2].length;
+            }
+            export function indexed_key() { return { b: 9 }['abc'[1]]; }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "ascii", &[], 1.0);
+    assert_executes_in_all_runtimes(&module, "astral", &[], 2.0);
+    assert_executes_in_all_runtimes(&module, "aliased_astral", &[], 2.0);
+    assert_executes_in_all_runtimes(&module, "indexed_key", &[], 9.0);
+}
+
+#[test]
 fn rejects_colliding_internal_gc_export_names() {
     let error = lower_module(
         "
@@ -527,14 +670,6 @@ fn rejects_unsupported_forms_with_convert_error() {
         (
             "let object = {}; delete object.value;",
             "unary operator \"delete\"",
-        ),
-        (
-            "let key = 1; let object = {}; object[key];",
-            "dynamic property keys",
-        ),
-        (
-            "function value() { return 'runtime string'; } value();",
-            "runtime value",
         ),
     ] {
         let error = match lower(source) {

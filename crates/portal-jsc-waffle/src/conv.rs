@@ -29,6 +29,9 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
         pending: VecDeque::new(),
         lowered: BTreeSet::new(),
         ref_table: None,
+        string_equal: None,
+        string_utf16: None,
+        string_index: None,
         trie_clone: None,
     };
     converter.ensure_function(root)?;
@@ -110,6 +113,9 @@ pub fn convert_module<'a, 'wasm>(
         pending: VecDeque::new(),
         lowered: BTreeSet::new(),
         ref_table: None,
+        string_equal: None,
+        string_utf16: None,
+        string_index: None,
         trie_clone: None,
     };
     let mut exports = Vec::with_capacity(exported.len());
@@ -233,8 +239,13 @@ enum LowerValue {
         value: Value,
         key: String,
     },
-    /// String literals are retained solely for static property-key lowering.
-    StaticKey(String),
+    /// A string literal is both an ordinary runtime value and, until it
+    /// crosses an alias/control-flow boundary, a statically known member key.
+    String {
+        value: Value,
+        key: String,
+        bytes: Vec<u8>,
+    },
 }
 
 /// One Wasm control-flow continuation while lowering a source SSA block.
@@ -254,9 +265,7 @@ impl LowerValue {
             Self::Wasm { value, kind } => Ok((*value, *kind)),
             Self::ReferenceKey { value, .. } => Ok((*value, ValueKind::Reference)),
             Self::NumberLiteral { value, .. } => Ok((*value, ValueKind::Number)),
-            Self::StaticKey(_) => Err(ConvertError::invalid(
-                "a property key was used as a runtime value",
-            )),
+            Self::String { value, .. } => Ok((*value, ValueKind::Reference)),
         }
     }
 
@@ -269,6 +278,10 @@ impl LowerValue {
                 kind: ValueKind::Number,
             },
             Self::ReferenceKey { value, .. } => Self::Wasm {
+                value,
+                kind: ValueKind::Reference,
+            },
+            Self::String { value, .. } => Self::Wasm {
                 value,
                 kind: ValueKind::Reference,
             },
@@ -290,8 +303,15 @@ struct Converter<'a, 'module, 'wasm> {
     /// A declaration-only table makes every adapter legal as a `ref.func`
     /// target under Wasm's typed-function-reference validation rules.
     ref_table: Option<Table>,
-    /// Deep-copy helper used by object-rest lowering. It is generated lazily
-    /// because ordinary object programs do not need to enumerate trie edges.
+    /// Bytewise WTF-8 string equality used by the persistent dynamic property
+    /// store. It is generated only when a member lookup needs it.
+    string_equal: Option<Func>,
+    /// Lazy UTF-16 cache initializer for string indexing and length.
+    string_utf16: Option<Func>,
+    /// Canonical JavaScript array-index parser for runtime string keys.
+    string_index: Option<Func>,
+    /// Temporary compatibility helper for static object-rest lowering.  The
+    /// dynamic property store supersedes this as its call sites are migrated.
     trie_clone: Option<Func>,
 }
 
@@ -595,6 +615,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             value: body.blocks[body.entry].params[1].1,
             kind: ValueKind::Reference,
         };
+        // Keep the ABI's raw argument array private to adapters/native entry
+        // code. Source-level `arguments` is one stable object wrapper sharing
+        // that component, so named fields and resized elements persist for
+        // the whole activation.
+        let arguments = LowerValue::Wasm {
+            value: self.new_array_object(body, body.entry, body.blocks[body.entry].params[2].1)?,
+            kind: ValueKind::Reference,
+        };
         // jsaw's entry shim parameters may be referenced directly from later
         // blocks without being explicit jump arguments. Keep them available
         // while lowering every source block.
@@ -653,6 +681,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         continuation.block,
                         context,
                         this.clone(),
+                        arguments.clone(),
                         &continuation.values,
                         &sfunc.cfg.values[stmt].value,
                     )? {
@@ -890,12 +919,13 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         block: Block,
         context: Value,
         this: LowerValue,
+        arguments: LowerValue,
         values: &BTreeMap<SValueId, LowerValue>,
         source: &'a SValue,
     ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
         match source {
             SValue::Item { item, span } => {
-                self.lower_item(body, block, context, this, values, item, span)
+                self.lower_item(body, block, context, this, arguments, values, item, span)
             }
             SValue::LoadId(id) => {
                 let key = id.0.to_string();
@@ -920,10 +950,22 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         let object = values
                             .get(obj)
                             .ok_or_else(|| ConvertError::invalid("undefined assignment object"))?;
-                        let key = self.key_of(values.get(&mem[0]).ok_or_else(|| {
+                        let key = values.get(&mem[0]).ok_or_else(|| {
                             ConvertError::invalid("undefined assignment property key")
-                        })?)?;
-                        let block = self.set_property_value(body, block, object, &key, value)?;
+                        })?;
+                        let block = match self.key_of(key) {
+                            Ok(key) => self.set_property_value(body, block, object, &key, value)?,
+                            Err(_) => match key.kind()? {
+                                ValueKind::Number | ValueKind::Integer | ValueKind::Boolean => {
+                                    let index = self.numeric_index(body, block, key)?;
+                                    self.set_numeric_member(body, block, object, index, value)?
+                                }
+                                ValueKind::Reference => {
+                                    let key = self.dynamic_string_key(body, block, key)?;
+                                    self.set_string_member(body, block, object, key, value)?
+                                }
+                            }
+                        };
                         Ok(vec![(block, value.clone())])
                     }
                     _ => Err(ConvertError::unsupported("non-member assignment", ())),
@@ -949,6 +991,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         mut block: Block,
         context: Value,
         this: LowerValue,
+        arguments: LowerValue,
         values: &BTreeMap<SValueId, LowerValue>,
         item: &'a Item<SValueId, SFunc>,
         span: &impl std::fmt::Debug,
@@ -1014,27 +1057,34 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 members,
                 span,
             )?,
-            Item::Arr { members } => LowerValue::Wasm {
-                value: self.make_arguments(body, block, values, members)?,
-                kind: ValueKind::Reference,
-            },
-            Item::Arguments => LowerValue::Wasm {
-                // Native body parameters are `(context, this, arguments,
-                // formals...)`; unlike the normalized formals, this retains
-                // every actual argument supplied by the caller.
-                value: body.blocks[body.entry].params[2].1,
-                kind: ValueKind::Reference,
-            },
+            Item::Arr { members } => {
+                let elements = self.make_arguments(body, block, values, members)?;
+                LowerValue::Wasm {
+                    value: self.new_array_object(body, block, elements)?,
+                    kind: ValueKind::Reference,
+                }
+            }
+            Item::Arguments => arguments,
             Item::Mem { obj, mem } => {
                 let object = values
                     .get(obj)
                     .ok_or_else(|| ConvertError::invalid("undefined member object"))?;
-                let key = self.key_of(
-                    values
-                        .get(mem)
-                        .ok_or_else(|| ConvertError::invalid("undefined member key"))?,
-                )?;
-                let (next, value) = self.get_property_value(body, block, object, &key)?;
+                let key = values
+                    .get(mem)
+                    .ok_or_else(|| ConvertError::invalid("undefined member key"))?;
+                let (next, value) = match self.key_of(key) {
+                    Ok(key) => self.get_property_value(body, block, object, &key)?,
+                    Err(_) => match key.kind()? {
+                        ValueKind::Number | ValueKind::Integer | ValueKind::Boolean => {
+                            let index = self.numeric_index(body, block, key)?;
+                            self.get_numeric_member(body, block, object, index)?
+                        }
+                        ValueKind::Reference => {
+                            let key = self.dynamic_string_key(body, block, key)?;
+                            self.get_string_member(body, block, object, key)?
+                        }
+                    }
+                };
                 block = next;
                 value
             }
@@ -1348,7 +1398,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 kind: ValueKind::Boolean,
             },
             Lit::Null(_) => self.undef(body, block),
-            Lit::Str(string) => LowerValue::StaticKey(string.value.to_string_lossy().into_owned()),
+            Lit::Str(string) => LowerValue::String {
+                value: self.new_string(body, block, string.value.as_wtf8().as_bytes())?,
+                key: string.value.to_string_lossy().into_owned(),
+                bytes: string.value.as_wtf8().as_bytes().to_vec(),
+            },
             _ => return Err(ConvertError::unsupported(format!("literal {lit:?}"), span)),
         })
     }
@@ -1901,18 +1955,1789 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         block: Block,
     ) -> Result<LowerValue, ConvertError> {
         let trie = self.new_trie(body, block)?;
+        let elements = body.add_op(
+            block,
+            Operator::RefNull {
+                ty: self.repr.arguments_ty(),
+            },
+            &[],
+            &[self.repr.arguments_ty()],
+        );
+        let properties = body.add_op(
+            block,
+            Operator::RefNull { ty: self.repr.value },
+            &[],
+            &[self.repr.value],
+        );
         let object = body.add_op(
             block,
             Operator::StructNew {
                 sig: self.repr.object,
             },
-            &[trie],
+            &[trie, elements, properties],
             &[self.repr.object_ty()],
         );
         Ok(LowerValue::Wasm {
             value: object,
             kind: ValueKind::Reference,
         })
+    }
+
+    /// Arrays are ordinary objects whose second header field carries the
+    /// element component.  This deliberately gives them the same static
+    /// property trie as object literals.
+    fn new_array_object(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        elements: Value,
+    ) -> Result<Value, ConvertError> {
+        let trie = self.new_trie(body, block)?;
+        let properties = body.add_op(
+            block,
+            Operator::RefNull { ty: self.repr.value },
+            &[],
+            &[self.repr.value],
+        );
+        Ok(body.add_op(
+            block,
+            Operator::StructNew {
+                sig: self.repr.object,
+            },
+            &[trie, elements, properties],
+            &[self.repr.object_ty()],
+        ))
+    }
+
+    fn new_string(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        bytes: &[u8],
+    ) -> Result<Value, ConvertError> {
+        let bytes = bytes
+            .iter()
+            .map(|byte| {
+                body.add_op(
+                    block,
+                    Operator::I32Const {
+                        value: u32::from(*byte),
+                    },
+                    &[],
+                    &[Type::I32],
+                )
+            })
+            .collect::<Vec<_>>();
+        let bytes = body.add_op(
+            block,
+            Operator::ArrayNewFixed {
+                sig: self.repr.utf8,
+                num: bytes.len(),
+            },
+            &bytes,
+            &[self.repr.utf8_ty()],
+        );
+        let cache = body.add_op(
+            block,
+            Operator::RefNull {
+                ty: self.repr.utf16_ty(),
+            },
+            &[],
+            &[self.repr.utf16_ty()],
+        );
+        Ok(body.add_op(
+            block,
+            Operator::StructNew {
+                sig: self.repr.string,
+            },
+            &[bytes, cache],
+            &[self.repr.string_ty()],
+        ))
+    }
+
+    fn utf16_unit_from_wtf8(bytes: &[u8], target: u32) -> Option<u16> {
+        let mut offset = 0usize;
+        let mut index = 0u32;
+        while offset < bytes.len() {
+            let first = bytes[offset];
+            let (code_point, width) = if first < 0x80 {
+                (u32::from(first), 1)
+            } else if first < 0xe0 {
+                (
+                    (u32::from(first & 0x1f) << 6) | u32::from(bytes[offset + 1] & 0x3f),
+                    2,
+                )
+            } else if first < 0xf0 {
+                (
+                    (u32::from(first & 0x0f) << 12)
+                        | (u32::from(bytes[offset + 1] & 0x3f) << 6)
+                        | u32::from(bytes[offset + 2] & 0x3f),
+                    3,
+                )
+            } else {
+                (
+                    (u32::from(first & 0x07) << 18)
+                        | (u32::from(bytes[offset + 1] & 0x3f) << 12)
+                        | (u32::from(bytes[offset + 2] & 0x3f) << 6)
+                        | u32::from(bytes[offset + 3] & 0x3f),
+                    4,
+                )
+            };
+            if code_point <= 0xffff {
+                if index == target {
+                    return u16::try_from(code_point).ok();
+                }
+                index += 1;
+            } else {
+                let pair = code_point - 0x1_0000;
+                let high = 0xd800 | u16::try_from(pair >> 10).ok()?;
+                let low = 0xdc00 | u16::try_from(pair & 0x3ff).ok()?;
+                if index == target {
+                    return Some(high);
+                }
+                if index + 1 == target {
+                    return Some(low);
+                }
+                index += 2;
+            }
+            offset += width;
+        }
+        None
+    }
+
+    fn wtf8_for_utf16_unit(unit: u16) -> Vec<u8> {
+        let unit = u32::from(unit);
+        if unit < 0x80 {
+            vec![unit as u8]
+        } else if unit < 0x800 {
+            vec![(0xc0 | (unit >> 6)) as u8, (0x80 | (unit & 0x3f)) as u8]
+        } else {
+            vec![
+                (0xe0 | (unit >> 12)) as u8,
+                (0x80 | ((unit >> 6) & 0x3f)) as u8,
+                (0x80 | (unit & 0x3f)) as u8,
+            ]
+        }
+    }
+
+    fn literal_string_index(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        bytes: &[u8],
+        index: u32,
+    ) -> Result<LowerValue, ConvertError> {
+        let Some(unit) = Self::utf16_unit_from_wtf8(bytes, index) else {
+            return Ok(self.undef(body, block));
+        };
+        let bytes = Self::wtf8_for_utf16_unit(unit);
+        let key = String::from_utf8_lossy(&bytes).into_owned();
+        Ok(LowerValue::String {
+            value: self.new_string(body, block, &bytes)?,
+            key,
+            bytes,
+        })
+    }
+
+    fn ensure_string_utf16(&mut self) -> Result<Func, ConvertError> {
+        if let Some(function) = self.string_utf16 {
+            return Ok(function);
+        }
+        let signature = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.string_ty()],
+            returns: vec![self.repr.utf16_ty()],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let string = body.blocks[entry].params[0].1;
+        let cache = body.add_op(
+            entry,
+            Operator::StructGet { sig: self.repr.string, idx: 1 },
+            &[string],
+            &[self.repr.utf16_ty()],
+        );
+        let cached = body.add_block();
+        let compute = body.add_block();
+        let absent = body.add_op(entry, Operator::RefIsNull, &[cache], &[Type::I32]);
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: absent,
+                if_true: BlockTarget { block: compute, args: vec![] },
+                if_false: BlockTarget { block: cached, args: vec![] },
+            },
+        );
+        body.set_terminator(cached, Terminator::Return { values: vec![cache] });
+
+        let bytes = body.add_op(
+            compute,
+            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            &[string],
+            &[self.repr.utf8_ty()],
+        );
+        let byte_length = body.add_op(compute, Operator::ArrayLen, &[bytes], &[Type::I32]);
+        let scan = body.add_block();
+        let position = body.add_blockparam(scan, Type::I32);
+        let units = body.add_blockparam(scan, Type::I32);
+        let zero = body.add_op(compute, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        body.set_terminator(
+            compute,
+            Terminator::Br {
+                target: BlockTarget { block: scan, args: vec![zero, zero] },
+            },
+        );
+        let complete = body.add_op(scan, Operator::I32GeU, &[position, byte_length], &[Type::I32]);
+        let allocate = body.add_block();
+        let step = body.add_block();
+        body.set_terminator(
+            scan,
+            Terminator::CondBr {
+                cond: complete,
+                if_true: BlockTarget { block: allocate, args: vec![] },
+                if_false: BlockTarget { block: step, args: vec![] },
+            },
+        );
+        let byte = body.add_op(
+            step,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, position],
+            &[Type::I32],
+        );
+        let ascii_limit = body.add_op(step, Operator::I32Const { value: 0x80 }, &[], &[Type::I32]);
+        let two_limit = body.add_op(step, Operator::I32Const { value: 0xe0 }, &[], &[Type::I32]);
+        let four_limit = body.add_op(step, Operator::I32Const { value: 0xf0 }, &[], &[Type::I32]);
+        let one = body.add_op(step, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        let two = body.add_op(step, Operator::I32Const { value: 2 }, &[], &[Type::I32]);
+        let three = body.add_op(step, Operator::I32Const { value: 3 }, &[], &[Type::I32]);
+        let four = body.add_op(step, Operator::I32Const { value: 4 }, &[], &[Type::I32]);
+        let is_ascii = body.add_op(step, Operator::I32LtU, &[byte, ascii_limit], &[Type::I32]);
+        let is_two = body.add_op(step, Operator::I32LtU, &[byte, two_limit], &[Type::I32]);
+        let is_three = body.add_op(step, Operator::I32LtU, &[byte, four_limit], &[Type::I32]);
+        let multi_width = body.add_op(
+            step,
+            Operator::TypedSelect { ty: Type::I32 },
+            &[two, three, is_two],
+            &[Type::I32],
+        );
+        let multi_width = body.add_op(
+            step,
+            Operator::TypedSelect { ty: Type::I32 },
+            &[multi_width, four, is_three],
+            &[Type::I32],
+        );
+        let width = body.add_op(
+            step,
+            Operator::TypedSelect { ty: Type::I32 },
+            &[one, multi_width, is_ascii],
+            &[Type::I32],
+        );
+        let multi_units = body.add_op(
+            step,
+            Operator::TypedSelect { ty: Type::I32 },
+            &[one, two, is_three],
+            &[Type::I32],
+        );
+        let added_units = body.add_op(
+            step,
+            Operator::TypedSelect { ty: Type::I32 },
+            &[one, multi_units, is_ascii],
+            &[Type::I32],
+        );
+        let next_position = body.add_op(step, Operator::I32Add, &[position, width], &[Type::I32]);
+        let next_units = body.add_op(step, Operator::I32Add, &[units, added_units], &[Type::I32]);
+        body.set_terminator(
+            step,
+            Terminator::Br {
+                target: BlockTarget { block: scan, args: vec![next_position, next_units] },
+            },
+        );
+        let allocated = body.add_op(
+            allocate,
+            Operator::ArrayNewDefault { sig: self.repr.utf16 },
+            &[units],
+            &[self.repr.utf16_ty()],
+        );
+        body.add_op(
+            allocate,
+            Operator::StructSet { sig: self.repr.string, idx: 1 },
+            &[string, allocated],
+            &[],
+        );
+        let fill = body.add_block();
+        let fill_position = body.add_blockparam(fill, Type::I32);
+        let fill_unit = body.add_blockparam(fill, Type::I32);
+        body.set_terminator(
+            allocate,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: fill,
+                    args: vec![zero, zero],
+                },
+            },
+        );
+        let filled = body.add_op(
+            fill,
+            Operator::I32GeU,
+            &[fill_position, byte_length],
+            &[Type::I32],
+        );
+        let filled_return = body.add_block();
+        let fill_step = body.add_block();
+        body.set_terminator(
+            fill,
+            Terminator::CondBr {
+                cond: filled,
+                if_true: BlockTarget {
+                    block: filled_return,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: fill_step,
+                    args: vec![],
+                },
+            },
+        );
+        body.set_terminator(
+            filled_return,
+            Terminator::Return {
+                values: vec![allocated],
+            },
+        );
+        let first = body.add_op(
+            fill_step,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, fill_position],
+            &[Type::I32],
+        );
+        // The fill loop is a separate continuation from the counting loop,
+        // so keep its constants local to a block that dominates every decode
+        // case below.
+        let fill_ascii_limit = body.add_op(
+            fill_step,
+            Operator::I32Const { value: 0x80 },
+            &[],
+            &[Type::I32],
+        );
+        let fill_two_limit = body.add_op(
+            fill_step,
+            Operator::I32Const { value: 0xe0 },
+            &[],
+            &[Type::I32],
+        );
+        let fill_four_limit = body.add_op(
+            fill_step,
+            Operator::I32Const { value: 0xf0 },
+            &[],
+            &[Type::I32],
+        );
+        let fill_one = body.add_op(
+            fill_step,
+            Operator::I32Const { value: 1 },
+            &[],
+            &[Type::I32],
+        );
+        let fill_two = body.add_op(
+            fill_step,
+            Operator::I32Const { value: 2 },
+            &[],
+            &[Type::I32],
+        );
+        let fill_three = body.add_op(
+            fill_step,
+            Operator::I32Const { value: 3 },
+            &[],
+            &[Type::I32],
+        );
+        let fill_four = body.add_op(
+            fill_step,
+            Operator::I32Const { value: 4 },
+            &[],
+            &[Type::I32],
+        );
+        let ascii = body.add_op(
+            fill_step,
+            Operator::I32LtU,
+            &[first, fill_ascii_limit],
+            &[Type::I32],
+        );
+        let write_ascii = body.add_block();
+        let multi_byte = body.add_block();
+        body.set_terminator(
+            fill_step,
+            Terminator::CondBr {
+                cond: ascii,
+                if_true: BlockTarget {
+                    block: write_ascii,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: multi_byte,
+                    args: vec![],
+                },
+            },
+        );
+        body.add_op(
+            write_ascii,
+            Operator::ArraySet { sig: self.repr.utf16 },
+            &[allocated, fill_unit, first],
+            &[],
+        );
+        let ascii_position = body.add_op(
+            write_ascii,
+            Operator::I32Add,
+            &[fill_position, fill_one],
+            &[Type::I32],
+        );
+        let ascii_unit = body.add_op(
+            write_ascii,
+            Operator::I32Add,
+            &[fill_unit, fill_one],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            write_ascii,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: fill,
+                    args: vec![ascii_position, ascii_unit],
+                },
+            },
+        );
+        let is_two = body.add_op(
+            multi_byte,
+            Operator::I32LtU,
+            &[first, fill_two_limit],
+            &[Type::I32],
+        );
+        let write_two = body.add_block();
+        let three_or_four = body.add_block();
+        body.set_terminator(
+            multi_byte,
+            Terminator::CondBr {
+                cond: is_two,
+                if_true: BlockTarget {
+                    block: write_two,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: three_or_four,
+                    args: vec![],
+                },
+            },
+        );
+        let is_three = body.add_op(
+            three_or_four,
+            Operator::I32LtU,
+            &[first, fill_four_limit],
+            &[Type::I32],
+        );
+        let write_three = body.add_block();
+        let write_four = body.add_block();
+        body.set_terminator(
+            three_or_four,
+            Terminator::CondBr {
+                cond: is_three,
+                if_true: BlockTarget {
+                    block: write_three,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: write_four,
+                    args: vec![],
+                },
+            },
+        );
+
+        let mask_six = body.add_op(
+            write_two,
+            Operator::I32Const { value: 0x3f },
+            &[],
+            &[Type::I32],
+        );
+        let mask_five = body.add_op(
+            write_two,
+            Operator::I32Const { value: 0x1f },
+            &[],
+            &[Type::I32],
+        );
+        let shift_six = body.add_op(
+            write_two,
+            Operator::I32Const { value: 6 },
+            &[],
+            &[Type::I32],
+        );
+        let second_position = body.add_op(
+            write_two,
+            Operator::I32Add,
+            &[fill_position, fill_one],
+            &[Type::I32],
+        );
+        let second = body.add_op(
+            write_two,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, second_position],
+            &[Type::I32],
+        );
+        let first_payload = body.add_op(
+            write_two,
+            Operator::I32And,
+            &[first, mask_five],
+            &[Type::I32],
+        );
+        let high = body.add_op(
+            write_two,
+            Operator::I32Shl,
+            &[first_payload, shift_six],
+            &[Type::I32],
+        );
+        let second_payload = body.add_op(
+            write_two,
+            Operator::I32And,
+            &[second, mask_six],
+            &[Type::I32],
+        );
+        let unit = body.add_op(
+            write_two,
+            Operator::I32Or,
+            &[high, second_payload],
+            &[Type::I32],
+        );
+        body.add_op(
+            write_two,
+            Operator::ArraySet { sig: self.repr.utf16 },
+            &[allocated, fill_unit, unit],
+            &[],
+        );
+        let two_position = body.add_op(
+            write_two,
+            Operator::I32Add,
+            &[fill_position, fill_two],
+            &[Type::I32],
+        );
+        let two_unit = body.add_op(
+            write_two,
+            Operator::I32Add,
+            &[fill_unit, fill_one],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            write_two,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: fill,
+                    args: vec![two_position, two_unit],
+                },
+            },
+        );
+
+        let mask_six = body.add_op(
+            write_three,
+            Operator::I32Const { value: 0x3f },
+            &[],
+            &[Type::I32],
+        );
+        let mask_four = body.add_op(
+            write_three,
+            Operator::I32Const { value: 0x0f },
+            &[],
+            &[Type::I32],
+        );
+        let shift_six = body.add_op(
+            write_three,
+            Operator::I32Const { value: 6 },
+            &[],
+            &[Type::I32],
+        );
+        let shift_twelve = body.add_op(
+            write_three,
+            Operator::I32Const { value: 12 },
+            &[],
+            &[Type::I32],
+        );
+        let second_position = body.add_op(
+            write_three,
+            Operator::I32Add,
+            &[fill_position, fill_one],
+            &[Type::I32],
+        );
+        let third_position = body.add_op(
+            write_three,
+            Operator::I32Add,
+            &[fill_position, fill_two],
+            &[Type::I32],
+        );
+        let second = body.add_op(
+            write_three,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, second_position],
+            &[Type::I32],
+        );
+        let third = body.add_op(
+            write_three,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, third_position],
+            &[Type::I32],
+        );
+        let first_payload = body.add_op(
+            write_three,
+            Operator::I32And,
+            &[first, mask_four],
+            &[Type::I32],
+        );
+        let high = body.add_op(
+            write_three,
+            Operator::I32Shl,
+            &[first_payload, shift_twelve],
+            &[Type::I32],
+        );
+        let second_payload = body.add_op(
+            write_three,
+            Operator::I32And,
+            &[second, mask_six],
+            &[Type::I32],
+        );
+        let middle = body.add_op(
+            write_three,
+            Operator::I32Shl,
+            &[second_payload, shift_six],
+            &[Type::I32],
+        );
+        let high_middle = body.add_op(
+            write_three,
+            Operator::I32Or,
+            &[high, middle],
+            &[Type::I32],
+        );
+        let third_payload = body.add_op(
+            write_three,
+            Operator::I32And,
+            &[third, mask_six],
+            &[Type::I32],
+        );
+        let unit = body.add_op(
+            write_three,
+            Operator::I32Or,
+            &[high_middle, third_payload],
+            &[Type::I32],
+        );
+        body.add_op(
+            write_three,
+            Operator::ArraySet { sig: self.repr.utf16 },
+            &[allocated, fill_unit, unit],
+            &[],
+        );
+        let three_position = body.add_op(
+            write_three,
+            Operator::I32Add,
+            &[fill_position, fill_three],
+            &[Type::I32],
+        );
+        let three_unit = body.add_op(
+            write_three,
+            Operator::I32Add,
+            &[fill_unit, fill_one],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            write_three,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: fill,
+                    args: vec![three_position, three_unit],
+                },
+            },
+        );
+
+        let mask_six = body.add_op(
+            write_four,
+            Operator::I32Const { value: 0x3f },
+            &[],
+            &[Type::I32],
+        );
+        let mask_three = body.add_op(
+            write_four,
+            Operator::I32Const { value: 0x07 },
+            &[],
+            &[Type::I32],
+        );
+        let shift_six = body.add_op(
+            write_four,
+            Operator::I32Const { value: 6 },
+            &[],
+            &[Type::I32],
+        );
+        let shift_twelve = body.add_op(
+            write_four,
+            Operator::I32Const { value: 12 },
+            &[],
+            &[Type::I32],
+        );
+        let shift_eighteen = body.add_op(
+            write_four,
+            Operator::I32Const { value: 18 },
+            &[],
+            &[Type::I32],
+        );
+        let second_position = body.add_op(
+            write_four,
+            Operator::I32Add,
+            &[fill_position, fill_one],
+            &[Type::I32],
+        );
+        let third_position = body.add_op(
+            write_four,
+            Operator::I32Add,
+            &[fill_position, fill_two],
+            &[Type::I32],
+        );
+        let fourth_position = body.add_op(
+            write_four,
+            Operator::I32Add,
+            &[fill_position, fill_three],
+            &[Type::I32],
+        );
+        let second = body.add_op(
+            write_four,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, second_position],
+            &[Type::I32],
+        );
+        let third = body.add_op(
+            write_four,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, third_position],
+            &[Type::I32],
+        );
+        let fourth = body.add_op(
+            write_four,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, fourth_position],
+            &[Type::I32],
+        );
+        let first_payload = body.add_op(
+            write_four,
+            Operator::I32And,
+            &[first, mask_three],
+            &[Type::I32],
+        );
+        let high = body.add_op(
+            write_four,
+            Operator::I32Shl,
+            &[first_payload, shift_eighteen],
+            &[Type::I32],
+        );
+        let second_payload = body.add_op(
+            write_four,
+            Operator::I32And,
+            &[second, mask_six],
+            &[Type::I32],
+        );
+        let middle_high = body.add_op(
+            write_four,
+            Operator::I32Shl,
+            &[second_payload, shift_twelve],
+            &[Type::I32],
+        );
+        let third_payload = body.add_op(
+            write_four,
+            Operator::I32And,
+            &[third, mask_six],
+            &[Type::I32],
+        );
+        let middle_low = body.add_op(
+            write_four,
+            Operator::I32Shl,
+            &[third_payload, shift_six],
+            &[Type::I32],
+        );
+        let high_middle = body.add_op(
+            write_four,
+            Operator::I32Or,
+            &[high, middle_high],
+            &[Type::I32],
+        );
+        let high_middle_low = body.add_op(
+            write_four,
+            Operator::I32Or,
+            &[high_middle, middle_low],
+            &[Type::I32],
+        );
+        let fourth_payload = body.add_op(
+            write_four,
+            Operator::I32And,
+            &[fourth, mask_six],
+            &[Type::I32],
+        );
+        let code_point = body.add_op(
+            write_four,
+            Operator::I32Or,
+            &[high_middle_low, fourth_payload],
+            &[Type::I32],
+        );
+        let surrogate_offset = body.add_op(
+            write_four,
+            Operator::I32Const { value: 0x1_0000 },
+            &[],
+            &[Type::I32],
+        );
+        let pair = body.add_op(
+            write_four,
+            Operator::I32Sub,
+            &[code_point, surrogate_offset],
+            &[Type::I32],
+        );
+        let ten = body.add_op(
+            write_four,
+            Operator::I32Const { value: 10 },
+            &[],
+            &[Type::I32],
+        );
+        let high_base = body.add_op(
+            write_four,
+            Operator::I32Const { value: 0xd800 },
+            &[],
+            &[Type::I32],
+        );
+        let low_base = body.add_op(
+            write_four,
+            Operator::I32Const { value: 0xdc00 },
+            &[],
+            &[Type::I32],
+        );
+        let low_mask = body.add_op(
+            write_four,
+            Operator::I32Const { value: 0x3ff },
+            &[],
+            &[Type::I32],
+        );
+        let high_payload = body.add_op(
+            write_four,
+            Operator::I32ShrU,
+            &[pair, ten],
+            &[Type::I32],
+        );
+        let high_unit = body.add_op(
+            write_four,
+            Operator::I32Or,
+            &[high_base, high_payload],
+            &[Type::I32],
+        );
+        let low_payload = body.add_op(
+            write_four,
+            Operator::I32And,
+            &[pair, low_mask],
+            &[Type::I32],
+        );
+        let low_unit = body.add_op(
+            write_four,
+            Operator::I32Or,
+            &[low_base, low_payload],
+            &[Type::I32],
+        );
+        body.add_op(
+            write_four,
+            Operator::ArraySet { sig: self.repr.utf16 },
+            &[allocated, fill_unit, high_unit],
+            &[],
+        );
+        let low_index = body.add_op(
+            write_four,
+            Operator::I32Add,
+            &[fill_unit, fill_one],
+            &[Type::I32],
+        );
+        body.add_op(
+            write_four,
+            Operator::ArraySet { sig: self.repr.utf16 },
+            &[allocated, low_index, low_unit],
+            &[],
+        );
+        let four_position = body.add_op(
+            write_four,
+            Operator::I32Add,
+            &[fill_position, fill_four],
+            &[Type::I32],
+        );
+        let four_unit = body.add_op(
+            write_four,
+            Operator::I32Add,
+            &[fill_unit, fill_two],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            write_four,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: fill,
+                    args: vec![four_position, four_unit],
+                },
+            },
+        );
+        let function = self.module.funcs.push(FuncDecl::Body(
+            signature,
+            format!("js_string_utf16_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.string_utf16 = Some(function);
+        Ok(function)
+    }
+
+    fn string_length(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        string: Value,
+    ) -> Result<LowerValue, ConvertError> {
+        let helper = self.ensure_string_utf16()?;
+        let utf16 = body.add_op(
+            block,
+            Operator::Call { function_index: helper },
+            &[string],
+            &[self.repr.utf16_ty()],
+        );
+        let length = body.add_op(block, Operator::ArrayLen, &[utf16], &[Type::I32]);
+        let length = body.add_op(block, Operator::F64ConvertI32S, &[length], &[Type::F64]);
+        let length = body.add_op(
+            block,
+            Operator::StructNew { sig: self.repr.number },
+            &[length],
+            &[self.repr.number_ty()],
+        );
+        Ok(LowerValue::Wasm {
+            value: body.add_op(
+                block,
+                Operator::RefCast { ty: self.repr.value },
+                &[length],
+                &[self.repr.value],
+            ),
+            kind: ValueKind::Reference,
+        })
+    }
+
+    fn get_string_index(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        string: Value,
+        index: Value,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        let helper = self.ensure_string_utf16()?;
+        let units = body.add_op(
+            block,
+            Operator::Call {
+                function_index: helper,
+            },
+            &[string],
+            &[self.repr.utf16_ty()],
+        );
+        let length = body.add_op(block, Operator::ArrayLen, &[units], &[Type::I32]);
+        let in_bounds = body.add_op(block, Operator::I32LtU, &[index, length], &[Type::I32]);
+        let present = body.add_block();
+        let missing = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: in_bounds,
+                if_true: BlockTarget {
+                    block: present,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: missing,
+                    args: vec![],
+                },
+            },
+        );
+        let unit = body.add_op(
+            present,
+            Operator::ArrayGet {
+                sig: self.repr.utf16,
+            },
+            &[units, index],
+            &[Type::I32],
+        );
+        let ascii_limit = body.add_op(
+            present,
+            Operator::I32Const { value: 0x80 },
+            &[],
+            &[Type::I32],
+        );
+        let two_limit = body.add_op(
+            present,
+            Operator::I32Const { value: 0x800 },
+            &[],
+            &[Type::I32],
+        );
+        let ascii = body.add_op(present, Operator::I32LtU, &[unit, ascii_limit], &[Type::I32]);
+        let one_byte = body.add_block();
+        let more_bytes = body.add_block();
+        body.set_terminator(
+            present,
+            Terminator::CondBr {
+                cond: ascii,
+                if_true: BlockTarget {
+                    block: one_byte,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: more_bytes,
+                    args: vec![],
+                },
+            },
+        );
+        let two_bytes = body.add_block();
+        let three_bytes = body.add_block();
+        let two_byte = body.add_op(
+            more_bytes,
+            Operator::I32LtU,
+            &[unit, two_limit],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            more_bytes,
+            Terminator::CondBr {
+                cond: two_byte,
+                if_true: BlockTarget {
+                    block: two_bytes,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: three_bytes,
+                    args: vec![],
+                },
+            },
+        );
+
+        let one_bytes = body.add_op(
+            one_byte,
+            Operator::ArrayNewFixed {
+                sig: self.repr.utf8,
+                num: 1,
+            },
+            &[unit],
+            &[self.repr.utf8_ty()],
+        );
+        let one_cache = body.add_op(
+            one_byte,
+            Operator::ArrayNewFixed {
+                sig: self.repr.utf16,
+                num: 1,
+            },
+            &[unit],
+            &[self.repr.utf16_ty()],
+        );
+        let one_string = body.add_op(
+            one_byte,
+            Operator::StructNew {
+                sig: self.repr.string,
+            },
+            &[one_bytes, one_cache],
+            &[self.repr.string_ty()],
+        );
+        let one_string = body.add_op(
+            one_byte,
+            Operator::RefCast {
+                ty: self.repr.value,
+            },
+            &[one_string],
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            one_byte,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![one_string],
+                },
+            },
+        );
+
+        let six = body.add_op(
+            two_bytes,
+            Operator::I32Const { value: 6 },
+            &[],
+            &[Type::I32],
+        );
+        let prefix = body.add_op(
+            two_bytes,
+            Operator::I32Const { value: 0xc0 },
+            &[],
+            &[Type::I32],
+        );
+        let continuation = body.add_op(
+            two_bytes,
+            Operator::I32Const { value: 0x80 },
+            &[],
+            &[Type::I32],
+        );
+        let mask = body.add_op(
+            two_bytes,
+            Operator::I32Const { value: 0x3f },
+            &[],
+            &[Type::I32],
+        );
+        let high = body.add_op(two_bytes, Operator::I32ShrU, &[unit, six], &[Type::I32]);
+        let first = body.add_op(two_bytes, Operator::I32Or, &[prefix, high], &[Type::I32]);
+        let low = body.add_op(two_bytes, Operator::I32And, &[unit, mask], &[Type::I32]);
+        let second = body.add_op(
+            two_bytes,
+            Operator::I32Or,
+            &[continuation, low],
+            &[Type::I32],
+        );
+        let two_bytes_array = body.add_op(
+            two_bytes,
+            Operator::ArrayNewFixed {
+                sig: self.repr.utf8,
+                num: 2,
+            },
+            &[first, second],
+            &[self.repr.utf8_ty()],
+        );
+        let two_cache = body.add_op(
+            two_bytes,
+            Operator::ArrayNewFixed {
+                sig: self.repr.utf16,
+                num: 1,
+            },
+            &[unit],
+            &[self.repr.utf16_ty()],
+        );
+        let two_string = body.add_op(
+            two_bytes,
+            Operator::StructNew {
+                sig: self.repr.string,
+            },
+            &[two_bytes_array, two_cache],
+            &[self.repr.string_ty()],
+        );
+        let two_string = body.add_op(
+            two_bytes,
+            Operator::RefCast {
+                ty: self.repr.value,
+            },
+            &[two_string],
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            two_bytes,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![two_string],
+                },
+            },
+        );
+
+        let six = body.add_op(
+            three_bytes,
+            Operator::I32Const { value: 6 },
+            &[],
+            &[Type::I32],
+        );
+        let twelve = body.add_op(
+            three_bytes,
+            Operator::I32Const { value: 12 },
+            &[],
+            &[Type::I32],
+        );
+        let prefix = body.add_op(
+            three_bytes,
+            Operator::I32Const { value: 0xe0 },
+            &[],
+            &[Type::I32],
+        );
+        let continuation = body.add_op(
+            three_bytes,
+            Operator::I32Const { value: 0x80 },
+            &[],
+            &[Type::I32],
+        );
+        let mask = body.add_op(
+            three_bytes,
+            Operator::I32Const { value: 0x3f },
+            &[],
+            &[Type::I32],
+        );
+        let first_payload = body.add_op(
+            three_bytes,
+            Operator::I32ShrU,
+            &[unit, twelve],
+            &[Type::I32],
+        );
+        let first = body.add_op(
+            three_bytes,
+            Operator::I32Or,
+            &[prefix, first_payload],
+            &[Type::I32],
+        );
+        let middle_shifted = body.add_op(
+            three_bytes,
+            Operator::I32ShrU,
+            &[unit, six],
+            &[Type::I32],
+        );
+        let middle_payload = body.add_op(
+            three_bytes,
+            Operator::I32And,
+            &[middle_shifted, mask],
+            &[Type::I32],
+        );
+        let second = body.add_op(
+            three_bytes,
+            Operator::I32Or,
+            &[continuation, middle_payload],
+            &[Type::I32],
+        );
+        let final_payload = body.add_op(
+            three_bytes,
+            Operator::I32And,
+            &[unit, mask],
+            &[Type::I32],
+        );
+        let third = body.add_op(
+            three_bytes,
+            Operator::I32Or,
+            &[continuation, final_payload],
+            &[Type::I32],
+        );
+        let three_bytes_array = body.add_op(
+            three_bytes,
+            Operator::ArrayNewFixed {
+                sig: self.repr.utf8,
+                num: 3,
+            },
+            &[first, second, third],
+            &[self.repr.utf8_ty()],
+        );
+        let three_cache = body.add_op(
+            three_bytes,
+            Operator::ArrayNewFixed {
+                sig: self.repr.utf16,
+                num: 1,
+            },
+            &[unit],
+            &[self.repr.utf16_ty()],
+        );
+        let three_string = body.add_op(
+            three_bytes,
+            Operator::StructNew {
+                sig: self.repr.string,
+            },
+            &[three_bytes_array, three_cache],
+            &[self.repr.string_ty()],
+        );
+        let three_string = body.add_op(
+            three_bytes,
+            Operator::RefCast {
+                ty: self.repr.value,
+            },
+            &[three_string],
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            three_bytes,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![three_string],
+                },
+            },
+        );
+        let undef = self.undef(body, missing);
+        let undef = self.box_value(body, missing, &undef)?;
+        body.set_terminator(
+            missing,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![undef],
+                },
+            },
+        );
+        Ok((
+            join,
+            LowerValue::Wasm {
+                value: result,
+                kind: ValueKind::Reference,
+            },
+        ))
+    }
+
+    /// Parse the canonical string forms that JavaScript treats as array
+    /// indices. `u32::MAX` is the sole invalid-key sentinel, leaving the
+    /// complete JavaScript array-index range representable.
+    fn ensure_string_index(&mut self) -> Result<Func, ConvertError> {
+        if let Some(function) = self.string_index {
+            return Ok(function);
+        }
+        const INVALID: u32 = u32::MAX;
+        let signature = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.string_ty()],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let string = body.blocks[entry].params[0].1;
+        let bytes = body.add_op(
+            entry,
+            Operator::StructGet {
+                sig: self.repr.string,
+                idx: 0,
+            },
+            &[string],
+            &[self.repr.utf8_ty()],
+        );
+        let length = body.add_op(entry, Operator::ArrayLen, &[bytes], &[Type::I32]);
+        let zero = body.add_op(entry, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let empty = body.add_op(entry, Operator::I32Eq, &[length, zero], &[Type::I32]);
+        let invalid = body.add_block();
+        let nonempty = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: empty,
+                if_true: BlockTarget {
+                    block: invalid,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: nonempty,
+                    args: vec![],
+                },
+            },
+        );
+        let invalid_value = body.add_op(
+            invalid,
+            Operator::I32Const { value: INVALID },
+            &[],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            invalid,
+            Terminator::Return {
+                values: vec![invalid_value],
+            },
+        );
+        let parse_first = body.add_block();
+        body.set_terminator(
+            nonempty,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: parse_first,
+                    args: vec![],
+                },
+            },
+        );
+
+        let first = body.add_op(
+            parse_first,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, zero],
+            &[Type::I32],
+        );
+        let char_zero = body.add_op(
+            parse_first,
+            Operator::I32Const { value: u32::from(b'0') },
+            &[],
+            &[Type::I32],
+        );
+        let char_one = body.add_op(
+            parse_first,
+            Operator::I32Const { value: u32::from(b'1') },
+            &[],
+            &[Type::I32],
+        );
+        let char_nine = body.add_op(
+            parse_first,
+            Operator::I32Const { value: u32::from(b'9') },
+            &[],
+            &[Type::I32],
+        );
+        let first_is_zero = body.add_op(
+            parse_first,
+            Operator::I32Eq,
+            &[first, char_zero],
+            &[Type::I32],
+        );
+        let zero_first = body.add_block();
+        let nonzero_first = body.add_block();
+        body.set_terminator(
+            parse_first,
+            Terminator::CondBr {
+                cond: first_is_zero,
+                if_true: BlockTarget {
+                    block: zero_first,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: nonzero_first,
+                    args: vec![],
+                },
+            },
+        );
+        let one = body.add_op(
+            zero_first,
+            Operator::I32Const { value: 1 },
+            &[],
+            &[Type::I32],
+        );
+        let zero_is_canonical = body.add_op(
+            zero_first,
+            Operator::I32Eq,
+            &[length, one],
+            &[Type::I32],
+        );
+        let zero_result = body.add_block();
+        body.set_terminator(
+            zero_first,
+            Terminator::CondBr {
+                cond: zero_is_canonical,
+                if_true: BlockTarget {
+                    block: zero_result,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: invalid,
+                    args: vec![],
+                },
+            },
+        );
+        let zero_value = body.add_op(
+            zero_result,
+            Operator::I32Const { value: 0 },
+            &[],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            zero_result,
+            Terminator::Return {
+                values: vec![zero_value],
+            },
+        );
+        let first_at_least_one = body.add_op(
+            nonzero_first,
+            Operator::I32GeU,
+            &[first, char_one],
+            &[Type::I32],
+        );
+        let first_at_most_nine = body.add_op(
+            nonzero_first,
+            Operator::I32LeU,
+            &[first, char_nine],
+            &[Type::I32],
+        );
+        let first_is_digit = body.add_op(
+            nonzero_first,
+            Operator::I32And,
+            &[first_at_least_one, first_at_most_nine],
+            &[Type::I32],
+        );
+        let loop_start = body.add_block();
+        let position = body.add_blockparam(loop_start, Type::I32);
+        let value = body.add_blockparam(loop_start, Type::I32);
+        let first_value = body.add_op(
+            nonzero_first,
+            Operator::I32Sub,
+            &[first, char_zero],
+            &[Type::I32],
+        );
+        let start_position = body.add_op(
+            nonzero_first,
+            Operator::I32Const { value: 1 },
+            &[],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            nonzero_first,
+            Terminator::CondBr {
+                cond: first_is_digit,
+                if_true: BlockTarget {
+                    block: loop_start,
+                    args: vec![start_position, first_value],
+                },
+                if_false: BlockTarget {
+                    block: invalid,
+                    args: vec![],
+                },
+            },
+        );
+        let complete = body.add_op(
+            loop_start,
+            Operator::I32GeU,
+            &[position, length],
+            &[Type::I32],
+        );
+        let parsed = body.add_block();
+        let digit = body.add_block();
+        body.set_terminator(
+            loop_start,
+            Terminator::CondBr {
+                cond: complete,
+                if_true: BlockTarget {
+                    block: parsed,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: digit,
+                    args: vec![],
+                },
+            },
+        );
+        body.set_terminator(parsed, Terminator::Return { values: vec![value] });
+        let byte = body.add_op(
+            digit,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, position],
+            &[Type::I32],
+        );
+        let at_least_zero = body.add_op(
+            digit,
+            Operator::I32GeU,
+            &[byte, char_zero],
+            &[Type::I32],
+        );
+        let at_most_nine = body.add_op(
+            digit,
+            Operator::I32LeU,
+            &[byte, char_nine],
+            &[Type::I32],
+        );
+        let is_digit = body.add_op(
+            digit,
+            Operator::I32And,
+            &[at_least_zero, at_most_nine],
+            &[Type::I32],
+        );
+        let valid_digit = body.add_block();
+        body.set_terminator(
+            digit,
+            Terminator::CondBr {
+                cond: is_digit,
+                if_true: BlockTarget {
+                    block: valid_digit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: invalid,
+                    args: vec![],
+                },
+            },
+        );
+        let digit_value = body.add_op(
+            valid_digit,
+            Operator::I32Sub,
+            &[byte, char_zero],
+            &[Type::I32],
+        );
+        let overflow_prefix = body.add_op(
+            valid_digit,
+            Operator::I32Const { value: 429_496_729 },
+            &[],
+            &[Type::I32],
+        );
+        let overflow_digit = body.add_op(
+            valid_digit,
+            Operator::I32Const { value: 4 },
+            &[],
+            &[Type::I32],
+        );
+        let too_large = body.add_op(
+            valid_digit,
+            Operator::I32GtU,
+            &[value, overflow_prefix],
+            &[Type::I32],
+        );
+        let at_limit = body.add_op(
+            valid_digit,
+            Operator::I32Eq,
+            &[value, overflow_prefix],
+            &[Type::I32],
+        );
+        let final_digit_too_large = body.add_op(
+            valid_digit,
+            Operator::I32GtU,
+            &[digit_value, overflow_digit],
+            &[Type::I32],
+        );
+        let limit_overflow = body.add_op(
+            valid_digit,
+            Operator::I32And,
+            &[at_limit, final_digit_too_large],
+            &[Type::I32],
+        );
+        let overflow = body.add_op(
+            valid_digit,
+            Operator::I32Or,
+            &[too_large, limit_overflow],
+            &[Type::I32],
+        );
+        let continue_parse = body.add_block();
+        body.set_terminator(
+            valid_digit,
+            Terminator::CondBr {
+                cond: overflow,
+                if_true: BlockTarget {
+                    block: invalid,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: continue_parse,
+                    args: vec![],
+                },
+            },
+        );
+        let ten = body.add_op(
+            continue_parse,
+            Operator::I32Const { value: 10 },
+            &[],
+            &[Type::I32],
+        );
+        let one = body.add_op(
+            continue_parse,
+            Operator::I32Const { value: 1 },
+            &[],
+            &[Type::I32],
+        );
+        let multiplied = body.add_op(
+            continue_parse,
+            Operator::I32Mul,
+            &[value, ten],
+            &[Type::I32],
+        );
+        let next_value = body.add_op(
+            continue_parse,
+            Operator::I32Add,
+            &[multiplied, digit_value],
+            &[Type::I32],
+        );
+        let next_position = body.add_op(
+            continue_parse,
+            Operator::I32Add,
+            &[position, one],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            continue_parse,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: loop_start,
+                    args: vec![next_position, next_value],
+                },
+            },
+        );
+        let function = self.module.funcs.push(FuncDecl::Body(
+            signature,
+            format!("js_string_index_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.string_index = Some(function);
+        Ok(function)
+    }
+
+    fn ensure_string_equal(&mut self) -> Result<Func, ConvertError> {
+        if let Some(function) = self.string_equal {
+            return Ok(function);
+        }
+        let signature = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.string_ty(), self.repr.string_ty()],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let left = body.blocks[entry].params[0].1;
+        let right = body.blocks[entry].params[1].1;
+        let left_bytes = body.add_op(
+            entry,
+            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            &[left],
+            &[self.repr.utf8_ty()],
+        );
+        let right_bytes = body.add_op(
+            entry,
+            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            &[right],
+            &[self.repr.utf8_ty()],
+        );
+        let left_len = body.add_op(entry, Operator::ArrayLen, &[left_bytes], &[Type::I32]);
+        let right_len = body.add_op(entry, Operator::ArrayLen, &[right_bytes], &[Type::I32]);
+        let lengths_match = body.add_op(entry, Operator::I32Eq, &[left_len, right_len], &[Type::I32]);
+        let compare = body.add_block();
+        let unequal = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: lengths_match,
+                if_true: BlockTarget { block: compare, args: vec![] },
+                if_false: BlockTarget { block: unequal, args: vec![] },
+            },
+        );
+        let zero = body.add_op(unequal, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        body.set_terminator(unequal, Terminator::Return { values: vec![zero] });
+        let loop_block = body.add_block();
+        let index = body.add_blockparam(loop_block, Type::I32);
+        let zero = body.add_op(compare, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        body.set_terminator(
+            compare,
+            Terminator::Br {
+                target: BlockTarget { block: loop_block, args: vec![zero] },
+            },
+        );
+        let complete = body.add_op(loop_block, Operator::I32GeU, &[index, left_len], &[Type::I32]);
+        let equal = body.add_block();
+        let step = body.add_block();
+        body.set_terminator(
+            loop_block,
+            Terminator::CondBr {
+                cond: complete,
+                if_true: BlockTarget { block: equal, args: vec![] },
+                if_false: BlockTarget { block: step, args: vec![] },
+            },
+        );
+        let one = body.add_op(equal, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        body.set_terminator(equal, Terminator::Return { values: vec![one] });
+        let left_byte = body.add_op(
+            step,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[left_bytes, index],
+            &[Type::I32],
+        );
+        let right_byte = body.add_op(
+            step,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[right_bytes, index],
+            &[Type::I32],
+        );
+        let same = body.add_op(step, Operator::I32Eq, &[left_byte, right_byte], &[Type::I32]);
+        let next = body.add_block();
+        body.set_terminator(
+            step,
+            Terminator::CondBr {
+                cond: same,
+                if_true: BlockTarget { block: next, args: vec![] },
+                if_false: BlockTarget { block: unequal, args: vec![] },
+            },
+        );
+        let one = body.add_op(next, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        let next_index = body.add_op(next, Operator::I32Add, &[index, one], &[Type::I32]);
+        body.set_terminator(
+            next,
+            Terminator::Br {
+                target: BlockTarget { block: loop_block, args: vec![next_index] },
+            },
+        );
+        let function = self.module.funcs.push(FuncDecl::Body(
+            signature,
+            format!("js_string_equal_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.string_equal = Some(function);
+        Ok(function)
     }
 
     fn function_object(
@@ -1938,6 +3763,20 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         arrow: bool,
     ) -> Result<LowerValue, ConvertError> {
         let trie = self.new_trie(body, block)?;
+        let elements = body.add_op(
+            block,
+            Operator::RefNull {
+                ty: self.repr.arguments_ty(),
+            },
+            &[],
+            &[self.repr.arguments_ty()],
+        );
+        let properties = body.add_op(
+            block,
+            Operator::RefNull { ty: self.repr.value },
+            &[],
+            &[self.repr.value],
+        );
         let code = body.add_op(
             block,
             Operator::RefFunc {
@@ -1960,7 +3799,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             Operator::StructNew {
                 sig: self.repr.function,
             },
-            &[trie, code, context, captured_this, arrow],
+            &[trie, elements, properties, code, context, captured_this, arrow],
             &[self.repr.function_ty()],
         );
         Ok(LowerValue::Wasm {
@@ -2010,13 +3849,26 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
 
     fn key_of(&self, value: &LowerValue) -> Result<String, ConvertError> {
         match value {
-            LowerValue::StaticKey(key) => Ok(key.clone()),
             LowerValue::ReferenceKey { key, .. } => Ok(key.clone()),
             LowerValue::NumberLiteral { key, .. } => Ok(key.clone()),
+            LowerValue::String { key, .. } => Ok(key.clone()),
             _ => Err(ConvertError::invalid(
                 "dynamic property keys are unsupported",
             )),
         }
+    }
+
+    fn static_array_index(key: &str) -> Option<u32> {
+        let bytes = key.as_bytes();
+        if bytes.is_empty()
+            || (bytes.len() > 1 && bytes.first().is_some_and(|byte| *byte == b'0'))
+            || bytes.iter().any(|byte| !byte.is_ascii_digit())
+        {
+            return None;
+        }
+        let value = key.parse::<u32>().ok()?;
+        // `2^32 - 1` is the `length` sentinel rather than an array index.
+        (value != u32::MAX).then_some(value)
     }
 
     fn object_and_trie(
@@ -2149,7 +4001,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn get_property(
-        &self,
+        &mut self,
         body: &mut FunctionBody,
         block: Block,
         context: Value,
@@ -2167,76 +4019,99 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn get_property_value(
-        &self,
+        &mut self,
         body: &mut FunctionBody,
         block: Block,
         object: &LowerValue,
         key: &str,
     ) -> Result<(Block, LowerValue), ConvertError> {
+        if key == "length"
+            && let LowerValue::String { value, .. } = object
+        {
+            return Ok((block, self.string_length(body, block, *value)?));
+        }
+        if let LowerValue::String { bytes, .. } = object
+            && let Some(index) = Self::static_array_index(key)
+        {
+            return Ok((
+                block,
+                self.literal_string_index(body, block, bytes, index)?,
+            ));
+        }
+        let string_index = Self::static_array_index(key);
+        if key != "length" && string_index.is_none() {
+            return self.get_nonstring_property_value(body, block, object, key);
+        }
         let (value, kind) = object.wasm()?;
         if kind != ValueKind::Reference {
-            return self.get_object_property_value(body, block, object, key);
+            return self.get_nonstring_property_value(body, block, object, key);
         }
-
-        // Arrays share the `anyref` JavaScript value boundary with objects.
-        // Test before interpreting the reference as an object/function trie:
-        // an array's indexed elements and length live in its WasmGC array,
-        // not in the property trie.
-        let is_array = body.add_op(
+        let is_string = body.add_op(
             block,
             Operator::RefTest {
-                ty: self.repr.arguments_ty(),
+                ty: self.repr.string_ty(),
             },
             &[value],
             &[Type::I32],
         );
-        let array_block = body.add_block();
-        let object_block = body.add_block();
+        let string = body.add_block();
+        let non_string = body.add_block();
         let join = body.add_block();
         let result = body.add_blockparam(join, self.repr.value);
         body.set_terminator(
             block,
             Terminator::CondBr {
-                cond: is_array,
+                cond: is_string,
                 if_true: BlockTarget {
-                    block: array_block,
+                    block: string,
                     args: vec![],
                 },
                 if_false: BlockTarget {
-                    block: object_block,
+                    block: non_string,
                     args: vec![],
                 },
             },
         );
-
-        let array = body.add_op(
-            array_block,
+        let string_value = body.add_op(
+            string,
             Operator::RefCast {
-                ty: self.repr.arguments_ty(),
+                ty: self.repr.string_ty(),
             },
             &[value],
-            &[self.repr.arguments_ty()],
+            &[self.repr.string_ty()],
         );
-        let (array_block, array_value) = self.get_array_property(body, array_block, array, key)?;
+        let (string, string_value) = if key == "length" {
+            (string, self.string_length(body, string, string_value)?)
+        } else {
+            let index = body.add_op(
+                string,
+                Operator::I32Const {
+                    value: string_index.expect("numeric key was checked above"),
+                },
+                &[],
+                &[Type::I32],
+            );
+            self.get_string_index(body, string, string_value, index)?
+        };
+        let string_value = self.box_value(body, string, &string_value)?;
         body.set_terminator(
-            array_block,
+            string,
             Terminator::Br {
                 target: BlockTarget {
                     block: join,
-                    args: vec![array_value],
+                    args: vec![string_value],
                 },
             },
         );
-
-        let (object_block, object_value) =
-            self.get_object_property_value(body, object_block, object, key)?;
-        let object_value = self.box_value(body, object_block, &object_value)?;
+        let (non_string, non_string_value) =
+            self.get_nonstring_property_value(body, non_string, object, key)?;
+        let non_string_value = self.box_value(body, non_string, &non_string_value)?;
         body.set_terminator(
-            object_block,
+            non_string,
             Terminator::Br {
                 target: BlockTarget {
                     block: join,
-                    args: vec![object_value],
+                    args: vec![non_string_value],
                 },
             },
         );
@@ -2247,6 +4122,124 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 kind: ValueKind::Reference,
             },
         ))
+    }
+
+    fn get_nonstring_property_value(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &str,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        if let LowerValue::String { bytes, .. } = object
+            && let Some(index) = Self::static_array_index(key)
+        {
+            return Ok((
+                block,
+                self.literal_string_index(body, block, bytes, index)?,
+            ));
+        }
+        let (value, kind) = object.wasm()?;
+        if kind != ValueKind::Reference || !(key == "length" || Self::static_array_index(key).is_some()) {
+            return self.get_object_property_value(body, block, object, key);
+        }
+
+        // The call ABI still uses a raw Wasm array, but JavaScript array
+        // values are ordinary objects with an optional element component.
+        // Keep accepting the raw representation here for adapter internals.
+        let is_raw_array = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.arguments_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let raw_array = body.add_block();
+        let non_raw = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_raw_array,
+                if_true: BlockTarget { block: raw_array, args: vec![] },
+                if_false: BlockTarget { block: non_raw, args: vec![] },
+            },
+        );
+        let array = body.add_op(
+            raw_array,
+            Operator::RefCast { ty: self.repr.arguments_ty() },
+            &[value],
+            &[self.repr.arguments_ty()],
+        );
+        let (raw_array, raw_value) = self.get_array_property(body, raw_array, array, key)?;
+        body.set_terminator(
+            raw_array,
+            Terminator::Br {
+                target: BlockTarget { block: join, args: vec![raw_value] },
+            },
+        );
+
+        let is_object = body.add_op(
+            non_raw,
+            Operator::RefTest { ty: self.repr.object_ty() },
+            &[value],
+            &[Type::I32],
+        );
+        let object_array = body.add_block();
+        let fallback = body.add_block();
+        body.set_terminator(
+            non_raw,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget { block: object_array, args: vec![] },
+                if_false: BlockTarget { block: fallback, args: vec![] },
+            },
+        );
+        let plain = body.add_op(
+            object_array,
+            Operator::RefCast { ty: self.repr.object_ty() },
+            &[value],
+            &[self.repr.object_ty()],
+        );
+        let elements = body.add_op(
+            object_array,
+            Operator::StructGet { sig: self.repr.object, idx: 1 },
+            &[plain],
+            &[self.repr.arguments_ty()],
+        );
+        let no_elements = body.add_op(object_array, Operator::RefIsNull, &[elements], &[Type::I32]);
+        let array_component = body.add_block();
+        let no_component = body.add_block();
+        body.set_terminator(
+            object_array,
+            Terminator::CondBr {
+                cond: no_elements,
+                if_true: BlockTarget { block: no_component, args: vec![] },
+                if_false: BlockTarget { block: array_component, args: vec![] },
+            },
+        );
+        let (array_component, component_value) =
+            self.get_array_property(body, array_component, elements, key)?;
+        body.set_terminator(
+            array_component,
+            Terminator::Br {
+                target: BlockTarget { block: join, args: vec![component_value] },
+            },
+        );
+        for fallback_block in [fallback, no_component] {
+            let (fallback_block, fallback_value) =
+                self.get_object_property_value(body, fallback_block, object, key)?;
+            let fallback_value = self.box_value(body, fallback_block, &fallback_value)?;
+            body.set_terminator(
+                fallback_block,
+                Terminator::Br {
+                    target: BlockTarget { block: join, args: vec![fallback_value] },
+                },
+            );
+        }
+        Ok((join, LowerValue::Wasm { value: result, kind: ValueKind::Reference }))
     }
 
     fn get_array_property(
@@ -2280,7 +4273,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             ));
         }
 
-        let Some(index) = key.parse::<u32>().ok() else {
+        let Some(index) = Self::static_array_index(key) else {
             return Ok((
                 block,
                 body.add_op(
@@ -2299,6 +4292,16 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[],
             &[Type::I32],
         );
+        self.get_array_index(body, block, array, index)
+    }
+
+    fn get_array_index(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        array: Value,
+        index: Value,
+    ) -> Result<(Block, Value), ConvertError> {
         let length = body.add_op(block, Operator::ArrayLen, &[array], &[Type::I32]);
         let present = body.add_op(block, Operator::I32LtU, &[index, length], &[Type::I32]);
         let get = body.add_block();
@@ -2356,6 +4359,954 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         Ok((join, result))
     }
 
+    fn numeric_index(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        key: &LowerValue,
+    ) -> Result<Value, ConvertError> {
+        let (key, kind) = key.wasm()?;
+        Ok(match kind {
+            ValueKind::Number => body.add_op(
+                block,
+                Operator::I32TruncSatF64U,
+                &[key],
+                &[Type::I32],
+            ),
+            ValueKind::Integer | ValueKind::Boolean => key,
+            _ => return Err(ConvertError::invalid("dynamic member key is not numeric")),
+        })
+    }
+
+    fn get_numeric_member(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        index: Value,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        let (value, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return Ok((block, self.undef(body, block)));
+        }
+        let is_string = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.string_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let string = body.add_block();
+        let non_string = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_string,
+                if_true: BlockTarget {
+                    block: string,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: non_string,
+                    args: vec![],
+                },
+            },
+        );
+        let string_value = body.add_op(
+            string,
+            Operator::RefCast {
+                ty: self.repr.string_ty(),
+            },
+            &[value],
+            &[self.repr.string_ty()],
+        );
+        let (string, string_value) = self.get_string_index(body, string, string_value, index)?;
+        let string_value = self.box_value(body, string, &string_value)?;
+        body.set_terminator(
+            string,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![string_value],
+                },
+            },
+        );
+        let (non_string, non_string_value) =
+            self.get_nonstring_numeric_member(body, non_string, object, index)?;
+        let non_string_value = self.box_value(body, non_string, &non_string_value)?;
+        body.set_terminator(
+            non_string,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![non_string_value],
+                },
+            },
+        );
+        Ok((
+            join,
+            LowerValue::Wasm {
+                value: result,
+                kind: ValueKind::Reference,
+            },
+        ))
+    }
+
+    fn get_nonstring_numeric_member(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        index: Value,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        let (value, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return Ok((block, self.undef(body, block)));
+        }
+        let is_raw = body.add_op(
+            block,
+            Operator::RefTest { ty: self.repr.arguments_ty() },
+            &[value],
+            &[Type::I32],
+        );
+        let raw = body.add_block();
+        let non_raw = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_raw,
+                if_true: BlockTarget { block: raw, args: vec![] },
+                if_false: BlockTarget { block: non_raw, args: vec![] },
+            },
+        );
+        let raw_array = body.add_op(
+            raw,
+            Operator::RefCast { ty: self.repr.arguments_ty() },
+            &[value],
+            &[self.repr.arguments_ty()],
+        );
+        let (raw, raw_value) = self.get_array_index(body, raw, raw_array, index)?;
+        body.set_terminator(
+            raw,
+            Terminator::Br {
+                target: BlockTarget { block: join, args: vec![raw_value] },
+            },
+        );
+        let is_object = body.add_op(
+            non_raw,
+            Operator::RefTest { ty: self.repr.object_ty() },
+            &[value],
+            &[Type::I32],
+        );
+        let array_object = body.add_block();
+        let missing = body.add_block();
+        body.set_terminator(
+            non_raw,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget { block: array_object, args: vec![] },
+                if_false: BlockTarget { block: missing, args: vec![] },
+            },
+        );
+        let plain = body.add_op(
+            array_object,
+            Operator::RefCast { ty: self.repr.object_ty() },
+            &[value],
+            &[self.repr.object_ty()],
+        );
+        let elements = body.add_op(
+            array_object,
+            Operator::StructGet { sig: self.repr.object, idx: 1 },
+            &[plain],
+            &[self.repr.arguments_ty()],
+        );
+        let null = body.add_op(array_object, Operator::RefIsNull, &[elements], &[Type::I32]);
+        let present = body.add_block();
+        body.set_terminator(
+            array_object,
+            Terminator::CondBr {
+                cond: null,
+                if_true: BlockTarget { block: missing, args: vec![] },
+                if_false: BlockTarget { block: present, args: vec![] },
+            },
+        );
+        let (present, present_value) = self.get_array_index(body, present, elements, index)?;
+        body.set_terminator(
+            present,
+            Terminator::Br {
+                target: BlockTarget { block: join, args: vec![present_value] },
+            },
+        );
+        let undef = self.undef(body, missing);
+        let undef = self.box_value(body, missing, &undef)?;
+        body.set_terminator(
+            missing,
+            Terminator::Br {
+                target: BlockTarget { block: join, args: vec![undef] },
+            },
+        );
+        Ok((join, LowerValue::Wasm { value: result, kind: ValueKind::Reference }))
+    }
+
+    fn dynamic_string_key(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        key: &LowerValue,
+    ) -> Result<Value, ConvertError> {
+        let (key, kind) = key.wasm()?;
+        if kind != ValueKind::Reference {
+            return Err(ConvertError::invalid("dynamic member key is not a string"));
+        }
+        Ok(body.add_op(
+            block,
+            Operator::RefCast { ty: self.repr.string_ty() },
+            &[key],
+            &[self.repr.string_ty()],
+        ))
+    }
+
+    fn get_string_member(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: Value,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        const INVALID: u32 = u32::MAX;
+        let (value, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return self.get_dynamic_property(body, block, object, key);
+        }
+        let parser = self.ensure_string_index()?;
+        let equal = self.ensure_string_equal()?;
+        let is_object = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.object_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let array_object = body.add_block();
+        let property = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget {
+                    block: array_object,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: property,
+                    args: vec![],
+                },
+            },
+        );
+        let plain = body.add_op(
+            array_object,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[value],
+            &[self.repr.object_ty()],
+        );
+        let elements = body.add_op(
+            array_object,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 1,
+            },
+            &[plain],
+            &[self.repr.arguments_ty()],
+        );
+        let no_elements = body.add_op(
+            array_object,
+            Operator::RefIsNull,
+            &[elements],
+            &[Type::I32],
+        );
+        let array = body.add_block();
+        body.set_terminator(
+            array_object,
+            Terminator::CondBr {
+                cond: no_elements,
+                if_true: BlockTarget {
+                    block: property,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: array,
+                    args: vec![],
+                },
+            },
+        );
+        let length_name = self.new_string(body, array, b"length")?;
+        let is_length = body.add_op(
+            array,
+            Operator::Call {
+                function_index: equal,
+            },
+            &[key, length_name],
+            &[Type::I32],
+        );
+        let length = body.add_block();
+        let maybe_index = body.add_block();
+        body.set_terminator(
+            array,
+            Terminator::CondBr {
+                cond: is_length,
+                if_true: BlockTarget {
+                    block: length,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: maybe_index,
+                    args: vec![],
+                },
+            },
+        );
+        let (length, length_value) = self.get_array_property(body, length, elements, "length")?;
+        body.set_terminator(
+            length,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![length_value],
+                },
+            },
+        );
+        let index = body.add_op(
+            maybe_index,
+            Operator::Call {
+                function_index: parser,
+            },
+            &[key],
+            &[Type::I32],
+        );
+        let invalid = body.add_op(
+            maybe_index,
+            Operator::I32Const { value: INVALID },
+            &[],
+            &[Type::I32],
+        );
+        let is_invalid = body.add_op(
+            maybe_index,
+            Operator::I32Eq,
+            &[index, invalid],
+            &[Type::I32],
+        );
+        let array_index = body.add_block();
+        body.set_terminator(
+            maybe_index,
+            Terminator::CondBr {
+                cond: is_invalid,
+                if_true: BlockTarget {
+                    block: property,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: array_index,
+                    args: vec![],
+                },
+            },
+        );
+        let (array_index, array_value) =
+            self.get_array_index(body, array_index, elements, index)?;
+        body.set_terminator(
+            array_index,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![array_value],
+                },
+            },
+        );
+        let (property, property_value) = self.get_dynamic_property(body, property, object, key)?;
+        let property_value = self.box_value(body, property, &property_value)?;
+        body.set_terminator(
+            property,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![property_value],
+                },
+            },
+        );
+        Ok((
+            join,
+            LowerValue::Wasm {
+                value: result,
+                kind: ValueKind::Reference,
+            },
+        ))
+    }
+
+    fn get_dynamic_property(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: Value,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        let (object, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return Ok((block, self.undef(body, block)));
+        }
+        let equal = self.ensure_string_equal()?;
+        let is_function = body.add_op(
+            block,
+            Operator::RefTest { ty: self.repr.function_ty() },
+            &[object],
+            &[Type::I32],
+        );
+        let function = body.add_block();
+        let non_function = body.add_block();
+        let head_join = body.add_block();
+        let head = body.add_blockparam(head_join, self.repr.value);
+        let missing = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_function,
+                if_true: BlockTarget { block: function, args: vec![] },
+                if_false: BlockTarget { block: non_function, args: vec![] },
+            },
+        );
+        let function_value = body.add_op(
+            function,
+            Operator::RefCast { ty: self.repr.function_ty() },
+            &[object],
+            &[self.repr.function_ty()],
+        );
+        let function_head = body.add_op(
+            function,
+            Operator::StructGet { sig: self.repr.function, idx: 2 },
+            &[function_value],
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            function,
+            Terminator::Br {
+                target: BlockTarget { block: head_join, args: vec![function_head] },
+            },
+        );
+        let is_object = body.add_op(
+            non_function,
+            Operator::RefTest { ty: self.repr.object_ty() },
+            &[object],
+            &[Type::I32],
+        );
+        let plain = body.add_block();
+        body.set_terminator(
+            non_function,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget { block: plain, args: vec![] },
+                if_false: BlockTarget { block: missing, args: vec![] },
+            },
+        );
+        let plain_value = body.add_op(
+            plain,
+            Operator::RefCast { ty: self.repr.object_ty() },
+            &[object],
+            &[self.repr.object_ty()],
+        );
+        let plain_head = body.add_op(
+            plain,
+            Operator::StructGet { sig: self.repr.object, idx: 2 },
+            &[plain_value],
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            plain,
+            Terminator::Br {
+                target: BlockTarget { block: head_join, args: vec![plain_head] },
+            },
+        );
+        let scan = body.add_block();
+        let current = body.add_blockparam(scan, self.repr.value);
+        body.set_terminator(
+            head_join,
+            Terminator::Br {
+                target: BlockTarget { block: scan, args: vec![head] },
+            },
+        );
+        let absent = body.add_op(scan, Operator::RefIsNull, &[current], &[Type::I32]);
+        let entry = body.add_block();
+        body.set_terminator(
+            scan,
+            Terminator::CondBr {
+                cond: absent,
+                if_true: BlockTarget { block: missing, args: vec![] },
+                if_false: BlockTarget { block: entry, args: vec![] },
+            },
+        );
+        let entry_value = body.add_op(
+            entry,
+            Operator::RefCast { ty: self.repr.property_ty() },
+            &[current],
+            &[self.repr.property_ty()],
+        );
+        let entry_key = body.add_op(
+            entry,
+            Operator::StructGet { sig: self.repr.property, idx: 0 },
+            &[entry_value],
+            &[self.repr.string_ty()],
+        );
+        let matches = body.add_op(
+            entry,
+            Operator::Call { function_index: equal },
+            &[key, entry_key],
+            &[Type::I32],
+        );
+        let found = body.add_block();
+        let next = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: matches,
+                if_true: BlockTarget { block: found, args: vec![] },
+                if_false: BlockTarget { block: next, args: vec![] },
+            },
+        );
+        let result_join = body.add_block();
+        let result = body.add_blockparam(result_join, self.repr.value);
+        let found_value = body.add_op(
+            found,
+            Operator::StructGet { sig: self.repr.property, idx: 1 },
+            &[entry_value],
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            found,
+            Terminator::Br {
+                target: BlockTarget { block: result_join, args: vec![found_value] },
+            },
+        );
+        let next_link = body.add_op(
+            next,
+            Operator::StructGet { sig: self.repr.property, idx: 2 },
+            &[entry_value],
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            next,
+            Terminator::Br {
+                target: BlockTarget { block: scan, args: vec![next_link] },
+            },
+        );
+        let undef = self.undef(body, missing);
+        let undef = self.box_value(body, missing, &undef)?;
+        body.set_terminator(
+            missing,
+            Terminator::Br {
+                target: BlockTarget { block: result_join, args: vec![undef] },
+            },
+        );
+        Ok((result_join, LowerValue::Wasm { value: result, kind: ValueKind::Reference }))
+    }
+
+    fn set_string_member(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: Value,
+        value: &LowerValue,
+    ) -> Result<Block, ConvertError> {
+        const INVALID: u32 = u32::MAX;
+        let (object_value, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return self.set_dynamic_property(body, block, object, key, value);
+        }
+        let parser = self.ensure_string_index()?;
+        let equal = self.ensure_string_equal()?;
+        let is_object = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.object_ty(),
+            },
+            &[object_value],
+            &[Type::I32],
+        );
+        let array_object = body.add_block();
+        let property = body.add_block();
+        let done = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget {
+                    block: array_object,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: property,
+                    args: vec![],
+                },
+            },
+        );
+        let plain = body.add_op(
+            array_object,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[object_value],
+            &[self.repr.object_ty()],
+        );
+        let elements = body.add_op(
+            array_object,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 1,
+            },
+            &[plain],
+            &[self.repr.arguments_ty()],
+        );
+        let no_elements = body.add_op(
+            array_object,
+            Operator::RefIsNull,
+            &[elements],
+            &[Type::I32],
+        );
+        let array = body.add_block();
+        body.set_terminator(
+            array_object,
+            Terminator::CondBr {
+                cond: no_elements,
+                if_true: BlockTarget {
+                    block: property,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: array,
+                    args: vec![],
+                },
+            },
+        );
+        let length_name = self.new_string(body, array, b"length")?;
+        let is_length = body.add_op(
+            array,
+            Operator::Call {
+                function_index: equal,
+            },
+            &[key, length_name],
+            &[Type::I32],
+        );
+        let length = body.add_block();
+        let maybe_index = body.add_block();
+        body.set_terminator(
+            array,
+            Terminator::CondBr {
+                cond: is_length,
+                if_true: BlockTarget {
+                    block: length,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: maybe_index,
+                    args: vec![],
+                },
+            },
+        );
+        let length = self.set_array_length(body, length, object, value)?;
+        body.set_terminator(
+            length,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
+            },
+        );
+        let index = body.add_op(
+            maybe_index,
+            Operator::Call {
+                function_index: parser,
+            },
+            &[key],
+            &[Type::I32],
+        );
+        let invalid = body.add_op(
+            maybe_index,
+            Operator::I32Const { value: INVALID },
+            &[],
+            &[Type::I32],
+        );
+        let is_invalid = body.add_op(
+            maybe_index,
+            Operator::I32Eq,
+            &[index, invalid],
+            &[Type::I32],
+        );
+        let array_index = body.add_block();
+        body.set_terminator(
+            maybe_index,
+            Terminator::CondBr {
+                cond: is_invalid,
+                if_true: BlockTarget {
+                    block: property,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: array_index,
+                    args: vec![],
+                },
+            },
+        );
+        let array_index = self.set_numeric_member(body, array_index, object, index, value)?;
+        body.set_terminator(
+            array_index,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
+            },
+        );
+        let property = self.set_dynamic_property(body, property, object, key, value)?;
+        body.set_terminator(
+            property,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
+            },
+        );
+        Ok(done)
+    }
+
+    fn set_dynamic_property(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: Value,
+        value: &LowerValue,
+    ) -> Result<Block, ConvertError> {
+        let (object, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return Ok(block);
+        }
+        let boxed_value = self.box_value(body, block, value)?;
+        let is_function = body.add_op(
+            block,
+            Operator::RefTest { ty: self.repr.function_ty() },
+            &[object],
+            &[Type::I32],
+        );
+        let function = body.add_block();
+        let non_function = body.add_block();
+        let done = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_function,
+                if_true: BlockTarget { block: function, args: vec![] },
+                if_false: BlockTarget { block: non_function, args: vec![] },
+            },
+        );
+        let function_value = body.add_op(
+            function,
+            Operator::RefCast { ty: self.repr.function_ty() },
+            &[object],
+            &[self.repr.function_ty()],
+        );
+        let function_head = body.add_op(
+            function,
+            Operator::StructGet { sig: self.repr.function, idx: 2 },
+            &[function_value],
+            &[self.repr.value],
+        );
+        let function_entry = body.add_op(
+            function,
+            Operator::StructNew { sig: self.repr.property },
+            &[key, boxed_value, function_head],
+            &[self.repr.property_ty()],
+        );
+        let function_entry = body.add_op(
+            function,
+            Operator::RefCast { ty: self.repr.value },
+            &[function_entry],
+            &[self.repr.value],
+        );
+        body.add_op(
+            function,
+            Operator::StructSet { sig: self.repr.function, idx: 2 },
+            &[function_value, function_entry],
+            &[],
+        );
+        body.set_terminator(function, Terminator::Br { target: BlockTarget { block: done, args: vec![] } });
+        let is_object = body.add_op(
+            non_function,
+            Operator::RefTest { ty: self.repr.object_ty() },
+            &[object],
+            &[Type::I32],
+        );
+        let plain = body.add_block();
+        body.set_terminator(
+            non_function,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget { block: plain, args: vec![] },
+                if_false: BlockTarget { block: done, args: vec![] },
+            },
+        );
+        let plain_value = body.add_op(
+            plain,
+            Operator::RefCast { ty: self.repr.object_ty() },
+            &[object],
+            &[self.repr.object_ty()],
+        );
+        let plain_head = body.add_op(
+            plain,
+            Operator::StructGet { sig: self.repr.object, idx: 2 },
+            &[plain_value],
+            &[self.repr.value],
+        );
+        let plain_entry = body.add_op(
+            plain,
+            Operator::StructNew { sig: self.repr.property },
+            &[key, boxed_value, plain_head],
+            &[self.repr.property_ty()],
+        );
+        let plain_entry = body.add_op(
+            plain,
+            Operator::RefCast { ty: self.repr.value },
+            &[plain_entry],
+            &[self.repr.value],
+        );
+        body.add_op(
+            plain,
+            Operator::StructSet { sig: self.repr.object, idx: 2 },
+            &[plain_value, plain_entry],
+            &[],
+        );
+        body.set_terminator(plain, Terminator::Br { target: BlockTarget { block: done, args: vec![] } });
+        Ok(done)
+    }
+
+    fn set_numeric_member(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        index: Value,
+        value: &LowerValue,
+    ) -> Result<Block, ConvertError> {
+        let (object, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return Ok(block);
+        }
+        let boxed_value = self.box_value(body, block, value)?;
+        let is_object = body.add_op(
+            block,
+            Operator::RefTest { ty: self.repr.object_ty() },
+            &[object],
+            &[Type::I32],
+        );
+        let array_object = body.add_block();
+        let done = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget { block: array_object, args: vec![] },
+                if_false: BlockTarget { block: done, args: vec![] },
+            },
+        );
+        let plain = body.add_op(
+            array_object,
+            Operator::RefCast { ty: self.repr.object_ty() },
+            &[object],
+            &[self.repr.object_ty()],
+        );
+        let elements = body.add_op(
+            array_object,
+            Operator::StructGet { sig: self.repr.object, idx: 1 },
+            &[plain],
+            &[self.repr.arguments_ty()],
+        );
+        let no_elements = body.add_op(array_object, Operator::RefIsNull, &[elements], &[Type::I32]);
+        let write = body.add_block();
+        body.set_terminator(
+            array_object,
+            Terminator::CondBr {
+                cond: no_elements,
+                if_true: BlockTarget { block: done, args: vec![] },
+                if_false: BlockTarget { block: write, args: vec![] },
+            },
+        );
+        let length = body.add_op(write, Operator::ArrayLen, &[elements], &[Type::I32]);
+        let in_bounds = body.add_op(write, Operator::I32LtU, &[index, length], &[Type::I32]);
+        let set_existing = body.add_block();
+        let grow = body.add_block();
+        body.set_terminator(
+            write,
+            Terminator::CondBr {
+                cond: in_bounds,
+                if_true: BlockTarget { block: set_existing, args: vec![] },
+                if_false: BlockTarget { block: grow, args: vec![] },
+            },
+        );
+        body.add_op(
+            set_existing,
+            Operator::ArraySet { sig: self.repr.arguments },
+            &[elements, index, boxed_value],
+            &[],
+        );
+        body.set_terminator(
+            set_existing,
+            Terminator::Br {
+                target: BlockTarget { block: done, args: vec![] },
+            },
+        );
+        let one = body.add_op(grow, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        let grown_length = body.add_op(grow, Operator::I32Add, &[index, one], &[Type::I32]);
+        let grown = body.add_op(
+            grow,
+            Operator::ArrayNewDefault { sig: self.repr.arguments },
+            &[grown_length],
+            &[self.repr.arguments_ty()],
+        );
+        let zero = body.add_op(grow, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        body.add_op(
+            grow,
+            Operator::ArrayCopy { dest: self.repr.arguments, src: self.repr.arguments },
+            &[grown, zero, elements, zero, length],
+            &[],
+        );
+        body.add_op(
+            grow,
+            Operator::ArraySet { sig: self.repr.arguments },
+            &[grown, index, boxed_value],
+            &[],
+        );
+        body.add_op(
+            grow,
+            Operator::StructSet { sig: self.repr.object, idx: 1 },
+            &[plain, grown],
+            &[],
+        );
+        body.set_terminator(
+            grow,
+            Terminator::Br {
+                target: BlockTarget { block: done, args: vec![] },
+            },
+        );
+        Ok(done)
+    }
+
     fn static_subarray(
         &self,
         body: &mut FunctionBody,
@@ -2375,12 +5326,21 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             .map_err(|_| ConvertError::invalid("array slice start exceeds Wasm i32"))?;
         let end = u32::try_from(end)
             .map_err(|_| ConvertError::invalid("array slice end exceeds Wasm i32"))?;
-        let array = body.add_op(
+        let object = body.add_op(
             block,
             Operator::RefCast {
-                ty: self.repr.arguments_ty(),
+                ty: self.repr.object_ty(),
             },
             &[wrapped],
+            &[self.repr.object_ty()],
+        );
+        let array = body.add_op(
+            block,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 1,
+            },
+            &[object],
             &[self.repr.arguments_ty()],
         );
         let length = body.add_op(block, Operator::ArrayLen, &[array], &[Type::I32]);
@@ -2430,6 +5390,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[copy, zero, array, start, count],
             &[],
         );
+        let copy = self.new_array_object(body, block, copy)?;
         Ok((
             block,
             LowerValue::Wasm {
@@ -2465,12 +5426,24 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             };
             block = self.clear_property(body, block, trie, &key)?;
         }
+        let elements = body.add_op(
+            block,
+            Operator::RefNull { ty: self.repr.arguments_ty() },
+            &[],
+            &[self.repr.arguments_ty()],
+        );
+        let properties = body.add_op(
+            block,
+            Operator::RefNull { ty: self.repr.value },
+            &[],
+            &[self.repr.value],
+        );
         let object = body.add_op(
             block,
             Operator::StructNew {
                 sig: self.repr.object,
             },
-            &[trie],
+            &[trie, elements, properties],
             &[self.repr.object_ty()],
         );
         Ok((
@@ -2646,7 +5619,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn set_property(
-        &self,
+        &mut self,
         body: &mut FunctionBody,
         block: Block,
         context: Value,
@@ -2666,7 +5639,24 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn set_property_value(
-        &self,
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &str,
+        value: &LowerValue,
+    ) -> Result<Block, ConvertError> {
+        if let Some(index) = Self::static_array_index(key) {
+            return self.set_static_array_index(body, block, object, key, index, value);
+        }
+        if key == "length" {
+            return self.set_static_length_property(body, block, object, key, value);
+        }
+        self.set_static_property_value(body, block, object, key, value)
+    }
+
+    fn set_static_property_value(
+        &mut self,
         body: &mut FunctionBody,
         mut block: Block,
         object: &LowerValue,
@@ -2743,17 +5733,314 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             block = join;
             trie = next;
         }
-        let value = self.box_value(body, block, value)?;
+        let boxed_value = self.box_value(body, block, value)?;
         body.add_op(
             block,
             Operator::StructSet {
                 sig: self.repr.trie,
                 idx: 0,
             },
-            &[trie, value],
+            &[trie, boxed_value],
             &[],
         );
-        Ok(block)
+        let key = self.new_string(body, block, key.as_bytes())?;
+        self.set_dynamic_property(body, block, object, key, value)
+    }
+
+    fn set_static_array_index(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &str,
+        index: u32,
+        value: &LowerValue,
+    ) -> Result<Block, ConvertError> {
+        let (object_value, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return self.set_static_property_value(body, block, object, key, value);
+        }
+        let is_object = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.object_ty(),
+            },
+            &[object_value],
+            &[Type::I32],
+        );
+        let array_object = body.add_block();
+        let fallback = body.add_block();
+        let done = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget {
+                    block: array_object,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: fallback,
+                    args: vec![],
+                },
+            },
+        );
+        let plain = body.add_op(
+            array_object,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[object_value],
+            &[self.repr.object_ty()],
+        );
+        let elements = body.add_op(
+            array_object,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 1,
+            },
+            &[plain],
+            &[self.repr.arguments_ty()],
+        );
+        let no_elements = body.add_op(
+            array_object,
+            Operator::RefIsNull,
+            &[elements],
+            &[Type::I32],
+        );
+        let array = body.add_block();
+        body.set_terminator(
+            array_object,
+            Terminator::CondBr {
+                cond: no_elements,
+                if_true: BlockTarget {
+                    block: fallback,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: array,
+                    args: vec![],
+                },
+            },
+        );
+        let index = body.add_op(
+            array,
+            Operator::I32Const { value: index },
+            &[],
+            &[Type::I32],
+        );
+        let array = self.set_numeric_member(body, array, object, index, value)?;
+        body.set_terminator(
+            array,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
+            },
+        );
+        let fallback = self.set_static_property_value(body, fallback, object, key, value)?;
+        body.set_terminator(
+            fallback,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
+            },
+        );
+        Ok(done)
+    }
+
+    fn set_static_length_property(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &str,
+        value: &LowerValue,
+    ) -> Result<Block, ConvertError> {
+        let (object_value, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return self.set_static_property_value(body, block, object, key, value);
+        }
+        let is_object = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.object_ty(),
+            },
+            &[object_value],
+            &[Type::I32],
+        );
+        let array_object = body.add_block();
+        let fallback = body.add_block();
+        let done = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget {
+                    block: array_object,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: fallback,
+                    args: vec![],
+                },
+            },
+        );
+        let plain = body.add_op(
+            array_object,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[object_value],
+            &[self.repr.object_ty()],
+        );
+        let elements = body.add_op(
+            array_object,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 1,
+            },
+            &[plain],
+            &[self.repr.arguments_ty()],
+        );
+        let no_elements = body.add_op(
+            array_object,
+            Operator::RefIsNull,
+            &[elements],
+            &[Type::I32],
+        );
+        let array = body.add_block();
+        body.set_terminator(
+            array_object,
+            Terminator::CondBr {
+                cond: no_elements,
+                if_true: BlockTarget {
+                    block: fallback,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: array,
+                    args: vec![],
+                },
+            },
+        );
+        let array = self.set_array_length(body, array, object, value)?;
+        body.set_terminator(
+            array,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
+            },
+        );
+        let fallback = self.set_static_property_value(body, fallback, object, key, value)?;
+        body.set_terminator(
+            fallback,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
+            },
+        );
+        Ok(done)
+    }
+
+    fn set_array_length(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        value: &LowerValue,
+    ) -> Result<Block, ConvertError> {
+        let (object, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return Ok(block);
+        }
+        let requested = self.as_f64(body, block, value)?;
+        let requested = body.add_op(
+            block,
+            Operator::I32TruncSatF64U,
+            &[requested],
+            &[Type::I32],
+        );
+        let is_object = body.add_op(
+            block,
+            Operator::RefTest { ty: self.repr.object_ty() },
+            &[object],
+            &[Type::I32],
+        );
+        let array_object = body.add_block();
+        let done = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget { block: array_object, args: vec![] },
+                if_false: BlockTarget { block: done, args: vec![] },
+            },
+        );
+        let plain = body.add_op(
+            array_object,
+            Operator::RefCast { ty: self.repr.object_ty() },
+            &[object],
+            &[self.repr.object_ty()],
+        );
+        let elements = body.add_op(
+            array_object,
+            Operator::StructGet { sig: self.repr.object, idx: 1 },
+            &[plain],
+            &[self.repr.arguments_ty()],
+        );
+        let absent = body.add_op(array_object, Operator::RefIsNull, &[elements], &[Type::I32]);
+        let resize = body.add_block();
+        body.set_terminator(
+            array_object,
+            Terminator::CondBr {
+                cond: absent,
+                if_true: BlockTarget { block: done, args: vec![] },
+                if_false: BlockTarget { block: resize, args: vec![] },
+            },
+        );
+        let old_length = body.add_op(resize, Operator::ArrayLen, &[elements], &[Type::I32]);
+        let old_is_shorter =
+            body.add_op(resize, Operator::I32LtU, &[old_length, requested], &[Type::I32]);
+        let copy_length = body.add_op(
+            resize,
+            Operator::TypedSelect { ty: Type::I32 },
+            &[old_length, requested, old_is_shorter],
+            &[Type::I32],
+        );
+        let replacement = body.add_op(
+            resize,
+            Operator::ArrayNewDefault { sig: self.repr.arguments },
+            &[requested],
+            &[self.repr.arguments_ty()],
+        );
+        let zero = body.add_op(resize, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        body.add_op(
+            resize,
+            Operator::ArrayCopy { dest: self.repr.arguments, src: self.repr.arguments },
+            &[replacement, zero, elements, zero, copy_length],
+            &[],
+        );
+        body.add_op(
+            resize,
+            Operator::StructSet { sig: self.repr.object, idx: 1 },
+            &[plain, replacement],
+            &[],
+        );
+        body.set_terminator(
+            resize,
+            Terminator::Br {
+                target: BlockTarget { block: done, args: vec![] },
+            },
+        );
+        Ok(done)
     }
 
     fn make_arguments(
@@ -2814,7 +6101,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn lower_call_parts(
-        &self,
+        &mut self,
         body: &mut FunctionBody,
         block: Block,
         context: Value,
@@ -2836,12 +6123,22 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 let receiver = values
                     .get(func)
                     .ok_or_else(|| ConvertError::invalid("undefined member receiver"))?;
-                let key = self.key_of(
-                    values
-                        .get(member)
-                        .ok_or_else(|| ConvertError::invalid("undefined member key"))?,
-                )?;
-                let (next, callee) = self.get_property_value(body, block, receiver, &key)?;
+                let key = values
+                    .get(member)
+                    .ok_or_else(|| ConvertError::invalid("undefined member key"))?;
+                let (next, callee) = match self.key_of(key) {
+                    Ok(key) => self.get_property_value(body, block, receiver, &key)?,
+                    Err(_) => match key.kind()? {
+                        ValueKind::Number | ValueKind::Integer | ValueKind::Boolean => {
+                            let index = self.numeric_index(body, block, key)?;
+                            self.get_numeric_member(body, block, receiver, index)?
+                        }
+                        ValueKind::Reference => {
+                            let key = self.dynamic_string_key(body, block, key)?;
+                            self.get_string_member(body, block, receiver, key)?
+                        }
+                    },
+                };
                 block = next;
                 (callee, receiver.clone())
             }
@@ -2875,7 +6172,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             block,
             Operator::StructGet {
                 sig: self.repr.function,
-                idx: 1,
+                idx: 3,
             },
             &[function],
             &[ref_sig(self.repr.adapter)],
@@ -2884,7 +6181,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             block,
             Operator::StructGet {
                 sig: self.repr.function,
-                idx: 2,
+                idx: 4,
             },
             &[function],
             &[self.repr.object_ty()],
@@ -2893,7 +6190,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             block,
             Operator::StructGet {
                 sig: self.repr.function,
-                idx: 3,
+                idx: 5,
             },
             &[function],
             &[self.repr.value],
@@ -2902,7 +6199,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             block,
             Operator::StructGet {
                 sig: self.repr.function,
-                idx: 4,
+                idx: 6,
             },
             &[function],
             &[Type::I32],

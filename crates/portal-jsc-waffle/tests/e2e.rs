@@ -1,13 +1,20 @@
 use portal_jsc_swc_cfg::module::CfgModule;
-use portal_jsc_swc_ssa::{module::SModule, SFunc};
-use portal_jsc_swc_tac::module::TModule;
+use portal_jsc_swc_ssa::{SFunc, SValue, module::SModule};
+use portal_jsc_swc_tac::{Item, module::TModule};
 use portal_pc_waffle::{ExportKind, FuncDecl, Module, Operator, Type, ValueDef};
-use swc_common::{sync::Lrc, FileName, Globals, SourceMap, GLOBALS};
+use swc_common::{FileName, GLOBALS, Globals, SourceMap, sync::Lrc};
 use swc_ecma_ast::{EsVersion, Module as SwcModule, ModuleItem};
-use swc_ecma_parser::{parse_file_as_module, parse_file_as_script, EsSyntax, Syntax};
+use swc_ecma_parser::{EsSyntax, Syntax, parse_file_as_module, parse_file_as_script};
 use wasmtime::{Config, Engine, Instance, Module as WasmtimeModule, Store, Val};
 
 fn lower(source: &str) -> Result<Module<'static>, portal_jsc_waffle::ConvertError> {
+    let ssa = script_ssa(source);
+    let mut wasm = Module::empty();
+    portal_jsc_waffle::convert(&ssa, &mut wasm)?;
+    Ok(wasm)
+}
+
+fn script_ssa(source: &str) -> SFunc {
     GLOBALS.set(&Globals::default(), || {
         let cm: Lrc<SourceMap> = Lrc::new(SourceMap::default());
         let file = cm.new_source_file(
@@ -31,10 +38,7 @@ fn lower(source: &str) -> Result<Module<'static>, portal_jsc_waffle::ConvertErro
         };
         let cfg = CfgModule::try_from(module).expect("CFG lowering should succeed");
         let tac = TModule::try_from(cfg).expect("TAC lowering should succeed");
-        let ssa = SFunc::try_from(&tac.body).expect("SSA lowering should succeed");
-        let mut wasm = Module::empty();
-        portal_jsc_waffle::convert(&ssa, &mut wasm)?;
-        Ok(wasm)
+        SFunc::try_from(&tac.body).expect("SSA lowering should succeed")
     })
 }
 
@@ -125,7 +129,7 @@ fn execute_in_wasmtime(bytes: &[u8], name: &str, args: &[f64]) -> f64 {
 fn execute_in_node(bytes: &[u8], name: &str, args: &[f64]) -> f64 {
     use std::{
         fs,
-        process::{id, Command},
+        process::{Command, id},
         sync::atomic::{AtomicUsize, Ordering},
     };
 
@@ -379,6 +383,116 @@ fn executes_object_mutation_shape_changes_and_polymorphic_paths() {
         reference_tests >= 2,
         "object lowering should refine anyref values with ref.test before ref.cast"
     );
+}
+
+#[test]
+fn lowers_static_subarray_item_to_a_bounded_array_copy() {
+    // The current TAC source converter emits this helper for array-rest
+    // assignment. Build its already-normalized SSA form directly so this test
+    // covers the lowerer's contract independently of TAC-pattern coverage.
+    let mut ssa = script_ssa(
+        "
+            let source = [1, 2, 3];
+            let rest = [0];
+            let result = rest[0];
+            result;
+        ",
+    );
+    let arrays = ssa
+        .cfg
+        .values
+        .iter()
+        .filter_map(|(id, value)| {
+            matches!(
+                &value.value,
+                SValue::Item {
+                    item: Item::Arr { .. },
+                    ..
+                }
+            )
+            .then_some(id)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        arrays.len() >= 2,
+        "fixture must retain source and destination array items"
+    );
+    ssa.cfg.values[arrays[1]].value = SValue::Item {
+        item: Item::StaticSubArray {
+            begin: 1,
+            end: 0,
+            wrapped: arrays[0],
+        },
+        span: None,
+    };
+
+    let mut module = Module::empty();
+    portal_jsc_waffle::convert(&ssa, &mut module).expect("static subarray should lower");
+    validate(&module);
+    assert!(
+        module.funcs.entries().any(|(_, declaration)| {
+            declaration.body().is_some_and(|body| {
+                body.values.entries().any(|(_, definition)| {
+                    matches!(
+                        definition,
+                        ValueDef::Operator(Operator::ArrayCopy { .. }, _, _)
+                    )
+                })
+            })
+        }),
+        "static subarray must allocate and copy its bounded range"
+    );
+}
+
+#[test]
+fn executes_arrays_arguments_and_static_destructuring_helpers() {
+    let module = compile_module(
+        "
+            export function array_literal() {
+                let values = [3, 4, 5];
+                return values[0] * 100 + values[1] * 10 + values[2] + values.length;
+            }
+
+            export function arguments_visible(first, second) {
+                return arguments[0] * 100 + arguments[1] * 10 + arguments.length;
+            }
+
+            export function object_rest() {
+                let source = { hidden: 4, kept: 2, other: 3 };
+                let { hidden, ...rest } = source;
+                rest.kept = 7;
+                return source.kept * 100 + rest.kept * 10 + rest.other;
+            }
+        ",
+    );
+    validate(&module);
+
+    let mut array_new_fixed = false;
+    let mut array_get = false;
+    let mut array_len = false;
+    for (_, declaration) in module.funcs.entries() {
+        let Some(body) = declaration.body() else {
+            continue;
+        };
+        for (_, definition) in body.values.entries() {
+            let ValueDef::Operator(operator, _, _) = definition else {
+                continue;
+            };
+            array_new_fixed |= matches!(operator, Operator::ArrayNewFixed { .. });
+            array_get |= matches!(operator, Operator::ArrayGet { .. });
+            array_len |= matches!(operator, Operator::ArrayLen);
+        }
+    }
+    assert!(
+        array_new_fixed,
+        "array literals and calls should allocate arrays"
+    );
+    assert!(array_get, "array indexing should use WasmGC array.get");
+    assert!(array_len, "array length should use WasmGC array.len");
+
+    assert_executes_in_all_runtimes(&module, "array_literal", &[], 348.0);
+    assert_executes_in_all_runtimes(&module, "arguments_visible", &[2.0, 3.0], 232.0);
+    assert_executes_in_all_runtimes(&module, "object_rest", &[], 273.0);
 }
 
 #[test]

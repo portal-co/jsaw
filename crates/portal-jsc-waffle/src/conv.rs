@@ -4,8 +4,8 @@ use std::{
 };
 
 use portal_jsc_swc_ssa::{
-    module::{ExportSpec, SModule},
     SBlockId, SFunc, SValue, SValueId,
+    module::{ExportSpec, SModule},
 };
 use portal_jsc_swc_tac::{Item, LId, PropKey, PropVal, TCallee, TTerm};
 use portal_pc_waffle::{
@@ -14,7 +14,7 @@ use portal_pc_waffle::{
 };
 use swc_ecma_ast::{BinaryOp, Lit, UnaryOp};
 
-use crate::repr::{ref_sig, ConvertError, Repr};
+use crate::repr::{ConvertError, Repr, ref_sig};
 
 /// Convert jsaw-core SSA into a WasmGC module.
 ///
@@ -29,6 +29,7 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
         pending: VecDeque::new(),
         lowered: BTreeSet::new(),
         ref_table: None,
+        trie_clone: None,
     };
     converter.ensure_function(root)?;
     converter.lower_all()
@@ -109,6 +110,7 @@ pub fn convert_module<'a, 'wasm>(
         pending: VecDeque::new(),
         lowered: BTreeSet::new(),
         ref_table: None,
+        trie_clone: None,
     };
     let mut exports = Vec::with_capacity(exported.len());
     for export in exported {
@@ -288,6 +290,9 @@ struct Converter<'a, 'module, 'wasm> {
     /// A declaration-only table makes every adapter legal as a `ref.func`
     /// target under Wasm's typed-function-reference validation rules.
     ref_table: Option<Table>,
+    /// Deep-copy helper used by object-rest lowering. It is generated lazily
+    /// because ordinary object programs do not need to enumerate trie edges.
+    trie_clone: Option<Func>,
 }
 
 impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
@@ -305,6 +310,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let native_sig = self.module.signatures.push(SignatureData::Func {
             params: std::iter::once(self.repr.object_ty())
                 .chain(std::iter::once(self.repr.value))
+                // The unnormalized argument array remains available to the
+                // native body as JavaScript's `arguments` binding.
+                .chain(std::iter::once(self.repr.arguments_ty()))
                 .chain(std::iter::repeat_n(self.repr.value, arity))
                 .collect(),
             returns: vec![self.repr.value],
@@ -406,7 +414,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             formals.push(formal);
         }
 
-        let mut call_args = vec![context, this];
+        let mut call_args = vec![context, this, args];
         call_args.extend(formals);
         let result = body.add_op(
             block,
@@ -459,7 +467,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let (context, _) = context.wasm()?;
         let this = self.undef(&mut body, block);
         let (this, _) = this.wasm()?;
-        let mut args = vec![context, this];
+        let mut arguments = Vec::with_capacity(params.len());
         for value in params {
             let boxed = self.box_value(
                 &mut body,
@@ -469,14 +477,23 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     kind: ValueKind::Number,
                 },
             )?;
-            args.push(boxed);
+            arguments.push(boxed);
         }
+        let arguments = body.add_op(
+            block,
+            Operator::ArrayNewFixed {
+                sig: self.repr.arguments,
+                num: arguments.len(),
+            },
+            &arguments,
+            &[self.repr.arguments_ty()],
+        );
         let result = body.add_op(
             block,
             Operator::Call {
-                function_index: info.native,
+                function_index: info.adapter,
             },
-            &args,
+            &[context, this, arguments],
             &[self.repr.value],
         );
         let number = body.add_op(
@@ -584,7 +601,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let entry_values = sfunc.cfg.blocks[sfunc.entry]
             .params
             .iter()
-            .zip(body.blocks[body.entry].params.iter().skip(2))
+            .zip(body.blocks[body.entry].params.iter().skip(3))
             .map(|((source, _), (_, value))| {
                 (
                     *source,
@@ -605,12 +622,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 .get(&state)
                 .ok_or_else(|| ConvertError::invalid("missing source block mapping"))?;
             let mut values = entry_values.clone();
-            // Native bodies prepend the captured lexical context and the
-            // effective receiver. Source SSA parameters begin after those two
-            // ABI-only parameters in the entry shim.
+            // Native bodies prepend the captured lexical context, effective
+            // receiver, and original argument array. Source SSA parameters
+            // begin after those ABI-only parameters in the entry shim.
             let target_params = body.blocks[original_block].params.iter();
             let target_params = if sblock == sfunc.entry {
-                target_params.skip(2)
+                target_params.skip(3)
             } else {
                 target_params.skip(0)
             };
@@ -997,6 +1014,17 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 members,
                 span,
             )?,
+            Item::Arr { members } => LowerValue::Wasm {
+                value: self.make_arguments(body, block, values, members)?,
+                kind: ValueKind::Reference,
+            },
+            Item::Arguments => LowerValue::Wasm {
+                // Native body parameters are `(context, this, arguments,
+                // formals...)`; unlike the normalized formals, this retains
+                // every actual argument supplied by the caller.
+                value: body.blocks[body.entry].params[2].1,
+                kind: ValueKind::Reference,
+            },
             Item::Mem { obj, mem } => {
                 let object = values
                     .get(obj)
@@ -1007,6 +1035,26 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         .ok_or_else(|| ConvertError::invalid("undefined member key"))?,
                 )?;
                 let (next, value) = self.get_property_value(body, block, object, &key)?;
+                block = next;
+                value
+            }
+            Item::StaticSubArray {
+                begin,
+                end,
+                wrapped,
+            } => {
+                let wrapped = values
+                    .get(wrapped)
+                    .ok_or_else(|| ConvertError::invalid("undefined static subarray source"))?;
+                let (next, value) = self.static_subarray(body, block, wrapped, *begin, *end)?;
+                block = next;
+                value
+            }
+            Item::StaticSubObject { wrapped, keys } => {
+                let wrapped = values
+                    .get(wrapped)
+                    .ok_or_else(|| ConvertError::invalid("undefined static subobject source"))?;
+                let (next, value) = self.static_subobject(body, block, values, wrapped, keys)?;
                 block = next;
                 value
             }
@@ -1158,13 +1206,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             Item::PrivateMem { .. }
             | Item::HasPrivateMem { .. }
             | Item::Class(_)
-            | Item::Arr { .. }
-            | Item::StaticSubArray { .. }
-            | Item::StaticSubObject { .. }
             | Item::Yield { .. }
             | Item::Await { .. }
             | Item::Asm { .. }
-            | Item::Arguments
             | Item::Meta { .. } => {
                 return Err(ConvertError::unsupported(format!("{item:?}"), span));
             }
@@ -1693,6 +1737,164 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         ))
     }
 
+    fn clone_trie(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        trie: Value,
+    ) -> Result<Value, ConvertError> {
+        let function = self.ensure_trie_clone_function()?;
+        Ok(body.add_op(
+            block,
+            Operator::Call {
+                function_index: function,
+            },
+            &[trie],
+            &[self.repr.trie_ty()],
+        ))
+    }
+
+    fn ensure_trie_clone_function(&mut self) -> Result<Func, ConvertError> {
+        if let Some(function) = self.trie_clone {
+            return Ok(function);
+        }
+        let signature = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.trie_ty()],
+            returns: vec![self.repr.trie_ty()],
+            shared: false,
+        });
+        let body = FunctionBody::new(self.module, signature);
+        let function = self.module.funcs.push(FuncDecl::Body(
+            signature,
+            format!("js_clone_trie_{}", self.module.funcs.len()),
+            body,
+        ));
+        // Record the function before filling its body so every present child
+        // can recursively call the same helper.
+        self.trie_clone = Some(function);
+
+        let mut declaration = take(&mut self.module.funcs[function]);
+        let result = (|| {
+            let body = declaration.body_mut().ok_or_else(|| {
+                ConvertError::invalid("generated trie-clone function has no body")
+            })?;
+            let mut block = body.entry;
+            let source = body.blocks[block].params[0].1;
+            let target = self.new_trie(body, block)?;
+            let value = body.add_op(
+                block,
+                Operator::StructGet {
+                    sig: self.repr.trie,
+                    idx: 0,
+                },
+                &[source],
+                &[self.repr.value],
+            );
+            body.add_op(
+                block,
+                Operator::StructSet {
+                    sig: self.repr.trie,
+                    idx: 0,
+                },
+                &[target, value],
+                &[],
+            );
+
+            for byte in u8::MIN..=u8::MAX {
+                let child = body.add_op(
+                    block,
+                    Operator::StructGet {
+                        sig: self.repr.trie,
+                        idx: usize::from(byte) + 1,
+                    },
+                    &[source],
+                    &[self.repr.value],
+                );
+                let missing = body.add_op(block, Operator::RefIsNull, &[child], &[Type::I32]);
+                let absent = body.add_block();
+                let present = body.add_block();
+                let join = body.add_block();
+                let copied = body.add_blockparam(join, self.repr.value);
+                body.set_terminator(
+                    block,
+                    Terminator::CondBr {
+                        cond: missing,
+                        if_true: BlockTarget {
+                            block: absent,
+                            args: vec![],
+                        },
+                        if_false: BlockTarget {
+                            block: present,
+                            args: vec![],
+                        },
+                    },
+                );
+                body.set_terminator(
+                    absent,
+                    Terminator::Br {
+                        target: BlockTarget {
+                            block: join,
+                            args: vec![child],
+                        },
+                    },
+                );
+                let child = body.add_op(
+                    present,
+                    Operator::RefCast {
+                        ty: self.repr.trie_ty(),
+                    },
+                    &[child],
+                    &[self.repr.trie_ty()],
+                );
+                let child = body.add_op(
+                    present,
+                    Operator::Call {
+                        function_index: function,
+                    },
+                    &[child],
+                    &[self.repr.trie_ty()],
+                );
+                let child = body.add_op(
+                    present,
+                    Operator::RefCast {
+                        ty: self.repr.value,
+                    },
+                    &[child],
+                    &[self.repr.value],
+                );
+                body.set_terminator(
+                    present,
+                    Terminator::Br {
+                        target: BlockTarget {
+                            block: join,
+                            args: vec![child],
+                        },
+                    },
+                );
+                body.add_op(
+                    join,
+                    Operator::StructSet {
+                        sig: self.repr.trie,
+                        idx: usize::from(byte) + 1,
+                    },
+                    &[target, copied],
+                    &[],
+                );
+                block = join;
+            }
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![target],
+                },
+            );
+            Ok(())
+        })();
+        self.module.funcs[function] = declaration;
+        result?;
+        Ok(function)
+    }
+
     fn new_object(
         &self,
         body: &mut FunctionBody,
@@ -1965,6 +2167,395 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn get_property_value(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &str,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        let (value, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return self.get_object_property_value(body, block, object, key);
+        }
+
+        // Arrays share the `anyref` JavaScript value boundary with objects.
+        // Test before interpreting the reference as an object/function trie:
+        // an array's indexed elements and length live in its WasmGC array,
+        // not in the property trie.
+        let is_array = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.arguments_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let array_block = body.add_block();
+        let object_block = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_array,
+                if_true: BlockTarget {
+                    block: array_block,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: object_block,
+                    args: vec![],
+                },
+            },
+        );
+
+        let array = body.add_op(
+            array_block,
+            Operator::RefCast {
+                ty: self.repr.arguments_ty(),
+            },
+            &[value],
+            &[self.repr.arguments_ty()],
+        );
+        let (array_block, array_value) = self.get_array_property(body, array_block, array, key)?;
+        body.set_terminator(
+            array_block,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![array_value],
+                },
+            },
+        );
+
+        let (object_block, object_value) =
+            self.get_object_property_value(body, object_block, object, key)?;
+        let object_value = self.box_value(body, object_block, &object_value)?;
+        body.set_terminator(
+            object_block,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![object_value],
+                },
+            },
+        );
+        Ok((
+            join,
+            LowerValue::Wasm {
+                value: result,
+                kind: ValueKind::Reference,
+            },
+        ))
+    }
+
+    fn get_array_property(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        array: Value,
+        key: &str,
+    ) -> Result<(Block, Value), ConvertError> {
+        if key == "length" {
+            let length = body.add_op(block, Operator::ArrayLen, &[array], &[Type::I32]);
+            let length = body.add_op(block, Operator::F64ConvertI32S, &[length], &[Type::F64]);
+            let length = body.add_op(
+                block,
+                Operator::StructNew {
+                    sig: self.repr.number,
+                },
+                &[length],
+                &[self.repr.number_ty()],
+            );
+            return Ok((
+                block,
+                body.add_op(
+                    block,
+                    Operator::RefCast {
+                        ty: self.repr.value,
+                    },
+                    &[length],
+                    &[self.repr.value],
+                ),
+            ));
+        }
+
+        let Some(index) = key.parse::<u32>().ok() else {
+            return Ok((
+                block,
+                body.add_op(
+                    block,
+                    Operator::RefNull {
+                        ty: self.repr.value,
+                    },
+                    &[],
+                    &[self.repr.value],
+                ),
+            ));
+        };
+        let index = body.add_op(
+            block,
+            Operator::I32Const { value: index },
+            &[],
+            &[Type::I32],
+        );
+        let length = body.add_op(block, Operator::ArrayLen, &[array], &[Type::I32]);
+        let present = body.add_op(block, Operator::I32LtU, &[index, length], &[Type::I32]);
+        let get = body.add_block();
+        let missing = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: present,
+                if_true: BlockTarget {
+                    block: get,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: missing,
+                    args: vec![],
+                },
+            },
+        );
+        let value = body.add_op(
+            get,
+            Operator::ArrayGet {
+                sig: self.repr.arguments,
+            },
+            &[array, index],
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            get,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![value],
+                },
+            },
+        );
+        let undef = body.add_op(
+            missing,
+            Operator::RefNull {
+                ty: self.repr.value,
+            },
+            &[],
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            missing,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![undef],
+                },
+            },
+        );
+        Ok((join, result))
+    }
+
+    fn static_subarray(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        wrapped: &LowerValue,
+        begin: usize,
+        end: usize,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        let (wrapped, kind) = wrapped.wasm()?;
+        if kind != ValueKind::Reference {
+            return Err(ConvertError::unsupported(
+                "static array destructuring of a primitive",
+                (),
+            ));
+        }
+        let begin = u32::try_from(begin)
+            .map_err(|_| ConvertError::invalid("array slice start exceeds Wasm i32"))?;
+        let end = u32::try_from(end)
+            .map_err(|_| ConvertError::invalid("array slice end exceeds Wasm i32"))?;
+        let array = body.add_op(
+            block,
+            Operator::RefCast {
+                ty: self.repr.arguments_ty(),
+            },
+            &[wrapped],
+            &[self.repr.arguments_ty()],
+        );
+        let length = body.add_op(block, Operator::ArrayLen, &[array], &[Type::I32]);
+        let begin = body.add_op(
+            block,
+            Operator::I32Const { value: begin },
+            &[],
+            &[Type::I32],
+        );
+        let end = body.add_op(block, Operator::I32Const { value: end }, &[], &[Type::I32]);
+        // `start = min(begin, length)` and
+        // `count = max(length - start - end, 0)`.  The saturated arithmetic
+        // makes empty and too-short arrays match destructuring rest semantics
+        // without ever issuing an out-of-bounds array.copy.
+        let start_after_length =
+            body.add_op(block, Operator::I32LtU, &[length, begin], &[Type::I32]);
+        let start = body.add_op(
+            block,
+            Operator::TypedSelect { ty: Type::I32 },
+            &[length, begin, start_after_length],
+            &[Type::I32],
+        );
+        let remaining = body.add_op(block, Operator::I32Sub, &[length, start], &[Type::I32]);
+        let has_tail = body.add_op(block, Operator::I32LtU, &[end, remaining], &[Type::I32]);
+        let without_tail = body.add_op(block, Operator::I32Sub, &[remaining, end], &[Type::I32]);
+        let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let count = body.add_op(
+            block,
+            Operator::TypedSelect { ty: Type::I32 },
+            &[without_tail, zero, has_tail],
+            &[Type::I32],
+        );
+        let copy = body.add_op(
+            block,
+            Operator::ArrayNewDefault {
+                sig: self.repr.arguments,
+            },
+            &[count],
+            &[self.repr.arguments_ty()],
+        );
+        body.add_op(
+            block,
+            Operator::ArrayCopy {
+                dest: self.repr.arguments,
+                src: self.repr.arguments,
+            },
+            &[copy, zero, array, start, count],
+            &[],
+        );
+        Ok((
+            block,
+            LowerValue::Wasm {
+                value: copy,
+                kind: ValueKind::Reference,
+            },
+        ))
+    }
+
+    fn static_subobject(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        values: &BTreeMap<SValueId, LowerValue>,
+        wrapped: &LowerValue,
+        keys: &[PropKey<SValueId>],
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        // Object-rest must be independent from its source.  The object
+        // representation has no key enumeration table, so clone the complete
+        // trie (including keys that are unknown to this lowering site) before
+        // clearing the statically excluded keys.
+        let (mut block, trie) = self.object_and_trie(body, block, wrapped)?;
+        let trie = self.clone_trie(body, block, trie)?;
+        for key in keys {
+            let key = match key {
+                PropKey::Lit(key) => key.sym.to_string(),
+                PropKey::Computed(value) => {
+                    self.key_of(values.get(value).ok_or_else(|| {
+                        ConvertError::invalid("undefined static object-rest key")
+                    })?)?
+                }
+                _ => return Err(ConvertError::unsupported("object-rest property key", ())),
+            };
+            block = self.clear_property(body, block, trie, &key)?;
+        }
+        let object = body.add_op(
+            block,
+            Operator::StructNew {
+                sig: self.repr.object,
+            },
+            &[trie],
+            &[self.repr.object_ty()],
+        );
+        Ok((
+            block,
+            LowerValue::Wasm {
+                value: object,
+                kind: ValueKind::Reference,
+            },
+        ))
+    }
+
+    fn clear_property(
+        &self,
+        body: &mut FunctionBody,
+        mut block: Block,
+        mut trie: Value,
+        key: &str,
+    ) -> Result<Block, ConvertError> {
+        let done = body.add_block();
+        for byte in key.as_bytes() {
+            let child = body.add_op(
+                block,
+                Operator::StructGet {
+                    sig: self.repr.trie,
+                    idx: usize::from(*byte) + 1,
+                },
+                &[trie],
+                &[self.repr.value],
+            );
+            let missing = body.add_op(block, Operator::RefIsNull, &[child], &[Type::I32]);
+            let present = body.add_block();
+            body.set_terminator(
+                block,
+                Terminator::CondBr {
+                    cond: missing,
+                    if_true: BlockTarget {
+                        block: done,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: present,
+                        args: vec![],
+                    },
+                },
+            );
+            trie = body.add_op(
+                present,
+                Operator::RefCast {
+                    ty: self.repr.trie_ty(),
+                },
+                &[child],
+                &[self.repr.trie_ty()],
+            );
+            block = present;
+        }
+        let undef = body.add_op(
+            block,
+            Operator::RefNull {
+                ty: self.repr.value,
+            },
+            &[],
+            &[self.repr.value],
+        );
+        body.add_op(
+            block,
+            Operator::StructSet {
+                sig: self.repr.trie,
+                idx: 0,
+            },
+            &[trie, undef],
+            &[],
+        );
+        body.set_terminator(
+            block,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
+            },
+        );
+        Ok(done)
+    }
+
+    fn get_object_property_value(
         &self,
         body: &mut FunctionBody,
         mut block: Block,

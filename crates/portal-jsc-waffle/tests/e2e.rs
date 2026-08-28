@@ -1071,3 +1071,139 @@ fn executes_object_descriptor_manipulation() {
     );
     assert_executes_in_all_runtimes(&module, "get_own_property_descriptor_absent", &[], 1.0);
 }
+
+#[test]
+fn executes_object_keys() {
+    let module = compile_module(
+        "
+            export function keys_count() {
+                let obj = { a: 1, b: 2, c: 3 };
+                let keys = Object.keys(obj);
+                return keys.length;
+            }
+
+            export function keys_first() {
+                let obj = { z: 9 };
+                let keys = Object.keys(obj);
+                return obj[keys[0]];
+            }
+
+            export function keys_skip_non_enumerable() {
+                let obj = {};
+                Object.defineProperty(obj, 'hidden', { value: 1, enumerable: false });
+                obj.visible = 2;
+                let keys = Object.keys(obj);
+                return keys.length;
+            }
+
+            export function keys_empty() {
+                let obj = {};
+                let keys = Object.keys(obj);
+                return keys.length;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "keys_count", &[], 3.0);
+    assert_executes_in_all_runtimes(&module, "keys_first", &[], 9.0);
+    assert_executes_in_all_runtimes(&module, "keys_skip_non_enumerable", &[], 1.0);
+    assert_executes_in_all_runtimes(&module, "keys_empty", &[], 0.0);
+}
+
+#[test]
+fn executes_object_values_entries_and_names() {
+    let module = compile_module(
+        "
+            export function values_sum() {
+                let obj = { a: 1, b: 2, c: 3 };
+                let values = Object.values(obj);
+                return values[0] + values[1] + values[2];
+            }
+
+            export function entries_first_value() {
+                let obj = { x: 42 };
+                let entries = Object.entries(obj);
+                let pair = entries[0];
+                return pair[1];
+            }
+
+            export function get_own_property_names_includes_non_enumerable() {
+                let obj = {};
+                Object.defineProperty(obj, 'hidden', { value: 1, enumerable: false });
+                obj.visible = 2;
+                let names = Object.getOwnPropertyNames(obj);
+                return names.length;
+            }
+
+            export function get_own_property_descriptors_count() {
+                let obj = { a: 1, b: 2 };
+                let descriptors = Object.getOwnPropertyDescriptors(obj);
+                return descriptors.a.value * 10 + descriptors.b.value;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "values_sum", &[], 6.0);
+    assert_executes_in_all_runtimes(&module, "entries_first_value", &[], 42.0);
+    assert_executes_in_all_runtimes(
+        &module,
+        "get_own_property_names_includes_non_enumerable",
+        &[],
+        2.0,
+    );
+    assert_executes_in_all_runtimes(&module, "get_own_property_descriptors_count", &[], 12.0);
+}
+
+#[test]
+fn executes_object_assign_freeze_and_is_frozen() {
+    let module = compile_module(
+        "
+            export function assign_merges_and_overwrites() {
+                let target = { a: 1, b: 2 };
+                let source = { b: 20, c: 30 };
+                Object.assign(target, source);
+                return target.a * 10000 + target.b * 100 + target.c;
+            }
+
+            export function freeze_blocks_write() {
+                let obj = { a: 1 };
+                Object.freeze(obj);
+                obj.a = 99;
+                return obj.a;
+            }
+
+            export function is_frozen_false_before_freeze() {
+                let obj = { a: 1 };
+                return Object.isFrozen(obj) ? 1 : 0;
+            }
+
+            export function is_frozen_true_after_freeze() {
+                let obj = { a: 1 };
+                Object.freeze(obj);
+                return Object.isFrozen(obj) ? 1 : 0;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "assign_merges_and_overwrites", &[], 10000.0 + 2000.0 + 30.0);
+    assert_executes_in_all_runtimes(&module, "freeze_blocks_write", &[], 1.0);
+    assert_executes_in_all_runtimes(&module, "is_frozen_false_before_freeze", &[], 0.0);
+    assert_executes_in_all_runtimes(&module, "is_frozen_true_after_freeze", &[], 1.0);
+}
+
+#[test]
+fn executes_reflect_own_keys() {
+    let module = compile_module(
+        "
+            export function own_keys_includes_non_enumerable() {
+                let obj = {};
+                Object.defineProperty(obj, 'hidden', { value: 1, enumerable: false });
+                obj.visible = 2;
+                let keys = Reflect.ownKeys(obj);
+                return keys.length;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "own_keys_includes_non_enumerable", &[], 2.0);
+}

@@ -1462,6 +1462,30 @@ fn build_reflect_namespace(
     let value = self.native_function_value(body, *block, context, func)?;
     *block = self.set_static_property_value_raw(body, *block, &reflect, "getPrototypeOf", &value)?;
 
+    let func = self.build_native_adapter(
+        "reflect_own_keys",
+        |this, body, entry, _context, _this_val, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            let target = LowerValue::Wasm {
+                value: target_raw,
+                kind: ValueKind::Reference,
+            };
+            let (block, keys) = this.enumerate_own_keys(body, block, &target, false)?;
+            let array_obj = this.new_array_object(body, block, keys)?;
+            let boxed = this.anyref(body, block, array_obj);
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![boxed],
+                },
+            );
+            Ok(())
+        },
+    )?;
+    let (context, _) = reflect.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block = self.set_static_property_value_raw(body, *block, &reflect, "ownKeys", &value)?;
+
     Ok(reflect)
 }
 
@@ -1578,6 +1602,490 @@ fn build_object_namespace(
     let value = self.native_function_value(body, *block, context, func)?;
     *block =
         self.set_static_property_value_raw(body, *block, &object_ns, "setPrototypeOf", &value)?;
+
+    let func = self.build_native_adapter(
+        "object_keys",
+        |this, body, entry, _context, _this_val, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            let target = LowerValue::Wasm {
+                value: target_raw,
+                kind: ValueKind::Reference,
+            };
+            let (block, keys) = this.enumerate_own_keys(body, block, &target, true)?;
+            let array_obj = this.new_array_object(body, block, keys)?;
+            let boxed = this.anyref(body, block, array_obj);
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![boxed],
+                },
+            );
+            Ok(())
+        },
+    )?;
+    let (context, _) = object_ns.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block = self.set_static_property_value_raw(body, *block, &object_ns, "keys", &value)?;
+
+    let func = self.build_native_adapter(
+        "object_values",
+        |this, body, entry, _context, _this_val, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            let target = LowerValue::Wasm {
+                value: target_raw,
+                kind: ValueKind::Reference,
+            };
+            let (block, keys) = this.enumerate_own_keys(body, block, &target, true)?;
+            let len = body.add_op(block, Operator::ArrayLen, &[keys], &[Type::I32]);
+            let values_array = body.add_op(
+                block,
+                Operator::ArrayNewDefault {
+                    sig: this.repr.arguments,
+                },
+                &[len],
+                &[this.repr.arguments_ty()],
+            );
+            let block = this.for_each_index(body, block, len, |this, body, block, i| {
+                let key = body.add_op(
+                    block,
+                    Operator::ArrayGet {
+                        sig: this.repr.arguments,
+                    },
+                    &[keys, i],
+                    &[this.repr.value],
+                );
+                let key_string = body.add_op(
+                    block,
+                    Operator::RefCast {
+                        ty: this.repr.string_ty(),
+                    },
+                    &[key],
+                    &[this.repr.string_ty()],
+                );
+                let (block, raw) = this.get_string_member_raw(body, block, &target, key_string)?;
+                let (block, resolved) = this.resolve_property_read_join(body, block, &target, raw)?;
+                let boxed = this.box_value(body, block, &resolved)?;
+                body.add_op(
+                    block,
+                    Operator::ArraySet {
+                        sig: this.repr.arguments,
+                    },
+                    &[values_array, i, boxed],
+                    &[],
+                );
+                Ok(block)
+            })?;
+            let array_obj = this.new_array_object(body, block, values_array)?;
+            let boxed = this.anyref(body, block, array_obj);
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![boxed],
+                },
+            );
+            Ok(())
+        },
+    )?;
+    let (context, _) = object_ns.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block = self.set_static_property_value_raw(body, *block, &object_ns, "values", &value)?;
+
+    let func = self.build_native_adapter(
+        "object_entries",
+        |this, body, entry, _context, _this_val, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            let target = LowerValue::Wasm {
+                value: target_raw,
+                kind: ValueKind::Reference,
+            };
+            let (block, keys) = this.enumerate_own_keys(body, block, &target, true)?;
+            let len = body.add_op(block, Operator::ArrayLen, &[keys], &[Type::I32]);
+            let entries_array = body.add_op(
+                block,
+                Operator::ArrayNewDefault {
+                    sig: this.repr.arguments,
+                },
+                &[len],
+                &[this.repr.arguments_ty()],
+            );
+            let block = this.for_each_index(body, block, len, |this, body, block, i| {
+                let key = body.add_op(
+                    block,
+                    Operator::ArrayGet {
+                        sig: this.repr.arguments,
+                    },
+                    &[keys, i],
+                    &[this.repr.value],
+                );
+                let key_string = body.add_op(
+                    block,
+                    Operator::RefCast {
+                        ty: this.repr.string_ty(),
+                    },
+                    &[key],
+                    &[this.repr.string_ty()],
+                );
+                let (block, raw) = this.get_string_member_raw(body, block, &target, key_string)?;
+                let (block, resolved) = this.resolve_property_read_join(body, block, &target, raw)?;
+                let value_boxed = this.box_value(body, block, &resolved)?;
+                let pair = body.add_op(
+                    block,
+                    Operator::ArrayNewFixed {
+                        sig: this.repr.arguments,
+                        num: 2,
+                    },
+                    &[key, value_boxed],
+                    &[this.repr.arguments_ty()],
+                );
+                let pair_obj = this.new_array_object(body, block, pair)?;
+                let pair_boxed = this.anyref(body, block, pair_obj);
+                body.add_op(
+                    block,
+                    Operator::ArraySet {
+                        sig: this.repr.arguments,
+                    },
+                    &[entries_array, i, pair_boxed],
+                    &[],
+                );
+                Ok(block)
+            })?;
+            let array_obj = this.new_array_object(body, block, entries_array)?;
+            let boxed = this.anyref(body, block, array_obj);
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![boxed],
+                },
+            );
+            Ok(())
+        },
+    )?;
+    let (context, _) = object_ns.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block = self.set_static_property_value_raw(body, *block, &object_ns, "entries", &value)?;
+
+    let func = self.build_native_adapter(
+        "object_get_own_property_names",
+        |this, body, entry, _context, _this_val, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            let target = LowerValue::Wasm {
+                value: target_raw,
+                kind: ValueKind::Reference,
+            };
+            let (block, keys) = this.enumerate_own_keys(body, block, &target, false)?;
+            let array_obj = this.new_array_object(body, block, keys)?;
+            let boxed = this.anyref(body, block, array_obj);
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![boxed],
+                },
+            );
+            Ok(())
+        },
+    )?;
+    let (context, _) = object_ns.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block = self.set_static_property_value_raw(
+        body,
+        *block,
+        &object_ns,
+        "getOwnPropertyNames",
+        &value,
+    )?;
+
+    let func = self.build_native_adapter(
+        "object_get_own_property_descriptors",
+        |this, body, entry, _context, _this_val, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            let target = LowerValue::Wasm {
+                value: target_raw,
+                kind: ValueKind::Reference,
+            };
+            let (block, keys) = this.enumerate_own_keys(body, block, &target, false)?;
+            let len = body.add_op(block, Operator::ArrayLen, &[keys], &[Type::I32]);
+            let result = this.new_object(body, block)?;
+            let block = this.for_each_index(body, block, len, |this, body, block, i| {
+                let key = body.add_op(
+                    block,
+                    Operator::ArrayGet {
+                        sig: this.repr.arguments,
+                    },
+                    &[keys, i],
+                    &[this.repr.value],
+                );
+                let key_string = body.add_op(
+                    block,
+                    Operator::RefCast {
+                        ty: this.repr.string_ty(),
+                    },
+                    &[key],
+                    &[this.repr.string_ty()],
+                );
+                let (block, descriptor) =
+                    this.object_get_own_property_descriptor(body, block, &target, key_string)?;
+                this.set_dynamic_property_raw(body, block, &result, key_string, &descriptor)
+            })?;
+            let boxed = this.box_value(body, block, &result)?;
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![boxed],
+                },
+            );
+            Ok(())
+        },
+    )?;
+    let (context, _) = object_ns.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block = self.set_static_property_value_raw(
+        body,
+        *block,
+        &object_ns,
+        "getOwnPropertyDescriptors",
+        &value,
+    )?;
+
+    let func = self.build_native_adapter(
+        "object_assign",
+        |this, body, entry, _context, _this_val, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            let (block, source_raw) = this.read_arg_raw(body, block, args, 1);
+            let target = LowerValue::Wasm {
+                value: target_raw,
+                kind: ValueKind::Reference,
+            };
+            let source = LowerValue::Wasm {
+                value: source_raw,
+                kind: ValueKind::Reference,
+            };
+            let (block, keys) = this.enumerate_own_keys(body, block, &source, true)?;
+            let len = body.add_op(block, Operator::ArrayLen, &[keys], &[Type::I32]);
+            let block = this.for_each_index(body, block, len, |this, body, block, i| {
+                let key = body.add_op(
+                    block,
+                    Operator::ArrayGet {
+                        sig: this.repr.arguments,
+                    },
+                    &[keys, i],
+                    &[this.repr.value],
+                );
+                let key_string = body.add_op(
+                    block,
+                    Operator::RefCast {
+                        ty: this.repr.string_ty(),
+                    },
+                    &[key],
+                    &[this.repr.string_ty()],
+                );
+                let (block, raw) = this.get_string_member_raw(body, block, &source, key_string)?;
+                let (block, resolved) = this.resolve_property_read_join(body, block, &source, raw)?;
+                let mut written = this.set_string_member(body, block, &target, key_string, &resolved)?;
+                written
+                    .pop()
+                    .ok_or_else(|| ConvertError::invalid("Object.assign produced no continuation"))
+            })?;
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![target_raw],
+                },
+            );
+            Ok(())
+        },
+    )?;
+    let (context, _) = object_ns.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block = self.set_static_property_value_raw(body, *block, &object_ns, "assign", &value)?;
+
+    let func = self.build_native_adapter(
+        "object_freeze",
+        |this, body, entry, _context, _this_val, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            let target = LowerValue::Wasm {
+                value: target_raw,
+                kind: ValueKind::Reference,
+            };
+            let (block, root) = this.object_and_root(body, block, &target)?;
+            let helpers = this.ensure_property_helpers()?;
+            let (block, keys) = this.enumerate_own_keys(body, block, &target, false)?;
+            let len = body.add_op(block, Operator::ArrayLen, &[keys], &[Type::I32]);
+            let block = this.for_each_index(body, block, len, |this, body, block, i| {
+                let key = body.add_op(
+                    block,
+                    Operator::ArrayGet {
+                        sig: this.repr.arguments,
+                    },
+                    &[keys, i],
+                    &[this.repr.value],
+                );
+                let key_string = body.add_op(
+                    block,
+                    Operator::RefCast {
+                        ty: this.repr.string_ty(),
+                    },
+                    &[key],
+                    &[this.repr.string_ty()],
+                );
+                let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+                let slot = body.add_op(
+                    block,
+                    Operator::Call {
+                        function_index: helpers.lookup,
+                    },
+                    &[root, key_string, zero],
+                    &[this.repr.slot_ty()],
+                );
+                let cast = body.add_op(
+                    block,
+                    Operator::RefCast {
+                        ty: this.repr.slot_non_null_ty(),
+                    },
+                    &[slot],
+                    &[this.repr.slot_non_null_ty()],
+                );
+                let value = body.add_op(
+                    block,
+                    Operator::StructGet {
+                        sig: this.repr.slot,
+                        idx: 0,
+                    },
+                    &[cast],
+                    &[this.repr.value],
+                );
+                let flags = body.add_op(
+                    block,
+                    Operator::StructGet {
+                        sig: this.repr.slot,
+                        idx: 1,
+                    },
+                    &[cast],
+                    &[Type::I32],
+                );
+                let mask = body.add_op(
+                    block,
+                    Operator::I32Const {
+                        value: !(crate::repr::SLOT_WRITABLE | crate::repr::SLOT_CONFIGURABLE) as u32,
+                    },
+                    &[],
+                    &[Type::I32],
+                );
+                let new_flags = body.add_op(block, Operator::I32And, &[flags, mask], &[Type::I32]);
+                let new_slot = this.new_slot(body, block, value, new_flags);
+                body.add_op(
+                    block,
+                    Operator::Call {
+                        function_index: helpers.set,
+                    },
+                    &[root, key_string, new_slot, zero],
+                    &[],
+                );
+                Ok(block)
+            })?;
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![target_raw],
+                },
+            );
+            Ok(())
+        },
+    )?;
+    let (context, _) = object_ns.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block = self.set_static_property_value_raw(body, *block, &object_ns, "freeze", &value)?;
+
+    let func = self.build_native_adapter(
+        "object_is_frozen",
+        |this, body, entry, _context, _this_val, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            let target = LowerValue::Wasm {
+                value: target_raw,
+                kind: ValueKind::Reference,
+            };
+            let (block, root) = this.object_and_root(body, block, &target)?;
+            let helpers = this.ensure_property_helpers()?;
+            let (block, keys) = this.enumerate_own_keys(body, block, &target, false)?;
+            let len = body.add_op(block, Operator::ArrayLen, &[keys], &[Type::I32]);
+            let one = body.add_op(block, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+            let (block, frozen) = this.for_each_index_fold(
+                body,
+                block,
+                len,
+                one,
+                Type::I32,
+                |this, body, block, i, acc| {
+                    let key = body.add_op(
+                        block,
+                        Operator::ArrayGet {
+                            sig: this.repr.arguments,
+                        },
+                        &[keys, i],
+                        &[this.repr.value],
+                    );
+                    let key_string = body.add_op(
+                        block,
+                        Operator::RefCast {
+                            ty: this.repr.string_ty(),
+                        },
+                        &[key],
+                        &[this.repr.string_ty()],
+                    );
+                    let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+                    let slot = body.add_op(
+                        block,
+                        Operator::Call {
+                            function_index: helpers.lookup,
+                        },
+                        &[root, key_string, zero],
+                        &[this.repr.slot_ty()],
+                    );
+                    let cast = body.add_op(
+                        block,
+                        Operator::RefCast {
+                            ty: this.repr.slot_non_null_ty(),
+                        },
+                        &[slot],
+                        &[this.repr.slot_non_null_ty()],
+                    );
+                    let flags = body.add_op(
+                        block,
+                        Operator::StructGet {
+                            sig: this.repr.slot,
+                            idx: 1,
+                        },
+                        &[cast],
+                        &[Type::I32],
+                    );
+                    let writable = this.slot_flag_bit(body, block, flags, crate::repr::SLOT_WRITABLE);
+                    let configurable =
+                        this.slot_flag_bit(body, block, flags, crate::repr::SLOT_CONFIGURABLE);
+                    let either = body.add_op(block, Operator::I32Or, &[writable, configurable], &[Type::I32]);
+                    let this_frozen = body.add_op(block, Operator::I32Eqz, &[either], &[Type::I32]);
+                    let new_acc = body.add_op(block, Operator::I32And, &[acc, this_frozen], &[Type::I32]);
+                    Ok((block, new_acc))
+                },
+            )?;
+            let boxed = this.box_value(
+                body,
+                block,
+                &LowerValue::Wasm {
+                    value: frozen,
+                    kind: ValueKind::Boolean,
+                },
+            )?;
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![boxed],
+                },
+            );
+            Ok(())
+        },
+    )?;
+    let (context, _) = object_ns.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block = self.set_static_property_value_raw(body, *block, &object_ns, "isFrozen", &value)?;
 
     Ok(object_ns)
 }

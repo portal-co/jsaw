@@ -39,6 +39,9 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
         truthy_helper: None,
         native_function_cache: BTreeMap::new(),
         context_builder: None,
+        arguments_push_helper: None,
+        trie_enumerate_helper: None,
+        object_enumerate_keys_helper: None,
     };
     converter.collect_shapes(root)?;
     converter.ensure_function(root)?;
@@ -130,6 +133,9 @@ pub fn convert_module<'a, 'wasm>(
         truthy_helper: None,
         native_function_cache: BTreeMap::new(),
         context_builder: None,
+        arguments_push_helper: None,
+        trie_enumerate_helper: None,
+        object_enumerate_keys_helper: None,
     };
     let mut exports = Vec::with_capacity(exported.len());
     for export in exported {
@@ -373,6 +379,15 @@ struct Converter<'a, 'module, 'wasm> {
     /// allocates a fresh context at runtime — this only shares the
     /// generated *code*, not the runtime value).
     context_builder: Option<Func>,
+    /// Appends a value to a growable `arguments`-typed array, reallocating
+    /// when full. See `enumerate.rs`.
+    arguments_push_helper: Option<Func>,
+    /// Recursively walks a generic property trie collecting own-property
+    /// keys. See `enumerate.rs`.
+    trie_enumerate_helper: Option<Func>,
+    /// Collects an object's own-property keys across every registered
+    /// shape plus the generic trie fallback. See `enumerate.rs`.
+    object_enumerate_keys_helper: Option<Func>,
 }
 
 impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
@@ -7807,3 +7822,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
 // block of its own) so these methods share full access to the existing
 // property/object helpers without a separate crate-visibility surface.
 include!("primordials.rs");
+
+// Runtime property enumeration, backing Object.keys/values/entries/
+// getOwnPropertyNames/getOwnPropertyDescriptors/assign/freeze/isFrozen and
+// Reflect.ownKeys.
+include!("enumerate.rs");

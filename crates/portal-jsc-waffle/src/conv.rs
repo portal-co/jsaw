@@ -5758,6 +5758,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         }
         let string_index = Self::static_array_index(key);
         if key != "length" && string_index.is_none() {
+            if Self::is_array_instance_method(key) {
+                return self.get_array_method_or_property(body, block, object, key);
+            }
             return self.get_nonstring_property_value_raw(body, block, object, key);
         }
         let (value, kind) = object.wasm()?;
@@ -5833,6 +5836,126 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 },
             },
         );
+        Ok((
+            join,
+            LowerValue::Wasm {
+                value: result,
+                kind: ValueKind::Reference,
+            },
+        ))
+    }
+
+    /// `push`/`pop`/`map`/`forEach` are implemented as intrinsic dispatch on
+    /// any receiver with a non-null `elements` field, not via a real
+    /// inheritable `Array.prototype` object — there is no prototype-chain
+    /// walking anywhere in this crate (see `primordials.rs`'s module
+    /// comment). A plain object that happens to own a property with one of
+    /// these names is unaffected: the array check only fires for receivers
+    /// that are actually arrays, and falls back to ordinary property lookup
+    /// otherwise.
+    fn is_array_instance_method(key: &str) -> bool {
+        matches!(key, "push" | "pop" | "map" | "forEach")
+    }
+
+    fn get_array_method_or_property(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &str,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        let (value, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return self.get_nonstring_property_value_raw(body, block, object, key);
+        }
+        let is_object = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.object_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let maybe_array = body.add_block();
+        let fallback = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget {
+                    block: maybe_array,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: fallback,
+                    args: vec![],
+                },
+            },
+        );
+
+        let plain = body.add_op(
+            maybe_array,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[value],
+            &[self.repr.object_ty()],
+        );
+        let elements = body.add_op(
+            maybe_array,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 1,
+            },
+            &[plain],
+            &[self.repr.arguments_ty()],
+        );
+        let no_elements = body.add_op(maybe_array, Operator::RefIsNull, &[elements], &[Type::I32]);
+        let is_array = body.add_block();
+        body.set_terminator(
+            maybe_array,
+            Terminator::CondBr {
+                cond: no_elements,
+                if_true: BlockTarget {
+                    block: fallback,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: is_array,
+                    args: vec![],
+                },
+            },
+        );
+        let method = self.ensure_array_instance_method(key)?;
+        let context = self.new_object(body, is_array)?;
+        let (context_value, _) = context.wasm()?;
+        let method_value = self.native_function_value(body, is_array, context_value, method)?;
+        let method_boxed = self.box_value(body, is_array, &method_value)?;
+        body.set_terminator(
+            is_array,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![method_boxed],
+                },
+            },
+        );
+
+        let (fallback_end, fallback_value) =
+            self.get_nonstring_property_value_raw(body, fallback, object, key)?;
+        let fallback_boxed = self.box_value(body, fallback_end, &fallback_value)?;
+        body.set_terminator(
+            fallback_end,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![fallback_boxed],
+                },
+            },
+        );
+
         Ok((
             join,
             LowerValue::Wasm {

@@ -2090,4 +2090,359 @@ fn build_object_namespace(
     Ok(object_ns)
 }
 
+// ---------------------------------------------------------------------
+// Array instance methods (`push`/`pop`/`map`/`forEach`) — dispatched by
+// `Converter::get_array_method_or_property` in conv.rs whenever a receiver
+// with a non-null `elements` field is asked for one of these names. See
+// that function's doc comment for why this is intrinsic dispatch rather
+// than a real, inheritable `Array.prototype`.
+// ---------------------------------------------------------------------
+
+fn ensure_array_instance_method(&mut self, key: &str) -> Result<Func, ConvertError> {
+    match key {
+        "push" => self.array_push_method(),
+        "pop" => self.array_pop_method(),
+        "map" => self.array_map_method(),
+        "forEach" => self.array_for_each_method(),
+        _ => Err(ConvertError::invalid(format!(
+            "{key:?} is not a recognized array instance method"
+        ))),
+    }
+}
+
+fn array_push_method(&mut self) -> Result<Func, ConvertError> {
+    self.build_native_adapter(
+        "array_push",
+        |this, body, entry, _context, this_val, args| {
+            let plain = body.add_op(
+                entry,
+                Operator::RefCast {
+                    ty: this.repr.object_ty(),
+                },
+                &[this_val],
+                &[this.repr.object_ty()],
+            );
+            let old_elements = body.add_op(
+                entry,
+                Operator::StructGet {
+                    sig: this.repr.object,
+                    idx: 1,
+                },
+                &[plain],
+                &[this.repr.arguments_ty()],
+            );
+            let old_len = body.add_op(entry, Operator::ArrayLen, &[old_elements], &[Type::I32]);
+            let items_len = body.add_op(entry, Operator::ArrayLen, &[args], &[Type::I32]);
+            let new_len = body.add_op(entry, Operator::I32Add, &[old_len, items_len], &[Type::I32]);
+            let new_elements = body.add_op(
+                entry,
+                Operator::ArrayNewDefault {
+                    sig: this.repr.arguments,
+                },
+                &[new_len],
+                &[this.repr.arguments_ty()],
+            );
+            let zero = body.add_op(entry, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+            body.add_op(
+                entry,
+                Operator::ArrayCopy {
+                    dest: this.repr.arguments,
+                    src: this.repr.arguments,
+                },
+                &[new_elements, zero, old_elements, zero, old_len],
+                &[],
+            );
+            body.add_op(
+                entry,
+                Operator::ArrayCopy {
+                    dest: this.repr.arguments,
+                    src: this.repr.arguments,
+                },
+                &[new_elements, old_len, args, zero, items_len],
+                &[],
+            );
+            body.add_op(
+                entry,
+                Operator::StructSet {
+                    sig: this.repr.object,
+                    idx: 1,
+                },
+                &[plain, new_elements],
+                &[],
+            );
+            let new_len_f64 = body.add_op(entry, Operator::F64ConvertI32S, &[new_len], &[Type::F64]);
+            this.return_number(body, entry, new_len_f64);
+            Ok(())
+        },
+    )
+}
+
+fn array_pop_method(&mut self) -> Result<Func, ConvertError> {
+    self.build_native_adapter(
+        "array_pop",
+        |this, body, entry, _context, this_val, _args| {
+            let plain = body.add_op(
+                entry,
+                Operator::RefCast {
+                    ty: this.repr.object_ty(),
+                },
+                &[this_val],
+                &[this.repr.object_ty()],
+            );
+            let elements = body.add_op(
+                entry,
+                Operator::StructGet {
+                    sig: this.repr.object,
+                    idx: 1,
+                },
+                &[plain],
+                &[this.repr.arguments_ty()],
+            );
+            let len = body.add_op(entry, Operator::ArrayLen, &[elements], &[Type::I32]);
+            let zero = body.add_op(entry, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+            let is_empty = body.add_op(entry, Operator::I32Eq, &[len, zero], &[Type::I32]);
+            let empty_block = body.add_block();
+            let nonempty_block = body.add_block();
+            let join = body.add_block();
+            let result = body.add_blockparam(join, this.repr.value);
+            body.set_terminator(
+                entry,
+                Terminator::CondBr {
+                    cond: is_empty,
+                    if_true: BlockTarget {
+                        block: empty_block,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: nonempty_block,
+                        args: vec![],
+                    },
+                },
+            );
+            let undef = body.add_op(
+                empty_block,
+                Operator::RefNull {
+                    ty: this.repr.value,
+                },
+                &[],
+                &[this.repr.value],
+            );
+            body.set_terminator(
+                empty_block,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![undef],
+                    },
+                },
+            );
+            let one = body.add_op(nonempty_block, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+            let new_len = body.add_op(nonempty_block, Operator::I32Sub, &[len, one], &[Type::I32]);
+            let last = body.add_op(
+                nonempty_block,
+                Operator::ArrayGet {
+                    sig: this.repr.arguments,
+                },
+                &[elements, new_len],
+                &[this.repr.value],
+            );
+            let trimmed = body.add_op(
+                nonempty_block,
+                Operator::ArrayNewDefault {
+                    sig: this.repr.arguments,
+                },
+                &[new_len],
+                &[this.repr.arguments_ty()],
+            );
+            body.add_op(
+                nonempty_block,
+                Operator::ArrayCopy {
+                    dest: this.repr.arguments,
+                    src: this.repr.arguments,
+                },
+                &[trimmed, zero, elements, zero, new_len],
+                &[],
+            );
+            body.add_op(
+                nonempty_block,
+                Operator::StructSet {
+                    sig: this.repr.object,
+                    idx: 1,
+                },
+                &[plain, trimmed],
+                &[],
+            );
+            body.set_terminator(
+                nonempty_block,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![last],
+                    },
+                },
+            );
+            body.set_terminator(join, Terminator::Return { values: vec![result] });
+            Ok(())
+        },
+    )
+}
+
+/// Shared by `map`/`forEach`: invoke `callback(element, index, array)` (JS
+/// `Array` callback signature; `thisArg` isn't supported) for element `i`
+/// of `elements`, returning the raw call result.
+fn array_invoke_callback(
+    &mut self,
+    body: &mut FunctionBody,
+    block: Block,
+    callback: &LowerValue,
+    elements: Value,
+    this_val: Value,
+    i: Value,
+) -> Result<(Block, Value), ConvertError> {
+    let item = body.add_op(
+        block,
+        Operator::ArrayGet {
+            sig: self.repr.arguments,
+        },
+        &[elements, i],
+        &[self.repr.value],
+    );
+    let i_f64 = body.add_op(block, Operator::F64ConvertI32S, &[i], &[Type::F64]);
+    let i_boxed = self.box_value(
+        body,
+        block,
+        &LowerValue::Wasm {
+            value: i_f64,
+            kind: ValueKind::Number,
+        },
+    )?;
+    let call_args = body.add_op(
+        block,
+        Operator::ArrayNewFixed {
+            sig: self.repr.arguments,
+            num: 3,
+        },
+        &[item, i_boxed, this_val],
+        &[self.repr.arguments_ty()],
+    );
+    let undef_this = self.undef(body, block);
+    let (context, call_this, code, _arrow) = self.callable_parts(body, block, callback, undef_this)?;
+    let result = body.add_op(
+        block,
+        Operator::CallRef {
+            sig_index: self.repr.adapter,
+        },
+        &[context, call_this, call_args, code],
+        &[self.repr.value],
+    );
+    Ok((block, result))
+}
+
+fn array_for_each_method(&mut self) -> Result<Func, ConvertError> {
+    self.build_native_adapter(
+        "array_for_each",
+        |this, body, entry, _context, this_val, args| {
+            let (block, callback_raw) = this.read_arg_raw(body, entry, args, 0);
+            let callback = LowerValue::Wasm {
+                value: callback_raw,
+                kind: ValueKind::Reference,
+            };
+            let plain = body.add_op(
+                block,
+                Operator::RefCast {
+                    ty: this.repr.object_ty(),
+                },
+                &[this_val],
+                &[this.repr.object_ty()],
+            );
+            let elements = body.add_op(
+                block,
+                Operator::StructGet {
+                    sig: this.repr.object,
+                    idx: 1,
+                },
+                &[plain],
+                &[this.repr.arguments_ty()],
+            );
+            let len = body.add_op(block, Operator::ArrayLen, &[elements], &[Type::I32]);
+            let block = this.for_each_index(body, block, len, |this, body, block, i| {
+                let (block, _result) =
+                    this.array_invoke_callback(body, block, &callback, elements, this_val, i)?;
+                Ok(block)
+            })?;
+            let undef = body.add_op(
+                block,
+                Operator::RefNull {
+                    ty: this.repr.value,
+                },
+                &[],
+                &[this.repr.value],
+            );
+            body.set_terminator(block, Terminator::Return { values: vec![undef] });
+            Ok(())
+        },
+    )
+}
+
+fn array_map_method(&mut self) -> Result<Func, ConvertError> {
+    self.build_native_adapter(
+        "array_map",
+        |this, body, entry, _context, this_val, args| {
+            let (block, callback_raw) = this.read_arg_raw(body, entry, args, 0);
+            let callback = LowerValue::Wasm {
+                value: callback_raw,
+                kind: ValueKind::Reference,
+            };
+            let plain = body.add_op(
+                block,
+                Operator::RefCast {
+                    ty: this.repr.object_ty(),
+                },
+                &[this_val],
+                &[this.repr.object_ty()],
+            );
+            let elements = body.add_op(
+                block,
+                Operator::StructGet {
+                    sig: this.repr.object,
+                    idx: 1,
+                },
+                &[plain],
+                &[this.repr.arguments_ty()],
+            );
+            let len = body.add_op(block, Operator::ArrayLen, &[elements], &[Type::I32]);
+            let results = body.add_op(
+                block,
+                Operator::ArrayNewDefault {
+                    sig: this.repr.arguments,
+                },
+                &[len],
+                &[this.repr.arguments_ty()],
+            );
+            let block = this.for_each_index(body, block, len, |this, body, block, i| {
+                let (block, result) =
+                    this.array_invoke_callback(body, block, &callback, elements, this_val, i)?;
+                body.add_op(
+                    block,
+                    Operator::ArraySet {
+                        sig: this.repr.arguments,
+                    },
+                    &[results, i, result],
+                    &[],
+                );
+                Ok(block)
+            })?;
+            let array_obj = this.new_array_object(body, block, results)?;
+            let boxed = this.anyref(body, block, array_obj);
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![boxed],
+                },
+            );
+            Ok(())
+        },
+    )
+}
+
 }

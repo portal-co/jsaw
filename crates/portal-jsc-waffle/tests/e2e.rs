@@ -1207,3 +1207,71 @@ fn executes_reflect_own_keys() {
     validate(&module);
     assert_executes_in_all_runtimes(&module, "own_keys_includes_non_enumerable", &[], 2.0);
 }
+
+#[test]
+fn executes_array_instance_methods() {
+    let module = compile_module(
+        "
+            export function push_returns_new_length() {
+                let arr = [1, 2];
+                return arr.push(3, 4);
+            }
+
+            export function push_mutates_in_place() {
+                let arr = [1, 2];
+                arr.push(3);
+                return arr[0] * 100 + arr[1] * 10 + arr[2];
+            }
+
+            export function pop_returns_last_and_shrinks() {
+                let arr = [1, 2, 3];
+                let last = arr.pop();
+                let length = arr.length;
+                return last * 100 + length;
+            }
+
+            export function pop_empty_returns_undefined_ish() {
+                let arr = [];
+                let last = arr.pop();
+                return !last ? 1 : 0;
+            }
+
+            export function for_each_appends_doubled_values() {
+                let arr = [1, 2, 3];
+                arr.forEach(function (value, index, array) {
+                    array.push(value * 2);
+                });
+                let length = arr.length;
+                return length;
+            }
+
+            export function map_doubles_each_element() {
+                let arr = [1, 2, 3];
+                let doubled = arr.map(function (value) {
+                    return value * 2;
+                });
+                return doubled[0] * 100 + doubled[1] * 10 + doubled[2];
+            }
+
+            export function plain_object_own_push_property_still_wins() {
+                let obj = { push: 42 };
+                return obj.push;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "push_returns_new_length", &[], 4.0);
+    assert_executes_in_all_runtimes(&module, "push_mutates_in_place", &[], 123.0);
+    assert_executes_in_all_runtimes(&module, "pop_returns_last_and_shrinks", &[], 302.0);
+    assert_executes_in_all_runtimes(&module, "pop_empty_returns_undefined_ish", &[], 1.0);
+    assert_executes_in_all_runtimes(&module, "for_each_appends_doubled_values", &[], 6.0);
+    assert_executes_in_all_runtimes(&module, "map_doubles_each_element", &[], 246.0);
+    assert_executes_in_all_runtimes(
+        &module,
+        "plain_object_own_push_property_still_wins",
+        &[],
+        42.0,
+    );
+}
+
+

@@ -35,8 +35,48 @@ fn new_context_with_primordials(
     let array = self.build_array_namespace(body, &mut block)?;
     block = self.set_static_property_value_raw(body, block, &context, "Array", &array)?;
 
+    let reflect = self.build_reflect_namespace(body, &mut block)?;
+    block = self.set_static_property_value_raw(body, block, &context, "Reflect", &reflect)?;
+
+    let object_ns = self.build_object_namespace(body, &mut block)?;
+    block = self.set_static_property_value_raw(body, block, &context, "Object", &object_ns)?;
+
     let (context_value, _) = context.wasm()?;
     Ok((block, context_value))
+}
+
+/// Wrap [`Self::new_context_with_primordials`] in its own zero-argument
+/// Wasm function, generated once and cached. A call site just emits a
+/// single `call` instead of an inlined copy of the entire
+/// namespace-construction sequence — with 20+ primordial methods across
+/// four namespaces, inlining that at every export made this crate's own
+/// validation/emission (and Wasmtime/Node's compilation of the result)
+/// scale linearly with export count, which was impractically slow.
+fn ensure_context_builder(&mut self) -> Result<Func, ConvertError> {
+    if let Some(func) = self.context_builder {
+        return Ok(func);
+    }
+    let sig = self.module.signatures.push(SignatureData::Func {
+        params: vec![],
+        returns: vec![self.repr.object_ty()],
+        shared: false,
+    });
+    let mut body = FunctionBody::new(self.module, sig);
+    let entry = body.entry;
+    let (block, context_value) = self.new_context_with_primordials(&mut body, entry)?;
+    body.set_terminator(
+        block,
+        Terminator::Return {
+            values: vec![context_value],
+        },
+    );
+    let func = self.module.funcs.push(FuncDecl::Body(
+        sig,
+        "js_build_primordial_context".to_string(),
+        body,
+    ));
+    self.context_builder = Some(func);
+    Ok(func)
 }
 
 /// Declare and fully build a Wasm function with the adapter ABI
@@ -48,6 +88,9 @@ fn build_native_adapter(
     label: &str,
     build: impl FnOnce(&mut Self, &mut FunctionBody, Block, Value, Value, Value) -> Result<(), ConvertError>,
 ) -> Result<Func, ConvertError> {
+    if let Some(func) = self.native_function_cache.get(label) {
+        return Ok(*func);
+    }
     let mut body = FunctionBody::new(self.module, self.repr.adapter);
     let entry = body.entry;
     let context = body.blocks[entry].params[0].1;
@@ -60,6 +103,7 @@ fn build_native_adapter(
         body,
     ));
     self.declare_function_reference(func);
+    self.native_function_cache.insert(label.to_owned(), func);
     Ok(func)
 }
 
@@ -125,13 +169,17 @@ fn native_function_value(
 /// or an explicit `undefined` becomes `NaN`, matching ordinary JS numeric
 /// coercion of `undefined`. Values already known to be numbers (the only
 /// case this milestone's callers pass) reuse `as_f64` unchanged.
-fn read_arg_number(
+/// Read the `index`-th call argument as its raw boxed value (nullable
+/// `anyref`). A missing argument becomes `undefined` (null), matching an
+/// explicit `undefined` argument — this milestone does not distinguish the
+/// two, same as the rest of this crate's property-lookup machinery.
+fn read_arg_raw(
     &self,
     body: &mut FunctionBody,
     block: Block,
     args: Value,
     index: u32,
-) -> Result<(Block, Value), ConvertError> {
+) -> (Block, Value) {
     let len = body.add_op(block, Operator::ArrayLen, &[args], &[Type::I32]);
     let idx = body.add_op(
         block,
@@ -192,6 +240,21 @@ fn read_arg_number(
             },
         },
     );
+    (join, raw)
+}
+
+/// Read the `index`-th call argument, coerced to `f64`. A missing argument
+/// or an explicit `undefined` becomes `NaN`, matching ordinary JS numeric
+/// coercion of `undefined`. Values already known to be numbers (the only
+/// case this milestone's callers pass) reuse `as_f64` unchanged.
+fn read_arg_number(
+    &self,
+    body: &mut FunctionBody,
+    block: Block,
+    args: Value,
+    index: u32,
+) -> Result<(Block, Value), ConvertError> {
+    let (join, raw) = self.read_arg_raw(body, block, args, index);
 
     let is_null = body.add_op(join, Operator::RefIsNull, &[raw], &[Type::I32]);
     let has_value = body.add_block();
@@ -247,6 +310,30 @@ fn read_arg_number(
         },
     );
     Ok((result_join, result))
+}
+
+/// Read the `index`-th call argument as a runtime string property key
+/// (`Reflect`/`Object` methods take an already-computed key, unlike ordinary
+/// `obj.prop` member access). Traps at runtime if the argument isn't
+/// actually a string — full `ToPropertyKey` coercion (numbers, symbols) is
+/// out of scope for this milestone.
+fn read_arg_string_key(
+    &self,
+    body: &mut FunctionBody,
+    block: Block,
+    args: Value,
+    index: u32,
+) -> Result<(Block, Value), ConvertError> {
+    let (block, raw) = self.read_arg_raw(body, block, args, index);
+    let key = self.dynamic_string_key(
+        body,
+        block,
+        &LowerValue::Wasm {
+            value: raw,
+            kind: ValueKind::Reference,
+        },
+    )?;
+    Ok((block, key))
 }
 
 /// Box an `f64` result and return it, terminating `block`.
@@ -458,62 +545,7 @@ fn build_array_namespace(
     let func = self.build_native_adapter(
         "array_is_array",
         |this, body, entry, _context, _this_val, args| {
-            let len = body.add_op(entry, Operator::ArrayLen, &[args], &[Type::I32]);
-            let zero_idx = body.add_op(entry, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
-            let has_arg = body.add_op(entry, Operator::I32GtU, &[len, zero_idx], &[Type::I32]);
-            let read = body.add_block();
-            let no_arg = body.add_block();
-            let join = body.add_block();
-            let raw = body.add_blockparam(join, this.repr.value);
-            body.set_terminator(
-                entry,
-                Terminator::CondBr {
-                    cond: has_arg,
-                    if_true: BlockTarget {
-                        block: read,
-                        args: vec![],
-                    },
-                    if_false: BlockTarget {
-                        block: no_arg,
-                        args: vec![],
-                    },
-                },
-            );
-            let value = body.add_op(
-                read,
-                Operator::ArrayGet {
-                    sig: this.repr.arguments,
-                },
-                &[args, zero_idx],
-                &[this.repr.value],
-            );
-            body.set_terminator(
-                read,
-                Terminator::Br {
-                    target: BlockTarget {
-                        block: join,
-                        args: vec![value],
-                    },
-                },
-            );
-            let undef = body.add_op(
-                no_arg,
-                Operator::RefNull {
-                    ty: this.repr.value,
-                },
-                &[],
-                &[this.repr.value],
-            );
-            body.set_terminator(
-                no_arg,
-                Terminator::Br {
-                    target: BlockTarget {
-                        block: join,
-                        args: vec![undef],
-                    },
-                },
-            );
-
+            let (join, raw) = this.read_arg_raw(body, entry, args, 0);
             let is_null = body.add_op(join, Operator::RefIsNull, &[raw], &[Type::I32]);
             let non_null = body.add_block();
             let is_object = body.add_block();
@@ -616,6 +648,938 @@ fn build_array_namespace(
     let value = self.native_function_value(body, *block, context, func)?;
     *block = self.set_static_property_value_raw(body, *block, &array, "isArray", &value)?;
     Ok(array)
+}
+
+// ---------------------------------------------------------------------
+// Reflect / Object: descriptor manipulation
+//
+// `keys`/`values`/`entries`/`getOwnPropertyNames`/`assign`/`freeze`/
+// `isFrozen`/`ownKeys`/`construct` are not implemented yet — they need a
+// runtime property-enumeration primitive (walking every trie bucket and
+// every registered shape's field set) that nothing in this crate builds
+// today. `getPrototypeOf`/`setPrototypeOf`/`isExtensible`/
+// `preventExtensions` are accepted but not enforced, since there is no real
+// prototype-chain or extensibility tracking anywhere in this crate.
+// ---------------------------------------------------------------------
+
+/// `flags & mask != 0` as a clean JS boolean (0/1) i32.
+fn slot_flag_bit(&self, body: &mut FunctionBody, block: Block, flags: Value, mask: i32) -> Value {
+    let mask = body.add_op(
+        block,
+        Operator::I32Const {
+            value: mask as u32,
+        },
+        &[],
+        &[Type::I32],
+    );
+    let and = body.add_op(block, Operator::I32And, &[flags, mask], &[Type::I32]);
+    let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+    body.add_op(block, Operator::I32Ne, &[and, zero], &[Type::I32])
+}
+
+/// `value != null` as a clean JS boolean (0/1) i32 — "is this call argument
+/// actually present" (used to distinguish a data vs. accessor descriptor).
+fn is_present(&self, body: &mut FunctionBody, block: Block, value: Value) -> Value {
+    let is_null = body.add_op(block, Operator::RefIsNull, &[value], &[Type::I32]);
+    body.add_op(block, Operator::I32Eqz, &[is_null], &[Type::I32])
+}
+
+/// `Object.getOwnPropertyDescriptor(target, key)` / `Reflect.
+/// getOwnPropertyDescriptor(target, key)`. Reads the raw stored slot
+/// (bypassing accessor invocation) and reports its real, tracked
+/// `writable`/`enumerable`/`configurable` bits — no defaulting needed, since
+/// those attributes are genuinely stored per property.
+fn object_get_own_property_descriptor(
+    &mut self,
+    body: &mut FunctionBody,
+    block: Block,
+    target: &LowerValue,
+    key: Value,
+) -> Result<(Block, LowerValue), ConvertError> {
+    let (block, root) = self.object_and_root(body, block, target)?;
+    let helpers = self.ensure_property_helpers()?;
+    let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+    let slot = body.add_op(
+        block,
+        Operator::Call {
+            function_index: helpers.lookup,
+        },
+        &[root, key, zero],
+        &[self.repr.slot_ty()],
+    );
+    let is_null = body.add_op(block, Operator::RefIsNull, &[slot], &[Type::I32]);
+    let absent = body.add_block();
+    let present = body.add_block();
+    let join = body.add_block();
+    let result = body.add_blockparam(join, self.repr.value);
+    body.set_terminator(
+        block,
+        Terminator::CondBr {
+            cond: is_null,
+            if_true: BlockTarget {
+                block: absent,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: present,
+                args: vec![],
+            },
+        },
+    );
+    let undef = body.add_op(
+        absent,
+        Operator::RefNull {
+            ty: self.repr.value,
+        },
+        &[],
+        &[self.repr.value],
+    );
+    body.set_terminator(
+        absent,
+        Terminator::Br {
+            target: BlockTarget {
+                block: join,
+                args: vec![undef],
+            },
+        },
+    );
+
+    let cast = body.add_op(
+        present,
+        Operator::RefCast {
+            ty: self.repr.slot_non_null_ty(),
+        },
+        &[slot],
+        &[self.repr.slot_non_null_ty()],
+    );
+    let raw_value = body.add_op(
+        present,
+        Operator::StructGet {
+            sig: self.repr.slot,
+            idx: 0,
+        },
+        &[cast],
+        &[self.repr.value],
+    );
+    let flags = body.add_op(
+        present,
+        Operator::StructGet {
+            sig: self.repr.slot,
+            idx: 1,
+        },
+        &[cast],
+        &[Type::I32],
+    );
+    let enumerable = self.slot_flag_bit(body, present, flags, crate::repr::SLOT_ENUMERABLE);
+    let configurable = self.slot_flag_bit(body, present, flags, crate::repr::SLOT_CONFIGURABLE);
+    let enumerable = self.box_value(
+        body,
+        present,
+        &LowerValue::Wasm {
+            value: enumerable,
+            kind: ValueKind::Boolean,
+        },
+    )?;
+    let configurable = self.box_value(
+        body,
+        present,
+        &LowerValue::Wasm {
+            value: configurable,
+            kind: ValueKind::Boolean,
+        },
+    )?;
+
+    let is_descriptor = body.add_op(
+        present,
+        Operator::RefTest {
+            ty: self.repr.descriptor_non_null_ty(),
+        },
+        &[raw_value],
+        &[Type::I32],
+    );
+    let accessor = body.add_block();
+    let data = body.add_block();
+    body.set_terminator(
+        present,
+        Terminator::CondBr {
+            cond: is_descriptor,
+            if_true: BlockTarget {
+                block: accessor,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: data,
+                args: vec![],
+            },
+        },
+    );
+
+    let descriptor_cast = body.add_op(
+        accessor,
+        Operator::RefCast {
+            ty: self.repr.descriptor_ty(),
+        },
+        &[raw_value],
+        &[self.repr.descriptor_ty()],
+    );
+    let getter = body.add_op(
+        accessor,
+        Operator::StructGet {
+            sig: self.repr.descriptor,
+            idx: 0,
+        },
+        &[descriptor_cast],
+        &[self.repr.value],
+    );
+    let setter = body.add_op(
+        accessor,
+        Operator::StructGet {
+            sig: self.repr.descriptor,
+            idx: 1,
+        },
+        &[descriptor_cast],
+        &[self.repr.value],
+    );
+    let accessor_result = self.new_object(body, accessor)?;
+    let mut accessor_block = accessor;
+    accessor_block = self.set_static_property_value_raw(
+        body,
+        accessor_block,
+        &accessor_result,
+        "get",
+        &LowerValue::Wasm {
+            value: getter,
+            kind: ValueKind::Reference,
+        },
+    )?;
+    accessor_block = self.set_static_property_value_raw(
+        body,
+        accessor_block,
+        &accessor_result,
+        "set",
+        &LowerValue::Wasm {
+            value: setter,
+            kind: ValueKind::Reference,
+        },
+    )?;
+    accessor_block = self.set_static_property_value_raw(
+        body,
+        accessor_block,
+        &accessor_result,
+        "enumerable",
+        &LowerValue::Wasm {
+            value: enumerable,
+            kind: ValueKind::Reference,
+        },
+    )?;
+    accessor_block = self.set_static_property_value_raw(
+        body,
+        accessor_block,
+        &accessor_result,
+        "configurable",
+        &LowerValue::Wasm {
+            value: configurable,
+            kind: ValueKind::Reference,
+        },
+    )?;
+    let accessor_result_value = self.box_value(body, accessor_block, &accessor_result)?;
+    body.set_terminator(
+        accessor_block,
+        Terminator::Br {
+            target: BlockTarget {
+                block: join,
+                args: vec![accessor_result_value],
+            },
+        },
+    );
+
+    let writable = self.slot_flag_bit(body, data, flags, crate::repr::SLOT_WRITABLE);
+    let writable = self.box_value(
+        body,
+        data,
+        &LowerValue::Wasm {
+            value: writable,
+            kind: ValueKind::Boolean,
+        },
+    )?;
+    let data_result = self.new_object(body, data)?;
+    let mut data_block = data;
+    data_block = self.set_static_property_value_raw(
+        body,
+        data_block,
+        &data_result,
+        "value",
+        &LowerValue::Wasm {
+            value: raw_value,
+            kind: ValueKind::Reference,
+        },
+    )?;
+    data_block = self.set_static_property_value_raw(
+        body,
+        data_block,
+        &data_result,
+        "writable",
+        &LowerValue::Wasm {
+            value: writable,
+            kind: ValueKind::Reference,
+        },
+    )?;
+    data_block = self.set_static_property_value_raw(
+        body,
+        data_block,
+        &data_result,
+        "enumerable",
+        &LowerValue::Wasm {
+            value: enumerable,
+            kind: ValueKind::Reference,
+        },
+    )?;
+    data_block = self.set_static_property_value_raw(
+        body,
+        data_block,
+        &data_result,
+        "configurable",
+        &LowerValue::Wasm {
+            value: configurable,
+            kind: ValueKind::Reference,
+        },
+    )?;
+    let data_result_value = self.box_value(body, data_block, &data_result)?;
+    body.set_terminator(
+        data_block,
+        Terminator::Br {
+            target: BlockTarget {
+                block: join,
+                args: vec![data_result_value],
+            },
+        },
+    );
+
+    Ok((
+        join,
+        LowerValue::Wasm {
+            value: result,
+            kind: ValueKind::Reference,
+        },
+    ))
+}
+
+/// `Object.defineProperty(target, key, descriptor)` / `Reflect.
+/// defineProperty(target, key, descriptor)`. Installs a data or accessor
+/// property (whichever the descriptor specifies) with real, tracked
+/// attribute flags. Attributes absent from `descriptor` default to `false`,
+/// matching spec behavior for a freshly-defined property; this milestone
+/// does not merge with an existing property's attributes on a partial
+/// update.
+fn object_define_property(
+    &mut self,
+    body: &mut FunctionBody,
+    block: Block,
+    target: &LowerValue,
+    key: Value,
+    descriptor: &LowerValue,
+) -> Result<Block, ConvertError> {
+    let (block, value_prop) = self.get_property_value_raw(body, block, descriptor, "value")?;
+    let (block, get_prop) = self.get_property_value_raw(body, block, descriptor, "get")?;
+    let (block, set_prop) = self.get_property_value_raw(body, block, descriptor, "set")?;
+    let (block, writable_prop) =
+        self.get_property_value_raw(body, block, descriptor, "writable")?;
+    let (block, enumerable_prop) =
+        self.get_property_value_raw(body, block, descriptor, "enumerable")?;
+    let (block, configurable_prop) =
+        self.get_property_value_raw(body, block, descriptor, "configurable")?;
+
+    let writable = self.as_condition(body, block, &writable_prop)?;
+    let enumerable = self.as_condition(body, block, &enumerable_prop)?;
+    let configurable = self.as_condition(body, block, &configurable_prop)?;
+    let one = body.add_op(block, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+    let two = body.add_op(block, Operator::I32Const { value: 2 }, &[], &[Type::I32]);
+    let enumerable_bit = body.add_op(block, Operator::I32Shl, &[enumerable, one], &[Type::I32]);
+    let configurable_bit = body.add_op(block, Operator::I32Shl, &[configurable, two], &[Type::I32]);
+    let flags = body.add_op(block, Operator::I32Or, &[writable, enumerable_bit], &[Type::I32]);
+    let flags = body.add_op(block, Operator::I32Or, &[flags, configurable_bit], &[Type::I32]);
+
+    let (get_raw, _) = get_prop.wasm()?;
+    let (set_raw, _) = set_prop.wasm()?;
+    let has_get = self.is_present(body, block, get_raw);
+    let has_set = self.is_present(body, block, set_raw);
+    let is_accessor = body.add_op(block, Operator::I32Or, &[has_get, has_set], &[Type::I32]);
+
+    let accessor = body.add_block();
+    let data = body.add_block();
+    let join = body.add_block();
+    let final_value = body.add_blockparam(join, self.repr.value);
+    body.set_terminator(
+        block,
+        Terminator::CondBr {
+            cond: is_accessor,
+            if_true: BlockTarget {
+                block: accessor,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: data,
+                args: vec![],
+            },
+        },
+    );
+    let descriptor_struct = self.new_descriptor(body, accessor);
+    body.add_op(
+        accessor,
+        Operator::StructSet {
+            sig: self.repr.descriptor,
+            idx: 0,
+        },
+        &[descriptor_struct, get_raw],
+        &[],
+    );
+    body.add_op(
+        accessor,
+        Operator::StructSet {
+            sig: self.repr.descriptor,
+            idx: 1,
+        },
+        &[descriptor_struct, set_raw],
+        &[],
+    );
+    let descriptor_any = self.anyref(body, accessor, descriptor_struct);
+    body.set_terminator(
+        accessor,
+        Terminator::Br {
+            target: BlockTarget {
+                block: join,
+                args: vec![descriptor_any],
+            },
+        },
+    );
+    let (value_raw, _) = value_prop.wasm()?;
+    body.set_terminator(
+        data,
+        Terminator::Br {
+            target: BlockTarget {
+                block: join,
+                args: vec![value_raw],
+            },
+        },
+    );
+
+    let slot = self.new_slot(body, join, final_value, flags);
+    let (join, root) = self.object_and_root(body, join, target)?;
+    let helpers = self.ensure_property_helpers()?;
+    let zero = body.add_op(join, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+    body.add_op(
+        join,
+        Operator::Call {
+            function_index: helpers.set,
+        },
+        &[root, key, slot, zero],
+        &[],
+    );
+    Ok(join)
+}
+
+fn build_reflect_namespace(
+    &mut self,
+    body: &mut FunctionBody,
+    block: &mut Block,
+) -> Result<LowerValue, ConvertError> {
+    let reflect = self.new_object(body, *block)?;
+
+    let func = self.build_native_adapter(
+        "reflect_get",
+        |this, body, entry, _context, _this_val, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            let (block, key) = this.read_arg_string_key(body, block, args, 1)?;
+            let target = LowerValue::Wasm {
+                value: target_raw,
+                kind: ValueKind::Reference,
+            };
+            let (block, raw) = this.get_string_member_raw(body, block, &target, key)?;
+            let (block, resolved) = this.resolve_property_read_join(body, block, &target, raw)?;
+            let boxed = this.box_value(body, block, &resolved)?;
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![boxed],
+                },
+            );
+            Ok(())
+        },
+    )?;
+    let (context, _) = reflect.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block = self.set_static_property_value_raw(body, *block, &reflect, "get", &value)?;
+
+    let func = self.build_native_adapter(
+        "reflect_set",
+        |this, body, entry, _context, _this_val, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            let (block, key) = this.read_arg_string_key(body, block, args, 1)?;
+            let (block, new_value) = this.read_arg_raw(body, block, args, 2);
+            let target = LowerValue::Wasm {
+                value: target_raw,
+                kind: ValueKind::Reference,
+            };
+            let new_value = LowerValue::Wasm {
+                value: new_value,
+                kind: ValueKind::Reference,
+            };
+            let mut written = this.set_string_member(body, block, &target, key, &new_value)?;
+            let block = written
+                .pop()
+                .ok_or_else(|| ConvertError::invalid("Reflect.set produced no continuation"))?;
+            let true_value = body.add_op(block, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+            let boxed = this.box_value(
+                body,
+                block,
+                &LowerValue::Wasm {
+                    value: true_value,
+                    kind: ValueKind::Boolean,
+                },
+            )?;
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![boxed],
+                },
+            );
+            Ok(())
+        },
+    )?;
+    let (context, _) = reflect.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block = self.set_static_property_value_raw(body, *block, &reflect, "set", &value)?;
+
+    let func = self.build_native_adapter(
+        "reflect_has",
+        |this, body, entry, _context, _this_val, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            let (block, key) = this.read_arg_string_key(body, block, args, 1)?;
+            let target = LowerValue::Wasm {
+                value: target_raw,
+                kind: ValueKind::Reference,
+            };
+            let (block, raw) = this.get_string_member_raw(body, block, &target, key)?;
+            let (raw_value, _) = raw.wasm()?;
+            let has = this.is_present(body, block, raw_value);
+            let boxed = this.box_value(
+                body,
+                block,
+                &LowerValue::Wasm {
+                    value: has,
+                    kind: ValueKind::Boolean,
+                },
+            )?;
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![boxed],
+                },
+            );
+            Ok(())
+        },
+    )?;
+    let (context, _) = reflect.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block = self.set_static_property_value_raw(body, *block, &reflect, "has", &value)?;
+
+    let func = self.build_native_adapter(
+        "reflect_delete_property",
+        |this, body, entry, _context, _this_val, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            let (block, key) = this.read_arg_string_key(body, block, args, 1)?;
+            let target = LowerValue::Wasm {
+                value: target_raw,
+                kind: ValueKind::Reference,
+            };
+            let (block, root) = this.object_and_root(body, block, &target)?;
+            let helpers = this.ensure_property_helpers()?;
+            let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+            let null_slot = body.add_op(
+                block,
+                Operator::RefNull {
+                    ty: this.repr.slot_ty(),
+                },
+                &[],
+                &[this.repr.slot_ty()],
+            );
+            body.add_op(
+                block,
+                Operator::Call {
+                    function_index: helpers.set,
+                },
+                &[root, key, null_slot, zero],
+                &[],
+            );
+            let true_value = body.add_op(block, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+            let boxed = this.box_value(
+                body,
+                block,
+                &LowerValue::Wasm {
+                    value: true_value,
+                    kind: ValueKind::Boolean,
+                },
+            )?;
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![boxed],
+                },
+            );
+            Ok(())
+        },
+    )?;
+    let (context, _) = reflect.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block = self.set_static_property_value_raw(body, *block, &reflect, "deleteProperty", &value)?;
+
+    let func = self.build_native_adapter(
+        "reflect_apply",
+        |this, body, entry, _context, _this_val, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            let (block, this_arg_raw) = this.read_arg_raw(body, block, args, 1);
+            let (block, args_array_raw) = this.read_arg_raw(body, block, args, 2);
+            let is_object = body.add_op(
+                block,
+                Operator::RefTest {
+                    ty: this.repr.object_ty(),
+                },
+                &[args_array_raw],
+                &[Type::I32],
+            );
+            let has_array = body.add_block();
+            let no_array = body.add_block();
+            let elements_join = body.add_block();
+            let elements = body.add_blockparam(elements_join, this.repr.arguments_ty());
+            body.set_terminator(
+                block,
+                Terminator::CondBr {
+                    cond: is_object,
+                    if_true: BlockTarget {
+                        block: has_array,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: no_array,
+                        args: vec![],
+                    },
+                },
+            );
+            let plain = body.add_op(
+                has_array,
+                Operator::RefCast {
+                    ty: this.repr.object_ty(),
+                },
+                &[args_array_raw],
+                &[this.repr.object_ty()],
+            );
+            let found_elements = body.add_op(
+                has_array,
+                Operator::StructGet {
+                    sig: this.repr.object,
+                    idx: 1,
+                },
+                &[plain],
+                &[this.repr.arguments_ty()],
+            );
+            body.set_terminator(
+                has_array,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: elements_join,
+                        args: vec![found_elements],
+                    },
+                },
+            );
+            let empty = body.add_op(
+                no_array,
+                Operator::ArrayNewFixed {
+                    sig: this.repr.arguments,
+                    num: 0,
+                },
+                &[],
+                &[this.repr.arguments_ty()],
+            );
+            body.set_terminator(
+                no_array,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: elements_join,
+                        args: vec![empty],
+                    },
+                },
+            );
+
+            let target = LowerValue::Wasm {
+                value: target_raw,
+                kind: ValueKind::Reference,
+            };
+            let this_arg = LowerValue::Wasm {
+                value: this_arg_raw,
+                kind: ValueKind::Reference,
+            };
+            let (context, call_this, code, _arrow) =
+                this.callable_parts(body, elements_join, &target, this_arg)?;
+            let result = body.add_op(
+                elements_join,
+                Operator::CallRef {
+                    sig_index: this.repr.adapter,
+                },
+                &[context, call_this, elements, code],
+                &[this.repr.value],
+            );
+            body.set_terminator(
+                elements_join,
+                Terminator::Return {
+                    values: vec![result],
+                },
+            );
+            Ok(())
+        },
+    )?;
+    let (context, _) = reflect.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block = self.set_static_property_value_raw(body, *block, &reflect, "apply", &value)?;
+
+    let func = self.build_native_adapter(
+        "reflect_define_property",
+        |this, body, entry, _context, _this_val, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            let (block, key) = this.read_arg_string_key(body, block, args, 1)?;
+            let (block, descriptor_raw) = this.read_arg_raw(body, block, args, 2);
+            let target = LowerValue::Wasm {
+                value: target_raw,
+                kind: ValueKind::Reference,
+            };
+            let descriptor = LowerValue::Wasm {
+                value: descriptor_raw,
+                kind: ValueKind::Reference,
+            };
+            let block = this.object_define_property(body, block, &target, key, &descriptor)?;
+            let true_value = body.add_op(block, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+            let boxed = this.box_value(
+                body,
+                block,
+                &LowerValue::Wasm {
+                    value: true_value,
+                    kind: ValueKind::Boolean,
+                },
+            )?;
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![boxed],
+                },
+            );
+            Ok(())
+        },
+    )?;
+    let (context, _) = reflect.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block = self.set_static_property_value_raw(body, *block, &reflect, "defineProperty", &value)?;
+
+    let func = self.build_native_adapter(
+        "reflect_get_own_property_descriptor",
+        |this, body, entry, _context, _this_val, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            let (block, key) = this.read_arg_string_key(body, block, args, 1)?;
+            let target = LowerValue::Wasm {
+                value: target_raw,
+                kind: ValueKind::Reference,
+            };
+            let (block, result) = this.object_get_own_property_descriptor(body, block, &target, key)?;
+            let boxed = this.box_value(body, block, &result)?;
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![boxed],
+                },
+            );
+            Ok(())
+        },
+    )?;
+    let (context, _) = reflect.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block = self.set_static_property_value_raw(
+        body,
+        *block,
+        &reflect,
+        "getOwnPropertyDescriptor",
+        &value,
+    )?;
+
+    for (name, literal) in [
+        ("setPrototypeOf", true),
+        ("isExtensible", true),
+        ("preventExtensions", true),
+    ] {
+        let func = self.build_native_adapter(name, move |this, body, entry, _c, _t, _a| {
+            let bit = body.add_op(
+                entry,
+                Operator::I32Const {
+                    value: u32::from(literal),
+                },
+                &[],
+                &[Type::I32],
+            );
+            let boxed = this.box_value(
+                body,
+                entry,
+                &LowerValue::Wasm {
+                    value: bit,
+                    kind: ValueKind::Boolean,
+                },
+            )?;
+            body.set_terminator(
+                entry,
+                Terminator::Return {
+                    values: vec![boxed],
+                },
+            );
+            Ok(())
+        })?;
+        let (context, _) = reflect.wasm()?;
+        let value = self.native_function_value(body, *block, context, func)?;
+        *block = self.set_static_property_value_raw(body, *block, &reflect, name, &value)?;
+    }
+
+    let func = self.build_native_adapter(
+        "reflect_get_prototype_of",
+        |this, body, entry, _c, _t, _a| {
+            let undef = body.add_op(
+                entry,
+                Operator::RefNull {
+                    ty: this.repr.value,
+                },
+                &[],
+                &[this.repr.value],
+            );
+            body.set_terminator(entry, Terminator::Return { values: vec![undef] });
+            Ok(())
+        },
+    )?;
+    let (context, _) = reflect.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block = self.set_static_property_value_raw(body, *block, &reflect, "getPrototypeOf", &value)?;
+
+    Ok(reflect)
+}
+
+fn build_object_namespace(
+    &mut self,
+    body: &mut FunctionBody,
+    block: &mut Block,
+) -> Result<LowerValue, ConvertError> {
+    let object_ns = self.new_object(body, *block)?;
+
+    let func = self.build_native_adapter(
+        "object_define_property",
+        |this, body, entry, _context, _this_val, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            let (block, key) = this.read_arg_string_key(body, block, args, 1)?;
+            let (block, descriptor_raw) = this.read_arg_raw(body, block, args, 2);
+            let target = LowerValue::Wasm {
+                value: target_raw,
+                kind: ValueKind::Reference,
+            };
+            let descriptor = LowerValue::Wasm {
+                value: descriptor_raw,
+                kind: ValueKind::Reference,
+            };
+            let block = this.object_define_property(body, block, &target, key, &descriptor)?;
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![target_raw],
+                },
+            );
+            Ok(())
+        },
+    )?;
+    let (context, _) = object_ns.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block =
+        self.set_static_property_value_raw(body, *block, &object_ns, "defineProperty", &value)?;
+
+    let func = self.build_native_adapter(
+        "object_get_own_property_descriptor",
+        |this, body, entry, _context, _this_val, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            let (block, key) = this.read_arg_string_key(body, block, args, 1)?;
+            let target = LowerValue::Wasm {
+                value: target_raw,
+                kind: ValueKind::Reference,
+            };
+            let (block, result) = this.object_get_own_property_descriptor(body, block, &target, key)?;
+            let boxed = this.box_value(body, block, &result)?;
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![boxed],
+                },
+            );
+            Ok(())
+        },
+    )?;
+    let (context, _) = object_ns.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block = self.set_static_property_value_raw(
+        body,
+        *block,
+        &object_ns,
+        "getOwnPropertyDescriptor",
+        &value,
+    )?;
+
+    let func = self.build_native_adapter("object_create", |this, body, entry, _c, _t, _a| {
+        let created = this.new_object(body, entry)?;
+        let boxed = this.box_value(body, entry, &created)?;
+        body.set_terminator(entry, Terminator::Return { values: vec![boxed] });
+        Ok(())
+    })?;
+    let (context, _) = object_ns.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block = self.set_static_property_value_raw(body, *block, &object_ns, "create", &value)?;
+
+    let func = self.build_native_adapter(
+        "object_get_prototype_of",
+        |this, body, entry, _c, _t, _a| {
+            let undef = body.add_op(
+                entry,
+                Operator::RefNull {
+                    ty: this.repr.value,
+                },
+                &[],
+                &[this.repr.value],
+            );
+            body.set_terminator(entry, Terminator::Return { values: vec![undef] });
+            Ok(())
+        },
+    )?;
+    let (context, _) = object_ns.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block =
+        self.set_static_property_value_raw(body, *block, &object_ns, "getPrototypeOf", &value)?;
+
+    let func = self.build_native_adapter(
+        "object_set_prototype_of",
+        |this, body, entry, _context, _this_val, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![target_raw],
+                },
+            );
+            Ok(())
+        },
+    )?;
+    let (context, _) = object_ns.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block =
+        self.set_static_property_value_raw(body, *block, &object_ns, "setPrototypeOf", &value)?;
+
+    Ok(object_ns)
 }
 
 }

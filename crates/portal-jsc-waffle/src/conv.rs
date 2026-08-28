@@ -37,6 +37,8 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
         shapes: Vec::new(),
         property_helpers: None,
         truthy_helper: None,
+        native_function_cache: BTreeMap::new(),
+        context_builder: None,
     };
     converter.collect_shapes(root)?;
     converter.ensure_function(root)?;
@@ -126,6 +128,8 @@ pub fn convert_module<'a, 'wasm>(
         shapes: Vec::new(),
         property_helpers: None,
         truthy_helper: None,
+        native_function_cache: BTreeMap::new(),
+        context_builder: None,
     };
     let mut exports = Vec::with_capacity(exported.len());
     for export in exported {
@@ -355,6 +359,20 @@ struct Converter<'a, 'module, 'wasm> {
     /// crosses a function-call/property-read boundary and loses its
     /// unboxed `ValueKind`.
     truthy_helper: Option<Func>,
+    /// Native primordial method bodies (`Math.sqrt`, `Reflect.get`, ...),
+    /// keyed by the label passed to `build_native_adapter`. A fresh lexical
+    /// context is built per exported function, but the underlying Wasm
+    /// function bodies are identical every time, so this cache is what
+    /// keeps that from regenerating (and re-validating/re-compiling) the
+    /// entire primordial surface once per export.
+    native_function_cache: BTreeMap<String, Func>,
+    /// `new_context_with_primordials`'s body, hoisted into its own function
+    /// so every export emits one `call` rather than a full inlined copy of
+    /// the entire namespace-construction sequence (Wasm reference-typed
+    /// globals aren't supported by this backend, so each call still
+    /// allocates a fresh context at runtime — this only shares the
+    /// generated *code*, not the runtime value).
+    context_builder: Option<Func>,
 }
 
 impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
@@ -594,7 +612,15 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         // lexical context, pre-populated with the primordial globals
         // (`Math`, `Array`, ...). Top-level values and re-exports are not
         // part of this function-only export surface yet.
-        let (block, context) = self.new_context_with_primordials(&mut body, block)?;
+        let context_builder = self.ensure_context_builder()?;
+        let context = body.add_op(
+            block,
+            Operator::Call {
+                function_index: context_builder,
+            },
+            &[],
+            &[self.repr.object_ty()],
+        );
         let this = self.undef(&mut body, block);
         let (this, _) = this.wasm()?;
         let mut arguments = Vec::with_capacity(params.len());
@@ -2470,6 +2496,60 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             },
         );
         (join, result)
+    }
+
+    /// Perform the trie/shape "set" only if `flags` says the slot is
+    /// writable — silently a no-op otherwise (non-strict-mode assignment to
+    /// a non-writable property). `flags` should come from
+    /// [`Self::slot_flags_or_default`] applied to the property's existing
+    /// slot, so a brand-new property (which defaults to writable) is never
+    /// blocked.
+    fn write_slot_if_writable(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        root: Value,
+        key: Value,
+        slot: Value,
+        flags: Value,
+        offset: Value,
+    ) -> Result<Block, ConvertError> {
+        let helpers = self.ensure_property_helpers()?;
+        let writable = self.slot_flag_bit(body, block, flags, crate::repr::SLOT_WRITABLE);
+        let do_write = body.add_block();
+        let join = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: writable,
+                if_true: BlockTarget {
+                    block: do_write,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: join,
+                    args: vec![],
+                },
+            },
+        );
+        body.add_op(
+            do_write,
+            Operator::Call {
+                function_index: helpers.set,
+            },
+            &[root, key, slot, offset],
+            &[],
+        );
+        body.set_terminator(
+            do_write,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![],
+                },
+            },
+        );
+        Ok(join)
     }
 
     /// Arrays are ordinary objects whose second header field carries the
@@ -6594,14 +6674,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         );
         let (block, flags) = self.slot_flags_or_default(body, block, existing);
         let slot = self.new_slot(body, block, boxed_value, flags);
-        body.add_op(
-            block,
-            Operator::Call {
-                function_index: helpers.set,
-            },
-            &[root, key, slot, zero],
-            &[],
-        );
+        let block = self.write_slot_if_writable(body, block, root, key, slot, flags, zero)?;
         Ok(block)
     }
 
@@ -7248,14 +7321,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         );
         let (block, flags) = self.slot_flags_or_default(body, block, existing);
         let slot = self.new_slot(body, block, boxed_value, flags);
-        body.add_op(
-            block,
-            Operator::Call {
-                function_index: helpers.set,
-            },
-            &[root, key, slot, zero],
-            &[],
-        );
+        let block = self.write_slot_if_writable(body, block, root, key, slot, flags, zero)?;
         Ok(block)
     }
 

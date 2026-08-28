@@ -957,3 +957,117 @@ fn executes_array_primordial() {
     assert_executes_in_all_runtimes(&module, "array_is_array_false_object", &[], 0.0);
     assert_executes_in_all_runtimes(&module, "array_is_array_false_number", &[], 0.0);
 }
+
+#[test]
+fn executes_reflect_primordial() {
+    let module = compile_module(
+        "
+            export function reflect_get_basic() {
+                let obj = { x: 42 };
+                return Reflect.get(obj, 'x');
+            }
+
+            export function reflect_set_basic() {
+                let obj = { x: 1 };
+                Reflect.set(obj, 'x', 99);
+                return obj.x;
+            }
+
+            export function reflect_has_true() {
+                let obj = { x: 1 };
+                return Reflect.has(obj, 'x') ? 1 : 0;
+            }
+
+            export function reflect_has_false() {
+                let obj = { x: 1 };
+                return Reflect.has(obj, 'y') ? 1 : 0;
+            }
+
+            export function reflect_delete_property() {
+                let obj = { x: 1 };
+                Reflect.deleteProperty(obj, 'x');
+                return Reflect.has(obj, 'x') ? 1 : 0;
+            }
+
+            export function reflect_apply_basic() {
+                function add(a, b) { return a + b; }
+                return Reflect.apply(add, null, [3, 4]);
+            }
+        ",
+    );
+    validate(&module);
+
+    assert_executes_in_all_runtimes(&module, "reflect_get_basic", &[], 42.0);
+    assert_executes_in_all_runtimes(&module, "reflect_set_basic", &[], 99.0);
+    assert_executes_in_all_runtimes(&module, "reflect_has_true", &[], 1.0);
+    assert_executes_in_all_runtimes(&module, "reflect_has_false", &[], 0.0);
+    assert_executes_in_all_runtimes(&module, "reflect_delete_property", &[], 0.0);
+    assert_executes_in_all_runtimes(&module, "reflect_apply_basic", &[], 7.0);
+}
+
+#[test]
+fn executes_object_descriptor_manipulation() {
+    let module = compile_module(
+        "
+            export function define_property_data() {
+                let obj = {};
+                Object.defineProperty(obj, 'x', { value: 42, writable: true, enumerable: true, configurable: true });
+                return obj.x;
+            }
+
+            export function define_property_non_writable_blocks_write() {
+                let obj = {};
+                Object.defineProperty(obj, 'x', { value: 42, writable: false });
+                obj.x = 100;
+                return obj.x;
+            }
+
+            export function define_property_writable_allows_write() {
+                let obj = {};
+                Object.defineProperty(obj, 'x', { value: 42, writable: true });
+                obj.x = 100;
+                return obj.x;
+            }
+
+            export function define_property_accessor_getter() {
+                let obj = {};
+                Object.defineProperty(obj, 'x', { get: function() { return 7; } });
+                return obj.x;
+            }
+
+            export function get_own_property_descriptor_value() {
+                let obj = {};
+                Object.defineProperty(obj, 'x', { value: 42, writable: false, enumerable: true, configurable: false });
+                let d = Object.getOwnPropertyDescriptor(obj, 'x');
+                return d.value;
+            }
+
+            export function get_own_property_descriptor_writable_flag() {
+                let obj = {};
+                Object.defineProperty(obj, 'x', { value: 42, writable: false, enumerable: true, configurable: false });
+                let d = Object.getOwnPropertyDescriptor(obj, 'x');
+                return d.writable ? 1 : 0;
+            }
+
+            export function get_own_property_descriptor_absent() {
+                let obj = {};
+                let d = Object.getOwnPropertyDescriptor(obj, 'missing');
+                return !d ? 1 : 0;
+            }
+        ",
+    );
+    validate(&module);
+
+    assert_executes_in_all_runtimes(&module, "define_property_data", &[], 42.0);
+    assert_executes_in_all_runtimes(&module, "define_property_non_writable_blocks_write", &[], 42.0);
+    assert_executes_in_all_runtimes(&module, "define_property_writable_allows_write", &[], 100.0);
+    assert_executes_in_all_runtimes(&module, "define_property_accessor_getter", &[], 7.0);
+    assert_executes_in_all_runtimes(&module, "get_own_property_descriptor_value", &[], 42.0);
+    assert_executes_in_all_runtimes(
+        &module,
+        "get_own_property_descriptor_writable_flag",
+        &[],
+        0.0,
+    );
+    assert_executes_in_all_runtimes(&module, "get_own_property_descriptor_absent", &[], 1.0);
+}

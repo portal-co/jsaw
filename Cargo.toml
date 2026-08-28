@@ -80,3 +80,14 @@ bitvec = "^1.0.1"
 instability = "^0.3.7"
 linearize = "^0.1.4"
 linearize-derive = "^0.1.0"
+
+# Development-only: build against the local jsaw-core checkout so Primordial
+# enum changes there are picked up without waiting on an upstream release.
+# Remove once the jsaw-core changes are pushed and the version pin is bumped.
+[patch."https://github.com/portal-co/jsaw-core.git"]
+portal-jsc-common =      { path = "../jsaw-core/crates/portal-jsc-common" }
+portal-jsc-swc-cfg =     { path = "../jsaw-core/crates/swc-cfg" }
+portal-jsc-swc-tac =     { path = "../jsaw-core/crates/swc-tac" }
+portal-jsc-swc-ssa =     { path = "../jsaw-core/crates/swc-ssa" }
+portal-jsc-swc-opt-ssa = { path = "../jsaw-core/crates/swc-opt-ssa" }
+portal-jsc-swc-util =    { path = "../jsaw-core/crates/swc-util" }

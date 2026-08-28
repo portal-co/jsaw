@@ -20,6 +20,15 @@ pub(crate) struct Repr {
     pub(crate) number: Signature,
     pub(crate) boolean: Signature,
     pub(crate) function: Signature,
+    /// Internal accessor descriptor. Ordinary property values remain direct
+    /// `anyref`s; only accessor properties use this tagged representation.
+    pub(crate) descriptor: Signature,
+    /// Every property location (a trie bucket or a generated shape field)
+    /// stores a `slot` rather than a bare value. `slot.value` holds exactly
+    /// what a bare value slot held before (a data value, or a `descriptor`
+    /// ref for an accessor); `slot.flags` is a bitset of
+    /// `writable | enumerable << 1 | configurable << 2`.
+    pub(crate) slot: Signature,
     pub(crate) trie: Signature,
     /// WTF-8 source bytes for a JavaScript string.
     pub(crate) utf8: Signature,
@@ -37,11 +46,23 @@ impl Repr {
             nullable: true,
         });
 
+        // Forward-declare `slot` so the trie's bucket type and the object
+        // header below can both reference it before its fields are filled
+        // in, mirroring the `object`/`function`/`descriptor` pattern.
+        let slot = module.signatures.push(SignatureData::Struct {
+            fields: vec![],
+            shared: false,
+        });
+        let slot_ty = ref_sig(slot);
+
         // Generic property tries use nullable `anyref` child links so nodes
         // can dispatch to a generated shape or continue through the trie
-        // without requiring a recursive Wasm type group.
+        // without requiring a recursive Wasm type group. The terminal slot
+        // (field 0) holds a `slot`, not a bare value, so
+        // writable/enumerable/configurable survive alongside the stored
+        // value.
         let mut tries = Tries::default();
-        let trie = tries.get(module, value);
+        let trie = tries.get(module, slot_ty, value);
         // GC type references outside a recursive group must point backward.
         // Allocate the element component before the object header that owns
         // it.
@@ -92,6 +113,10 @@ impl Repr {
             fields: vec![],
             shared: false,
         });
+        let descriptor = module.signatures.push(SignatureData::Struct {
+            fields: vec![],
+            shared: false,
+        });
 
         module.signatures[object] = SignatureData::Struct {
             // Every ordinary object has the same header.  `elements` being
@@ -119,6 +144,17 @@ impl Repr {
             ],
             shared: false,
         };
+        module.signatures[descriptor] = SignatureData::Struct {
+            // Getter and setter entries are nullable function objects. A
+            // data property has no descriptor at all, so `ref.test` is the
+            // single runtime tag check that separates the two cases.
+            fields: vec![field(value), field(value)],
+            shared: false,
+        };
+        module.signatures[slot] = SignatureData::Struct {
+            fields: vec![field(value), field(Type::I32)],
+            shared: false,
+        };
 
         Self {
             value,
@@ -126,6 +162,8 @@ impl Repr {
             number,
             boolean,
             function,
+            descriptor,
+            slot,
             trie,
             utf8,
             utf16,
@@ -151,8 +189,34 @@ impl Repr {
         ref_sig(self.function)
     }
 
+    pub(crate) fn descriptor_ty(self) -> Type {
+        ref_sig(self.descriptor)
+    }
+
+    pub(crate) fn descriptor_non_null_ty(self) -> Type {
+        Type::Heap(WithNullable {
+            value: portal_pc_waffle::HeapType::Sig {
+                sig_index: self.descriptor,
+            },
+            nullable: false,
+        })
+    }
+
     pub(crate) fn trie_ty(self) -> Type {
         ref_sig(self.trie)
+    }
+
+    pub(crate) fn slot_ty(self) -> Type {
+        ref_sig(self.slot)
+    }
+
+    pub(crate) fn slot_non_null_ty(self) -> Type {
+        Type::Heap(WithNullable {
+            value: portal_pc_waffle::HeapType::Sig {
+                sig_index: self.slot,
+            },
+            nullable: false,
+        })
     }
 
     pub(crate) fn utf8_ty(self) -> Type {
@@ -171,6 +235,14 @@ impl Repr {
         ref_sig(self.arguments)
     }
 }
+
+/// Bit layout of a `slot`'s `flags` field. Ordinary object-literal and
+/// `obj.x = y` writes use [`SLOT_FLAGS_DEFAULT`]; `Object.defineProperty`
+/// and friends compose the individual bits from a user-supplied descriptor.
+pub(crate) const SLOT_WRITABLE: i32 = 1 << 0;
+pub(crate) const SLOT_ENUMERABLE: i32 = 1 << 1;
+pub(crate) const SLOT_CONFIGURABLE: i32 = 1 << 2;
+pub(crate) const SLOT_FLAGS_DEFAULT: i32 = SLOT_WRITABLE | SLOT_ENUMERABLE | SLOT_CONFIGURABLE;
 
 pub(crate) fn field(value: Type) -> WithMutablility<StorageType> {
     WithMutablility {

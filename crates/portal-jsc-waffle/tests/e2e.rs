@@ -1,7 +1,9 @@
 use portal_jsc_swc_cfg::module::CfgModule;
 use portal_jsc_swc_ssa::{SFunc, SValue, module::SModule};
 use portal_jsc_swc_tac::{Item, module::TModule};
-use portal_pc_waffle::{ExportKind, FuncDecl, Module, Operator, Terminator, Type, ValueDef};
+use portal_pc_waffle::{
+    ExportKind, FuncDecl, HeapType, Module, Operator, SignatureData, Terminator, Type, ValueDef,
+};
 use swc_common::{FileName, GLOBALS, Globals, SourceMap, sync::Lrc};
 use swc_ecma_ast::{EsVersion, Module as SwcModule, ModuleItem};
 use swc_ecma_parser::{EsSyntax, Syntax, parse_file_as_module, parse_file_as_script};
@@ -408,6 +410,136 @@ fn executes_object_mutation_shape_changes_and_polymorphic_paths() {
 }
 
 #[test]
+fn executes_object_accessors_with_continuations() {
+    let module = compile_module(
+        "
+            export function paired() {
+                let object = {
+                    value: 2,
+                    get doubled() { return this.value * 2; },
+                    set doubled(next) { this.value = next / 2; },
+                };
+                object.doubled = 10;
+                let result = object.doubled;
+                object.extra = 3;
+                return result * 100 + object.value + object.extra;
+            }
+
+            export function getter_only() {
+                let object = { get value() { return 7; } };
+                object.value = 12;
+                return object.value;
+            }
+
+            export function setter_only() {
+                let object = {
+                    stored: 1,
+                    set value(next) { this.stored = next; },
+                };
+                object.value = 9;
+                if (object.value) return 0;
+                return object.stored;
+            }
+
+            export function dynamic() {
+                let key = 'value';
+                let object = {
+                    stored: 4,
+                    get value() { return this.stored; },
+                    set value(next) { this.stored = next + 1; },
+                };
+                object[key] = 8;
+                return object[key];
+            }
+
+            export function overwrite() {
+                let object = {
+                    get value() { return 1; },
+                    value: 6,
+                };
+                return object.value;
+            }
+
+            export function accessor_call() {
+                let object = {
+                    factor: 3,
+                    get method() {
+                        return function(value) { return this.factor * value; };
+                    },
+                };
+                return object.method(4);
+            }
+
+            export function accessor_tail(value) {
+                let object = {
+                    get invoke() {
+                        return function(input) { return input + 1; };
+                    },
+                };
+                return object.invoke(value);
+            }
+
+            export function rest_materializes_accessors() {
+                let source = {
+                    base: 5,
+                    get value() { return this.base + 1; },
+                    extra: 2,
+                };
+                let { base, ...rest } = source;
+                return rest.value * 10 + rest.extra;
+            }
+        ",
+    );
+    validate(&module);
+
+    assert_executes_in_all_runtimes(&module, "paired", &[], 1008.0);
+    assert_executes_in_all_runtimes(&module, "getter_only", &[], 7.0);
+    assert_executes_in_all_runtimes(&module, "setter_only", &[], 9.0);
+    assert_executes_in_all_runtimes(&module, "dynamic", &[], 9.0);
+    assert_executes_in_all_runtimes(&module, "overwrite", &[], 6.0);
+    assert_executes_in_all_runtimes(&module, "accessor_call", &[], 12.0);
+    assert_executes_in_all_runtimes(&module, "accessor_tail", &[4.0], 5.0);
+    assert_executes_in_all_runtimes(&module, "rest_materializes_accessors", &[], 62.0);
+
+    assert!(
+        module.funcs.entries().any(|(_, declaration)| {
+            declaration.body().is_some_and(|body| {
+                body.values.entries().any(|(_, definition)| {
+                    matches!(
+                        definition,
+                        ValueDef::Operator(Operator::CallRef { .. }, _, _)
+                    )
+                })
+            })
+        }),
+        "accessor paths should invoke their getter or setter through the function adapter"
+    );
+    assert!(
+        module.funcs.entries().any(|(_, declaration)| {
+            declaration.body().is_some_and(|body| {
+                body.values.entries().any(|(_, definition)| {
+                    let ValueDef::Operator(Operator::RefTest { ty }, _, _) = definition else {
+                        return false;
+                    };
+                    let Type::Heap(reference) = ty else {
+                        return false;
+                    };
+                    let HeapType::Sig { sig_index } = reference.value else {
+                        return false;
+                    };
+                    !reference.nullable
+                        && matches!(
+                            &module.signatures[sig_index],
+                            SignatureData::Struct { fields, .. } if fields.len() == 2
+                        )
+                })
+            })
+        }),
+        "property reads and writes should branch on a non-null descriptor tag"
+    );
+}
+
+#[test]
 fn lowers_static_subarray_item_to_a_bounded_array_copy() {
     // The current TAC source converter emits this helper for array-rest
     // assignment. Build its already-normalized SSA form directly so this test
@@ -723,4 +855,105 @@ fn rejects_unsupported_forms_with_convert_error() {
             "expected {expected:?} in {error}"
         );
     }
+}
+
+#[test]
+fn executes_math_primordial() {
+    let module = compile_module(
+        "
+            export function math_pi() {
+                return (Math.PI > 3.14159 && Math.PI < 3.14160) ? 1 : 0;
+            }
+
+            export function math_sqrt() {
+                return Math.sqrt(16);
+            }
+
+            export function math_abs() {
+                return Math.abs(-5);
+            }
+
+            export function math_floor() {
+                return Math.floor(3.7);
+            }
+
+            export function math_ceil() {
+                return Math.ceil(3.2);
+            }
+
+            export function math_round_half_up() {
+                // JS rounds .5 up, unlike Wasm's round-half-to-even f64.nearest.
+                return Math.round(2.5);
+            }
+
+            export function math_trunc() {
+                return Math.trunc(-3.9);
+            }
+
+            export function math_max() {
+                return Math.max(1, 9);
+            }
+
+            export function math_min() {
+                return Math.min(4, 2);
+            }
+
+            export function math_sign_negative() {
+                return Math.sign(-7);
+            }
+
+            export function math_imul_overflow() {
+                // Wraps as a 32-bit multiply rather than producing 3 * 2^30 exactly.
+                return Math.imul(3, 1073741824);
+            }
+
+            export function math_fround_exact() {
+                return Math.fround(2);
+            }
+
+            export function math_shadowed_by_local() {
+                let Math = { PI: 42 };
+                return Math.PI;
+            }
+        ",
+    );
+    validate(&module);
+
+    assert_executes_in_all_runtimes(&module, "math_pi", &[], 1.0);
+    assert_executes_in_all_runtimes(&module, "math_sqrt", &[], 4.0);
+    assert_executes_in_all_runtimes(&module, "math_abs", &[], 5.0);
+    assert_executes_in_all_runtimes(&module, "math_floor", &[], 3.0);
+    assert_executes_in_all_runtimes(&module, "math_ceil", &[], 4.0);
+    assert_executes_in_all_runtimes(&module, "math_round_half_up", &[], 3.0);
+    assert_executes_in_all_runtimes(&module, "math_trunc", &[], -3.0);
+    assert_executes_in_all_runtimes(&module, "math_max", &[], 9.0);
+    assert_executes_in_all_runtimes(&module, "math_min", &[], 2.0);
+    assert_executes_in_all_runtimes(&module, "math_sign_negative", &[], -1.0);
+    assert_executes_in_all_runtimes(&module, "math_imul_overflow", &[], -1073741824.0);
+    assert_executes_in_all_runtimes(&module, "math_fround_exact", &[], 2.0);
+    assert_executes_in_all_runtimes(&module, "math_shadowed_by_local", &[], 42.0);
+}
+
+#[test]
+fn executes_array_primordial() {
+    let module = compile_module(
+        "
+            export function array_is_array_true() {
+                return Array.isArray([1, 2, 3]) ? 1 : 0;
+            }
+
+            export function array_is_array_false_object() {
+                return Array.isArray({}) ? 1 : 0;
+            }
+
+            export function array_is_array_false_number() {
+                return Array.isArray(5) ? 1 : 0;
+            }
+        ",
+    );
+    validate(&module);
+
+    assert_executes_in_all_runtimes(&module, "array_is_array_true", &[], 1.0);
+    assert_executes_in_all_runtimes(&module, "array_is_array_false_object", &[], 0.0);
+    assert_executes_in_all_runtimes(&module, "array_is_array_false_number", &[], 0.0);
 }

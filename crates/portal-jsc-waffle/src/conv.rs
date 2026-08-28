@@ -36,6 +36,7 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
         trie_clone: None,
         shapes: Vec::new(),
         property_helpers: None,
+        truthy_helper: None,
     };
     converter.collect_shapes(root)?;
     converter.ensure_function(root)?;
@@ -124,6 +125,7 @@ pub fn convert_module<'a, 'wasm>(
         trie_clone: None,
         shapes: Vec::new(),
         property_helpers: None,
+        truthy_helper: None,
     };
     let mut exports = Vec::with_capacity(exported.len());
     for export in exported {
@@ -347,6 +349,12 @@ struct Converter<'a, 'module, 'wasm> {
     shapes: Vec<ShapeInfo>,
     /// The small deep module shared by static and computed property access.
     property_helpers: Option<PropertyHelpers>,
+    /// Generic JS `ToBoolean` for a value already known to be a reference.
+    /// Distinguishes a boxed `false` (falsy) from every other non-null
+    /// reference (truthy) — plain null-ness alone isn't enough once a value
+    /// crosses a function-call/property-read boundary and loses its
+    /// unboxed `ValueKind`.
+    truthy_helper: Option<Func>,
 }
 
 impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
@@ -406,7 +414,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         }
         let sig = self.module.signatures.push(SignatureData::Struct {
             fields: std::iter::once(field(self.repr.trie_ty()))
-                .chain(keys.iter().map(|_| field(self.repr.value)))
+                .chain(keys.iter().map(|_| field(self.repr.slot_ty())))
                 .collect(),
             shared: false,
         });
@@ -583,10 +591,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             .map(|(_, value)| *value)
             .collect::<Vec<_>>();
         // Function declarations in the first public ABI receive a fresh
-        // lexical context. Top-level values and re-exports are not part of
-        // this function-only export surface yet.
-        let context = self.new_object(&mut body, block)?;
-        let (context, _) = context.wasm()?;
+        // lexical context, pre-populated with the primordial globals
+        // (`Math`, `Array`, ...). Top-level values and re-exports are not
+        // part of this function-only export surface yet.
+        let (block, context) = self.new_context_with_primordials(&mut body, block)?;
         let this = self.undef(&mut body, block);
         let (this, _) = this.wasm()?;
         let mut arguments = Vec::with_capacity(params.len());
@@ -917,7 +925,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 }
                 TTerm::Tail { callee, args } => {
                     for continuation in continuations {
-                        let (block, context, receiver, array, code) = self.lower_call_parts(
+                        for (block, context, receiver, array, code) in self.lower_call_parts(
                             body,
                             continuation.block,
                             context,
@@ -925,14 +933,15 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                             &continuation.values,
                             callee,
                             args,
-                        )?;
-                        body.set_terminator(
-                            block,
-                            Terminator::ReturnCallRef {
-                                sig: self.repr.adapter,
-                                args: vec![context, receiver, array, code],
-                            },
-                        );
+                        )? {
+                            body.set_terminator(
+                                block,
+                                Terminator::ReturnCallRef {
+                                    sig: self.repr.adapter,
+                                    args: vec![context, receiver, array, code],
+                                },
+                            );
+                        }
                     }
                 }
                 // The jsaw pipeline leaves a `Default` terminator on an
@@ -1000,7 +1009,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn lower_block_args(
-        &self,
+        &mut self,
         body: &mut FunctionBody,
         block: Block,
         args: Vec<LowerValue>,
@@ -1031,17 +1040,23 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             }
             SValue::LoadId(id) => {
                 let key = id.0.to_string();
-                let (block, value) = self.get_property(body, block, context, &key)?;
-                let (value, _) = value.wasm()?;
-                Ok(vec![(block, LowerValue::ReferenceKey { value, key })])
+                self.get_property(body, block, context, &key)?
+                    .into_iter()
+                    .map(|(block, value)| {
+                        let (value, _) = value.wasm()?;
+                        Ok((block, LowerValue::ReferenceKey { value, key: key.clone() }))
+                    })
+                    .collect()
             }
             SValue::StoreId { target, val } => {
                 let value = values
                     .get(val)
                     .ok_or_else(|| ConvertError::invalid("undefined stored value"))?;
-                let block =
-                    self.set_property(body, block, context, &target.0.to_string(), value)?;
-                Ok(vec![(block, value.clone())])
+                Ok(self
+                    .set_property(body, block, context, &target.0.to_string(), value)?
+                    .into_iter()
+                    .map(|block| (block, value.clone()))
+                    .collect())
             }
             SValue::Assign { target, val } => {
                 let value = values
@@ -1055,7 +1070,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         let key = values.get(&mem[0]).ok_or_else(|| {
                             ConvertError::invalid("undefined assignment property key")
                         })?;
-                        let block = match self.key_of(key) {
+                        let blocks = match self.key_of(key) {
                             Ok(key) => self.set_property_value(body, block, object, &key, value)?,
                             Err(_) => match key.kind()? {
                                 ValueKind::Number | ValueKind::Integer | ValueKind::Boolean => {
@@ -1068,7 +1083,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                                 }
                             }
                         };
-                        Ok(vec![(block, value.clone())])
+                        Ok(blocks
+                            .into_iter()
+                            .map(|block| (block, value.clone()))
+                            .collect())
                     }
                     _ => Err(ConvertError::unsupported("non-member assignment", ())),
                 }
@@ -1137,6 +1155,56 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 return self.logical_continuations(body, block, left, right, *op);
             }
         }
+        if let Item::Mem { obj, mem } = item {
+            let object = values
+                .get(obj)
+                .ok_or_else(|| ConvertError::invalid("undefined member object"))?;
+            let key = values
+                .get(mem)
+                .ok_or_else(|| ConvertError::invalid("undefined member key"))?;
+            return match self.key_of(key) {
+                Ok(key) => self.get_property_value(body, block, object, &key),
+                Err(_) => match key.kind()? {
+                    ValueKind::Number | ValueKind::Integer | ValueKind::Boolean => {
+                        let index = self.numeric_index(body, block, key)?;
+                        self.get_numeric_member(body, block, object, index)
+                    }
+                    ValueKind::Reference => {
+                        let key = self.dynamic_string_key(body, block, key)?;
+                        self.get_string_member(body, block, object, key)
+                    }
+                },
+            };
+        }
+        if let Item::Call { callee, args } = item {
+            return self
+                .lower_call_parts(body, block, context, this.clone(), values, callee, args)?
+                .into_iter()
+                .map(|(block, context, receiver, array, code)| {
+                    let value = body.add_op(
+                        block,
+                        Operator::CallRef {
+                            sig_index: self.repr.adapter,
+                        },
+                        &[context, receiver, array, code],
+                        &[self.repr.value],
+                    );
+                    Ok((
+                        block,
+                        LowerValue::Wasm {
+                            value,
+                            kind: ValueKind::Reference,
+                        },
+                    ))
+                })
+                .collect();
+        }
+        if let Item::StaticSubObject { wrapped, keys } = item {
+            let wrapped = values
+                .get(wrapped)
+                .ok_or_else(|| ConvertError::invalid("undefined static subobject source"))?;
+            return self.static_subobject(body, block, values, wrapped, keys);
+        }
 
         let value = match item {
             Item::Just { id } => values
@@ -1167,29 +1235,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 }
             }
             Item::Arguments => arguments,
-            Item::Mem { obj, mem } => {
-                let object = values
-                    .get(obj)
-                    .ok_or_else(|| ConvertError::invalid("undefined member object"))?;
-                let key = values
-                    .get(mem)
-                    .ok_or_else(|| ConvertError::invalid("undefined member key"))?;
-                let (next, value) = match self.key_of(key) {
-                    Ok(key) => self.get_property_value(body, block, object, &key)?,
-                    Err(_) => match key.kind()? {
-                        ValueKind::Number | ValueKind::Integer | ValueKind::Boolean => {
-                            let index = self.numeric_index(body, block, key)?;
-                            self.get_numeric_member(body, block, object, index)?
-                        }
-                        ValueKind::Reference => {
-                            let key = self.dynamic_string_key(body, block, key)?;
-                            self.get_string_member(body, block, object, key)?
-                        }
-                    }
-                };
-                block = next;
-                value
-            }
+            Item::Mem { .. } => unreachable!("member reads were lowered as continuations"),
             Item::StaticSubArray {
                 begin,
                 end,
@@ -1202,38 +1248,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 block = next;
                 value
             }
-            Item::StaticSubObject { wrapped, keys } => {
-                let wrapped = values
-                    .get(wrapped)
-                    .ok_or_else(|| ConvertError::invalid("undefined static subobject source"))?;
-                let (next, value) = self.static_subobject(body, block, values, wrapped, keys)?;
-                block = next;
-                value
+            Item::StaticSubObject { .. } => {
+                unreachable!("object rest was lowered as continuations")
             }
-            Item::Call { callee, args } => {
-                let (next, ctx, receiver, array, code) = self.lower_call_parts(
-                    body,
-                    block,
-                    context,
-                    this.clone(),
-                    values,
-                    callee,
-                    args,
-                )?;
-                block = next;
-                let value = body.add_op(
-                    block,
-                    Operator::CallRef {
-                        sig_index: self.repr.adapter,
-                    },
-                    &[ctx, receiver, array, code],
-                    &[self.repr.value],
-                );
-                LowerValue::Wasm {
-                    value,
-                    kind: ValueKind::Reference,
-                }
-            }
+            Item::Call { .. } => unreachable!("calls were lowered as continuations"),
             Item::New { class, args } => {
                 let callee = values
                     .get(class)
@@ -1376,7 +1394,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     /// control flow instead; `lower_function` subsequently emits the source
     /// block's remaining statements for each refined continuation.
     fn select_continuations(
-        &self,
+        &mut self,
         body: &mut FunctionBody,
         block: Block,
         cond: &LowerValue,
@@ -1388,7 +1406,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn logical_continuations(
-        &self,
+        &mut self,
         body: &mut FunctionBody,
         block: Block,
         left: LowerValue,
@@ -1660,7 +1678,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn unary(
-        &self,
+        &mut self,
         body: &mut FunctionBody,
         block: Block,
         arg: &LowerValue,
@@ -1812,7 +1830,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn as_condition(
-        &self,
+        &mut self,
         body: &mut FunctionBody,
         block: Block,
         value: &LowerValue,
@@ -1832,10 +1850,118 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 body.add_op(block, Operator::F64Ne, &[value, zero], &[Type::I32])
             }
             ValueKind::Reference => {
-                let null = body.add_op(block, Operator::RefIsNull, &[value], &[Type::I32]);
-                body.add_op(block, Operator::I32Eqz, &[null], &[Type::I32])
+                let helper = self.ensure_truthy_helper()?;
+                body.add_op(
+                    block,
+                    Operator::Call {
+                        function_index: helper,
+                    },
+                    &[value],
+                    &[Type::I32],
+                )
             }
         })
+    }
+
+    /// Generic JS `ToBoolean` for a value already at the `anyref` boundary.
+    /// Only a boxed `false` and `null`/`undefined` are falsy here — every
+    /// other reference (object, function, string, boxed non-zero number) is
+    /// truthy. Lazily generated as its own function (rather than inlined at
+    /// every `as_condition` call site) so callers keep their existing
+    /// single-block, non-branching contract.
+    fn ensure_truthy_helper(&mut self) -> Result<Func, ConvertError> {
+        if let Some(func) = self.truthy_helper {
+            return Ok(func);
+        }
+        let sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.value],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, sig);
+        let entry = body.entry;
+        let value = body.blocks[entry].params[0].1;
+        let is_null = body.add_op(entry, Operator::RefIsNull, &[value], &[Type::I32]);
+        let non_null = body.add_block();
+        let is_null_block = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: is_null,
+                if_true: BlockTarget {
+                    block: is_null_block,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: non_null,
+                    args: vec![],
+                },
+            },
+        );
+        let zero = body.add_op(is_null_block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        body.set_terminator(
+            is_null_block,
+            Terminator::Return { values: vec![zero] },
+        );
+
+        let boolean_non_null_ty = Type::Heap(WithNullable {
+            value: HeapType::Sig {
+                sig_index: self.repr.boolean,
+            },
+            nullable: false,
+        });
+        let is_boolean = body.add_op(
+            non_null,
+            Operator::RefTest {
+                ty: boolean_non_null_ty,
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let unbox = body.add_block();
+        let truthy = body.add_block();
+        body.set_terminator(
+            non_null,
+            Terminator::CondBr {
+                cond: is_boolean,
+                if_true: BlockTarget {
+                    block: unbox,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: truthy,
+                    args: vec![],
+                },
+            },
+        );
+        let boxed = body.add_op(
+            unbox,
+            Operator::RefCast {
+                ty: self.repr.boolean_ty(),
+            },
+            &[value],
+            &[self.repr.boolean_ty()],
+        );
+        let bit = body.add_op(
+            unbox,
+            Operator::StructGet {
+                sig: self.repr.boolean,
+                idx: 0,
+            },
+            &[boxed],
+            &[Type::I32],
+        );
+        body.set_terminator(unbox, Terminator::Return { values: vec![bit] });
+        let one = body.add_op(truthy, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        body.set_terminator(truthy, Terminator::Return { values: vec![one] });
+
+        let func = self.module.funcs.push(FuncDecl::Body(
+            sig,
+            format!("js_truthy_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.truthy_helper = Some(func);
+        Ok(func)
     }
 
     fn undef(&self, body: &mut FunctionBody, block: Block) -> LowerValue {
@@ -1975,7 +2101,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     idx: 0,
                 },
                 &[source],
-                &[self.repr.value],
+                &[self.repr.slot_ty()],
             );
             body.add_op(
                 block,
@@ -2126,6 +2252,33 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         })
     }
 
+    fn new_descriptor(&self, body: &mut FunctionBody, block: Block) -> Value {
+        let absent_getter = body.add_op(
+            block,
+            Operator::RefNull {
+                ty: self.repr.value,
+            },
+            &[],
+            &[self.repr.value],
+        );
+        let absent_setter = body.add_op(
+            block,
+            Operator::RefNull {
+                ty: self.repr.value,
+            },
+            &[],
+            &[self.repr.value],
+        );
+        body.add_op(
+            block,
+            Operator::StructNew {
+                sig: self.repr.descriptor,
+            },
+            &[absent_getter, absent_setter],
+            &[self.repr.descriptor_ty()],
+        )
+    }
+
     fn new_shape(&self, body: &mut FunctionBody, block: Block, index: usize) -> Result<Value, ConvertError> {
         let shape = self
             .shapes
@@ -2138,10 +2291,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             fields.push(body.add_op(
                 block,
                 Operator::RefNull {
-                    ty: self.repr.value,
+                    ty: self.repr.slot_ty(),
                 },
                 &[],
-                &[self.repr.value],
+                &[self.repr.slot_ty()],
             ));
         }
         let shape = body.add_op(
@@ -2151,6 +2304,172 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[ref_sig(shape.sig)],
         );
         Ok(self.anyref(body, block, shape))
+    }
+
+    /// Wrap a value in a fresh property slot carrying the given attribute
+    /// flags (a dynamic i32, e.g. one already loaded from an existing slot).
+    fn new_slot(&self, body: &mut FunctionBody, block: Block, value: Value, flags: Value) -> Value {
+        body.add_op(
+            block,
+            Operator::StructNew {
+                sig: self.repr.slot,
+            },
+            &[value, flags],
+            &[self.repr.slot_ty()],
+        )
+    }
+
+    /// Like [`Self::new_slot`], but for a flags bitset known at generation
+    /// time (an [`crate::repr::SLOT_WRITABLE`]-style constant combination).
+    fn new_slot_literal(&self, body: &mut FunctionBody, block: Block, value: Value, flags: i32) -> Value {
+        let flags = body.add_op(
+            block,
+            Operator::I32Const {
+                value: flags as u32,
+            },
+            &[],
+            &[Type::I32],
+        );
+        self.new_slot(body, block, value, flags)
+    }
+
+    /// Unwrap a (possibly null) property slot into the value it stores. An
+    /// absent slot (no such own property) becomes the same null `value` a
+    /// bare-value trie bucket used to represent directly, before slots
+    /// existed.
+    fn unwrap_slot(&self, body: &mut FunctionBody, block: Block, slot: Value) -> (Block, Value) {
+        let is_null = body.add_op(block, Operator::RefIsNull, &[slot], &[Type::I32]);
+        let absent = body.add_block();
+        let present = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_null,
+                if_true: BlockTarget {
+                    block: absent,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: present,
+                    args: vec![],
+                },
+            },
+        );
+        let undef = body.add_op(
+            absent,
+            Operator::RefNull {
+                ty: self.repr.value,
+            },
+            &[],
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            absent,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![undef],
+                },
+            },
+        );
+        let cast = body.add_op(
+            present,
+            Operator::RefCast {
+                ty: self.repr.slot_non_null_ty(),
+            },
+            &[slot],
+            &[self.repr.slot_non_null_ty()],
+        );
+        let value = body.add_op(
+            present,
+            Operator::StructGet {
+                sig: self.repr.slot,
+                idx: 0,
+            },
+            &[cast],
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            present,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![value],
+                },
+            },
+        );
+        (join, result)
+    }
+
+    /// Extract a (possibly null) property slot's attribute flags, defaulting
+    /// to [`crate::repr::SLOT_FLAGS_DEFAULT`] for an absent slot (a brand new
+    /// own property behaves as ordinary/unrestricted until told otherwise).
+    fn slot_flags_or_default(&self, body: &mut FunctionBody, block: Block, slot: Value) -> (Block, Value) {
+        let is_null = body.add_op(block, Operator::RefIsNull, &[slot], &[Type::I32]);
+        let absent = body.add_block();
+        let present = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, Type::I32);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_null,
+                if_true: BlockTarget {
+                    block: absent,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: present,
+                    args: vec![],
+                },
+            },
+        );
+        let default = body.add_op(
+            absent,
+            Operator::I32Const {
+                value: crate::repr::SLOT_FLAGS_DEFAULT as u32,
+            },
+            &[],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            absent,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![default],
+                },
+            },
+        );
+        let cast = body.add_op(
+            present,
+            Operator::RefCast {
+                ty: self.repr.slot_non_null_ty(),
+            },
+            &[slot],
+            &[self.repr.slot_non_null_ty()],
+        );
+        let flags = body.add_op(
+            present,
+            Operator::StructGet {
+                sig: self.repr.slot,
+                idx: 1,
+            },
+            &[cast],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            present,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![flags],
+                },
+            },
+        );
+        (join, result)
     }
 
     /// Arrays are ordinary objects whose second header field carries the
@@ -4000,16 +4319,16 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let equal = self.ensure_string_equal()?;
         let lookup_sig = self.module.signatures.push(SignatureData::Func {
             params: vec![self.repr.value, self.repr.string_ty(), Type::I32],
-            returns: vec![self.repr.value],
+            returns: vec![self.repr.slot_ty()],
             shared: false,
         });
         let trie_lookup_sig = self.module.signatures.push(SignatureData::Func {
             params: vec![self.repr.trie_ty(), self.repr.string_ty(), Type::I32],
-            returns: vec![self.repr.value],
+            returns: vec![self.repr.slot_ty()],
             shared: false,
         });
         let set_sig = self.module.signatures.push(SignatureData::Func {
-            params: vec![self.repr.value, self.repr.string_ty(), self.repr.value, Type::I32],
+            params: vec![self.repr.value, self.repr.string_ty(), self.repr.slot_ty(), Type::I32],
             returns: vec![],
             shared: false,
         });
@@ -4017,7 +4336,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             params: vec![
                 self.repr.trie_ty(),
                 self.repr.string_ty(),
-                self.repr.value,
+                self.repr.slot_ty(),
                 Type::I32,
             ],
             returns: vec![],
@@ -4057,14 +4376,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             let shape = self.shapes[index].clone();
             let lookup_sig = self.module.signatures.push(SignatureData::Func {
                 params: vec![ref_sig(shape.sig), self.repr.string_ty(), Type::I32],
-                returns: vec![self.repr.value],
+                returns: vec![self.repr.slot_ty()],
                 shared: false,
             });
             let set_sig = self.module.signatures.push(SignatureData::Func {
                 params: vec![
                     ref_sig(shape.sig),
                     self.repr.string_ty(),
-                    self.repr.value,
+                    self.repr.slot_ty(),
                     Type::I32,
                 ],
                 returns: vec![],
@@ -4141,7 +4460,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     idx: field + 1,
                 },
                 &[instance],
-                &[self.repr.value],
+                &[self.repr.slot_ty()],
             );
             body.set_terminator(found, Terminator::Return { values: vec![value] });
             current = next;
@@ -4398,7 +4717,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             terminal,
             Operator::StructGet { sig: self.repr.trie, idx: 0 },
             &[trie],
-            &[self.repr.value],
+            &[self.repr.slot_ty()],
         );
         body.set_terminator(terminal, Terminator::Return { values: vec![result] });
         let byte = body.add_op(
@@ -4482,9 +4801,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             );
             let undef = body.add_op(
                 absent,
-                Operator::RefNull { ty: self.repr.value },
+                Operator::RefNull {
+                    ty: self.repr.slot_ty(),
+                },
                 &[],
-                &[self.repr.value],
+                &[self.repr.slot_ty()],
             );
             body.set_terminator(absent, Terminator::Return { values: vec![undef] });
             body.set_terminator(
@@ -4752,6 +5073,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             }
             None => self.new_object(body, *block)?,
         };
+        // Source object members are already ordered by the front-end. Keep
+        // a local descriptor table so `get x` followed by `set x` shares one
+        // descriptor, while a later data definition replaces it entirely.
+        let mut accessors = BTreeMap::<String, Value>::new();
         for (key, property) in members {
             let key = match key {
                 PropKey::Lit(key) => key.sym.to_string(),
@@ -4762,20 +5087,59 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 )?,
                 _ => return Err(ConvertError::unsupported("object property key", span)),
             };
-            let value = match property {
-                PropVal::Item(value) => values
-                    .get(value)
-                    .cloned()
-                    .ok_or_else(|| ConvertError::invalid("undefined object property value"))?,
-                PropVal::Method(func) => {
-                    self.function_object(body, *block, context, this.clone(), func, false)?
+            match property {
+                PropVal::Item(value) => {
+                    let value = values
+                        .get(value)
+                        .cloned()
+                        .ok_or_else(|| ConvertError::invalid("undefined object property value"))?;
+                    accessors.remove(&key);
+                    *block = self.set_static_property_value_raw(body, *block, &object, &key, &value)?;
                 }
-                PropVal::Getter(_) | PropVal::Setter(_) => {
-                    return Err(ConvertError::unsupported("object accessor", span));
+                PropVal::Method(func) => {
+                    let value = self.function_object(body, *block, context, this.clone(), func, false)?;
+                    accessors.remove(&key);
+                    *block = self.set_static_property_value_raw(body, *block, &object, &key, &value)?;
+                }
+                PropVal::Getter(func) | PropVal::Setter(func) => {
+                    let descriptor = if let Some(descriptor) = accessors.get(&key).copied() {
+                        descriptor
+                    } else {
+                        let descriptor = self.new_descriptor(body, *block);
+                        let descriptor_value = self.anyref(body, *block, descriptor);
+                        let descriptor_value = LowerValue::Wasm {
+                            value: descriptor_value,
+                            kind: ValueKind::Reference,
+                        };
+                        *block = self.set_static_property_value_raw(
+                            body,
+                            *block,
+                            &object,
+                            &key,
+                            &descriptor_value,
+                        )?;
+                        accessors.insert(key.clone(), descriptor);
+                        descriptor
+                    };
+                    let function = self.function_object(body, *block, context, this.clone(), func, false)?;
+                    let function = self.box_value(body, *block, &function)?;
+                    let index = match property {
+                        PropVal::Getter(_) => 0,
+                        PropVal::Setter(_) => 1,
+                        _ => unreachable!("accessor arm only matches getter/setter"),
+                    };
+                    body.add_op(
+                        *block,
+                        Operator::StructSet {
+                            sig: self.repr.descriptor,
+                            idx: index,
+                        },
+                        &[descriptor, function],
+                        &[],
+                    );
                 }
                 _ => return Err(ConvertError::unsupported("object property", span)),
-            };
-            *block = self.set_property_value(body, *block, &object, &key, &value)?;
+            }
         }
         Ok(object)
     }
@@ -4934,14 +5298,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         Ok((join, root))
     }
 
-    fn get_property(
+    fn get_property_raw(
         &mut self,
         body: &mut FunctionBody,
         block: Block,
         context: Value,
         key: &str,
     ) -> Result<(Block, LowerValue), ConvertError> {
-        self.get_property_value(
+        self.get_property_value_raw(
             body,
             block,
             &LowerValue::Wasm {
@@ -4952,7 +5316,332 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         )
     }
 
+    /// Turn a raw property slot into the JavaScript result of a property
+    /// read. Values and absent slots keep one path; an internal descriptor
+    /// splits into no-getter and call-getter paths before callers merge their
+    /// common `anyref` result continuation.
+    fn resolve_property_read_paths(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        receiver: &LowerValue,
+        value: LowerValue,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let value = self.box_value(body, block, &value)?;
+        let is_descriptor = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.descriptor_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let ordinary = body.add_block();
+        let descriptor = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_descriptor,
+                if_true: BlockTarget {
+                    block: descriptor,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: ordinary,
+                    args: vec![],
+                },
+            },
+        );
+
+        let descriptor_value = body.add_op(
+            descriptor,
+            Operator::RefCast {
+                ty: self.repr.descriptor_ty(),
+            },
+            &[value],
+            &[self.repr.descriptor_ty()],
+        );
+        let getter = body.add_op(
+            descriptor,
+            Operator::StructGet {
+                sig: self.repr.descriptor,
+                idx: 0,
+            },
+            &[descriptor_value],
+            &[self.repr.value],
+        );
+        let missing = body.add_op(descriptor, Operator::RefIsNull, &[getter], &[Type::I32]);
+        let absent = body.add_block();
+        let invoke = body.add_block();
+        body.set_terminator(
+            descriptor,
+            Terminator::CondBr {
+                cond: missing,
+                if_true: BlockTarget {
+                    block: absent,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: invoke,
+                    args: vec![],
+                },
+            },
+        );
+        let undefined = self.undef(body, absent);
+        let getter = LowerValue::Wasm {
+            value: getter,
+            kind: ValueKind::Reference,
+        };
+        let (context, receiver, code, _) =
+            self.callable_parts(body, invoke, &getter, receiver.clone())?;
+        let arguments = body.add_op(
+            invoke,
+            Operator::ArrayNewFixed {
+                sig: self.repr.arguments,
+                num: 0,
+            },
+            &[],
+            &[self.repr.arguments_ty()],
+        );
+        let result = body.add_op(
+            invoke,
+            Operator::CallRef {
+                sig_index: self.repr.adapter,
+            },
+            &[context, receiver, arguments, code],
+            &[self.repr.value],
+        );
+        Ok(vec![
+            (
+                ordinary,
+                LowerValue::Wasm {
+                    value,
+                    kind: ValueKind::Reference,
+                },
+            ),
+            (absent, undefined),
+            (
+                invoke,
+                LowerValue::Wasm {
+                    value: result,
+                    kind: ValueKind::Reference,
+                },
+            ),
+        ])
+    }
+
+    /// Merge descriptor outcomes when all of them carry the same `anyref`
+    /// representation. The descriptor branch still gets its own Wasm
+    /// continuation for a getter invocation, but the subsequent source
+    /// statement can be emitted once without duplicating a whole SSA suffix.
+    fn resolve_property_read(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        receiver: &LowerValue,
+        value: LowerValue,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let (block, value) = self.resolve_property_read_join(body, block, receiver, value)?;
+        Ok(vec![(block, value)])
+    }
+
+    /// Use the same descriptor semantics when an internal operation only
+    /// needs one post-read block. This keeps object-rest copying linear in
+    /// the number of fields.
+    fn resolve_property_read_join(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        receiver: &LowerValue,
+        value: LowerValue,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        let continuations = self.resolve_property_read_paths(body, block, receiver, value)?;
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        for (block, value) in continuations {
+            let value = self.box_value(body, block, &value)?;
+            body.set_terminator(
+                block,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![value],
+                    },
+                },
+            );
+        }
+        Ok((
+            join,
+            LowerValue::Wasm {
+                value: result,
+                kind: ValueKind::Reference,
+            },
+        ))
+    }
+
+    /// Separate a descriptor write from the ordinary define/update path.
+    /// The returned first block is the one caller-owned direct-write
+    /// continuation; every returned vector block has already handled an
+    /// accessor setter (or intentionally ignored the write).
+    fn split_descriptor_write(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        receiver: &LowerValue,
+        existing: LowerValue,
+        assigned: &LowerValue,
+    ) -> Result<(Block, Vec<Block>), ConvertError> {
+        let existing = self.box_value(body, block, &existing)?;
+        let is_descriptor = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.descriptor_non_null_ty(),
+            },
+            &[existing],
+            &[Type::I32],
+        );
+        let ordinary = body.add_block();
+        let descriptor = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_descriptor,
+                if_true: BlockTarget {
+                    block: descriptor,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: ordinary,
+                    args: vec![],
+                },
+            },
+        );
+        let descriptor_value = body.add_op(
+            descriptor,
+            Operator::RefCast {
+                ty: self.repr.descriptor_ty(),
+            },
+            &[existing],
+            &[self.repr.descriptor_ty()],
+        );
+        let setter = body.add_op(
+            descriptor,
+            Operator::StructGet {
+                sig: self.repr.descriptor,
+                idx: 1,
+            },
+            &[descriptor_value],
+            &[self.repr.value],
+        );
+        let missing = body.add_op(descriptor, Operator::RefIsNull, &[setter], &[Type::I32]);
+        let absent = body.add_block();
+        let invoke = body.add_block();
+        body.set_terminator(
+            descriptor,
+            Terminator::CondBr {
+                cond: missing,
+                if_true: BlockTarget {
+                    block: absent,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: invoke,
+                    args: vec![],
+                },
+            },
+        );
+        let setter = LowerValue::Wasm {
+            value: setter,
+            kind: ValueKind::Reference,
+        };
+        let (context, receiver, code, _) =
+            self.callable_parts(body, invoke, &setter, receiver.clone())?;
+        let assigned = self.box_value(body, invoke, assigned)?;
+        let arguments = body.add_op(
+            invoke,
+            Operator::ArrayNewFixed {
+                sig: self.repr.arguments,
+                num: 1,
+            },
+            &[assigned],
+            &[self.repr.arguments_ty()],
+        );
+        body.add_op(
+            invoke,
+            Operator::CallRef {
+                sig_index: self.repr.adapter,
+            },
+            &[context, receiver, arguments, code],
+            &[self.repr.value],
+        );
+        Ok((ordinary, vec![absent, invoke]))
+    }
+
+    fn join_write_continuations(&self, body: &mut FunctionBody, blocks: Vec<Block>) -> Block {
+        let join = body.add_block();
+        for block in blocks {
+            body.set_terminator(
+                block,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![],
+                    },
+                },
+            );
+        }
+        join
+    }
+
+    fn get_property(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        context: Value,
+        key: &str,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let receiver = LowerValue::Wasm {
+            value: context,
+            kind: ValueKind::Reference,
+        };
+        let (block, value) = self.get_property_raw(body, block, context, key)?;
+        self.resolve_property_read(body, block, &receiver, value)
+    }
+
     fn get_property_value(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &str,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let (block, value) = self.get_property_value_raw(body, block, object, key)?;
+        self.resolve_property_read(body, block, object, value)
+    }
+
+    fn get_numeric_member(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        index: Value,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let (block, value) = self.get_numeric_member_raw(body, block, object, index)?;
+        self.resolve_property_read(body, block, object, value)
+    }
+
+    fn get_string_member(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: Value,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let (block, value) = self.get_string_member_raw(body, block, object, key)?;
+        self.resolve_property_read(body, block, object, value)
+    }
+
+    fn get_property_value_raw(
         &mut self,
         body: &mut FunctionBody,
         block: Block,
@@ -4974,11 +5663,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         }
         let string_index = Self::static_array_index(key);
         if key != "length" && string_index.is_none() {
-            return self.get_nonstring_property_value(body, block, object, key);
+            return self.get_nonstring_property_value_raw(body, block, object, key);
         }
         let (value, kind) = object.wasm()?;
         if kind != ValueKind::Reference {
-            return self.get_nonstring_property_value(body, block, object, key);
+            return self.get_nonstring_property_value_raw(body, block, object, key);
         }
         let is_string = body.add_op(
             block,
@@ -5038,7 +5727,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             },
         );
         let (non_string, non_string_value) =
-            self.get_nonstring_property_value(body, non_string, object, key)?;
+            self.get_nonstring_property_value_raw(body, non_string, object, key)?;
         let non_string_value = self.box_value(body, non_string, &non_string_value)?;
         body.set_terminator(
             non_string,
@@ -5058,7 +5747,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         ))
     }
 
-    fn get_nonstring_property_value(
+    fn get_nonstring_property_value_raw(
         &mut self,
         body: &mut FunctionBody,
         block: Block,
@@ -5312,7 +6001,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         })
     }
 
-    fn get_numeric_member(
+    fn get_numeric_member_raw(
         &mut self,
         body: &mut FunctionBody,
         block: Block,
@@ -5505,7 +6194,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         ))
     }
 
-    fn get_string_member(
+    fn get_string_member_raw(
         &mut self,
         body: &mut FunctionBody,
         block: Block,
@@ -5694,14 +6383,15 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let (block, root) = self.object_and_root(body, block, object)?;
         let helpers = self.ensure_property_helpers()?;
         let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
-        let value = body.add_op(
+        let slot = body.add_op(
             block,
             Operator::Call {
                 function_index: helpers.lookup,
             },
             &[root, key, zero],
-            &[self.repr.value],
+            &[self.repr.slot_ty()],
         );
+        let (block, value) = self.unwrap_slot(body, block, slot);
         Ok((
             block,
             LowerValue::Wasm {
@@ -5711,7 +6401,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         ))
     }
 
-    fn set_string_member(
+    fn set_string_member_raw(
         &mut self,
         body: &mut FunctionBody,
         block: Block,
@@ -5722,7 +6412,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         const INVALID: u32 = u32::MAX;
         let (object_value, kind) = object.wasm()?;
         if kind != ValueKind::Reference {
-            return self.set_dynamic_property(body, block, object, key, value);
+            return self.set_dynamic_property_raw(body, block, object, key, value);
         }
         let parser = self.ensure_string_index()?;
         let equal = self.ensure_string_equal()?;
@@ -5859,7 +6549,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 },
             },
         );
-        let array_index = self.set_numeric_member(body, array_index, object, index, value)?;
+        let array_index = self.set_numeric_member_raw(body, array_index, object, index, value)?;
         body.set_terminator(
             array_index,
             Terminator::Br {
@@ -5869,7 +6559,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 },
             },
         );
-        let property = self.set_dynamic_property(body, property, object, key, value)?;
+        let property = self.set_dynamic_property_raw(body, property, object, key, value)?;
         body.set_terminator(
             property,
             Terminator::Br {
@@ -5882,7 +6572,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         Ok(done)
     }
 
-    fn set_dynamic_property(
+    fn set_dynamic_property_raw(
         &mut self,
         body: &mut FunctionBody,
         block: Block,
@@ -5894,18 +6584,28 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let boxed_value = self.box_value(body, block, value)?;
         let helpers = self.ensure_property_helpers()?;
         let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let existing = body.add_op(
+            block,
+            Operator::Call {
+                function_index: helpers.lookup,
+            },
+            &[root, key, zero],
+            &[self.repr.slot_ty()],
+        );
+        let (block, flags) = self.slot_flags_or_default(body, block, existing);
+        let slot = self.new_slot(body, block, boxed_value, flags);
         body.add_op(
             block,
             Operator::Call {
                 function_index: helpers.set,
             },
-            &[root, key, boxed_value, zero],
+            &[root, key, slot, zero],
             &[],
         );
         Ok(block)
     }
 
-    fn set_numeric_member(
+    fn set_numeric_member_raw(
         &self,
         body: &mut FunctionBody,
         block: Block,
@@ -6116,53 +6816,121 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         values: &BTreeMap<SValueId, LowerValue>,
         wrapped: &LowerValue,
         keys: &[PropKey<SValueId>],
-    ) -> Result<(Block, LowerValue), ConvertError> {
-        // Object-rest must be independent from its source. Materialize shape
-        // fields into a generic trie, clone its unknown-key fallback, then
-        // clear the statically excluded names from that private copy.
-        let (mut block, root) = self.object_and_root(body, block, wrapped)?;
-        let (next, trie) = self.clone_property_root(body, block, root)?;
-        block = next;
-        for key in keys {
-            let key = match key {
-                PropKey::Lit(key) => key.sym.to_string(),
-                PropKey::Computed(value) => {
-                    self.key_of(values.get(value).ok_or_else(|| {
-                        ConvertError::invalid("undefined static object-rest key")
-                    })?)?
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        // CopyDataProperties reads accessor properties from the source and
+        // writes their resulting values into the rest object. For shapes we
+        // know every direct field, so lower those reads as ordinary accessor
+        // continuations instead of copying the descriptor representation.
+        let excluded = keys
+            .iter()
+            .map(|key| match key {
+                PropKey::Lit(key) => Ok(key.sym.to_string()),
+                PropKey::Computed(value) => self.key_of(values.get(value).ok_or_else(|| {
+                    ConvertError::invalid("undefined static object-rest key")
+                })?),
+                _ => Err(ConvertError::unsupported("object-rest property key", ())),
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let (block, root) = self.object_and_root(body, block, wrapped)?;
+        let mut current = block;
+        let mut results = Vec::new();
+
+        for shape in self.shapes.clone() {
+            let matches = body.add_op(
+                current,
+                Operator::RefTest {
+                    ty: ref_sig(shape.sig),
+                },
+                &[root],
+                &[Type::I32],
+            );
+            let matched = body.add_block();
+            let next = body.add_block();
+            body.set_terminator(
+                current,
+                Terminator::CondBr {
+                    cond: matches,
+                    if_true: BlockTarget {
+                        block: matched,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: next,
+                        args: vec![],
+                    },
+                },
+            );
+            let instance = body.add_op(
+                matched,
+                Operator::RefCast {
+                    ty: ref_sig(shape.sig),
+                },
+                &[root],
+                &[ref_sig(shape.sig)],
+            );
+            let fallback = body.add_op(
+                matched,
+                Operator::StructGet {
+                    sig: shape.sig,
+                    idx: 0,
+                },
+                &[instance],
+                &[self.repr.trie_ty()],
+            );
+            let copied = self.clone_trie(body, matched, fallback)?;
+            let mut copied_block = matched;
+            for key in &excluded {
+                copied_block = self.clear_property(body, copied_block, copied, key)?;
+            }
+            let copied_root = self.anyref(body, copied_block, copied);
+            let object = self.new_object_with_root(body, copied_block, copied_root)?;
+            for (field, name) in shape.keys.iter().enumerate() {
+                if excluded.contains(name) {
+                    continue;
                 }
-                _ => return Err(ConvertError::unsupported("object-rest property key", ())),
-            };
-            block = self.clear_property(body, block, trie, &key)?;
+                let source_slot = body.add_op(
+                    copied_block,
+                    Operator::StructGet {
+                        sig: shape.sig,
+                        idx: field + 1,
+                    },
+                    &[instance],
+                    &[self.repr.slot_ty()],
+                );
+                let (unwrapped_block, value) = self.unwrap_slot(body, copied_block, source_slot);
+                let (next, value) = self.resolve_property_read_join(
+                    body,
+                    unwrapped_block,
+                    wrapped,
+                    LowerValue::Wasm {
+                        value,
+                        kind: ValueKind::Reference,
+                    },
+                )?;
+                copied_block = self.set_static_property_value_raw(
+                    body,
+                    next,
+                    &object,
+                    name,
+                    &value,
+                )?;
+            }
+            results.push((copied_block, object));
+            current = next;
         }
-        let generic_root = self.anyref(body, block, trie);
-        let elements = body.add_op(
-            block,
-            Operator::RefNull { ty: self.repr.arguments_ty() },
-            &[],
-            &[self.repr.arguments_ty()],
-        );
-        let properties = body.add_op(
-            block,
-            Operator::RefNull { ty: self.repr.value },
-            &[],
-            &[self.repr.value],
-        );
-        let object = body.add_op(
-            block,
-            Operator::StructNew {
-                sig: self.repr.object,
-            },
-            &[generic_root, elements, properties],
-            &[self.repr.object_ty()],
-        );
-        Ok((
-            block,
-            LowerValue::Wasm {
-                value: object,
-                kind: ValueKind::Reference,
-            },
-        ))
+
+        // Accessors originate in object literals with a known literal-key
+        // shape. The remaining generic path preserves dynamic data entries
+        // with the existing trie clone and exclusion handling.
+        let (next, trie) = self.clone_property_root(body, current, root)?;
+        current = next;
+        for key in &excluded {
+            current = self.clear_property(body, current, trie, key)?;
+        }
+        let trie = self.anyref(body, current, trie);
+        let object = self.new_object_with_root(body, current, trie)?;
+        results.push((current, object));
+        Ok(results)
     }
 
     fn clone_property_root(
@@ -6206,19 +6974,25 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 &[instance],
                 &[self.repr.trie_ty()],
             );
-            let copied_block = matched;
+            let mut copied_block = matched;
             let copied = self.clone_trie(body, copied_block, fallback)?;
             let copied_root = self.anyref(body, copied_block, copied);
             for (field, name) in shape.keys.iter().enumerate() {
-                let value = body.add_op(
+                let source_slot = body.add_op(
                     copied_block,
                     Operator::StructGet {
                         sig: shape.sig,
                         idx: field + 1,
                     },
                     &[instance],
-                    &[self.repr.value],
+                    &[self.repr.slot_ty()],
                 );
+                // `CopyDataProperties` (object-rest/spread) always creates
+                // fresh writable/enumerable/configurable own properties on
+                // the target, regardless of the source's attributes.
+                let (next_block, value) = self.unwrap_slot(body, copied_block, source_slot);
+                copied_block = next_block;
+                let slot = self.new_slot_literal(body, copied_block, value, crate::repr::SLOT_FLAGS_DEFAULT);
                 let key = self.new_string(body, copied_block, name.as_bytes())?;
                 let zero = body.add_op(
                     copied_block,
@@ -6231,7 +7005,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     Operator::Call {
                         function_index: helpers.set,
                     },
-                    &[copied_root, key, value, zero],
+                    &[copied_root, key, slot, zero],
                     &[],
                 );
             }
@@ -6314,10 +7088,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let undef = body.add_op(
             block,
             Operator::RefNull {
-                ty: self.repr.value,
+                ty: self.repr.slot_ty(),
             },
             &[],
-            &[self.repr.value],
+            &[self.repr.slot_ty()],
         );
         body.add_op(
             block,
@@ -6351,14 +7125,15 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let helpers = self.ensure_property_helpers()?;
         let key = self.new_string(body, block, key.as_bytes())?;
         let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
-        let value = body.add_op(
+        let slot = body.add_op(
             block,
             Operator::Call {
                 function_index: helpers.lookup,
             },
             &[root, key, zero],
-            &[self.repr.value],
+            &[self.repr.slot_ty()],
         );
+        let (block, value) = self.unwrap_slot(body, block, slot);
         Ok((
             block,
             LowerValue::Wasm {
@@ -6375,7 +7150,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         context: Value,
         key: &str,
         value: &LowerValue,
-    ) -> Result<Block, ConvertError> {
+    ) -> Result<Vec<Block>, ConvertError> {
         self.set_property_value(
             body,
             block,
@@ -6395,17 +7170,62 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         object: &LowerValue,
         key: &str,
         value: &LowerValue,
-    ) -> Result<Block, ConvertError> {
-        if let Some(index) = Self::static_array_index(key) {
-            return self.set_static_array_index(body, block, object, key, index, value);
-        }
-        if key == "length" {
-            return self.set_static_length_property(body, block, object, key, value);
-        }
-        self.set_static_property_value(body, block, object, key, value)
+    ) -> Result<Vec<Block>, ConvertError> {
+        let (block, existing) = self.get_property_value_raw(body, block, object, key)?;
+        let (ordinary, mut done) =
+            self.split_descriptor_write(body, block, object, existing, value)?;
+        done.push(self.set_property_value_raw(body, ordinary, object, key, value)?);
+        Ok(vec![self.join_write_continuations(body, done)])
     }
 
-    fn set_static_property_value(
+    fn set_numeric_member(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        index: Value,
+        value: &LowerValue,
+    ) -> Result<Vec<Block>, ConvertError> {
+        let (block, existing) = self.get_numeric_member_raw(body, block, object, index)?;
+        let (ordinary, mut done) =
+            self.split_descriptor_write(body, block, object, existing, value)?;
+        done.push(self.set_numeric_member_raw(body, ordinary, object, index, value)?);
+        Ok(vec![self.join_write_continuations(body, done)])
+    }
+
+    fn set_string_member(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: Value,
+        value: &LowerValue,
+    ) -> Result<Vec<Block>, ConvertError> {
+        let (block, existing) = self.get_string_member_raw(body, block, object, key)?;
+        let (ordinary, mut done) =
+            self.split_descriptor_write(body, block, object, existing, value)?;
+        done.push(self.set_string_member_raw(body, ordinary, object, key, value)?);
+        Ok(vec![self.join_write_continuations(body, done)])
+    }
+
+    fn set_property_value_raw(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &str,
+        value: &LowerValue,
+    ) -> Result<Block, ConvertError> {
+        if let Some(index) = Self::static_array_index(key) {
+            return self.set_static_array_index_raw(body, block, object, key, index, value);
+        }
+        if key == "length" {
+            return self.set_static_length_property_raw(body, block, object, key, value);
+        }
+        self.set_static_property_value_raw(body, block, object, key, value)
+    }
+
+    fn set_static_property_value_raw(
         &mut self,
         body: &mut FunctionBody,
         block: Block,
@@ -6418,18 +7238,28 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let key = self.new_string(body, block, key.as_bytes())?;
         let helpers = self.ensure_property_helpers()?;
         let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let existing = body.add_op(
+            block,
+            Operator::Call {
+                function_index: helpers.lookup,
+            },
+            &[root, key, zero],
+            &[self.repr.slot_ty()],
+        );
+        let (block, flags) = self.slot_flags_or_default(body, block, existing);
+        let slot = self.new_slot(body, block, boxed_value, flags);
         body.add_op(
             block,
             Operator::Call {
                 function_index: helpers.set,
             },
-            &[root, key, boxed_value, zero],
+            &[root, key, slot, zero],
             &[],
         );
         Ok(block)
     }
 
-    fn set_static_array_index(
+    fn set_static_array_index_raw(
         &mut self,
         body: &mut FunctionBody,
         block: Block,
@@ -6440,7 +7270,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     ) -> Result<Block, ConvertError> {
         let (object_value, kind) = object.wasm()?;
         if kind != ValueKind::Reference {
-            return self.set_static_property_value(body, block, object, key, value);
+            return self.set_static_property_value_raw(body, block, object, key, value);
         }
         let is_object = body.add_op(
             block,
@@ -6511,7 +7341,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[],
             &[Type::I32],
         );
-        let array = self.set_numeric_member(body, array, object, index, value)?;
+        let array = self.set_numeric_member_raw(body, array, object, index, value)?;
         body.set_terminator(
             array,
             Terminator::Br {
@@ -6521,7 +7351,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 },
             },
         );
-        let fallback = self.set_static_property_value(body, fallback, object, key, value)?;
+        let fallback = self.set_static_property_value_raw(body, fallback, object, key, value)?;
         body.set_terminator(
             fallback,
             Terminator::Br {
@@ -6534,7 +7364,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         Ok(done)
     }
 
-    fn set_static_length_property(
+    fn set_static_length_property_raw(
         &mut self,
         body: &mut FunctionBody,
         block: Block,
@@ -6544,7 +7374,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     ) -> Result<Block, ConvertError> {
         let (object_value, kind) = object.wasm()?;
         if kind != ValueKind::Reference {
-            return self.set_static_property_value(body, block, object, key, value);
+            return self.set_static_property_value_raw(body, block, object, key, value);
         }
         let is_object = body.add_op(
             block,
@@ -6619,7 +7449,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 },
             },
         );
-        let fallback = self.set_static_property_value(body, fallback, object, key, value)?;
+        let fallback = self.set_static_property_value_raw(body, fallback, object, key, value)?;
         body.set_terminator(
             fallback,
             Terminator::Br {
@@ -6791,16 +7621,16 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         values: &BTreeMap<SValueId, LowerValue>,
         callee: &TCallee<SValueId>,
         args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
-    ) -> Result<(Block, Value, Value, Value, Value), ConvertError> {
-        let mut block = block;
-        let (callee, receiver) = match callee {
-            TCallee::Val(value) => (
+    ) -> Result<Vec<(Block, Value, Value, Value, Value)>, ConvertError> {
+        let callees = match callee {
+            TCallee::Val(value) => vec![(
+                block,
                 values
                     .get(value)
                     .cloned()
                     .ok_or_else(|| ConvertError::invalid("undefined callee"))?,
                 self.undef(body, block),
-            ),
+            )],
             TCallee::Member { func, member } => {
                 let receiver = values
                     .get(func)
@@ -6808,30 +7638,36 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 let key = values
                     .get(member)
                     .ok_or_else(|| ConvertError::invalid("undefined member key"))?;
-                let (next, callee) = match self.key_of(key) {
-                    Ok(key) => self.get_property_value(body, block, receiver, &key)?,
+                let callees = match self.key_of(key) {
+                    Ok(key) => self.get_property_value(body, block, receiver, &key),
                     Err(_) => match key.kind()? {
                         ValueKind::Number | ValueKind::Integer | ValueKind::Boolean => {
                             let index = self.numeric_index(body, block, key)?;
-                            self.get_numeric_member(body, block, receiver, index)?
+                            self.get_numeric_member(body, block, receiver, index)
                         }
                         ValueKind::Reference => {
                             let key = self.dynamic_string_key(body, block, key)?;
-                            self.get_string_member(body, block, receiver, key)?
+                            self.get_string_member(body, block, receiver, key)
                         }
                     },
-                };
-                block = next;
-                (callee, receiver.clone())
+                }?;
+                callees
+                    .into_iter()
+                    .map(|(block, callee)| (block, callee, receiver.clone()))
+                    .collect()
             }
             _ => return Err(ConvertError::unsupported(format!("callee {callee:?}"), ())),
         };
-        let (captured_context, effective_this, code, _) =
-            self.callable_parts(body, block, &callee, receiver)?;
-        let array = self.make_arguments(body, block, values, args)?;
+        let mut result = Vec::with_capacity(callees.len());
+        for (block, callee, receiver) in callees {
+            let (captured_context, effective_this, code, _) =
+                self.callable_parts(body, block, &callee, receiver)?;
+            let array = self.make_arguments(body, block, values, args)?;
+            result.push((block, captured_context, effective_this, array, code));
+        }
         let _ = context;
         let _ = this;
-        Ok((block, captured_context, effective_this, array, code))
+        Ok(result)
     }
 
     fn callable_parts(
@@ -6898,3 +7734,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         Ok((context, this, code, arrow))
     }
 }
+
+// Hand-written native (non-lowered-source) implementations of the
+// `Math`/`Array` primordials, installed into each exported function's fresh
+// lexical context. `include!`d as a module-level item (an `impl Converter`
+// block of its own) so these methods share full access to the existing
+// property/object helpers without a separate crate-visibility surface.
+include!("primordials.rs");

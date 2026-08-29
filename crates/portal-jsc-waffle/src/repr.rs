@@ -177,6 +177,19 @@ impl Repr {
         ref_sig(self.object)
     }
 
+    /// For `RefTest`: `ref.test` against a *nullable* type matches `null`
+    /// too, so a plain `RefTest{ty: object_ty()}` cannot distinguish "is an
+    /// object" from "is null" — combine both checks in one test with this
+    /// non-null variant instead (same pattern as `descriptor_non_null_ty`).
+    pub(crate) fn object_non_null_ty(self) -> Type {
+        Type::Heap(WithNullable {
+            value: portal_pc_waffle::HeapType::Sig {
+                sig_index: self.object,
+            },
+            nullable: false,
+        })
+    }
+
     pub(crate) fn number_ty(self) -> Type {
         ref_sig(self.number)
     }

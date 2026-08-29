@@ -5871,7 +5871,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let is_object = body.add_op(
             block,
             Operator::RefTest {
-                ty: self.repr.object_ty(),
+                ty: self.repr.object_non_null_ty(),
             },
             &[value],
             &[Type::I32],

@@ -91,3 +91,11 @@ portal-jsc-swc-tac =     { path = "../jsaw-core/crates/swc-tac" }
 portal-jsc-swc-ssa =     { path = "../jsaw-core/crates/swc-ssa" }
 portal-jsc-swc-opt-ssa = { path = "../jsaw-core/crates/swc-opt-ssa" }
 portal-jsc-swc-util =    { path = "../jsaw-core/crates/swc-util" }
+
+# Development-only: build against the local waffle- checkout, which has a
+# fix for a treeify bug that inlined values across block boundaries (see
+# call_then_prop_read_combined_in_one_expression in
+# crates/portal-jsc-waffle/tests/e2e.rs). Remove once the fix is pushed
+# upstream and the version pin is bumped.
+[patch."https://github.com/portal-co/waffle-.git"]
+portal-pc-waffle = { path = "../waffle-" }

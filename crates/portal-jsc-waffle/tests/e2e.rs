@@ -1273,5 +1273,114 @@ fn executes_array_instance_methods() {
         42.0,
     );
 }
+#[test]
+fn for_each_closure_writes_to_captured_array() {
+    let module = compile_module(
+        "
+            export function for_each_push_to_other_array() {
+                let arr = [10, 20, 30];
+                let out = [];
+                arr.forEach(function (value) {
+                    out.push(value);
+                });
+                return out.length;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "for_each_push_to_other_array", &[], 3.0);
+}
 
+#[test]
+fn for_each_closure_reads_and_writes_captured_variable() {
+    let module = compile_module(
+        "
+            export function for_each_read_capture() {
+                let arr = [10, 20, 30];
+                let out = 7;
+                let last = 0;
+                arr.forEach(function (value) {
+                    last = out;
+                });
+                return last;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "for_each_read_capture", &[], 7.0);
+}
 
+#[test]
+fn call_then_prop_read_across_separate_statements() {
+    // Same object, same mutating call, same later property read as the
+    // `#[ignore]`d cases below -- but as separate statements rather than
+    // operands of one arithmetic expression. This shape is unaffected by
+    // the waffle- backend bug documented there, and must keep working.
+    let module = compile_module(
+        "
+            export function push_then_length() {
+                let arr = [1, 2, 3];
+                arr.push(4);
+                return arr.length;
+            }
+            export function plain_call_then_prop_read() {
+                let o = { a: 1, b: 2 };
+                function mutate(obj) {
+                    obj.a = 99;
+                }
+                mutate(o);
+                return o.a;
+            }
+            export function plain_call_then_other_prop_read() {
+                let o = { a: 1, b: 2 };
+                function mutate(obj) {
+                    obj.a = 99;
+                }
+                return mutate(o), o.a;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "push_then_length", &[], 4.0);
+    assert_executes_in_all_runtimes(&module, "plain_call_then_prop_read", &[], 99.0);
+    assert_executes_in_all_runtimes(&module, "plain_call_then_other_prop_read", &[], 99.0);
+}
+
+#[test]
+fn call_then_prop_read_combined_in_one_expression() {
+    // Regression test for a waffle- backend bug: `Trees::compute`
+    // (treeify.rs) could treeify a pure, single-use value across a block
+    // boundary -- e.g. a call's boxed result used only by a later block's
+    // arithmetic -- without checking that the consumer and producer share
+    // a block. Since the Wasm value stack doesn't survive a branch, this
+    // silently relocated side-effecting computations (including the call
+    // itself) to wherever the owning value ended up, reordering them
+    // relative to code the source placed earlier (like this test's
+    // property read). Fixed upstream in
+    // ~/Code-local/portal-hot/waffle-'s treeify.rs by requiring
+    // same-block placement before claiming ownership.
+    let module = compile_module(
+        "
+            export function fn_call_plus_prop_arith() {
+                let o = { a: 1 };
+                function mutateAndReturn(obj) {
+                    obj.a = 99;
+                    return 7;
+                }
+                return mutateAndReturn(o) * 100 + o.a;
+            }
+            export function push_call_plus_prop_arith() {
+                let arr = [1, 2, 3];
+                return arr.push(4) * 100 + arr.length;
+            }
+            export function pop_combined_expr() {
+                let arr = [1, 2, 3];
+                return arr.pop() * 100 + arr.length;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "fn_call_plus_prop_arith", &[], 799.0);
+    assert_executes_in_all_runtimes(&module, "push_call_plus_prop_arith", &[], 404.0);
+    assert_executes_in_all_runtimes(&module, "pop_combined_expr", &[], 302.0);
+}

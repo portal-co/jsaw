@@ -14,7 +14,7 @@ use portal_pc_waffle::{
 };
 use swc_ecma_ast::{BinaryOp, Lit, UnaryOp};
 
-use crate::repr::{ConvertError, Repr, field, ref_sig};
+use crate::repr::{ConvertError, Repr, TypedArrayKind, field, ref_sig};
 
 /// Convert jsaw-core SSA into a WasmGC module.
 ///
@@ -2279,12 +2279,19 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[],
             &[self.repr.value],
         );
+        let typed_data = body.add_op(
+            block,
+            Operator::RefNull { ty: self.repr.value },
+            &[],
+            &[self.repr.value],
+        );
+        let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
         let object = body.add_op(
             block,
             Operator::StructNew {
                 sig: self.repr.object,
             },
-            &[root, elements, properties],
+            &[root, elements, properties, typed_data, zero, zero, zero],
             &[self.repr.object_ty()],
         );
         Ok(LowerValue::Wasm {
@@ -2584,12 +2591,19 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[],
             &[self.repr.value],
         );
+        let typed_data = body.add_op(
+            block,
+            Operator::RefNull { ty: self.repr.value },
+            &[],
+            &[self.repr.value],
+        );
+        let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
         Ok(body.add_op(
             block,
             Operator::StructNew {
                 sig: self.repr.object,
             },
-            &[trie, elements, properties],
+            &[trie, elements, properties, typed_data, zero, zero, zero],
             &[self.repr.object_ty()],
         ))
     }
@@ -5743,6 +5757,17 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         object: &LowerValue,
         key: &str,
     ) -> Result<(Block, LowerValue), ConvertError> {
+        // Typed arrays share the object/property seam with ordinary arrays,
+        // but their elements live in unboxed native WasmGC arrays. Intercept
+        // the small typed surface before ordinary-array dispatch; the helper
+        // falls through to the existing path for every non-typed receiver.
+        if !matches!(object, LowerValue::String { .. })
+            && (matches!(key, "length" | "byteLength" | "set" | "subarray")
+                || Self::static_array_index(key).is_some())
+            && let Some(result) = self.get_typed_array_static_property(body, block, object, key)?
+        {
+            return Ok(result);
+        }
         if key == "length"
             && let LowerValue::String { value, .. } = object
         {
@@ -6296,7 +6321,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         ))
     }
 
-    fn get_nonstring_numeric_member(
+    fn get_nonstring_numeric_member_base(
         &self,
         body: &mut FunctionBody,
         block: Block,
@@ -6412,7 +6437,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         ))
     }
 
-    fn get_string_member_raw(
+    fn get_string_member_raw_base(
         &mut self,
         body: &mut FunctionBody,
         block: Block,
@@ -6619,7 +6644,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         ))
     }
 
-    fn set_string_member_raw(
+    fn set_string_member_raw_base(
         &mut self,
         body: &mut FunctionBody,
         block: Block,
@@ -6816,7 +6841,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         Ok(block)
     }
 
-    fn set_numeric_member_raw(
+    fn set_numeric_member_raw_base(
         &self,
         body: &mut FunctionBody,
         block: Block,
@@ -7463,7 +7488,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         Ok(block)
     }
 
-    fn set_static_array_index_raw(
+    fn set_static_array_index_raw_base(
         &mut self,
         body: &mut FunctionBody,
         block: Block,
@@ -7568,7 +7593,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         Ok(done)
     }
 
-    fn set_static_length_property_raw(
+    fn set_static_length_property_raw_base(
         &mut self,
         body: &mut FunctionBody,
         block: Block,
@@ -7945,6 +7970,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
 // block of its own) so these methods share full access to the existing
 // property/object helpers without a separate crate-visibility surface.
 include!("primordials.rs");
+
+// Native WasmGC backing storage and the corresponding JavaScript typed-array
+// surface. Kept beside the primordial implementation because constructors and
+// prototype-like methods are installed through that same context builder.
+include!("typed_arrays.rs");
 
 // Runtime property enumeration, backing Object.keys/values/entries/
 // getOwnPropertyNames/getOwnPropertyDescriptors/assign/freeze/isFrozen and

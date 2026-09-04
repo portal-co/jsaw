@@ -959,6 +959,112 @@ fn executes_array_primordial() {
 }
 
 #[test]
+fn executes_native_wasm_gc_typed_array_integer_storage() {
+    let module = compile_module(
+        "
+            export function run() {
+                let values = new Int8Array(2);
+                values[0] = 257;
+                values[1] = -129;
+                values[4] = 99;
+                return values.length * 10000 + values.byteLength * 1000 + values[0] * 10 + values[1];
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 22137.0);
+}
+
+#[test]
+fn executes_native_wasm_gc_typed_array_numeric_kinds() {
+    let module = compile_module(
+        "
+            export function run() {
+                let u8 = new Uint8Array(1);
+                let u16 = new Uint16Array(1);
+                let u32 = new Uint32Array(1);
+                let i16 = new Int16Array(1);
+                let i32 = new Int32Array(1);
+                let f32 = new Float32Array(1);
+                let f64 = new Float64Array(1);
+                u8[0] = 4294967551;
+                u16[0] = 65535;
+                u32[0] = 4294967295;
+                i16[0] = -1;
+                i32[0] = -1;
+                f32[0] = 16777217;
+                f64[0] = 0.5;
+                return u8[0] + u16[0] + u32[0] + i16[0] + i32[0] + f32[0] + f64[0];
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 4311810299.5);
+}
+
+#[test]
+fn executes_native_wasm_gc_typed_array_views_and_metadata() {
+    let module = compile_module(
+        "
+            export function view() {
+                let values = new Uint8ClampedArray(4);
+                values[0] = -3;
+                values[1] = 1.5;
+                values[2] = 255.5;
+                let view = values.subarray(1, 3);
+                view[0] = 9;
+                return values[0] * 1000 + values[1] * 100 + values[2] * 10 + view.length;
+            }
+            export function metadata() {
+                let values = new Float64Array(3);
+                return Float64Array.BYTES_PER_ELEMENT * 100 + values.byteLength * 10 + (Array.isArray(values) ? 1 : 0);
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "view", &[], 3452.0);
+    assert_executes_in_all_runtimes(&module, "metadata", &[], 1040.0);
+}
+
+#[test]
+fn executes_native_wasm_gc_typed_array_sources_and_set() {
+    let module = compile_module(
+        "
+            export function run() {
+                let source = new Uint16Array([257, 3]);
+                let copied = new Int8Array(source);
+                let destination = new Uint8Array(4);
+                destination.set([4, 5], 1);
+                let overlap = new Uint8Array([1, 2, 3]);
+                overlap.set(overlap.subarray(0, 2), 1);
+                let copied_and_offset = copied[0] * 10000 + copied[1] * 1000 + destination[0] * 100 + destination[1] * 10 + destination[2];
+                return copied_and_offset * 1000 + overlap[0] * 100 + overlap[1] * 10 + overlap[2];
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 13045112.0);
+}
+
+#[test]
+fn compiles_native_wasm_gc_typed_array_constructor() {
+    let _ = compile_module("export function make() { return new Uint8Array(2).length; }");
+}
+
+#[test]
+fn validates_native_wasm_gc_typed_array_constructor() {
+    let module = compile_module("export function make() { let a = new Uint8Array(2); a[0] = 3; return a[0]; }");
+    validate(&module);
+}
+
+#[test]
+fn executes_native_wasm_gc_typed_array_constructor() {
+    let module = compile_module("export function make() { let a = new Uint8Array(2); a[0] = 3; return a[0]; }");
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "make", &[], 3.0);
+}
+
+#[test]
 fn executes_reflect_primordial() {
     let module = compile_module(
         "

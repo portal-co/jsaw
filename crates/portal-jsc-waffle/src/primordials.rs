@@ -41,6 +41,69 @@ fn new_context_with_primordials(
     let object_ns = self.build_object_namespace(body, &mut block)?;
     block = self.set_static_property_value_raw(body, block, &context, "Object", &object_ns)?;
 
+    // Typed-array constructors are globals rather than namespace members.
+    // Installing them through the ordinary context preserves the same
+    // shadowing rules as Math/Array: a later local declaration is just an
+    // ordinary property write on this object.
+    let typed_constructor = self.typed_array_constructor()?;
+    for kind in TypedArrayKind::ALL {
+        // Each function value captures a tiny private context containing its
+        // kind tag. The adapter body is shared across all nine globals,
+        // avoiding nine copies of the source-copy and WasmGC dispatch code.
+        let constructor_context = self.new_object(body, block)?;
+        let (constructor_context_value, _) = constructor_context.wasm()?;
+        let context_object = body.add_op(
+            block,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[constructor_context_value],
+            &[self.repr.object_ty()],
+        );
+        let tag = body.add_op(
+            block,
+            Operator::I32Const {
+                value: kind.code() as u32,
+            },
+            &[],
+            &[Type::I32],
+        );
+        body.add_op(
+            block,
+            Operator::StructSet {
+                sig: self.repr.object,
+                idx: 4,
+            },
+            &[context_object, tag],
+            &[],
+        );
+        let constructor = self.native_function_value(
+            body,
+            block,
+            constructor_context_value,
+            typed_constructor,
+        )?;
+        let bytes = body.add_op(
+            block,
+            Operator::F64Const {
+                value: f64::from(kind.bytes_per_element()).to_bits(),
+            },
+            &[],
+            &[Type::F64],
+        );
+        block = self.set_static_property_value_raw(
+            body,
+            block,
+            &constructor,
+            "BYTES_PER_ELEMENT",
+            &LowerValue::Wasm {
+                value: bytes,
+                kind: ValueKind::Number,
+            },
+        )?;
+        block = self.set_static_property_value_raw(body, block, &context, kind.name(), &constructor)?;
+    }
+
     let (context_value, _) = context.wasm()?;
     Ok((block, context_value))
 }

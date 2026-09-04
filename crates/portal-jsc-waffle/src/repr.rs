@@ -36,7 +36,83 @@ pub(crate) struct Repr {
     pub(crate) utf16: Signature,
     pub(crate) string: Signature,
     pub(crate) arguments: Signature,
+    /// Packed/unboxed native storage for Number-backed typed arrays.  The
+    /// JavaScript object header carries these references as `anyref`, then
+    /// typed-array lowering refines to the concrete signature before a load
+    /// or store.
+    pub(crate) typed_i8: Signature,
+    pub(crate) typed_i16: Signature,
+    pub(crate) typed_i32: Signature,
+    pub(crate) typed_f32: Signature,
+    pub(crate) typed_f64: Signature,
     pub(crate) adapter: Signature,
+}
+
+/// The supported Number-backed typed-array constructors.  The discriminant
+/// is stored in the common object header, keeping property dispatch at one
+/// seam while the concrete WasmGC array remains unboxed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TypedArrayKind {
+    Int8,
+    Uint8,
+    Uint8Clamped,
+    Int16,
+    Uint16,
+    Int32,
+    Uint32,
+    Float32,
+    Float64,
+}
+
+impl TypedArrayKind {
+    pub(crate) const ALL: [Self; 9] = [
+        Self::Int8,
+        Self::Uint8,
+        Self::Uint8Clamped,
+        Self::Int16,
+        Self::Uint16,
+        Self::Int32,
+        Self::Uint32,
+        Self::Float32,
+        Self::Float64,
+    ];
+
+    pub(crate) const fn code(self) -> i32 {
+        match self {
+            Self::Int8 => 0,
+            Self::Uint8 => 1,
+            Self::Uint8Clamped => 2,
+            Self::Int16 => 3,
+            Self::Uint16 => 4,
+            Self::Int32 => 5,
+            Self::Uint32 => 6,
+            Self::Float32 => 7,
+            Self::Float64 => 8,
+        }
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Int8 => "Int8Array",
+            Self::Uint8 => "Uint8Array",
+            Self::Uint8Clamped => "Uint8ClampedArray",
+            Self::Int16 => "Int16Array",
+            Self::Uint16 => "Uint16Array",
+            Self::Int32 => "Int32Array",
+            Self::Uint32 => "Uint32Array",
+            Self::Float32 => "Float32Array",
+            Self::Float64 => "Float64Array",
+        }
+    }
+
+    pub(crate) const fn bytes_per_element(self) -> i32 {
+        match self {
+            Self::Int8 | Self::Uint8 | Self::Uint8Clamped => 1,
+            Self::Int16 | Self::Uint16 => 2,
+            Self::Int32 | Self::Uint32 | Self::Float32 => 4,
+            Self::Float64 => 8,
+        }
+    }
 }
 
 impl Repr {
@@ -88,6 +164,36 @@ impl Repr {
             },
             shared: false,
         });
+        // Typed arrays use actual WasmGC array element storage rather than
+        // the boxed `arguments` array used by ordinary JavaScript arrays.
+        // i8/i16 deliberately remain packed: signed/unsigned reads select
+        // the appropriate WasmGC load instruction at the typed-array seam.
+        let typed_i8 = module.signatures.push(SignatureData::Array {
+            ty: WithMutablility {
+                value: StorageType::I8,
+                mutable: true,
+            },
+            shared: false,
+        });
+        let typed_i16 = module.signatures.push(SignatureData::Array {
+            ty: WithMutablility {
+                value: StorageType::I16,
+                mutable: true,
+            },
+            shared: false,
+        });
+        let typed_i32 = module.signatures.push(SignatureData::Array {
+            ty: field(Type::I32),
+            shared: false,
+        });
+        let typed_f32 = module.signatures.push(SignatureData::Array {
+            ty: field(Type::F32),
+            shared: false,
+        });
+        let typed_f64 = module.signatures.push(SignatureData::Array {
+            ty: field(Type::F64),
+            shared: false,
+        });
         let string = module.signatures.push(SignatureData::Struct {
             fields: vec![],
             shared: false,
@@ -120,12 +226,21 @@ impl Repr {
 
         module.signatures[object] = SignatureData::Struct {
             // Every ordinary object has the same header.  `elements` being
-            // non-null is the sole distinction between an object and an
-            // array, which is exactly what a future `Array.isArray` needs.
+            // non-null is the sole distinction between an ordinary array and
+            // an object. Typed arrays keep `elements` null and use the final
+            // four fields, so `Array.isArray` remains false for them.
             // The property root is either a generic trie or a generated
             // shape instance. Both are carried as `anyref` so a lookup can
             // refine with `ref.test` before continuing through a trie.
-            fields: vec![field(value), field(ref_sig(arguments)), field(value)],
+            fields: vec![
+                field(value),
+                field(ref_sig(arguments)),
+                field(value),
+                field(value),
+                field(Type::I32),
+                field(Type::I32),
+                field(Type::I32),
+            ],
             shared: false,
         };
         module.signatures[string] = SignatureData::Struct {
@@ -169,6 +284,11 @@ impl Repr {
             utf16,
             string,
             arguments,
+            typed_i8,
+            typed_i16,
+            typed_i32,
+            typed_f32,
+            typed_f64,
             adapter,
         }
     }

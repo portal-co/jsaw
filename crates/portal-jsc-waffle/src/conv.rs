@@ -14,7 +14,7 @@ use portal_pc_waffle::{
 };
 use swc_ecma_ast::{BinaryOp, Lit, UnaryOp};
 
-use crate::repr::{ConvertError, Repr, TypedArrayKind, field, ref_sig};
+use crate::repr::{ConvertError, FUNCTION_FIELD_TAG, JS_NULL_SENTINEL, Repr, TypedArrayKind, field, ref_sig};
 
 /// Convert jsaw-core SSA into a WasmGC module.
 ///
@@ -30,6 +30,7 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
         lowered: BTreeSet::new(),
         ref_table: None,
         string_equal: None,
+        strict_equality_helper: None,
         string_concat: None,
         string_utf16: None,
         string_index: None,
@@ -42,8 +43,11 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
         arguments_push_helper: None,
         trie_enumerate_helper: None,
         object_enumerate_keys_helper: None,
+        primordial_fast_cores: BTreeMap::new(),
+        shadowed_names: BTreeSet::new(),
     };
     converter.collect_shapes(root)?;
+    converter.collect_shadowed_names(root, &mut BTreeSet::new());
     converter.ensure_function(root)?;
     converter.lower_all()
 }
@@ -124,6 +128,7 @@ pub fn convert_module<'a, 'wasm>(
         lowered: BTreeSet::new(),
         ref_table: None,
         string_equal: None,
+        strict_equality_helper: None,
         string_concat: None,
         string_utf16: None,
         string_index: None,
@@ -136,10 +141,15 @@ pub fn convert_module<'a, 'wasm>(
         arguments_push_helper: None,
         trie_enumerate_helper: None,
         object_enumerate_keys_helper: None,
+        primordial_fast_cores: BTreeMap::new(),
+        shadowed_names: BTreeSet::new(),
     };
     let mut exports = Vec::with_capacity(exported.len());
     for export in exported {
         converter.collect_shapes(export.function)?;
+        converter.shadowed_names.clear();
+        let mut visited = BTreeSet::new();
+        converter.collect_shadowed_names(export.function, &mut visited);
         exports.push((export.name, converter.ensure_function(export.function)?));
     }
     converter.lower_all()?;
@@ -344,6 +354,9 @@ struct Converter<'a, 'module, 'wasm> {
     /// Bytewise WTF-8 string equality used for shape-key checks and runtime
     /// property lookup. It is generated only when a member lookup needs it.
     string_equal: Option<Func>,
+    /// Full strict equality (`===`) over two boxed values. Generated only
+    /// when a comparison cannot be resolved by the static fast paths.
+    strict_equality_helper: Option<Func>,
     /// UTF-8 byte-array concatenation. Its result intentionally starts with
     /// no UTF-16 cache so existing indexing/length machinery owns caching.
     string_concat: Option<Func>,
@@ -388,6 +401,14 @@ struct Converter<'a, 'module, 'wasm> {
     /// Collects an object's own-property keys across every registered
     /// shape plus the generic trie fallback. See `enumerate.rs`.
     object_enumerate_keys_helper: Option<Func>,
+    /// Fast cores for provably-primordial call sites, keyed by primordial
+    /// tag. See `primordials.rs` for the tag assignment and the guarded /
+    /// provable call-emission paths.
+    primordial_fast_cores: BTreeMap<i32, Func>,
+    /// Variable names assigned somewhere in the function currently being
+    /// collected (including its nested closures). Reset per top-level
+    /// function before lowering. See `collect_shadowed_names`.
+    shadowed_names: BTreeSet<String>,
 }
 
 impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
@@ -435,6 +456,42 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             }
         }
         Ok(())
+    }
+
+    /// Record every variable name a function (transitively, including its
+    /// nested closures) assigns. A primordial name that is never assigned in
+    /// an enclosing scope chain cannot be shadowed, so call sites can skip
+    /// the runtime tag check entirely. Collected into `shadowed_names`.
+    fn collect_shadowed_names(&mut self, func: &'a SFunc, visited: &mut BTreeSet<usize>) {
+        if !visited.insert(Self::key(func)) {
+            return;
+        }
+        for (_, value) in func.cfg.values.iter() {
+            match &value.value {
+                SValue::StoreId { target, .. } => {
+                    self.shadowed_names.insert(target.0.to_string());
+                }
+                SValue::Item { item, .. } => {
+                    for nested in item.funcs() {
+                        self.collect_shadowed_names(nested, visited);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Function-declaration bodies assign their own name in the enclosing
+        // scope only at the module level, which the exported-function ABI
+        // never lowers; parameters and locals live on the context object and
+        // go through `StoreId` already. Hoisted `function name()` forms are
+        // therefore not separately tracked here.
+    }
+
+    /// Can the named identifier resolve to a primordial without any runtime
+    /// check? True when neither this function nor any nested closure assigns
+    /// that name — the context property then stays exactly the primordial
+    /// value `new_context_with_primordials` installed.
+    fn primordial_is_provable(&self, name: &str) -> bool {
+        static_primordial_tag_namespace(name).is_some() && !self.shadowed_names.contains(name)
     }
 
     fn register_shape(&mut self, mut keys: Vec<String>) {
@@ -1218,6 +1275,18 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             };
         }
         if let Item::Call { callee, args } = item {
+            // Provable primordial call: the callee is `<unshadowed
+            // primordial>.<member-with-fast-core>` — skip the lookup, the
+            // arguments array, and the `CallRef` dispatch entirely.
+            if let TCallee::Member { func, member } = callee {
+                if let Some(receiver) = values.get(func)
+                    && let Some(key) = values.get(member)
+                    && let Some(result) =
+                        self.try_provable_primordial_call(body, block, receiver, key, values, args)?
+                {
+                    return Ok(vec![result]);
+                }
+            }
             return self
                 .lower_call_parts(body, block, context, this.clone(), values, callee, args)?
                 .into_iter()
@@ -1294,6 +1363,16 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             }
             Item::Call { .. } => unreachable!("calls were lowered as continuations"),
             Item::New { class, args } => {
+                // Provable typed-array construction: `new Uint8Array(...)`
+                // with an unshadowed global goes straight to the per-kind
+                // fast core (see `try_provable_typed_constructor`).
+                if let Some(callee) = values.get(class) {
+                    if let Some(result) =
+                        self.try_provable_typed_constructor(body, block, callee, values, args)?
+                    {
+                        return Ok(vec![result]);
+                    }
+                }
                 let callee = values
                     .get(class)
                     .ok_or_else(|| ConvertError::invalid("undefined constructor"))?;
@@ -1558,7 +1637,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 ),
                 kind: ValueKind::Boolean,
             },
-            Lit::Null(_) => self.undef(body, block),
+            // JS `null` is a distinct value from `undefined`; see
+            // [`Self::js_null`] for the representation choice.
+            Lit::Null(_) => self.js_null(body, block),
             Lit::Str(string) => LowerValue::String {
                 value: self.new_string(body, block, string.value.as_wtf8().as_bytes())?,
                 key: string.value.to_string_lossy().into_owned(),
@@ -1769,7 +1850,30 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn equality(
-        &self,
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        left: &LowerValue,
+        right: &LowerValue,
+        negated: bool,
+    ) -> Result<LowerValue, ConvertError> {
+        let strict = self.strict_equality(body, block, left, right, negated)?;
+        Ok(strict)
+    }
+
+    /// JS `===` / `!==`. Static primitive combinations compare by value
+    /// inline; any comparison involving a value of statically unknown kind
+    /// goes through [`Self::ensure_strict_equality_helper`], which applies
+    /// the full strict-equality algorithm to boxed values — including the
+    /// cases the previous single-`RefEq` fallback got wrong (boxed primitives
+    /// crossing a call/property boundary, and string content equality).
+    ///
+    /// Loose `==` deliberately routes here too for now: it already didn't
+    /// coerce in the reference fallback, and the numeric/boolean paths cover
+    /// the overwhelmingly common `x == 1`-style comparisons. Full loose
+    /// coercion (e.g. `"5" == 5`) remains a known deviation.
+    fn strict_equality(
+        &mut self,
         body: &mut FunctionBody,
         block: Block,
         left: &LowerValue,
@@ -1801,14 +1905,59 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     &[Type::I32],
                 )
             }
-            _ => {
-                let left = self.box_value(body, block, left)?;
-                let right = self.box_value(body, block, right)?;
-                let equal = body.add_op(block, Operator::RefEq, &[left, right], &[Type::I32]);
+            // Statically-known string vs string compares content (two equal
+            // string structs are distinct allocations, so `ref.eq` would be
+            // wrong). Reuses the shape/property byte-equality helper.
+            (ValueKind::Reference, ValueKind::Reference)
+                if matches!(left, LowerValue::String { .. })
+                    && matches!(right, LowerValue::String { .. }) =>
+            {
+                let equal = self.ensure_string_equal()?;
+                let equal = body.add_op(
+                    block,
+                    Operator::Call { function_index: equal },
+                    &[left_value, right_value],
+                    &[Type::I32],
+                );
                 if negated {
                     body.add_op(block, Operator::I32Eqz, &[equal], &[Type::I32])
                 } else {
                     equal
+                }
+            }
+            // Any remaining statically-known cross-kind combination (string
+            // vs number, boolean vs string, ...) can never be strict-equal:
+            // strict equality never coerces.
+            //
+            // But a `Reference` whose kind is unknown may hold a boxed
+            // primitive (a value that crossed a call/property boundary), so
+            // reference-vs-primitive must still go through the runtime
+            // helper with the primitive side boxed.
+            (_, _) if matches!(left_kind, ValueKind::Reference)
+                || matches!(right_kind, ValueKind::Reference) =>
+            {
+                let helper = self.ensure_strict_equality_helper()?;
+                let left = self.box_value(body, block, left)?;
+                let right = self.box_value(body, block, right)?;
+                let equal = body.add_op(
+                    block,
+                    Operator::Call { function_index: helper },
+                    &[left, right],
+                    &[Type::I32],
+                );
+                if negated {
+                    body.add_op(block, Operator::I32Eqz, &[equal], &[Type::I32])
+                } else {
+                    equal
+                }
+            }
+            _ => {
+                let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+                // `negated` inverts: `1 !== 2` is true. XOR the constant.
+                if negated {
+                    body.add_op(block, Operator::I32Eqz, &[zero], &[Type::I32])
+                } else {
+                    zero
                 }
             }
         };
@@ -1816,6 +1965,393 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             value,
             kind: ValueKind::Boolean,
         })
+    }
+
+    /// Full strict equality (`SameValueNonNumeric` plus numeric equality)
+    /// over two boxed values at the `anyref` boundary. Handles every
+    /// combination the inline fast paths cannot prove statically:
+    /// unbox-and-compare for primitives, content equality for strings,
+    /// `ref.eq` for genuine references, and i31-sentinel checks for JS
+    /// `null` (distinguishing it from `undefined`, the null `anyref`).
+    fn ensure_strict_equality_helper(&mut self) -> Result<Func, ConvertError> {
+        if let Some(func) = self.strict_equality_helper {
+            return Ok(func);
+        }
+        let sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.value, self.repr.value],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, sig);
+        let entry = body.entry;
+        let left = body.blocks[entry].params[0].1;
+        let right = body.blocks[entry].params[1].1;
+
+        // Classify both operands once. A non-null `ref.test` returns 0 for
+        // the null `anyref` (undefined) as well, so every later test already
+        // excludes `undefined` without a separate null arm.
+        let left_number = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.number_non_null_ty(),
+            },
+            &[left],
+            &[Type::I32],
+        );
+        let right_number = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.number_non_null_ty(),
+            },
+            &[right],
+            &[Type::I32],
+        );
+        let number_pair = body.add_op(
+            entry,
+            Operator::I32And,
+            &[left_number, right_number],
+            &[Type::I32],
+        );
+        let left_string = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.string_non_null_ty(),
+            },
+            &[left],
+            &[Type::I32],
+        );
+        let right_string = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.string_non_null_ty(),
+            },
+            &[right],
+            &[Type::I32],
+        );
+        let string_pair = body.add_op(
+            entry,
+            Operator::I32And,
+            &[left_string, right_string],
+            &[Type::I32],
+        );
+        let left_boolean = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.boolean_non_null_ty(),
+            },
+            &[left],
+            &[Type::I32],
+        );
+        let right_boolean = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.boolean_non_null_ty(),
+            },
+            &[right],
+            &[Type::I32],
+        );
+        let boolean_pair = body.add_op(
+            entry,
+            Operator::I32And,
+            &[left_boolean, right_boolean],
+            &[Type::I32],
+        );
+        let left_js_null = self.is_js_null(&mut body, entry, left);
+        let right_js_null = self.is_js_null(&mut body, entry, right);
+
+        // Chain of pairwise tests. Within each matched pair the casts are
+        // safe; an unmatched value cannot equal the other side (a primitive
+        // never strict-equals a different primitive or a reference), so each
+        // miss contributes a constant 0 and control continues to the next
+        // test. Values of different kinds and any reference/primitive mix
+        // never reach the wrong branch.
+        let join = body.add_block();
+        let result = body.add_blockparam(join, Type::I32);
+
+        let mut miss_block = entry;
+
+        // 1. Numbers: unbox and compare. `F64Eq` gives correct `NaN !== NaN`
+        //    and `+0 === -0` semantics for free.
+        let number_test = body.add_block();
+        body.set_terminator(
+            miss_block,
+            Terminator::CondBr {
+                cond: number_pair,
+                if_true: BlockTarget {
+                    block: number_test,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: number_test,
+                    args: vec![],
+                },
+            },
+        );
+        let number_miss = body.add_block();
+        let number_hit = body.add_block();
+        body.set_terminator(
+            number_test,
+            Terminator::CondBr {
+                cond: number_pair,
+                if_true: BlockTarget {
+                    block: number_hit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: number_miss,
+                    args: vec![],
+                },
+            },
+        );
+        let left_num = body.add_op(
+            number_hit,
+            Operator::RefCast {
+                ty: self.repr.number_ty(),
+            },
+            &[left],
+            &[self.repr.number_ty()],
+        );
+        let right_num = body.add_op(
+            number_hit,
+            Operator::RefCast {
+                ty: self.repr.number_ty(),
+            },
+            &[right],
+            &[self.repr.number_ty()],
+        );
+        let left_bits = body.add_op(
+            number_hit,
+            Operator::StructGet {
+                sig: self.repr.number,
+                idx: 0,
+            },
+            &[left_num],
+            &[Type::F64],
+        );
+        let right_bits = body.add_op(
+            number_hit,
+            Operator::StructGet {
+                sig: self.repr.number,
+                idx: 0,
+            },
+            &[right_num],
+            &[Type::F64],
+        );
+        let number_equal = body.add_op(
+            number_hit,
+            Operator::F64Eq,
+            &[left_bits, right_bits],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            number_hit,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![number_equal],
+                },
+            },
+        );
+        miss_block = number_miss;
+
+        // 2. Strings: content equality through the byte-compare helper.
+        let string_hit = body.add_block();
+        let string_miss = body.add_block();
+        body.set_terminator(
+            miss_block,
+            Terminator::CondBr {
+                cond: string_pair,
+                if_true: BlockTarget {
+                    block: string_hit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: string_miss,
+                    args: vec![],
+                },
+            },
+        );
+        let left_str = body.add_op(
+            string_hit,
+            Operator::RefCast {
+                ty: self.repr.string_ty(),
+            },
+            &[left],
+            &[self.repr.string_ty()],
+        );
+        let right_str = body.add_op(
+            string_hit,
+            Operator::RefCast {
+                ty: self.repr.string_ty(),
+            },
+            &[right],
+            &[self.repr.string_ty()],
+        );
+        let string_equal = self.ensure_string_equal()?;
+        let strings_equal = body.add_op(
+            string_hit,
+            Operator::Call {
+                function_index: string_equal,
+            },
+            &[left_str, right_str],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            string_hit,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![strings_equal],
+                },
+            },
+        );
+        miss_block = string_miss;
+
+        // 3. Booleans: unbox and compare bits.
+        let boolean_hit = body.add_block();
+        let boolean_miss = body.add_block();
+        body.set_terminator(
+            miss_block,
+            Terminator::CondBr {
+                cond: boolean_pair,
+                if_true: BlockTarget {
+                    block: boolean_hit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: boolean_miss,
+                    args: vec![],
+                },
+            },
+        );
+        let left_bool = body.add_op(
+            boolean_hit,
+            Operator::RefCast {
+                ty: self.repr.boolean_ty(),
+            },
+            &[left],
+            &[self.repr.boolean_ty()],
+        );
+        let right_bool = body.add_op(
+            boolean_hit,
+            Operator::RefCast {
+                ty: self.repr.boolean_ty(),
+            },
+            &[right],
+            &[self.repr.boolean_ty()],
+        );
+        let left_bit = body.add_op(
+            boolean_hit,
+            Operator::StructGet {
+                sig: self.repr.boolean,
+                idx: 0,
+            },
+            &[left_bool],
+            &[Type::I32],
+        );
+        let right_bit = body.add_op(
+            boolean_hit,
+            Operator::StructGet {
+                sig: self.repr.boolean,
+                idx: 0,
+            },
+            &[right_bool],
+            &[Type::I32],
+        );
+        let boolean_equal = body.add_op(
+            boolean_hit,
+            Operator::I32Eq,
+            &[left_bit, right_bit],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            boolean_hit,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![boolean_equal],
+                },
+            },
+        );
+        miss_block = boolean_miss;
+
+        // 4. JS null: two i31 sentinels with the same payload are equal to
+        //    each other and to nothing else (undefined is the null `anyref`,
+        //    so it never passes the i31 test).
+        let null_hit = body.add_block();
+        let null_miss = body.add_block();
+        let either_js_null = body.add_op(
+            miss_block,
+            Operator::I32Or,
+            &[left_js_null, right_js_null],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            miss_block,
+            Terminator::CondBr {
+                cond: either_js_null,
+                if_true: BlockTarget {
+                    block: null_hit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: null_miss,
+                    args: vec![],
+                },
+            },
+        );
+        let nulls_equal = body.add_op(
+            null_hit,
+            Operator::I32And,
+            &[left_js_null, right_js_null],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            null_hit,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![nulls_equal],
+                },
+            },
+        );
+
+        // 5. Genuine references: `ref.eq`. Requires `eqref` operands, so cast
+        //    both sides; every value this backend produces (struct, array,
+        //    i31, null) is an eqref subtype, so the cast cannot trap.
+        let eq = self.repr.eq_ty();
+        let left_eq = body.add_op(null_miss, Operator::RefCast { ty: eq }, &[left], &[eq]);
+        let right_eq = body.add_op(null_miss, Operator::RefCast { ty: eq }, &[right], &[eq]);
+        let references_equal = body.add_op(
+            null_miss,
+            Operator::RefEq,
+            &[left_eq, right_eq],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            null_miss,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![references_equal],
+                },
+            },
+        );
+
+        body.set_terminator(
+            join,
+            Terminator::Return {
+                values: vec![result],
+            },
+        );
+
+        let func = self.module.funcs.push(FuncDecl::Body(
+            sig,
+            format!("js_strict_equal_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.strict_equality_helper = Some(func);
+        Ok(func)
     }
 
     fn as_f64(
@@ -2017,6 +2553,40 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             ),
             kind: ValueKind::Reference,
         }
+    }
+
+    /// The JS `null` value. `undefined` keeps the null `anyref`, so `null`
+    /// needs its own representation: an [`JS_NULL_SENTINEL`] i31. That makes
+    /// `x === null` a `ref.test (ref i31)`, keeps `null === null` and
+    /// `null === undefined` trivially correct under `ref.eq` (equal and
+    /// unequal respectively), and costs one constant plus one instruction.
+    fn js_null(&self, body: &mut FunctionBody, block: Block) -> LowerValue {
+        let sentinel = body.add_op(
+            block,
+            Operator::I32Const {
+                value: JS_NULL_SENTINEL as u32,
+            },
+            &[],
+            &[Type::I32],
+        );
+        LowerValue::Wasm {
+            value: body.add_op(block, Operator::RefI31, &[sentinel], &[self.repr.value]),
+            kind: ValueKind::Reference,
+        }
+    }
+
+    /// `value === JS null` as a raw i32 condition. Used by strict equality,
+    /// the truthiness helper's caller-adjacent fast paths, and any primordial
+    /// that must distinguish "absent" from "explicitly null".
+    fn is_js_null(&self, body: &mut FunctionBody, block: Block, value: Value) -> Value {
+        body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.i31_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        )
     }
 
     fn box_value(
@@ -5137,12 +5707,22 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         );
         let captured_this = self.box_value(body, block, &this)?;
         let trie = self.anyref(body, block, trie);
+        let tag = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
         let value = body.add_op(
             block,
             Operator::StructNew {
                 sig: self.repr.function,
             },
-            &[trie, elements, properties, code, context, captured_this, arrow],
+            &[
+                trie,
+                elements,
+                properties,
+                code,
+                context,
+                captured_this,
+                arrow,
+                tag,
+            ],
             &[self.repr.function_ty()],
         );
         Ok(LowerValue::Wasm {

@@ -181,6 +181,23 @@ fn native_function_value(
     context: Value,
     func: Func,
 ) -> Result<LowerValue, ConvertError> {
+    self.primordial_function_value(body, block, context, func, 0)
+}
+
+/// Install a declared native adapter as an ordinary function value with a
+/// nonzero [`PRIMORDIAL_TAG_BASE`]-offset tag. The tag rides in the final
+/// field of the function struct and lets a call site confirm "this callee is
+/// still exactly the primordial I expect" with one `i32.eq` — function
+/// references themselves are not `eqref`, so `ref.eq` cannot make that
+/// comparison. A tag of 0 marks user (non-primordial) functions.
+fn primordial_function_value(
+    &self,
+    body: &mut FunctionBody,
+    block: Block,
+    context: Value,
+    func: Func,
+    tag: i32,
+) -> Result<LowerValue, ConvertError> {
     let trie = self.new_trie(body, block)?;
     let trie = self.anyref(body, block, trie);
     let elements = body.add_op(
@@ -214,12 +231,22 @@ fn native_function_value(
         &[self.repr.value],
     );
     let arrow = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+    let tag = body.add_op(block, Operator::I32Const { value: tag as u32 }, &[], &[Type::I32]);
     let value = body.add_op(
         block,
         Operator::StructNew {
             sig: self.repr.function,
         },
-        &[trie, elements, extra, code, context, captured_this, arrow],
+        &[
+            trie,
+            elements,
+            extra,
+            code,
+            context,
+            captured_this,
+            arrow,
+            tag,
+        ],
         &[self.repr.function_ty()],
     );
     Ok(LowerValue::Wasm {
@@ -573,7 +600,13 @@ fn build_math_namespace(
     for (name, op) in UNARY {
         let func = self.math_unary_method(name, *op)?;
         let (context, _) = math.wasm()?;
-        let value = self.native_function_value(body, *block, context, func)?;
+        let value = self.primordial_function_value(
+            body,
+            *block,
+            context,
+            func,
+            static_primordial_tag("Math", name).unwrap_or(0),
+        )?;
         *block = self.set_static_property_value_raw(body, *block, &math, name, &value)?;
     }
 
@@ -581,7 +614,13 @@ fn build_math_namespace(
     for (name, op) in BINARY {
         let func = self.math_binary_method(name, *op)?;
         let (context, _) = math.wasm()?;
-        let value = self.native_function_value(body, *block, context, func)?;
+        let value = self.primordial_function_value(
+            body,
+            *block,
+            context,
+            func,
+            static_primordial_tag("Math", name).unwrap_or(0),
+        )?;
         *block = self.set_static_property_value_raw(body, *block, &math, name, &value)?;
     }
 
@@ -592,7 +631,13 @@ fn build_math_namespace(
         ("imul", self.math_imul_method()?),
     ] {
         let (context, _) = math.wasm()?;
-        let value = self.native_function_value(body, *block, context, func)?;
+        let value = self.primordial_function_value(
+            body,
+            *block,
+            context,
+            func,
+            static_primordial_tag("Math", name).unwrap_or(0),
+        )?;
         *block = self.set_static_property_value_raw(body, *block, &math, name, &value)?;
     }
 
@@ -2508,4 +2553,787 @@ fn array_map_method(&mut self) -> Result<Func, ConvertError> {
     )
 }
 
+}
+/// Stable tag constants for primordials with a fast core. These flow into
+/// the function struct's final i32 field (see `primordial_function_value`)
+/// and let a call site verify "this callee is still exactly this primordial"
+/// with one `i32.eq` — function references are not `eqref`, so `ref.eq`
+/// cannot make the comparison. Tags must stay in sync across compiles of one
+/// module only; they are never persisted.
+pub(crate) const PRIMORDIAL_TAG_BASE: i32 = 1;
+
+pub(crate) const TAG_MATH_ABS: i32 = PRIMORDIAL_TAG_BASE;
+pub(crate) const TAG_MATH_FLOOR: i32 = PRIMORDIAL_TAG_BASE + 1;
+pub(crate) const TAG_MATH_CEIL: i32 = PRIMORDIAL_TAG_BASE + 2;
+pub(crate) const TAG_MATH_TRUNC: i32 = PRIMORDIAL_TAG_BASE + 3;
+pub(crate) const TAG_MATH_SQRT: i32 = PRIMORDIAL_TAG_BASE + 4;
+pub(crate) const TAG_MATH_MIN: i32 = PRIMORDIAL_TAG_BASE + 5;
+pub(crate) const TAG_MATH_MAX: i32 = PRIMORDIAL_TAG_BASE + 6;
+pub(crate) const TAG_MATH_SIGN: i32 = PRIMORDIAL_TAG_BASE + 7;
+pub(crate) const TAG_MATH_ROUND: i32 = PRIMORDIAL_TAG_BASE + 8;
+pub(crate) const TAG_MATH_FROUND: i32 = PRIMORDIAL_TAG_BASE + 9;
+pub(crate) const TAG_MATH_IMUL: i32 = PRIMORDIAL_TAG_BASE + 10;
+pub(crate) const TAG_ARRAY_IS_ARRAY: i32 = PRIMORDIAL_TAG_BASE + 11;
+
+/// Static namespace-member tag lookup. `None` means the primordial has no
+/// fast core (its calls keep the generic dispatch path).
+fn static_primordial_tag(namespace: &str, member: &str) -> Option<i32> {
+    match (namespace, member) {
+        ("Math", "abs") => Some(TAG_MATH_ABS),
+        ("Math", "floor") => Some(TAG_MATH_FLOOR),
+        ("Math", "ceil") => Some(TAG_MATH_CEIL),
+        ("Math", "trunc") => Some(TAG_MATH_TRUNC),
+        ("Math", "sqrt") => Some(TAG_MATH_SQRT),
+        ("Math", "min") => Some(TAG_MATH_MIN),
+        ("Math", "max") => Some(TAG_MATH_MAX),
+        ("Math", "sign") => Some(TAG_MATH_SIGN),
+        ("Math", "round") => Some(TAG_MATH_ROUND),
+        ("Math", "fround") => Some(TAG_MATH_FROUND),
+        ("Math", "imul") => Some(TAG_MATH_IMUL),
+        ("Array", "isArray") => Some(TAG_ARRAY_IS_ARRAY),
+        _ => None,
+    }
+}
+
+impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
+    /// Build (or fetch from cache) the fast core for a primordial tag: a
+    /// plain Wasm function with an unboxed signature that the guarded and
+    /// provable call paths invoke directly, skipping the generic adapter's
+    /// arguments-array packing and `CallRef`. Every core has the ABI
+    /// `(f64...) -> f64` for the numeric surface; the arguments are missing
+    /// -argument/`undefined`-coerced to `NaN` by construction of the fast
+    /// path (the provable path statically knows arity, and the guarded path
+    /// passes NaN padding for absent arguments).
+    fn ensure_primordial_fast_core(&mut self, tag: i32) -> Result<Func, ConvertError> {
+        if let Some(func) = self.primordial_fast_cores.get(&tag) {
+            return Ok(*func);
+        }
+        let (name, build): (&str, Box<dyn FnOnce(&mut FunctionBody, Block, &[Value])>) =
+            match tag {
+                TAG_MATH_ABS => ("math_abs", Box::new(|body, block, args| unary_core(body, block, &args[0], Operator::F64Abs))),
+                TAG_MATH_FLOOR => ("math_floor", Box::new(|body, block, args| unary_core(body, block, &args[0], Operator::F64Floor))),
+                TAG_MATH_CEIL => ("math_ceil", Box::new(|body, block, args| unary_core(body, block, &args[0], Operator::F64Ceil))),
+                TAG_MATH_TRUNC => ("math_trunc", Box::new(|body, block, args| unary_core(body, block, &args[0], Operator::F64Trunc))),
+                TAG_MATH_SQRT => ("math_sqrt", Box::new(|body, block, args| unary_core(body, block, &args[0], Operator::F64Sqrt))),
+                TAG_MATH_MIN => ("math_min", Box::new(|body, block, args| binary_core(body, block, &args[0], &args[1], Operator::F64Min))),
+                TAG_MATH_MAX => ("math_max", Box::new(|body, block, args| binary_core(body, block, &args[0], &args[1], Operator::F64Max))),
+                TAG_MATH_SIGN => ("math_sign", Box::new(sign_core)),
+                TAG_MATH_ROUND => ("math_round", Box::new(round_core)),
+                TAG_MATH_FROUND => ("math_fround", Box::new(fround_core)),
+                TAG_MATH_IMUL => ("math_imul", Box::new(imul_core)),
+                _ => return Err(ConvertError::invalid("unknown primordial fast-core tag")),
+            };
+        let _ = name;
+        let arity = match tag {
+            TAG_MATH_MIN | TAG_MATH_MAX | TAG_MATH_IMUL => 2,
+            _ => 1,
+        };
+        if self.primordial_fast_cores.contains_key(&tag) {
+            return Ok(self.primordial_fast_cores[&tag]);
+        }
+        let sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![Type::F64; arity],
+            returns: vec![Type::F64],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, sig);
+        let entry = body.entry;
+        let args: Vec<Value> = body.blocks[entry]
+            .params
+            .iter()
+            .map(|(_, value)| *value)
+            .collect();
+        build(&mut body, entry, &args);
+        let func = self.module.funcs.push(FuncDecl::Body(
+            sig,
+            format!("js_fast_core_{tag}"),
+            body,
+        ));
+        self.primordial_fast_cores.insert(tag, func);
+        Ok(func)
+    }
+
+    /// `Array.isArray` fast core: `(anyref) -> i32` on the unboxed value,
+    /// mirroring the generic adapter's body without the boxing round trip.
+    fn ensure_is_array_fast_core(&mut self) -> Result<Func, ConvertError> {
+        if let Some(func) = self.primordial_fast_cores.get(&TAG_ARRAY_IS_ARRAY) {
+            return Ok(*func);
+        }
+        let sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.value],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, sig);
+        let entry = body.entry;
+        let raw = body.blocks[entry].params[0].1;
+        let is_null = body.add_op(entry, Operator::RefIsNull, &[raw], &[Type::I32]);
+        let non_null = body.add_block();
+        let is_object = body.add_block();
+        let not_array = body.add_block();
+        let result_join = body.add_block();
+        let result = body.add_blockparam(result_join, Type::I32);
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: is_null,
+                if_true: BlockTarget {
+                    block: not_array,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: non_null,
+                    args: vec![],
+                },
+            },
+        );
+        let matches_object = body.add_op(
+            non_null,
+            Operator::RefTest {
+                ty: self.repr.object_ty(),
+            },
+            &[raw],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            non_null,
+            Terminator::CondBr {
+                cond: matches_object,
+                if_true: BlockTarget {
+                    block: is_object,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: not_array,
+                    args: vec![],
+                },
+            },
+        );
+        let plain = body.add_op(
+            is_object,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[raw],
+            &[self.repr.object_ty()],
+        );
+        let elements = body.add_op(
+            is_object,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 1,
+            },
+            &[plain],
+            &[self.repr.arguments_ty()],
+        );
+        let has_elements = body.add_op(is_object, Operator::RefIsNull, &[elements], &[Type::I32]);
+        let is_array = body.add_op(is_object, Operator::I32Eqz, &[has_elements], &[Type::I32]);
+        body.set_terminator(
+            is_object,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: result_join,
+                    args: vec![is_array],
+                },
+            },
+        );
+        let zero = body.add_op(not_array, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        body.set_terminator(
+            not_array,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: result_join,
+                    args: vec![zero],
+                },
+            },
+        );
+        body.set_terminator(
+            result_join,
+            Terminator::Return {
+                values: vec![result],
+            },
+        );
+        let func = self.module.funcs.push(FuncDecl::Body(
+            sig,
+            "js_fast_core_is_array".to_string(),
+            body,
+        ));
+        self.primordial_fast_cores
+            .insert(TAG_ARRAY_IS_ARRAY, func);
+        Ok(func)
+    }
+
+    /// Emit a guarded direct call to a primordial fast core. The callee value
+    /// is checked at runtime: `ref.test` that it is a function struct, read
+    /// its primordial tag, and `i32.eq` against the expected tag. On match,
+    /// arguments are converted with the raw numeric/string coercions and the
+    /// core is called directly; on mismatch, `fallback` produces the blocks
+    /// for the ordinary generic-dispatch path.
+    #[allow(clippy::too_many_arguments)]
+    fn guarded_primordial_call(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        callee: &LowerValue,
+        expected_tag: i32,
+        args: &[LowerValue],
+        fallback: impl FnOnce(
+            &mut Self,
+            &mut FunctionBody,
+            Block,
+        ) -> Result<Vec<(Block, LowerValue)>, ConvertError>,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let (callee_value, kind) = callee.wasm()?;
+        if kind != ValueKind::Reference {
+            return fallback(self, body, block);
+        }
+        let is_function = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.function_non_null_ty(),
+            },
+            &[callee_value],
+            &[Type::I32],
+        );
+        let check = body.add_block();
+        let slow = body.add_block();
+        let fast = body.add_block();
+        let join = body.add_block();
+        let joined = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_function,
+                if_true: BlockTarget {
+                    block: check,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: slow,
+                    args: vec![],
+                },
+            },
+        );
+        let function = body.add_op(
+            check,
+            Operator::RefCast {
+                ty: self.repr.function_ty(),
+            },
+            &[callee_value],
+            &[self.repr.function_ty()],
+        );
+        let tag = body.add_op(
+            check,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: FUNCTION_FIELD_TAG,
+            },
+            &[function],
+            &[Type::I32],
+        );
+        let expected = body.add_op(
+            check,
+            Operator::I32Const {
+                value: expected_tag as u32,
+            },
+            &[],
+            &[Type::I32],
+        );
+        let matches = body.add_op(check, Operator::I32Eq, &[tag, expected], &[Type::I32]);
+        body.set_terminator(
+            check,
+            Terminator::CondBr {
+                cond: matches,
+                if_true: BlockTarget {
+                    block: fast,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: slow,
+                    args: vec![],
+                },
+            },
+        );
+        // Fast path: convert each argument at its position (missing/undefined
+        // → NaN matches the generic adapters' `read_arg_number` semantics) and
+        // call the unboxed core.
+        let mut blocks = vec![fast];
+        let mut core_args = Vec::with_capacity(args.len());
+        for arg in args.iter() {
+            let block = *blocks.last().expect("non-empty");
+            let (next, converted) = self.unbox_or_nan(body, block, arg)?;
+            core_args.push(converted);
+            blocks.push(next);
+        }
+        let core = self.ensure_primordial_fast_core(expected_tag)?;
+        let last = *blocks.last().expect("non-empty");
+        let call_args = self.pad_core_args(body, last, &core_args, core)?;
+        let result = body.add_op(
+            last,
+            Operator::Call {
+                function_index: core,
+            },
+            &call_args,
+            &[Type::F64],
+        );
+        let boxed = self.box_value(
+            body,
+            last,
+            &LowerValue::Wasm {
+                value: result,
+                kind: ValueKind::Number,
+            },
+        )?;
+        body.set_terminator(
+            last,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![boxed],
+                },
+            },
+        );
+        for (slow_block, slow_value) in fallback(self, body, slow)? {
+            let slow_value = self.box_value(body, slow_block, &slow_value)?;
+            body.set_terminator(
+                slow_block,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![slow_value],
+                    },
+                },
+            );
+        }
+        Ok(vec![(
+            join,
+            LowerValue::Wasm {
+                value: joined,
+                kind: ValueKind::Reference,
+            },
+        )])
+    }
+
+    /// Convert one call argument to the fast core's `f64` ABI. A missing or
+    /// `undefined` argument becomes `NaN`, matching `read_arg_number`.
+    fn unbox_or_nan(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        arg: &LowerValue,
+    ) -> Result<(Block, Value), ConvertError> {
+        let (value, kind) = arg.wasm()?;
+        Ok(match kind {
+            ValueKind::Number => (block, value),
+            ValueKind::Boolean | ValueKind::Integer => (
+                block,
+                body.add_op(block, Operator::F64ConvertI32S, &[value], &[Type::F64]),
+            ),
+            ValueKind::Reference => {
+                let is_null = body.add_op(block, Operator::RefIsNull, &[value], &[Type::I32]);
+                let convert = body.add_block();
+                let nan = body.add_block();
+                let join = body.add_block();
+                let result = body.add_blockparam(join, Type::F64);
+                body.set_terminator(
+                    block,
+                    Terminator::CondBr {
+                        cond: is_null,
+                        if_true: BlockTarget {
+                            block: nan,
+                            args: vec![],
+                        },
+                        if_false: BlockTarget {
+                            block: convert,
+                            args: vec![],
+                        },
+                    },
+                );
+                let nan_value = body.add_op(
+                    nan,
+                    Operator::F64Const {
+                        value: f64::NAN.to_bits(),
+                    },
+                    &[],
+                    &[Type::F64],
+                );
+                body.set_terminator(
+                    nan,
+                    Terminator::Br {
+                        target: BlockTarget {
+                            block: join,
+                            args: vec![nan_value],
+                        },
+                    },
+                );
+                let number = self.as_f64(
+                    body,
+                    convert,
+                    &LowerValue::Wasm {
+                        value,
+                        kind: ValueKind::Reference,
+                    },
+                )?;
+                body.set_terminator(
+                    convert,
+                    Terminator::Br {
+                        target: BlockTarget {
+                            block: join,
+                            args: vec![number],
+                        },
+                    },
+                );
+                (join, result)
+            }
+        })
+    }
+
+    /// Pad core arguments with NaN constants out to the core's arity.
+    fn pad_core_args(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        core_args: &[Value],
+        core: Func,
+    ) -> Result<Vec<Value>, ConvertError> {
+        let sig = self.module.funcs[core].sig();
+        let arity = match &self.module.signatures[sig] {
+            SignatureData::Func { params, .. } => params.len(),
+            _ => return Err(ConvertError::invalid("fast core signature is not a func")),
+        };
+        let mut args = core_args.to_vec();
+        while args.len() < arity {
+            let nan = body.add_op(
+                block,
+                Operator::F64Const {
+                    value: f64::NAN.to_bits(),
+                },
+                &[],
+                &[Type::F64],
+            );
+            args.push(nan);
+        }
+        Ok(args)
+    }
+}
+
+fn unary_core(body: &mut FunctionBody, block: Block, x: &Value, op: Operator) {
+    let result = body.add_op(block, op, &[*x], &[Type::F64]);
+    body.set_terminator(block, Terminator::Return { values: vec![result] });
+}
+
+fn binary_core(body: &mut FunctionBody, block: Block, x: &Value, y: &Value, op: Operator) {
+    let result = body.add_op(block, op, &[*x, *y], &[Type::F64]);
+    body.set_terminator(block, Terminator::Return { values: vec![result] });
+}
+
+fn sign_core(body: &mut FunctionBody, block: Block, args: &[Value]) {
+    let x = args[0];
+    let zero = body.add_op(block, Operator::F64Const { value: 0 }, &[], &[Type::F64]);
+    let is_positive = body.add_op(block, Operator::F64Gt, &[x, zero], &[Type::I32]);
+    let is_negative = body.add_op(block, Operator::F64Lt, &[x, zero], &[Type::I32]);
+    let one = body.add_op(
+        block,
+        Operator::F64Const {
+            value: 1.0f64.to_bits(),
+        },
+        &[],
+        &[Type::F64],
+    );
+    let minus_one = body.add_op(
+        block,
+        Operator::F64Const {
+            value: (-1.0f64).to_bits(),
+        },
+        &[],
+        &[Type::F64],
+    );
+    let negative_or_x = body.add_op(
+        block,
+        Operator::TypedSelect { ty: Type::F64 },
+        &[minus_one, x, is_negative],
+        &[Type::F64],
+    );
+    let result = body.add_op(
+        block,
+        Operator::TypedSelect { ty: Type::F64 },
+        &[one, negative_or_x, is_positive],
+        &[Type::F64],
+    );
+    body.set_terminator(block, Terminator::Return { values: vec![result] });
+}
+
+fn round_core(body: &mut FunctionBody, block: Block, args: &[Value]) {
+    let x = args[0];
+    let half = body.add_op(
+        block,
+        Operator::F64Const {
+            value: 0.5f64.to_bits(),
+        },
+        &[],
+        &[Type::F64],
+    );
+    let shifted = body.add_op(block, Operator::F64Add, &[x, half], &[Type::F64]);
+    let result = body.add_op(block, Operator::F64Floor, &[shifted], &[Type::F64]);
+    body.set_terminator(block, Terminator::Return { values: vec![result] });
+}
+
+fn fround_core(body: &mut FunctionBody, block: Block, args: &[Value]) {
+    let x = args[0];
+    let narrowed = body.add_op(block, Operator::F32DemoteF64, &[x], &[Type::F32]);
+    let result = body.add_op(block, Operator::F64PromoteF32, &[narrowed], &[Type::F64]);
+    body.set_terminator(block, Terminator::Return { values: vec![result] });
+}
+
+fn imul_core(body: &mut FunctionBody, block: Block, args: &[Value]) {
+    let x = args[0];
+    let y = args[1];
+    let x = body.add_op(block, Operator::I32TruncSatF64S, &[x], &[Type::I32]);
+    let y = body.add_op(block, Operator::I32TruncSatF64S, &[y], &[Type::I32]);
+    let product = body.add_op(block, Operator::I32Mul, &[x, y], &[Type::I32]);
+    let result = body.add_op(block, Operator::F64ConvertI32S, &[product], &[Type::F64]);
+    body.set_terminator(block, Terminator::Return { values: vec![result] });
+}
+impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
+    /// The provable direct-call path (plan Part 2, item 2). Called from
+    /// `lower_call_parts` before the ordinary lookup. Fires when:
+    ///   1. the callee receiver is a `LowerValue::ReferenceKey` produced by
+    ///      `LoadId` of a primordial namespace identifier (`Math`, ...),
+    ///   2. the member key is a static string with a registered fast core,
+    ///   3. the shadowing scan proves the namespace identifier is never
+    ///      assigned anywhere in the function (or its nested closures).
+    ///
+    /// Under those conditions the context property is still exactly the
+    /// primordial value `new_context_with_primordials` installed, so the
+    /// lookup, the namespace materialization the reader would keep alive,
+    /// the arguments array, and the `CallRef` dispatch all vanish. Each
+    /// argument is unboxed at its position and the typed fast core is
+    /// called directly.
+    ///
+    /// Returns `None` when any condition fails, leaving the ordinary path
+    /// completely in charge (including its block state — `block` is not
+    /// touched unless `Some` is returned).
+    #[allow(clippy::too_many_arguments)]
+    fn try_provable_primordial_call(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        receiver: &LowerValue,
+        key: &LowerValue,
+        values: &BTreeMap<SValueId, LowerValue>,
+        args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
+    ) -> Result<Option<(Block, LowerValue)>, ConvertError> {
+        // 1. Receiver must be the unshadowed identifier read.
+        let LowerValue::ReferenceKey { key: namespace, .. } = receiver else {
+            return Ok(None);
+        };
+        let provable = self.primordial_is_provable(namespace);
+        // 2. Static member key with a fast core.
+        let Ok(member) = self.key_of(key) else {
+            return Ok(None);
+        };
+        let Some(tag) = static_primordial_tag(namespace, &member) else {
+            return Ok(None);
+        };
+        // Spread arguments have no position-wise unboxing; leave them generic.
+        if args.iter().any(|arg| arg.is_spread) {
+            return Ok(None);
+        }
+        let mut core_args = Vec::with_capacity(args.len());
+        for arg in args {
+            let value = values
+                .get(&arg.value)
+                .ok_or_else(|| ConvertError::invalid("undefined call argument"))?;
+            core_args.push(value.clone());
+        }
+        if !provable {
+            // Guarded path (plan Part 2, item 3): shadowing could not be
+            // ruled out statically, so verify the callee's primordial tag at
+            // runtime and fall back to generic dispatch on mismatch. One
+            // predictable branch replaces the boxing + `CallRef` cost
+            // whenever the callee really is the primordial.
+            let callees = self.get_property_value(body, block, receiver, &member)?;
+            let mut continuations = Vec::with_capacity(callees.len());
+            for (callee_block, callee) in callees {
+                let fallback = |this: &mut Self,
+                                body: &mut FunctionBody,
+                                slow: Block|
+                 -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+                    let (ctx, this_v, code, _arrow) =
+                        this.callable_parts(body, slow, &callee, receiver.clone())?;
+                    let array = this.make_arguments(body, slow, values, args)?;
+                    let result = body.add_op(
+                        slow,
+                        Operator::CallRef {
+                            sig_index: this.repr.adapter,
+                        },
+                        &[ctx, this_v, array, code],
+                        &[this.repr.value],
+                    );
+                    Ok(vec![(
+                        slow,
+                        LowerValue::Wasm {
+                            value: result,
+                            kind: ValueKind::Reference,
+                        },
+                    )])
+                };
+                let continuation =
+                    self.guarded_primordial_call(body, callee_block, &callee, tag, &core_args, fallback)?;
+                continuations.extend(continuation);
+            }
+            return Ok(Some((continuations[0].0, continuations[0].1.clone())));
+        }
+        // 3. Direct dispatch: unbox each argument, call the core, box the
+        // result. The receiver of an unshadowed primordial method is the
+        // namespace object itself; `this` is unused by every fast core, so
+        // the undefined receiver stays undefined exactly as the generic
+        // adapters see it.
+        //
+        // `Array.isArray` has a dedicated boolean `(anyref) -> i32` core; the
+        // numeric surface shares the uniform `(f64...) -> f64` ABI.
+        if tag == TAG_ARRAY_IS_ARRAY {
+            let core = self.ensure_is_array_fast_core()?;
+            let raw = match core_args.first() {
+                Some(arg) => self.box_value(body, block, arg)?,
+                None => body.add_op(
+                    block,
+                    Operator::RefNull {
+                        ty: self.repr.value,
+                    },
+                    &[],
+                    &[self.repr.value],
+                ),
+            };
+            let result = body.add_op(
+                block,
+                Operator::Call {
+                    function_index: core,
+                },
+                &[raw],
+                &[Type::I32],
+            );
+            let boxed = self.box_value(
+                body,
+                block,
+                &LowerValue::Wasm {
+                    value: result,
+                    kind: ValueKind::Boolean,
+                },
+            )?;
+            return Ok(Some((
+                block,
+                LowerValue::Wasm {
+                    value: boxed,
+                    kind: ValueKind::Reference,
+                },
+            )));
+        }
+        let mut current = block;
+        let mut numeric_args = Vec::with_capacity(core_args.len());
+        for arg in &core_args {
+            let (next, converted) = self.unbox_or_nan(body, current, arg)?;
+            numeric_args.push(converted);
+            current = next;
+        }
+        let block = current;
+        let core = self.ensure_primordial_fast_core(tag)?;
+        let call_args = self.pad_core_args(body, block, &numeric_args, core)?;
+        let result = body.add_op(
+            block,
+            Operator::Call {
+                function_index: core,
+            },
+            &call_args,
+            &[Type::F64],
+        );
+        let boxed = self.box_value(
+            body,
+            block,
+            &LowerValue::Wasm {
+                value: result,
+                kind: ValueKind::Number,
+            },
+        )?;
+        Ok(Some((
+            block,
+            LowerValue::Wasm {
+                value: boxed,
+                kind: ValueKind::Reference,
+            },
+        )))
+    }
+}
+
+
+impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
+    /// The provable direct-construction path for typed arrays (plan Part 2,
+    /// item 4). Fires for `new Int8Array(...)`-style call sites when the
+    /// constructor identifier is provably unshadowed. Skips the pre-allocated
+    /// receiver object, the arrow-reject branch, the constructor-returned
+    /// object override check, the arguments array, and the `CallRef`: the
+    /// per-kind fast core builds and returns the typed array directly.
+    ///
+    /// `context` must still be consulted for the fallback path only; on the
+    /// fast path none of the generic `new` machinery is materialized.
+    fn try_provable_typed_constructor(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        callee: &LowerValue,
+        values: &BTreeMap<SValueId, LowerValue>,
+        args: &[SValueId],
+    ) -> Result<Option<(Block, LowerValue)>, ConvertError> {
+        let LowerValue::ReferenceKey { key: name, .. } = callee else {
+            return Ok(None);
+        };
+        if !self.primordial_is_provable(name) {
+            return Ok(None);
+        }
+        let Some(kind) = TypedArrayKind::from_name(name) else {
+            return Ok(None);
+        };
+        if !args.is_empty() && args.len() != 1 {
+            // Multi-argument forms (typed-array-of-iterable with mapping
+            // functions) stay on the generic path.
+            return Ok(None);
+        }
+        let source = match args.first() {
+            Some(arg) => values
+                .get(arg)
+                .cloned()
+                .ok_or_else(|| ConvertError::invalid("undefined constructor argument"))?,
+            None => self.undef(body, block),
+        };
+        let boxed_source = self.box_value(body, block, &source)?;
+        let core = self.typed_array_constructor_core(kind)?;
+        let result = body.add_op(
+            block,
+            Operator::Call {
+                function_index: core,
+            },
+            &[boxed_source],
+            &[self.repr.value],
+        );
+        Ok(Some((
+            block,
+            LowerValue::Wasm {
+                value: result,
+                kind: ValueKind::Reference,
+            },
+        )))
+    }
+}
+
+/// Namespace-level tag lookup used by the provable path: is this identifier
+/// a primordial global at all (`Math`, `Array`, ...), and if so, which
+/// member tags does it own? The member map lets a call site combine a
+/// provably-unshadowed namespace with a statically-known member name.
+pub(crate) fn static_primordial_tag_namespace(name: &str) -> Option<()> {
+    match name {
+        "Math" | "Array" | "Reflect" | "Object" => Some(()),
+        "Int8Array" | "Uint8Array" | "Uint8ClampedArray" | "Int16Array" | "Uint16Array"
+        | "Int32Array" | "Uint32Array" | "Float32Array" | "Float64Array" => Some(()),
+        _ => None,
+    }
 }

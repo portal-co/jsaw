@@ -935,6 +935,126 @@ fn executes_math_primordial() {
 }
 
 #[test]
+fn executes_primordial_fast_call_paths() {
+    let module = compile_module(
+        "
+            export function numeric_sweep() {
+                let sum = Math.abs(-2) + Math.floor(1.9) + Math.ceil(1.1)
+                    + Math.trunc(2.9) + Math.sqrt(9) + Math.min(2, 3)
+                    + Math.max(2, 3) + Math.sign(-8) + Math.round(2.5)
+                    + Math.fround(1.5) + Math.imul(6, 7);
+                return sum;
+            }
+            export function unshadowed_stays_fast() {
+                let total = 0;
+                total = total + Math.sqrt(16) + Math.abs(-4);
+                return total * 10 + Math.min(1, 2);
+            }
+            export function shadowed_math_member_call() {
+                let Math = { sqrt: function(x) { return x * x; } };
+                return Math.sqrt(5);
+            }
+            export function param_named_math(Math) { return 1; }
+            export function array_is_array_sweep() {
+                return (Array.isArray([1]) ? 1 : 0) + (Array.isArray({}) ? 10 : 0)
+                    + (Array.isArray(null) ? 100 : 0) + (Array.isArray(undefined) ? 1000 : 0)
+                    + (Array.isArray(new Int8Array(1)) ? 10000 : 0);
+            }
+            export function typed_ctor_direct() {
+                let values = new Uint8Array(3);
+                values[1] = 250;
+                return values.length * 1000 + values.byteLength * 10 + values[1];
+            }
+            export function typed_ctor_from_source() {
+                let source = new Int16Array([5, 300]);
+                let copy = new Uint8Array(source);
+                return copy[0] * 100 + copy[1] + source.length;
+            }
+            export function typed_ctor_shadowed() {
+                let Uint8Array = function(n) { return { tag: n * 3 }; };
+                let fake = new Uint8Array(4);
+                return fake.tag;
+            }
+        ",
+    );
+    validate(&module);
+    // abs(-2) + floor(1.9) + ceil(1.1) + trunc(2.9) + sqrt(9) + min(2,3)
+    // + max(2,3) + sign(-8) + round(2.5) + fround(1.5) + imul(6, 7)
+    //   = 2 + 1 + 2 + 2 + 3 + 2 + 3 + (-1) + 3 + 1.5 + 42 = 60.5
+    assert_executes_in_all_runtimes(&module, "numeric_sweep", &[], 60.5);
+    assert_executes_in_all_runtimes(&module, "unshadowed_stays_fast", &[], 81.0);
+    assert_executes_in_all_runtimes(&module, "shadowed_math_member_call", &[], 25.0);
+    assert_executes_in_all_runtimes(&module, "param_named_math", &[0.0], 1.0);
+    assert_executes_in_all_runtimes(&module, "array_is_array_sweep", &[], 1.0);
+    assert_executes_in_all_runtimes(&module, "typed_ctor_direct", &[], 3280.0);
+    assert_executes_in_all_runtimes(&module, "typed_ctor_from_source", &[], 546.0);
+    assert_executes_in_all_runtimes(&module, "typed_ctor_shadowed", &[], 12.0);
+}
+
+#[test]
+fn executes_strict_equality_semantics() {
+    let module = compile_module(
+        "
+            export function identity() {
+                let a = { value: 1 };
+                return a === a ? 1 : 0;
+            }
+            export function distinct_objects() {
+                return { value: 1 } === { value: 1 } ? 1 : 0;
+            }
+            export function negated_identity() {
+                let a = {};
+                let b = {};
+                return a !== b ? 1 : 0;
+            }
+            export function string_content() {
+                let a = 'ab' + 'c';
+                let b = 'a' + 'bc';
+                return a === b && 'xyz' !== 'abc' ? 1 : 0;
+            }
+            export function string_vs_number() {
+                return '5' === 5 || 5 === '5' ? 1 : 0;
+            }
+            export function boxed_number_crosses_call() {
+                let object = { value: 5, get() { return this.value; } };
+                let five = object.get();
+                let number_part = five === 5 ? 1 : 0;
+                let string_part = five === '5' ? 1 : 0;
+                return number_part * 10 + string_part;
+            }
+            export function null_undefined_distinct() {
+                let n = null;
+                return n === null && !(n === undefined) && !(null === undefined) ? 1 : 0;
+            }
+            export function null_identity() {
+                let n = null;
+                return n === null && null === null ? 1 : 0;
+            }
+            export function same_view_identity() {
+                let values = new Int8Array(2);
+                let view = values.subarray(0, 2);
+                return view === view && values !== view ? 1 : 0;
+            }
+            export function method_receiver_identity() {
+                let object = { check(it) { return it === object; } };
+                return object.check(object) && !object.check({}) ? 1 : 0;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "identity", &[], 1.0);
+    assert_executes_in_all_runtimes(&module, "distinct_objects", &[], 0.0);
+    assert_executes_in_all_runtimes(&module, "negated_identity", &[], 1.0);
+    assert_executes_in_all_runtimes(&module, "string_content", &[], 1.0);
+    assert_executes_in_all_runtimes(&module, "string_vs_number", &[], 0.0);
+    assert_executes_in_all_runtimes(&module, "boxed_number_crosses_call", &[], 10.0);
+    assert_executes_in_all_runtimes(&module, "null_undefined_distinct", &[], 1.0);
+    assert_executes_in_all_runtimes(&module, "null_identity", &[], 1.0);
+    assert_executes_in_all_runtimes(&module, "same_view_identity", &[], 1.0);
+    assert_executes_in_all_runtimes(&module, "method_receiver_identity", &[], 1.0);
+}
+
+#[test]
 fn executes_array_primordial() {
     let module = compile_module(
         "
@@ -1489,4 +1609,46 @@ fn call_then_prop_read_combined_in_one_expression() {
     assert_executes_in_all_runtimes(&module, "fn_call_plus_prop_arith", &[], 799.0);
     assert_executes_in_all_runtimes(&module, "push_call_plus_prop_arith", &[], 404.0);
     assert_executes_in_all_runtimes(&module, "pop_combined_expr", &[], 302.0);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#[test]
+fn provable_math_call_reaches_fast_core_directly() {
+    let module = compile_module(
+        "
+            export function run() { return Math.sqrt(9) + Math.abs(-1); }
+        ",
+    );
+    validate(&module);
+    let mut fast_core_called = false;
+    for (_, decl) in module.funcs.entries() {
+        if let FuncDecl::Body(_, name, body) = decl {
+            if name.starts_with("js_body_") {
+                for (_, def) in body.values.entries() {
+                    if let ValueDef::Operator(Operator::Call { function_index }, _, _) = def {
+                        let target = &module.funcs[*function_index];
+                        if target.name().starts_with("js_fast_core_") {
+                            fast_core_called = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(fast_core_called, "provable Math call must reach the fast core directly");
 }

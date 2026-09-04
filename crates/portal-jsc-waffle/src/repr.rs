@@ -105,6 +105,23 @@ impl TypedArrayKind {
         }
     }
 
+    /// Look up a kind by constructor name. Used by the provable fast path
+    /// for `new Uint8Array(...)`-style call sites.
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "Int8Array" => Some(Self::Int8),
+            "Uint8Array" => Some(Self::Uint8),
+            "Uint8ClampedArray" => Some(Self::Uint8Clamped),
+            "Int16Array" => Some(Self::Int16),
+            "Uint16Array" => Some(Self::Uint16),
+            "Int32Array" => Some(Self::Int32),
+            "Uint32Array" => Some(Self::Uint32),
+            "Float32Array" => Some(Self::Float32),
+            "Float64Array" => Some(Self::Float64),
+            _ => None,
+        }
+    }
+
     pub(crate) const fn bytes_per_element(self) -> i32 {
         match self {
             Self::Int8 | Self::Uint8 | Self::Uint8Clamped => 1,
@@ -256,6 +273,12 @@ impl Repr {
                 field(ref_sig(object)),
                 field(value),
                 field(Type::I32),
+                // Primordial tag: 0 for user functions, a positive [`crate::
+                // conv`] tag constant for native primordials with a fast
+                // core. `ref.eq` cannot compare function references (they are
+                // outside the `eq` hierarchy), so the guarded fast path
+                // identifies a primordial callee by this tag instead.
+                field(Type::I32),
             ],
             shared: false,
         };
@@ -314,12 +337,71 @@ impl Repr {
         ref_sig(self.number)
     }
 
+    pub(crate) fn number_non_null_ty(self) -> Type {
+        Type::Heap(WithNullable {
+            value: portal_pc_waffle::HeapType::Sig {
+                sig_index: self.number,
+            },
+            nullable: false,
+        })
+    }
+
     pub(crate) fn boolean_ty(self) -> Type {
         ref_sig(self.boolean)
     }
 
+    pub(crate) fn boolean_non_null_ty(self) -> Type {
+        Type::Heap(WithNullable {
+            value: portal_pc_waffle::HeapType::Sig {
+                sig_index: self.boolean,
+            },
+            nullable: false,
+        })
+    }
+
+    pub(crate) fn string_non_null_ty(self) -> Type {
+        Type::Heap(WithNullable {
+            value: portal_pc_waffle::HeapType::Sig {
+                sig_index: self.string,
+            },
+            nullable: false,
+        })
+    }
+
+    /// The abstract `eqref` heap type. `ref.eq` requires both operands to be
+    /// in the `eq` hierarchy — a plain `anyref` operand does not validate — so
+    /// every reference comparison casts through this type first. Every value
+    /// this backend produces is a struct, an array, or an i31, all of which
+    /// are `eqref` subtypes, so the cast cannot trap in practice.
+    pub(crate) fn eq_ty(self) -> Type {
+        Type::Heap(WithNullable {
+            value: portal_pc_waffle::HeapType::Eq,
+            nullable: true,
+        })
+    }
+
+    /// The non-nullable `i31ref` heap type. JS `null` is represented as an
+    /// i31 sentinel (see [`JS_NULL_SENTINEL`]), so `ref.test` against this
+    /// type is the single runtime check that distinguishes JS `null` from
+    /// `undefined` (the null `anyref`).
+    pub(crate) fn i31_non_null_ty(self) -> Type {
+        Type::Heap(WithNullable {
+            value: portal_pc_waffle::HeapType::I31,
+            nullable: false,
+        })
+    }
+
     pub(crate) fn function_ty(self) -> Type {
         ref_sig(self.function)
+    }
+
+    pub(crate) fn function_non_null_ty(self) -> Type {
+        Type::Heap(WithNullable {
+            value: portal_pc_waffle::HeapType::Sig {
+                sig_index: self.function,
+            },
+            nullable: false,
+        })
     }
 
     pub(crate) fn descriptor_ty(self) -> Type {
@@ -375,7 +457,22 @@ impl Repr {
 pub(crate) const SLOT_WRITABLE: i32 = 1 << 0;
 pub(crate) const SLOT_ENUMERABLE: i32 = 1 << 1;
 pub(crate) const SLOT_CONFIGURABLE: i32 = 1 << 2;
-pub(crate) const SLOT_FLAGS_DEFAULT: i32 = SLOT_WRITABLE | SLOT_ENUMERABLE | SLOT_CONFIGURABLE;
+pub(crate) const SLOT_FLAGS_DEFAULT: i32 =
+    SLOT_WRITABLE | SLOT_ENUMERABLE | SLOT_CONFIGURABLE;
+
+/// Index of the primordial-tag field within the `function` struct (see the
+/// field's declaration in [`Repr::new`]).
+pub(crate) const FUNCTION_FIELD_TAG: usize = 7;
+
+/// The i31 payload representing JS `null`. The null `anyref` is reserved for
+/// `undefined`, so `null` needs a distinct representation that is cheap,
+/// identity-comparable via `ref.eq`, and detectable with `ref.test` against
+/// [`Repr::i31_non_null_ty`]. An i31 sentinel provides all three: i31
+/// equality is by value, and this backend never materializes any other i31
+/// (numbers are boxed structs), so every `ref.test (ref i31)` hit is a JS
+/// `null`. Nothing else may ever emit `RefI31` without breaking this
+/// invariant — pick a value well away from any future small-int range.
+pub(crate) const JS_NULL_SENTINEL: i32 = 0x4000_0000;
 
 pub(crate) fn field(value: Type) -> WithMutablility<StorageType> {
     WithMutablility {

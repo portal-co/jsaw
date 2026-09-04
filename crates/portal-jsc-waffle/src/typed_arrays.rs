@@ -1189,6 +1189,331 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         )
     }
 
+    /// Fast core for a statically-known typed-array constructor: skip the
+    /// generic adapter entirely and build the array for `kind` directly from
+    /// the (possibly missing) single source argument. Missing arguments are
+    /// an empty array, matching the generic constructor's `undefined`
+    /// handling. The result is the already-boxed typed-array value.
+    fn typed_array_constructor_core(&mut self, kind: TypedArrayKind) -> Result<Func, ConvertError> {
+        let tag_key = format!("typed_array_ctor_core_{}", kind.name());
+        if let Some(func) = self.native_function_cache.get(&tag_key) {
+            return Ok(*func);
+        }
+        let value = self.repr.value;
+        let sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![value],
+            returns: vec![value],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, sig);
+        let entry = body.entry;
+        // ABI: one boxed `source`. Null (missing / `undefined` argument)
+        // builds an empty array; a number builds a zeroed array of that
+        // length; an ordinary or typed array is copied element-wise — the
+        // same three cases the generic constructor adapter implements.
+        let source = body.blocks[entry].params[0].1;
+        let absent = body.add_op(entry, Operator::RefIsNull, &[source], &[Type::I32]);
+        let empty = body.add_block();
+        let present = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        // Emitted in the entry block so every branch below dominates it.
+        let zero = body.add_op(entry, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: absent,
+                if_true: BlockTarget {
+                    block: empty,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: present,
+                    args: vec![],
+                },
+            },
+        );
+        let backing = self.typed_new_backing(&mut body, empty, kind, zero);
+        let object = self.new_typed_array_object(&mut body, empty, kind, backing, zero, zero)?;
+        let object = self.box_value(&mut body, empty, &object)?;
+        body.set_terminator(
+            empty,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![object],
+                },
+            },
+        );
+
+        // Present source: number -> length form; object -> copy form.
+        let is_number = body.add_op(
+            present,
+            Operator::RefTest {
+                ty: self.repr.number_non_null_ty(),
+            },
+            &[source],
+            &[Type::I32],
+        );
+        let numeric = body.add_block();
+        let source_object = body.add_block();
+        body.set_terminator(
+            present,
+            Terminator::CondBr {
+                cond: is_number,
+                if_true: BlockTarget {
+                    block: numeric,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: source_object,
+                    args: vec![],
+                },
+            },
+        );
+        let length = self.as_f64(
+            &mut body,
+            numeric,
+            &LowerValue::Wasm {
+                value: source,
+                kind: ValueKind::Reference,
+            },
+        )?;
+        let zero_number = body.add_op(
+            numeric,
+            Operator::F64Const {
+                value: 0.0f64.to_bits(),
+            },
+            &[],
+            &[Type::F64],
+        );
+        let max_length = body.add_op(
+            numeric,
+            Operator::F64Const {
+                value: 4_294_967_296.0f64.to_bits(),
+            },
+            &[],
+            &[Type::F64],
+        );
+        let negative = body.add_op(numeric, Operator::F64Lt, &[length, zero_number], &[Type::I32]);
+        let out_of_range = body.add_op(numeric, Operator::F64Ge, &[length, max_length], &[Type::I32]);
+        let invalid_length = body.add_op(numeric, Operator::I32Or, &[negative, out_of_range], &[Type::I32]);
+        let valid_length = body.add_block();
+        let invalid_length_block = body.add_block();
+        body.set_terminator(
+            numeric,
+            Terminator::CondBr {
+                cond: invalid_length,
+                if_true: BlockTarget {
+                    block: invalid_length_block,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: valid_length,
+                    args: vec![],
+                },
+            },
+        );
+        body.set_terminator(invalid_length_block, Terminator::Unreachable);
+        let length = body.add_op(
+            valid_length,
+            Operator::I32TruncSatF64U,
+            &[length],
+            &[Type::I32],
+        );
+        let backing = self.typed_new_backing(&mut body, valid_length, kind, length);
+        let object = self.new_typed_array_object(&mut body, valid_length, kind, backing, zero, length)?;
+        let object = self.box_value(&mut body, valid_length, &object)?;
+        body.set_terminator(
+            valid_length,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![object],
+                },
+            },
+        );
+
+        let is_object = body.add_op(
+            source_object,
+            Operator::RefTest {
+                ty: self.repr.object_ty(),
+            },
+            &[source],
+            &[Type::I32],
+        );
+        let object = body.add_block();
+        let unsupported = body.add_block();
+        body.set_terminator(
+            source_object,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget {
+                    block: object,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: unsupported,
+                    args: vec![],
+                },
+            },
+        );
+        let source_plain = body.add_op(
+            object,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[source],
+            &[self.repr.object_ty()],
+        );
+        let source_data = body.add_op(
+            object,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 3,
+            },
+            &[source_plain],
+            &[self.repr.value],
+        );
+        let no_typed_data =
+            body.add_op(object, Operator::RefIsNull, &[source_data], &[Type::I32]);
+        let ordinary_source = body.add_block();
+        let typed_source = body.add_block();
+        body.set_terminator(
+            object,
+            Terminator::CondBr {
+                cond: no_typed_data,
+                if_true: BlockTarget {
+                    block: ordinary_source,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: typed_source,
+                    args: vec![],
+                },
+            },
+        );
+
+        let source_length = body.add_op(
+            typed_source,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 6,
+            },
+            &[source_plain],
+            &[Type::I32],
+        );
+        let backing = self.typed_new_backing(&mut body, typed_source, kind, source_length);
+        let target_object =
+            self.new_typed_array_object(&mut body, typed_source, kind, backing, zero, source_length)?;
+        let target_value = self.box_value(&mut body, typed_source, &target_object)?;
+        let copied = self.for_each_index(
+            &mut body,
+            typed_source,
+            source_length,
+            |this, body, block, i| {
+                let (block, element) = this.typed_array_read(body, block, source, i)?;
+                this.typed_array_write(body, block, target_value, i, &element)
+            },
+        )?;
+        body.set_terminator(
+            copied,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![target_value],
+                },
+            },
+        );
+
+        let elements = body.add_op(
+            ordinary_source,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 1,
+            },
+            &[source_plain],
+            &[self.repr.arguments_ty()],
+        );
+        let no_elements = body.add_op(
+            ordinary_source,
+            Operator::RefIsNull,
+            &[elements],
+            &[Type::I32],
+        );
+        let copy_ordinary = body.add_block();
+        body.set_terminator(
+            ordinary_source,
+            Terminator::CondBr {
+                cond: no_elements,
+                if_true: BlockTarget {
+                    block: unsupported,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: copy_ordinary,
+                    args: vec![],
+                },
+            },
+        );
+        let source_length =
+            body.add_op(copy_ordinary, Operator::ArrayLen, &[elements], &[Type::I32]);
+        let backing = self.typed_new_backing(&mut body, copy_ordinary, kind, source_length);
+        let target_object =
+            self.new_typed_array_object(&mut body, copy_ordinary, kind, backing, zero, source_length)?;
+        let target_value = self.box_value(&mut body, copy_ordinary, &target_object)?;
+        let copied = self.for_each_index(
+            &mut body,
+            copy_ordinary,
+            source_length,
+            |this, body, block, i| {
+                let element = body.add_op(
+                    block,
+                    Operator::ArrayGet {
+                        sig: this.repr.arguments,
+                    },
+                    &[elements, i],
+                    &[this.repr.value],
+                );
+                this.typed_array_write(
+                    body,
+                    block,
+                    target_value,
+                    i,
+                    &LowerValue::Wasm {
+                        value: element,
+                        kind: ValueKind::Reference,
+                    },
+                )
+            },
+        )?;
+        body.set_terminator(
+            copied,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![target_value],
+                },
+            },
+        );
+
+        body.set_terminator(unsupported, Terminator::Unreachable);
+        body.set_terminator(
+            join,
+            Terminator::Return {
+                values: vec![result],
+            },
+        );
+
+        let func = self.module.funcs.push(FuncDecl::Body(
+            sig,
+            format!("js_fast_{tag_key}"),
+            body,
+        ));
+        self.native_function_cache.insert(tag_key, func);
+        Ok(func)
+    }
+
     fn typed_array_instance_method(&mut self, key: &str) -> Result<Func, ConvertError> {
         match key {
             "subarray" => self.typed_array_subarray_method(),

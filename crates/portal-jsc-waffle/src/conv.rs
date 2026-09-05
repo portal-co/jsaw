@@ -3,17 +3,15 @@ use std::{
     mem::take,
 };
 
-use portal_jsc_swc_ssa::{
-    SBlockId, SFunc, SValue, SValueId,
-    module::{ExportSpec, SModule},
-};
+use portal_jsc_swc_ssa::{SBlockId, SFunc, SValue, SValueId, module::SModule};
 use portal_jsc_swc_tac::{Item, LId, PropKey, PropVal, TCallee, TTerm};
 use portal_pc_waffle::{
     Block, BlockTarget, EntityRef, Export, ExportKind, Func, FuncDecl, FunctionBody, HeapType, Module,
     Operator, SignatureData, Table, TableData, Terminator, Type, Value, WithNullable,
 };
-use swc_ecma_ast::{BinaryOp, Lit, UnaryOp};
+use swc_ecma_ast::{BinaryOp, Id as Ident, Lit, UnaryOp};
 
+use crate::linker::{ImportTarget, ModuleSet};
 use crate::repr::{ConvertError, FUNCTION_FIELD_TAG, JS_NULL_SENTINEL, Repr, TypedArrayKind, field, ref_sig};
 
 /// Convert jsaw-core SSA into a WasmGC module.
@@ -51,10 +49,15 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
         return_kinds: BTreeMap::new(),
         current_native_returns: None,
         function_literal_locals: BTreeMap::new(),
+        // Bare-script conversion has no module set: the import tables stay
+        // empty and every load resolves through the ordinary context path.
+        import_tables: BTreeMap::new(),
+        module_of_function: BTreeMap::new(),
+        current_module: String::new(),
     };
     converter.collect_shapes(root)?;
     converter.collect_shadowed_names(root, &mut BTreeSet::new());
-    converter.ensure_function(root)?;
+    converter.ensure_function(root, "")?;
     converter.lower_all()
 }
 
@@ -86,8 +89,37 @@ impl Default for ConvertOptions {
 /// Named exports, renamed local function exports, and default function exports
 /// are supported. Other export forms remain module metadata only and do not
 /// receive a Wasm function export in this first ABI slice.
+///
+/// This is [`convert_modules`] with a single-module set: see that function
+/// for multi-module linking.
 pub fn convert_module<'a, 'wasm>(
     source: &'a SModule,
+    module: &mut Module<'wasm>,
+    options: &ConvertOptions,
+) -> Result<(), ConvertError> {
+    let set = ModuleSet::single("main.mjs", source);
+    convert_modules("main.mjs", &set, module, options)
+}
+
+/// Lower a set of ES modules into one WasmGC module.
+///
+/// `entry` selects the **main module**: only its export surface becomes
+/// Wasm exports (named function exports, `export default function`, named
+/// re-exports, and `export * from` star re-exports resolved through the
+/// set). Non-main modules contribute no Wasm exports — their functions
+/// enter the Wasm function pool only as link targets.
+///
+/// Cross-module imports resolve by relative path within the set:
+/// `import { f } from './lib.js'` in any module links to the hoisted
+/// function declaration `lib.js` exports. Only function declarations can
+/// cross modules in this milestone; every other form (namespace imports,
+/// value imports, `export default <expr>`, `export * as ns`) is a
+/// [`ConvertError`] rather than a silent fallback. Module top-level
+/// statements are not lowered yet, so a module set whose behavior depends
+/// on top-level evaluation is out of scope.
+pub fn convert_modules<'a, 'wasm>(
+    entry: &str,
+    set: &'a ModuleSet<'a>,
     module: &mut Module<'wasm>,
     options: &ConvertOptions,
 ) -> Result<(), ConvertError> {
@@ -100,22 +132,37 @@ pub fn convert_module<'a, 'wasm>(
             "the internal GC export suffix must not be empty",
         ));
     }
+    if !set.contains(entry) {
+        return Err(ConvertError::invalid(format!(
+            "entry module {entry:?} is not in the module set"
+        )));
+    }
 
-    let exported = source_function_exports(source);
-    let mut declared_names = source_export_names(source);
+    // Eager import-table construction: every declared import of every
+    // module must resolve before any lowering starts, so a closed set with
+    // dangling imports fails with a diagnostic instead of silently reading
+    // an undefined binding at runtime.
+    let mut import_tables = BTreeMap::new();
+    for path in set.keys() {
+        let source = set.get(path)?;
+        let table = crate::linker::build_import_table(set, path, source)?;
+        import_tables.insert(path.clone(), table);
+    }
+
+    let (exported, mut declared_names) = crate::linker::flatten_module_export_surface(set, entry)?;
     declared_names.extend(module.exports.iter().map(|export| export.name.clone()));
     let mut generated_names = BTreeSet::new();
     for export in &exported {
-        if !generated_names.insert(export.name.clone()) {
+        if !generated_names.insert(export.0.clone()) {
             return Err(ConvertError::invalid(format!(
                 "duplicate Wasm export name {:?}",
-                export.name
+                export.0
             )));
         }
     }
     if let Some(suffix) = &options.gc_export_suffix {
         for export in &exported {
-            let name = format!("{}{suffix}", export.name);
+            let name = format!("{}{suffix}", export.0);
             if declared_names.contains(&name) || !generated_names.insert(name.clone()) {
                 return Err(ConvertError::invalid(format!(
                     "internal GC export name {:?} collides with an existing export",
@@ -155,14 +202,18 @@ pub fn convert_module<'a, 'wasm>(
         return_kinds: BTreeMap::new(),
         current_native_returns: None,
         function_literal_locals: BTreeMap::new(),
+        import_tables,
+        module_of_function: BTreeMap::new(),
+        current_module: String::new(),
     };
     let mut exports = Vec::with_capacity(exported.len());
-    for export in exported {
-        converter.collect_shapes(export.function)?;
+    for (name, function) in exported {
+        converter.collect_shapes(function)?;
         converter.shadowed_names.clear();
+        converter.function_literal_locals.clear();
         let mut visited = BTreeSet::new();
-        converter.collect_shadowed_names(export.function, &mut visited);
-        exports.push((export.name, converter.ensure_function(export.function)?));
+        converter.collect_shadowed_names(function, &mut visited);
+        exports.push((name, converter.ensure_function(function, entry)?));
     }
     converter.lower_all()?;
 
@@ -178,60 +229,6 @@ pub fn convert_module<'a, 'wasm>(
         }
     }
     Ok(())
-}
-
-#[derive(Clone)]
-struct SourceFunctionExport<'a> {
-    name: String,
-    function: &'a SFunc,
-}
-
-fn source_function_exports(source: &SModule) -> Vec<SourceFunctionExport<'_>> {
-    source
-        .exports
-        .iter()
-        .filter_map(|export| match export {
-            ExportSpec::Local {
-                local, exported, ..
-            } => source
-                .funcs
-                .get(&local.0)
-                .map(|function| SourceFunctionExport {
-                    name: exported.to_string(),
-                    function,
-                }),
-            ExportSpec::DefaultFunc { func_name } => {
-                source
-                    .funcs
-                    .get(func_name)
-                    .map(|function| SourceFunctionExport {
-                        name: "default".to_owned(),
-                        function,
-                    })
-            }
-            ExportSpec::DefaultExpr { .. }
-            | ExportSpec::Reexport { .. }
-            | ExportSpec::ReexportAll { .. } => None,
-        })
-        .collect()
-}
-
-fn source_export_names(source: &SModule) -> BTreeSet<String> {
-    source
-        .exports
-        .iter()
-        .flat_map(|export| match export {
-            ExportSpec::Local { exported, .. } => vec![exported.to_string()],
-            ExportSpec::DefaultFunc { .. } | ExportSpec::DefaultExpr { .. } => {
-                vec!["default".to_owned()]
-            }
-            ExportSpec::Reexport { names, .. } => names
-                .iter()
-                .map(|(_, exported)| exported.to_string())
-                .collect(),
-            ExportSpec::ReexportAll { ns, .. } => ns.iter().map(ToString::to_string).collect(),
-        })
-        .collect()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -529,6 +526,18 @@ struct Converter<'a, 'module, 'wasm> {
     /// name produces a [`LowerValue::FunctionRef`] whose tag check proves
     /// the binding is unchanged at call time. Reset per top-level function.
     function_literal_locals: BTreeMap<String, &'a SFunc>,
+    /// Per-module import tables for multi-module ingestion: resolved
+    /// binding → linked target function. Keyed by module path; the single-
+    /// module and bare-script paths use the same shape with an empty table
+    /// (see [`convert_modules`] / [`convert`]).
+    import_tables: BTreeMap<String, BTreeMap<Ident, ImportTarget<'a>>>,
+    /// Owning module path per registered function (keyed like
+    /// [`Converter::functions`]), so an imported function can be registered
+    /// under its declaring module's import table before its body lowers.
+    module_of_function: BTreeMap<usize, String>,
+    /// Module path of the top-level function currently being collected or
+    /// lowered. Nested closures inherit it.
+    current_module: String,
 }
 
 impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
@@ -893,7 +902,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         self.shapes.iter().position(|shape| shape.keys == keys)
     }
 
-    fn ensure_function(&mut self, sfunc: &'a SFunc) -> Result<FunctionInfo, ConvertError> {
+    fn ensure_function(
+        &mut self,
+        sfunc: &'a SFunc,
+        module: &str,
+    ) -> Result<FunctionInfo, ConvertError> {
         let key = Self::key(sfunc);
         if let Some(info) = self.functions.get(&key) {
             return Ok(*info);
@@ -933,6 +946,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             returns,
         };
         self.functions.insert(key, info);
+        self.module_of_function
+            .insert(key, module.to_string());
         self.pending.push_back(sfunc);
         Ok(*self.functions.get(&key).expect("just inserted"))
     }
@@ -1200,6 +1215,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             let key = Self::key(sfunc);
             if !self.lowered.insert(key) {
                 continue;
+            }
+            // Imports resolve against the module that *declares* the
+            // function being lowered, which is not necessarily the module
+            // whose export triggered this lowering.
+            if let Some(module) = self.module_of_function.get(&key) {
+                self.current_module = module.clone();
             }
             let info = *self
                 .functions
@@ -1582,6 +1603,35 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             }
             SValue::LoadId(id) => {
                 let key = id.0.to_string();
+                // A cross-module import binding is statically the target
+                // function: function-declaration exports are immutable, so
+                // the load never touches the context and mints the target's
+                // function object directly. The value keeps its origin for
+                // the guarded direct-call paths; the runtime tag check this
+                // keeps always passes today (the binding can never be
+                // rebound) — skipping the check is follow-up work. Minting
+                // per load diverges from ESM object identity across
+                // separate loads within one activation; acceptable while
+                // module top-level state (a shared per-module context) does
+                // not exist yet.
+                if self
+                    .import_tables
+                    .get(&self.current_module)
+                    .is_some_and(|table| table.contains_key(id))
+                {
+                    let target = self.import_tables[&self.current_module][&id].clone();
+                    let info = self.ensure_function(target.function, &target.module)?;
+                    let value = self.function_object_from_info(
+                        body,
+                        block,
+                        context,
+                        this,
+                        info,
+                        false, // a hoisted declaration is never an arrow
+                        false, // call sites keep their tag check
+                    )?;
+                    return Ok(vec![(block, value)]);
+                }
                 let literal = self.function_literal_locals.get(&key).copied();
                 let mut results = Vec::new();
                 for (block, value) in self.get_property(body, block, context, &key)? {
@@ -1590,7 +1640,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     // origin: the call site's tag check proves the context
                     // slot still holds the literal at runtime.
                     let value = if let Some(literal) = literal {
-                        let info = self.ensure_function(literal)?;
+                        let module = self.current_module.clone();
+                        let info = self.ensure_function(literal, &module)?;
                         LowerValue::FunctionRef {
                             value,
                             info,
@@ -6624,7 +6675,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         func: &'a SFunc,
         arrow: bool,
     ) -> Result<LowerValue, ConvertError> {
-        let info = self.ensure_function(func)?;
+        let module = self.current_module.clone();
+        let info = self.ensure_function(func, &module)?;
         self.function_object_from_info(body, block, context, this, info, arrow, true)
     }
 

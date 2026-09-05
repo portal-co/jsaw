@@ -70,6 +70,13 @@ pub struct ConvertOptions {
     /// `(context, this, arguments-array) -> value` ABI and is intended only
     /// for embedders that can construct the internal GC values.
     pub gc_export_suffix: Option<String>,
+    /// When present, export the module's top-level body as a zero-argument
+    /// function under this name. The entry runs the script portion of the
+    /// module with a fresh context (primordials pre-populated) and returns
+    /// an `i32` status: `0` on normal completion, `1` when the body threw
+    /// (throw lowering is not yet supported, so a throw currently surfaces
+    /// as a compile error instead — the status exists for future use).
+    pub run_entry_export: Option<String>,
 }
 
 impl Default for ConvertOptions {
@@ -77,6 +84,7 @@ impl Default for ConvertOptions {
         Self {
             numeric_exports: true,
             gc_export_suffix: None,
+            run_entry_export: None,
         }
     }
 }
@@ -165,6 +173,13 @@ pub fn convert_module<'a, 'wasm>(
         exports.push((export.name, converter.ensure_function(export.function)?));
     }
     converter.lower_all()?;
+
+    if let Some(entry_name) = &options.run_entry_export {
+        converter.collect_shapes(&source.body)?;
+        let info = converter.ensure_function(&source.body)?;
+        converter.lower_all()?;
+        converter.export_run_entry(entry_name, info)?;
+    }
 
     for (name, info) in exports {
         if options.numeric_exports {
@@ -1164,6 +1179,79 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             self.module
                 .funcs
                 .push(FuncDecl::Body(signature, format!("js_export_{name}"), body));
+        self.module.exports.push(Export {
+            name: name.to_owned(),
+            kind: ExportKind::Func(func),
+        });
+        Ok(())
+    }
+
+    /// Emit the zero-argument run entry used by test runners: it executes
+    /// the module's top-level body in a fresh primordial-populated context
+    /// and reports an `i32` status (`0` = completed, `1` = threw).
+    ///
+    /// The body's native function is called directly with unboxed (empty)
+    /// formals; going through the `CallRef` adapter loses the fresh context
+    /// because the adapter reads its context from the callee's captured
+    /// function object, not from the caller's `context` parameter.
+    fn export_run_entry(&mut self, name: &str, info: FunctionInfo) -> Result<(), ConvertError> {
+        let signature = self.module.signatures.push(SignatureData::Func {
+            params: vec![],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, signature);
+        let block = body.entry;
+        let context_builder = self.ensure_context_builder()?;
+        let context = body.add_op(
+            block,
+            Operator::Call {
+                function_index: context_builder,
+            },
+            &[],
+            &[self.repr.object_ty()],
+        );
+        let this = self.undef(&mut body, block);
+        let (this, _) = this.wasm()?;
+        let arguments = body.add_op(
+            block,
+            Operator::ArrayNewFixed {
+                sig: self.repr.arguments,
+                num: 0,
+            },
+            &[],
+            &[self.repr.arguments_ty()],
+        );
+        // Native signature: (context, this/undefined, arguments, formals...).
+        let call = body.add_op(
+            block,
+            Operator::Call {
+                function_index: info.native,
+            },
+            &[context, this, arguments],
+            &[self.repr.value],
+        );
+        // The native result is discarded; the entry's contract only
+        // reports a completion status.
+        body.add_op(
+            block,
+            Operator::Call {
+                function_index: info.native,
+            },
+            &[context, this, arguments],
+            &[self.repr.value],
+        );
+        let status = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        body.set_terminator(
+            block,
+            Terminator::Return {
+                values: vec![status],
+            },
+        );
+        let func = self
+            .module
+            .funcs
+            .push(FuncDecl::Body(signature, format!("js_run_{name}"), body));
         self.module.exports.push(Export {
             name: name.to_owned(),
             kind: ExportKind::Func(func),

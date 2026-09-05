@@ -1921,3 +1921,55 @@ fn executes_ternary_returned_from_exported_functions() {
     assert_executes_in_all_runtimes(&module, "through_literal_sum", &[-1.0], 0.0);
     assert_executes_in_all_runtimes(&module, "through_literal_object_arm", &[-1.0], 0.0);
 }
+
+fn execute_run_entry_in_wasmtime(bytes: &[u8], name: &str) -> i32 {
+    let mut config = Config::new();
+    config.wasm_gc(true);
+    config.wasm_function_references(true);
+    let engine = Engine::new(&config).expect("Wasmtime engine should support WasmGC");
+    let module = WasmtimeModule::new(&engine, bytes).expect("Wasmtime should compile emitted Wasm");
+    let mut store = Store::new(&engine, ());
+    let instance =
+        Instance::new(&mut store, &module, &[]).expect("Wasmtime should instantiate emitted Wasm");
+    let function = instance
+        .get_func(&mut store, name)
+        .unwrap_or_else(|| panic!("missing Wasmtime export {name:?}"));
+    let mut outputs = [Val::I32(0)];
+    function
+        .call(&mut store, &[], &mut outputs)
+        .unwrap_or_else(|error| panic!("Wasmtime call {name:?} failed: {error:#}"));
+    match outputs[0] {
+        Val::I32(status) => status,
+        ref value => panic!("run entry returned {value:?}, expected i32"),
+    }
+}
+
+#[test]
+fn exports_run_entry_for_top_level_body() {
+    // The run entry executes the module's top-level body. Cross-function
+    // state sharing is not part of the current per-export-fresh-context
+    // ABI, so verify execution with observable primordial side effects:
+    // the top-level body overwrites the primordial `Math.sqrt`-style
+    // namespace slot? That too lives in the per-export context. Instead,
+    // assert the entry runs to completion (status 0) and that its own
+    // internal function declarations were lowered (compile success).
+    let source = r#"
+        let counter = 0;
+        function bump(by) { counter = counter + by; }
+        bump(2);
+        bump(3);
+        export function read() { return counter; }
+    "#;
+    let options = portal_jsc_waffle::ConvertOptions {
+        run_entry_export: Some("run".to_owned()),
+        ..Default::default()
+    };
+    let module = lower_module(source, &options).expect("module lowering should succeed");
+    validate(&module);
+    let bytes = wasm_bytes(&module);
+    assert_eq!(
+        execute_run_entry_in_wasmtime(&bytes, "run"),
+        0,
+        "run entry reports completion status 0"
+    );
+}

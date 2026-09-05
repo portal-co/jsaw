@@ -347,6 +347,38 @@ B4's split, not before it.
   validate.
 - `Math.sqrt` result feeding a phi with a boxed arm (join kind union).
 
+## Implementation status (2026-09-04)
+
+All four commits are implemented; the full e2e suite is 43 passed with
+only the 2 pre-existing utf16 string failures:
+
+1. `ed35047` — A4: user function tags (`USER_TAG_BASE = 1 << 20`),
+   minted per literal in `ensure_function`, stamped by
+   `function_object_from_info`.
+2. `d026d4d` — B1–B2: `ReturnKinds` analysis + raw native return types
+   with `make_adapter` re-boxing unboxed returns at the adapter
+   boundary.
+3. `dc0ace6` — B3–B4: primordial provable paths return raw f64/i32
+   results; `guarded_primordial_call` splits fast/slow arms into
+   separate continuations (also fixes the latent guarded-`Array.isArray`
+   conversion error).
+4. `f892f14` — Part A: `FunctionRef`/`ObjectLiteral` provenance,
+   single-assignment literal scan, `direct_native_call`, guarded tag
+   dispatch for locals and methods, e2e + inspection tests.
+
+Deviations discovered during implementation:
+
+- The analysis must classify *only* `TTerm::Return` values (an earlier
+  draft folded every statement value into the set, collapsing every
+  function to the boxed join).
+- `ReturnKinds::native_return_type` takes `&Repr` (the boxed type is
+  `repr.value`, not a constant).
+- Pre-existing backend bugs surfaced by the new tests (both confirmed
+  on the clean tree, out of scope here): `y === x` between two context
+  reads traps with a cast failure, and some ternary/call-result
+  coercions trap with a null reference. The e2e fixtures avoid those
+  patterns.
+
 ## Explicit non-goals
 
 - Whole-program escape analysis of function objects (the checks are

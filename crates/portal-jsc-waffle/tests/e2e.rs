@@ -1835,3 +1835,89 @@ fn provenance_single_kind_native_returns_raw() {
     assert!(raw_f64, "a single-Number-kind native body must declare an f64 return");
     assert!(boxed, "the Reference-kind callee must keep the boxed ABI");
 }
+
+#[test]
+fn executes_boolean_exports_and_lazy_string_member_reads() {
+    // Regression: every exported function used to RefCast its boxed result
+    // to the number struct, so returning any non-number (even the boolean
+    // of `1 === 1`) trapped `wasm trap: cast failure` at the export
+    // boundary. The export wrapper now coerces through the ToNumber
+    // surface instead.
+    let module = compile_module(
+        "
+            export function const_boolean() { return 1 === 1; }
+            export function context_compare(x) { let y = x; return y === x; }
+            export function loose_context_compare(x) { let y = x; return y == x; }
+            export function boolean_identity(x) { return x === x; }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "const_boolean", &[], 1.0);
+    assert_executes_in_all_runtimes(&module, "context_compare", &[1.0], 1.0);
+    assert_executes_in_all_runtimes(&module, "loose_context_compare", &[1.0], 1.0);
+    assert_executes_in_all_runtimes(&module, "boolean_identity", &[1.0], 1.0);
+
+    // Regression: member reads on lazily produced strings (the result of a
+    // string index read, whose static String representation is lost at the
+    // block boundary) fell through to the generic property lookup and read
+    // `undefined`. `length` must answer from the UTF-16 representation and
+    // numeric indexes from the string's code units.
+    let module = compile_module(
+        "
+            export function indexed_length() { return 'abc'[1].length; }
+            export function indexed_length_binding() {
+                let unit = 'abc'[1];
+                return unit.length;
+            }
+            export function indexed_length_via_concat() { return ('x' + 'abc'[1]).length; }
+            export function indexed_return() { return 'abc'[1] === 'b' ? 1 : 0; }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "indexed_length", &[], 1.0);
+    assert_executes_in_all_runtimes(&module, "indexed_length_binding", &[], 1.0);
+    assert_executes_in_all_runtimes(&module, "indexed_length_via_concat", &[], 2.0);
+    assert_executes_in_all_runtimes(&module, "indexed_return", &[], 1.0);
+}
+
+#[test]
+fn executes_ternary_returned_from_exported_functions() {
+    // Regression: in the module pipeline, converting a terminator whose
+    // expression splits blocks (`return c ? a : b;`) landed the term on the
+    // pre-split block, so the function returned the condition instead of
+    // the selected arm (or trapped downstream). Direct returns, let-bound
+    // returns, and calls through literals must all select the right arm.
+    let module = compile_module(
+        "
+            export function direct(x) { return x > 0 ? x : {}; }
+            export function number_or_zero(x) { return x > 0 ? x : 0; }
+            export function let_bound(x) { let z = x > 0 ? x : {}; return z; }
+            export function through_literal(x) {
+                let pick = function(v) { return v > 0 ? v : {}; };
+                return pick(x);
+            }
+            export function through_literal_sum(x) {
+                let pick = function(v) { return v > 0 ? v : 0; };
+                let y = pick(x);
+                return y + 0;
+            }
+            export function through_literal_object_arm(x) {
+                let pick = function(v) { return v > 0 ? v : {}; };
+                let y = pick(x);
+                // `{} + 0` is NaN in JavaScript (ToNumber of a plain
+                // object), and NaN compares false; assert via a
+                // comparison so the numeric export ABI stays f64.
+                return y + 0 > 0 ? 1 : 0;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "direct", &[1.0], 1.0);
+    assert_executes_in_all_runtimes(&module, "number_or_zero", &[1.0], 1.0);
+    assert_executes_in_all_runtimes(&module, "number_or_zero", &[-1.0], 0.0);
+    assert_executes_in_all_runtimes(&module, "let_bound", &[1.0], 1.0);
+    assert_executes_in_all_runtimes(&module, "through_literal", &[1.0], 1.0);
+    assert_executes_in_all_runtimes(&module, "through_literal_sum", &[1.0], 1.0);
+    assert_executes_in_all_runtimes(&module, "through_literal_sum", &[-1.0], 0.0);
+    assert_executes_in_all_runtimes(&module, "through_literal_object_arm", &[-1.0], 0.0);
+}

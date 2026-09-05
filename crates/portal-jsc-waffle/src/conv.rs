@@ -47,6 +47,7 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
         shadowed_names: BTreeSet::new(),
         next_function_tag: USER_TAG_BASE,
         to_number_helper: None,
+        add_helper: None,
         return_kinds: BTreeMap::new(),
         current_native_returns: None,
         function_literal_locals: BTreeMap::new(),
@@ -150,6 +151,7 @@ pub fn convert_module<'a, 'wasm>(
         shadowed_names: BTreeSet::new(),
         next_function_tag: USER_TAG_BASE,
         to_number_helper: None,
+        add_helper: None,
         return_kinds: BTreeMap::new(),
         current_native_returns: None,
         function_literal_locals: BTreeMap::new(),
@@ -512,6 +514,9 @@ struct Converter<'a, 'module, 'wasm> {
     /// Generic `ToNumber` coercion over a boxed value at the `anyref`
     /// boundary. Generated lazily; see `ensure_to_number_helper`.
     to_number_helper: Option<Func>,
+    /// Runtime `+` over boxed values (string concat vs numeric add).
+    /// Generated lazily; see `ensure_add_helper`.
+    add_helper: Option<Func>,
     /// Memoized static return-representation analysis per source function
     /// (keyed by [`Converter::key`]). See `analyze_return_kinds`.
     return_kinds: BTreeMap<usize, ReturnKinds>,
@@ -2241,6 +2246,34 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         })
     }
 
+    /// Materialize an `Add` operand as a string-struct reference for the
+    /// runtime-concat path. Statically string-typed operands already hold
+    /// the struct; reference operands passed the preceding `ref.test`
+    /// string check, so the cast cannot fail.
+    fn string_operand_for_concat(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        operand: &LowerValue,
+        wasm: Value,
+        is_static_string: bool,
+    ) -> Result<Value, ConvertError> {
+        if is_static_string && !matches!(operand, LowerValue::String { .. }) {
+            return Ok(wasm);
+        }
+        match operand {
+            LowerValue::String { value, .. } => Ok(*value),
+            _ => Ok(body.add_op(
+                block,
+                Operator::RefCast {
+                    ty: self.repr.string_ty(),
+                },
+                &[wasm],
+                &[self.repr.string_ty()],
+            )),
+        }
+    }
+
     fn binary(
         &mut self,
         body: &mut FunctionBody,
@@ -2252,27 +2285,55 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     ) -> Result<LowerValue, ConvertError> {
         use BinaryOp::*;
         match op {
-            Add
+            Add => {
+                // Static string concat: both operands are known literals.
                 if matches!(left, LowerValue::String { .. })
-                    && matches!(right, LowerValue::String { .. }) =>
-            {
-                let (left, _) = left.wasm()?;
-                let (right, _) = right.wasm()?;
-                let concat = self.ensure_string_concat()?;
-                let string = body.add_op(
-                    block,
-                    Operator::Call {
-                        function_index: concat,
-                    },
-                    &[left, right],
-                    &[self.repr.string_ty()],
-                );
-                Ok(LowerValue::Wasm {
-                    value: self.anyref(body, block, string),
-                    kind: ValueKind::Reference,
-                })
+                    && matches!(right, LowerValue::String { .. })
+                {
+                    let (left, _) = left.wasm()?;
+                    let (right, _) = right.wasm()?;
+                    let concat = self.ensure_string_concat()?;
+                    let string = body.add_op(
+                        block,
+                        Operator::Call {
+                            function_index: concat,
+                        },
+                        &[left, right],
+                        &[self.repr.string_ty()],
+                    );
+                    return Ok(LowerValue::Wasm {
+                        value: self.anyref(body, block, string),
+                        kind: ValueKind::Reference,
+                    });
+                }
+                // A member read on a string loses its static string
+                // representation at the block boundary (`'x' + 'abc'[1]`),
+                // so `+` over a reference operand must decide
+                // concatenation vs numeric addition at runtime. The
+                // shared helper takes boxed operands and returns one
+                // boxed result; `binary` cannot branch, so all of the
+                // dispatch lives inside the helper.
+                let (left_wasm, left_kind) = left.wasm()?;
+                let (right_wasm, right_kind) = right.wasm()?;
+                if left_kind == ValueKind::Reference || right_kind == ValueKind::Reference {
+                    let add = self.ensure_add_helper()?;
+                    let left_value = self.box_value(body, block, left)?;
+                    let right_value = self.box_value(body, block, right)?;
+                    let sum = body.add_op(
+                        block,
+                        Operator::Call {
+                            function_index: add,
+                        },
+                        &[left_value, right_value],
+                        &[self.repr.value],
+                    );
+                    return Ok(LowerValue::Wasm {
+                        value: sum,
+                        kind: ValueKind::Reference,
+                    });
+                }
+                self.f64_binary(body, block, left, right, Operator::F64Add)
             }
-            Add => self.f64_binary(body, block, left, right, Operator::F64Add),
             Sub => self.f64_binary(body, block, left, right, Operator::F64Sub),
             Mul => self.f64_binary(body, block, left, right, Operator::F64Mul),
             Div => self.f64_binary(body, block, left, right, Operator::F64Div),
@@ -3144,7 +3205,20 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             undefined_hit,
             Terminator::Return { values: vec![nan] },
         );
-        body.set_terminator(other, Terminator::Unreachable);
+        // Per spec, ToNumber of a plain object is NaN (ToPrimitive
+        // yields "[object Object]", which parses as NaN). Any reference
+        // shape this helper does not otherwise recognize — objects,
+        // functions, unhandled strings — follows that same NaN result
+        // rather than trapping.
+        let object_nan = body.add_op(
+            other,
+            Operator::F64Const {
+                value: f64::NAN.to_bits(),
+            },
+            &[],
+            &[Type::F64],
+        );
+        body.set_terminator(other, Terminator::Return { values: vec![object_nan] });
 
         let func = self.module.funcs.push(FuncDecl::Body(
             sig,
@@ -3991,6 +4065,126 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[bytes, cache],
             &[self.repr.string_ty()],
         ))
+    }
+
+    /// Shared runtime `+` over two boxed values: if both operands are
+    /// strings, concatenate; otherwise coerce both through the shared
+    /// ToNumber surface and add. Returns one boxed result, so a single
+    /// `Call` with no local branching serves every dynamic `+` site.
+    fn ensure_add_helper(&mut self) -> Result<Func, ConvertError> {
+        if let Some(func) = self.add_helper {
+            return Ok(func);
+        }
+        let signature = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.value, self.repr.value],
+            returns: vec![self.repr.value],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let left = body.blocks[entry].params[0].1;
+        let right = body.blocks[entry].params[1].1;
+
+        let left_string = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.string_ty(),
+            },
+            &[left],
+            &[Type::I32],
+        );
+        let right_string = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.string_ty(),
+            },
+            &[right],
+            &[Type::I32],
+        );
+        let both = body.add_op(entry, Operator::I32And, &[left_string, right_string], &[Type::I32]);
+        let concat = body.add_block();
+        let numeric = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: both,
+                if_true: BlockTarget { block: concat, args: vec![] },
+                if_false: BlockTarget { block: numeric, args: vec![] },
+            },
+        );
+
+        let concat_fn = self.ensure_string_concat()?;
+        let left_string_ref = body.add_op(
+            concat,
+            Operator::RefCast {
+                ty: self.repr.string_ty(),
+            },
+            &[left],
+            &[self.repr.string_ty()],
+        );
+        let right_string_ref = body.add_op(
+            concat,
+            Operator::RefCast {
+                ty: self.repr.string_ty(),
+            },
+            &[right],
+            &[self.repr.string_ty()],
+        );
+        let string = body.add_op(
+            concat,
+            Operator::Call {
+                function_index: concat_fn,
+            },
+            &[left_string_ref, right_string_ref],
+            &[self.repr.string_ty()],
+        );
+        let string_result = body.add_op(
+            concat,
+            Operator::RefCast { ty: self.repr.value },
+            &[string],
+            &[self.repr.value],
+        );
+        body.set_terminator(concat, Terminator::Return { values: vec![string_result] });
+
+        let to_number = self.ensure_to_number_helper()?;
+        let left_number = body.add_op(
+            numeric,
+            Operator::Call {
+                function_index: to_number,
+            },
+            &[left],
+            &[Type::F64],
+        );
+        let right_number = body.add_op(
+            numeric,
+            Operator::Call {
+                function_index: to_number,
+            },
+            &[right],
+            &[Type::F64],
+        );
+        let sum = body.add_op(numeric, Operator::F64Add, &[left_number, right_number], &[Type::F64]);
+        let boxed = body.add_op(
+            numeric,
+            Operator::StructNew { sig: self.repr.number },
+            &[sum],
+            &[self.repr.number_ty()],
+        );
+        let boxed_result = body.add_op(
+            numeric,
+            Operator::RefCast { ty: self.repr.value },
+            &[boxed],
+            &[self.repr.value],
+        );
+        body.set_terminator(numeric, Terminator::Return { values: vec![boxed_result] });
+
+        let func = self.module.funcs.push(FuncDecl::Body(
+            signature,
+            format!("js_add_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.add_helper = Some(func);
+        Ok(func)
     }
 
     fn ensure_string_concat(&mut self) -> Result<Func, ConvertError> {

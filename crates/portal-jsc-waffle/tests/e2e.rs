@@ -1652,3 +1652,173 @@ fn provable_math_call_reaches_fast_core_directly() {
     }
     assert!(fast_core_called, "provable Math call must reach the fast core directly");
 }
+
+#[test]
+fn executes_provenance_tracked_function_calls() {
+    let module = compile_module(
+        "
+            export function local_direct() {
+                let five = function() { return 5; };
+                return five() + five() * 10;
+            }
+            export function local_with_args(x) {
+                let double = function(v) { return v * 2; };
+                return double(x) + double(x) / 2;
+            }
+            export function reassigned_local() {
+                let f = function() { return 1; };
+                let tag = 0;
+                if (f() === 1) { tag = 10; }
+                f = function() { return 2; };
+                return tag + f() * 100;
+            }
+            export function method_direct() {
+                let object = { v: 3, add: function(x) { return this.v + x; } };
+                return object.add(4) + object.add(4) * 10;
+            }
+            export function method_overwritten() {
+                let object = { v: 3, add: function(x) { return this.v + x; } };
+                let first = object.add(1);
+                object.add = function(x) { return 100 + x; };
+                return first + object.add(2) * 10;
+            }
+            export function detached_method() {
+                let object = { v: 3, add: function(x) { return (this === undefined ? 1 : 3) + x; } };
+                let g = object.add;
+                return g(4);
+            }
+            export function number_return_kind(x) {
+                let inc = function(v) { return v + 1; };
+                return inc(x) * 10 + inc(x);
+            }
+            export function mixed_return(x) {
+                let pick = function(v) { return v > 0 ? 1 : v; };
+                let echo = function(w) { return 42; };
+                let r = pick(x);
+                let w = echo(r);
+                return w + (r > 0 ? 1 : 2);
+            }
+            export function shadowed_by_param(f) {
+                return f === undefined ? 7 : 1;
+            }
+        ",
+    );
+    validate(&module);
+    let bytes = wasm_bytes(&module);
+
+    assert_eq!(
+        execute_in_wasmtime(&bytes, "local_direct", &[]),
+        55.0,
+        "two calls through a single-assignment function literal"
+    );
+    assert_eq!(
+        execute_in_wasmtime(&bytes, "local_with_args", &[7.0]),
+        21.0,
+        "direct native call passes positionally boxed formals"
+    );
+    assert_eq!(
+        execute_in_wasmtime(&bytes, "reassigned_local", &[]),
+        210.0,
+        "the tag check must fall back after reassignment"
+    );
+    assert_eq!(
+        execute_in_wasmtime(&bytes, "method_direct", &[]),
+        77.0,
+        "method dispatch keeps `this` wired to the receiver"
+    );
+    assert_eq!(
+        execute_in_wasmtime(&bytes, "method_overwritten", &[]),
+        4.0 + 102.0 * 10.0,
+        "an overwritten method slot must take the fallback path (first=3+1, override=100+2)"
+    );
+    assert_eq!(
+        execute_in_wasmtime(&bytes, "detached_method", &[]),
+        5.0,
+        "a detached method loses its receiver"
+    );
+    assert_eq!(
+        execute_in_wasmtime(&bytes, "number_return_kind", &[4.0]),
+        55.0,
+        "a single-Number-kind callee returns raw f64 into the caller"
+    );
+    assert_eq!(
+        execute_in_wasmtime(&bytes, "mixed_return", &[1.0]),
+        43.0,
+        "a mixed-kind callee keeps the boxed ABI and still works"
+    );
+    assert_eq!(
+        execute_in_wasmtime(&bytes, "mixed_return", &[-1.0]),
+        44.0,
+        "a mixed-kind callee keeps the boxed ABI and still works"
+    );
+    assert_eq!(
+        execute_in_wasmtime(&bytes, "shadowed_by_param", &[0.0]),
+        1.0,
+        "a parameter named like a literal local is a plain value call"
+    );
+}
+
+#[test]
+fn provenance_local_call_reaches_native_body_directly() {
+    let module = compile_module(
+        "
+            export function run() {
+                let five = function() { return 5; };
+                let x = five();
+                return x;
+            }
+        ",
+    );
+    validate(&module);
+    let mut native_called = false;
+    let mut body_count = 0;
+    for (_, decl) in module.funcs.entries() {
+        if let FuncDecl::Body(_, name, body) = decl {
+            if name.starts_with("js_body_") {
+                for (_, def) in body.values.entries() {
+                    if let ValueDef::Operator(Operator::Call { function_index }, _, _) = def {
+                        body_count += 1;
+                        if module.funcs[*function_index].name().starts_with("js_body_") {
+                            native_called = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(native_called, "a provenance-tracked call must hit the native body directly");
+}
+
+#[test]
+fn provenance_single_kind_native_returns_raw() {
+    let module = compile_module(
+        "
+            export function run(x) {
+                let five = function() { return 5; };
+                let echo = function(w) { return w; };
+                return five() + echo(x);
+            }
+        ",
+    );
+    validate(&module);
+    let mut raw_f64 = false;
+    let mut boxed = false;
+    for (_, decl) in module.funcs.entries() {
+        if let FuncDecl::Body(sig, name, _) = decl {
+            let returns = match &module.signatures[*sig] {
+                SignatureData::Func { returns, .. } => returns.clone(),
+                _ => continue,
+            };
+            if name.starts_with("js_body_") {
+                if returns == vec![Type::F64] {
+                    raw_f64 = true;
+                }
+                if returns.len() == 1 && returns[0] != Type::F64 {
+                    boxed = true;
+                }
+            }
+        }
+    }
+    assert!(raw_f64, "a single-Number-kind native body must declare an f64 return");
+    assert!(boxed, "the Reference-kind callee must keep the boxed ABI");
+}

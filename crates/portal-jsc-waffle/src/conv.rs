@@ -48,6 +48,7 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
         next_function_tag: USER_TAG_BASE,
         return_kinds: BTreeMap::new(),
         current_native_returns: None,
+        function_literal_locals: BTreeMap::new(),
     };
     converter.collect_shapes(root)?;
     converter.collect_shadowed_names(root, &mut BTreeSet::new());
@@ -149,6 +150,7 @@ pub fn convert_module<'a, 'wasm>(
         next_function_tag: USER_TAG_BASE,
         return_kinds: BTreeMap::new(),
         current_native_returns: None,
+        function_literal_locals: BTreeMap::new(),
     };
     let mut exports = Vec::with_capacity(exported.len());
     for export in exported {
@@ -272,10 +274,6 @@ impl ReturnKinds {
         };
     }
 
-    fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-
     /// The single possible kind, if the set is exactly one.
     fn single(self) -> Option<ValueKind> {
         match self.0 {
@@ -365,6 +363,25 @@ enum LowerValue {
         key: String,
         bytes: Vec<u8>,
     },
+    /// A function value whose *origin* is statically known: a specific
+    /// lowered source function (and therefore a specific [`FunctionInfo`]).
+    /// The value is still an ordinary function object at runtime; the origin
+    /// lets a call site verify "this callee is still exactly that literal"
+    /// with a tag check and dispatch its native body directly. `fresh` marks
+    /// a literal allocated by the current statement, which needs no check.
+    FunctionRef {
+        value: Value,
+        info: FunctionInfo,
+        fresh: bool,
+    },
+    /// An object literal whose function-valued members are statically known
+    /// (by property key), enabling guarded direct method dispatch: the tag
+    /// check verifies the slot still holds the original method even if the
+    /// object escaped and its members were overwritten.
+    ObjectLiteral {
+        value: Value,
+        methods: std::rc::Rc<BTreeMap<String, FunctionInfo>>,
+    },
 }
 
 /// One Wasm control-flow continuation while lowering a source SSA block.
@@ -385,6 +402,9 @@ impl LowerValue {
             Self::ReferenceKey { value, .. } => Ok((*value, ValueKind::Reference)),
             Self::NumberLiteral { value, .. } => Ok((*value, ValueKind::Number)),
             Self::String { value, .. } => Ok((*value, ValueKind::Reference)),
+            Self::FunctionRef { value, .. } | Self::ObjectLiteral { value, .. } => {
+                Ok((*value, ValueKind::Reference))
+            }
         }
     }
 
@@ -403,6 +423,11 @@ impl LowerValue {
             // Strings are immutable, so retaining their byte identity across
             // an alias remains sound and lets `+` use the UTF-8 concat path.
             value @ Self::String { .. } => value,
+            // Function origins and object-literal method tables survive
+            // aliasing: the runtime tag check at each call site is what
+            // proves the binding is unchanged, and a copied reference is
+            // still the same object the check can verify.
+            value @ Self::FunctionRef { .. } | value @ Self::ObjectLiteral { .. } => value,
             value => value,
         }
     }
@@ -488,6 +513,12 @@ struct Converter<'a, 'module, 'wasm> {
     /// The return representation of the native body currently being
     /// lowered. `None` means the boxed `anyref` ABI.
     current_native_returns: Option<ValueKind>,
+    /// Variable names whose only write in the current function tree stores
+    /// one specific function literal (`let f = function () {...}` with no
+    /// reassignment anywhere, including nested closures). A load of such a
+    /// name produces a [`LowerValue::FunctionRef`] whose tag check proves
+    /// the binding is unchanged at call time. Reset per top-level function.
+    function_literal_locals: BTreeMap<String, &'a SFunc>,
 }
 
 impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
@@ -541,18 +572,39 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     /// nested closures) assigns. A primordial name that is never assigned in
     /// an enclosing scope chain cannot be shadowed, so call sites can skip
     /// the runtime tag check entirely. Collected into `shadowed_names`.
-    fn collect_shadowed_names(&mut self, func: &'a SFunc, visited: &mut BTreeSet<usize>) {
+    fn collect_shadowed_names(
+        &mut self,
+        func: &'a SFunc,
+        visited: &mut BTreeSet<usize>,
+    ) {
+        self.collect_shadowed_names_nested(func, visited, false)
+    }
+
+    fn collect_shadowed_names_nested(
+        &mut self,
+        func: &'a SFunc,
+        visited: &mut BTreeSet<usize>,
+        nested: bool,
+    ) {
         if !visited.insert(Self::key(func)) {
             return;
         }
         for (_, value) in func.cfg.values.iter() {
             match &value.value {
-                SValue::StoreId { target, .. } => {
+                SValue::StoreId { target, val } => {
                     self.shadowed_names.insert(target.0.to_string());
+                    // Only the top-level function's own stores can vouch for
+                    // a single-assignment literal; a nested closure's store
+                    // makes the name ambiguous from the outside.
+                    if !nested {
+                        self.note_function_literal_local(&target.0.to_string(), *val, func);
+                    } else {
+                        self.function_literal_locals.remove(&target.0.to_string());
+                    }
                 }
                 SValue::Item { item, .. } => {
-                    for nested in item.funcs() {
-                        self.collect_shadowed_names(nested, visited);
+                    for closure in item.funcs() {
+                        self.collect_shadowed_names_nested(closure, visited, true);
                     }
                 }
                 _ => {}
@@ -563,6 +615,43 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         // never lowers; parameters and locals live on the context object and
         // go through `StoreId` already. Hoisted `function name()` forms are
         // therefore not separately tracked here.
+    }
+
+    /// Record `name` as a single-assignment function-literal local when its
+    /// only write stores one specific function literal. Any second write to
+    /// the name drops the entry (the same conservative taint pattern as
+    /// `collect_shadowed_names`). A nested closure's write makes the name
+    /// ambiguous too — its `val` index resolves in the nested cfg, so treat
+    /// any store whose value is not found in *this* function's arena as a
+    /// disqualifier.
+    fn note_function_literal_local(&mut self, name: &str, val: SValueId, func: &'a SFunc) {
+        let literal: Option<&'a SFunc> = match &func.cfg.values[val].value {
+            SValue::Item {
+                item: Item::Func { func: literal, .. },
+                ..
+            } => Some(literal),
+            // An alias of a function literal also retains the origin.
+            SValue::Item {
+                item: Item::Just { id },
+                ..
+            } => match &func.cfg.values[*id].value {
+                SValue::Item {
+                    item: Item::Func { func: literal, .. },
+                    ..
+                } => Some(literal),
+                _ => None,
+            },
+            _ => None,
+        };
+        match (self.function_literal_locals.get(name).copied(), literal) {
+            (None, Some(literal)) => {
+                self.function_literal_locals.insert(name.to_string(), literal);
+            }
+            // A non-literal first store, or any second store, disqualifies.
+            (None, None) | (Some(_), _) => {
+                self.function_literal_locals.remove(name);
+            }
+        }
     }
 
     /// Can the named identifier resolve to a primordial without any runtime
@@ -593,7 +682,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let mut kinds = ReturnKinds::default();
         let mut visited_blocks = BTreeSet::new();
         self.scan_return_kinds(func, func.entry, &mut kinds, &mut visited_blocks);
+        eprintln!("scan result for func {key}: {kinds:?} over {} blocks", func.cfg.blocks.len());
         self.return_kinds.insert(key, kinds);
+        
+        eprintln!("return kinds of func {key}: {kinds:?}");
         kinds
     }
 
@@ -609,11 +701,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         }
         let sblock = &root.cfg.blocks[block];
         for stmt in sblock.stmts.iter().copied() {
-            let kind = self.classify_return_value(root, stmt);
-            if let Some(kind) = kind {
-                kinds.insert(kind);
-            }
-            self.scan_nested_return_kinds(root, stmt, kinds);
+            self.scan_nested_return_kinds(root, stmt);
         }
         match &sblock.postcedent.term {
             TTerm::Return(Some(value)) => {
@@ -637,15 +725,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         }
     }
 
-    /// Walk nested closures of a statement so their returns count toward
-    /// *their own* analysis (they are lowered as separate functions), not
-    /// toward the enclosing function's.
-    fn scan_nested_return_kinds(
-        &mut self,
-        root: &'a SFunc,
-        stmt: SValueId,
-        _kinds: &mut ReturnKinds,
-    ) {
+    /// Analyze the nested closures of a statement so their returns count
+    /// toward *their own* analysis (they are lowered as separate functions).
+    fn scan_nested_return_kinds(&mut self, root: &'a SFunc, stmt: SValueId) {
         if let SValue::Item { item, .. } = &root.cfg.values[stmt].value {
             for nested in item.funcs() {
                 self.analyze_return_kinds(nested);
@@ -845,7 +927,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         };
         self.functions.insert(key, info);
         self.pending.push_back(sfunc);
-        Ok(info)
+        Ok(*self.functions.get(&key).expect("just inserted"))
     }
 
     fn make_adapter(&mut self, native: Func, arity: usize) -> Result<Func, ConvertError> {
@@ -1499,13 +1581,26 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             }
             SValue::LoadId(id) => {
                 let key = id.0.to_string();
-                self.get_property(body, block, context, &key)?
-                    .into_iter()
-                    .map(|(block, value)| {
-                        let (value, _) = value.wasm()?;
-                        Ok((block, LowerValue::ReferenceKey { value, key: key.clone() }))
-                    })
-                    .collect()
+                let literal = self.function_literal_locals.get(&key).copied();
+                let mut results = Vec::new();
+                for (block, value) in self.get_property(body, block, context, &key)? {
+                    let (value, _) = value.wasm()?;
+                    // A single-assignment function-literal local keeps its
+                    // origin: the call site's tag check proves the context
+                    // slot still holds the literal at runtime.
+                    let value = if let Some(literal) = literal {
+                        let info = self.ensure_function(literal)?;
+                        LowerValue::FunctionRef {
+                            value,
+                            info,
+                            fresh: false,
+                        }
+                    } else {
+                        LowerValue::ReferenceKey { value, key: key.clone() }
+                    };
+                    results.push((block, value));
+                }
+                Ok(results)
             }
             SValue::StoreId { target, val } => {
                 let value = values
@@ -1648,6 +1743,144 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         self.try_provable_primordial_call(body, block, receiver, key, values, args)?
                 {
                     return Ok(result);
+                }
+            }
+            // Direct dispatch for provenance-tracked function values: local
+            // function-literal variables and object-literal methods. One
+            // tag check (or none, for a freshly allocated literal) proves
+            // the callee is still the original literal.
+            if !args.iter().any(|arg| arg.is_spread) {
+                match callee {
+                    TCallee::Val(value) => {
+                        if let Some(callee_value) = values.get(value)
+                            && let LowerValue::FunctionRef { info, fresh, .. } = callee_value
+                        {
+                            let info = *info;
+                            let fresh = *fresh;
+                            let callee_value = callee_value.clone();
+                            if fresh {
+                                // A literal allocated by the current
+                                // statement cannot have been rebound.
+                                let result = self.direct_native_call(
+                                    body,
+                                    block,
+                                    context,
+                                    info,
+                                    this.clone(),
+                                    values,
+                                    args,
+                                )?;
+                                return Ok(vec![result]);
+                            }
+                            let adapter_sig = self.repr.adapter;
+                            let adapter_value_ty = self.repr.value;
+                            let fallback = |conv: &mut Self,
+                                            body: &mut FunctionBody,
+                                            slow: Block|
+                             -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+                                let callees = conv.lower_call_parts(
+                                    body,
+                                    slow,
+                                    context,
+                                    this.clone(),
+                                    values,
+                                    callee,
+                                    args,
+                                )?;
+                                Ok(callees
+                                    .into_iter()
+                                    .map(|(block, ctx, recv, array, code)| {
+                                        let value = body.add_op(
+                                            block,
+                                            Operator::CallRef {
+                                                sig_index: adapter_sig,
+                                            },
+                                            &[ctx, recv, array, code],
+                                            &[adapter_value_ty],
+                                        );
+                                        (
+                                            block,
+                                            LowerValue::Wasm {
+                                                value,
+                                                kind: ValueKind::Reference,
+                                            },
+                                        )
+                                    })
+                                    .collect())
+                            };
+                            let result = self.guarded_function_ref_call(
+                                body,
+                                block,
+                                callee_value,
+                                info,
+                                context,
+                                this.clone(),
+                                values,
+                                args,
+                                fallback,
+                            )?;
+                            return Ok(result);
+                        }
+                    }
+                    TCallee::Member { func, member } => {
+                        if let Some(receiver) = values.get(func)
+                            && let LowerValue::ObjectLiteral { methods, .. } = receiver
+                            && let Some(key_value) = values.get(member)
+                            && let Ok(key) = self.key_of(key_value)
+                            && let Some(&info) = methods.get(&key)
+                        {
+                            // Load the method through the ordinary lookup
+                            // (shape/trie machinery, correct for every
+                            // receiver), then guard on the tag.
+                            let callees =
+                                self.get_property_value(body, block, receiver, &key)?;
+                            let mut continuations = Vec::new();
+                            for (callee_block, callee_value) in callees {
+                                let fallback_callee = callee_value.clone();
+                                let fallback = |this: &mut Self,
+                                                body: &mut FunctionBody,
+                                                slow: Block|
+                                 -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+                                    let (ctx, this_v, code, _arrow) = this.callable_parts(
+                                        body,
+                                        slow,
+                                        &fallback_callee,
+                                        receiver.clone(),
+                                    )?;
+                                    let array = this.make_arguments(body, slow, values, args)?;
+                                    let value = body.add_op(
+                                        slow,
+                                        Operator::CallRef {
+                                            sig_index: this.repr.adapter,
+                                        },
+                                        &[ctx, this_v, array, code],
+                                        &[this.repr.value],
+                                    );
+                                    Ok(vec![(
+                                        slow,
+                                        LowerValue::Wasm {
+                                            value,
+                                            kind: ValueKind::Reference,
+                                        },
+                                    )])
+                                };
+                                let result = self.guarded_function_ref_call(
+                                    body,
+                                    callee_block,
+                                    callee_value,
+                                    info,
+                                    context,
+                                    receiver.clone(),
+                                    values,
+                                    args,
+                                    fallback,
+                                )?;
+                                continuations.extend(result);
+                            }
+                            return Ok(continuations);
+                        }
+                    }
+                    _ => {}
                 }
             }
             return self
@@ -6025,7 +6258,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         arrow: bool,
     ) -> Result<LowerValue, ConvertError> {
         let info = self.ensure_function(func)?;
-        self.function_object_from_info(body, block, context, this, info, arrow)
+        self.function_object_from_info(body, block, context, this, info, arrow, true)
     }
 
     fn function_object_from_info(
@@ -6036,6 +6269,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         this: LowerValue,
         info: FunctionInfo,
         arrow: bool,
+        fresh: bool,
     ) -> Result<LowerValue, ConvertError> {
         let trie = self.new_trie(body, block)?;
         let elements = body.add_op(
@@ -6095,10 +6329,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             ],
             &[self.repr.function_ty()],
         );
-        Ok(LowerValue::Wasm {
-            value,
-            kind: ValueKind::Reference,
-        })
+        Ok(LowerValue::FunctionRef { value, info, fresh })
     }
 
     fn object_literal(
@@ -6136,6 +6367,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         // a local descriptor table so `get x` followed by `set x` shares one
         // descriptor, while a later data definition replaces it entirely.
         let mut accessors = BTreeMap::<String, Value>::new();
+        // Method literals keyed by property name, threaded onto the result.
+        let mut methods = BTreeMap::<String, FunctionInfo>::new();
         for (key, property) in members {
             let key = match key {
                 PropKey::Lit(key) => key.sym.to_string(),
@@ -6159,6 +6392,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     let value = self.function_object(body, *block, context, this.clone(), func, false)?;
                     accessors.remove(&key);
                     *block = self.set_static_property_value_raw(body, *block, &object, &key, &value)?;
+                    // Record the method's identity so member calls on this
+                    // literal can verify the slot still holds it.
+                    if let LowerValue::FunctionRef { info, .. } = &value {
+                        methods.insert(key.clone(), *info);
+                    }
                 }
                 PropVal::Getter(func) | PropVal::Setter(func) => {
                     let descriptor = if let Some(descriptor) = accessors.get(&key).copied() {
@@ -6200,7 +6438,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 _ => return Err(ConvertError::unsupported("object property", span)),
             }
         }
-        Ok(object)
+        let (object, _) = object.wasm()?;
+        Ok(LowerValue::ObjectLiteral {
+            value: object,
+            methods: std::rc::Rc::new(methods),
+        })
     }
 
     fn key_of(&self, value: &LowerValue) -> Result<String, ConvertError> {
@@ -8789,6 +9031,181 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &values,
             &[self.repr.arguments_ty()],
         ))
+    }
+
+    /// Emit the direct dispatch to a function literal's native body: a
+    /// `(context, this, arguments, args...) -> value` call with the current
+    /// context and the given receiver, skipping `callable_parts` and the
+    /// generic adapter's formal re-reads. Arguments are boxed positionally
+    /// (the unnormalized array still backs the source-level `arguments`).
+    fn direct_native_call(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        context: Value,
+        info: FunctionInfo,
+        this: LowerValue,
+        values: &BTreeMap<SValueId, LowerValue>,
+        args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        if args.iter().any(|arg| arg.is_spread) {
+            return Err(ConvertError::unsupported("spread argument", ()));
+        }
+        let (this, _) = this.wasm()?;
+        let this = self.anyref(body, block, this);
+        let mut boxed_args = Vec::with_capacity(args.len());
+        for arg in args {
+            let value = values
+                .get(&arg.value)
+                .ok_or_else(|| ConvertError::invalid("undefined call argument"))?;
+            boxed_args.push(self.box_value(body, block, value)?);
+        }
+        let arguments = body.add_op(
+            block,
+            Operator::ArrayNewFixed {
+                sig: self.repr.arguments,
+                num: boxed_args.len(),
+            },
+            &boxed_args,
+            &[self.repr.arguments_ty()],
+        );
+        // The native ABI has one formal per source parameter. Missing call
+        // arguments pass `undefined` (matching the adapter's bounds-checked
+        // reads); extra arguments ride in the array only.
+        let mut formals = boxed_args.clone();
+        formals.truncate(info.arity);
+        while formals.len() < info.arity {
+            let undef = body.add_op(
+                block,
+                Operator::RefNull {
+                    ty: self.repr.value,
+                },
+                &[],
+                &[self.repr.value],
+            );
+            formals.push(undef);
+        }
+        let mut call_args = vec![context, this, arguments];
+        call_args.extend(formals);
+        let result = body.add_op(
+            block,
+            Operator::Call {
+                function_index: info.native,
+            },
+            &call_args,
+            &[info.returns.native_return_type(&self.repr)],
+        );
+        let kind = info.returns.single().unwrap_or(ValueKind::Reference);
+        Ok((block, LowerValue::Wasm { value: result, kind }))
+    }
+
+    /// Guarded dispatch through a function literal: one tag check proves
+    /// the callee is still the original literal; mismatch falls back to the
+    /// generic `CallRef` path via the provided closure. Returns raw fast and
+    /// boxed-slow continuations.
+    fn guarded_function_ref_call<F>(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        callee: LowerValue,
+        info: FunctionInfo,
+        context: Value,
+        this: LowerValue,
+        values: &BTreeMap<SValueId, LowerValue>,
+        args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
+        fallback: F,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError>
+    where
+        F: FnOnce(
+            &mut Self,
+            &mut FunctionBody,
+            Block,
+        ) -> Result<Vec<(Block, LowerValue)>, ConvertError>,
+    {
+        let (callee_value, kind) = callee.wasm()?;
+        if kind != ValueKind::Reference || args.iter().any(|arg| arg.is_spread) {
+            return fallback(self, body, block);
+        }
+        let is_function = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.function_non_null_ty(),
+            },
+            &[callee_value],
+            &[Type::I32],
+        );
+        let check = body.add_block();
+        let slow = body.add_block();
+        let fast = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_function,
+                if_true: BlockTarget {
+                    block: check,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: slow,
+                    args: vec![],
+                },
+            },
+        );
+        let function = body.add_op(
+            check,
+            Operator::RefCast {
+                ty: self.repr.function_ty(),
+            },
+            &[callee_value],
+            &[self.repr.function_ty()],
+        );
+        let tag = body.add_op(
+            check,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: FUNCTION_FIELD_TAG,
+            },
+            &[function],
+            &[Type::I32],
+        );
+        let expected = body.add_op(
+            check,
+            Operator::I32Const {
+                value: info.tag as u32,
+            },
+            &[],
+            &[Type::I32],
+        );
+        let matches = body.add_op(check, Operator::I32Eq, &[tag, expected], &[Type::I32]);
+        body.set_terminator(
+            check,
+            Terminator::CondBr {
+                cond: matches,
+                if_true: BlockTarget {
+                    block: fast,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: slow,
+                    args: vec![],
+                },
+            },
+        );
+        let mut continuations = Vec::with_capacity(2);
+        let (fast_block, fast_value) =
+            self.direct_native_call(body, fast, context, info, this, values, args)?;
+        continuations.push((fast_block, fast_value));
+        for (slow_block, slow_value) in fallback(self, body, slow)? {
+            let slow_value = self.box_value(body, slow_block, &slow_value)?;
+            continuations.push((
+                slow_block,
+                LowerValue::Wasm {
+                    value: slow_value,
+                    kind: ValueKind::Reference,
+                },
+            ));
+        }
+        Ok(continuations)
     }
 
     fn lower_call_parts(

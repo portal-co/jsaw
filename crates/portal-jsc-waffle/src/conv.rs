@@ -1638,14 +1638,16 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         if let Item::Call { callee, args } = item {
             // Provable primordial call: the callee is `<unshadowed
             // primordial>.<member-with-fast-core>` — skip the lookup, the
-            // arguments array, and the `CallRef` dispatch entirely.
+            // arguments array, and the `CallRef` dispatch entirely. Proven
+            // sites produce one raw-representation continuation; guarded
+            // sites split into raw-fast and boxed-slow continuations.
             if let TCallee::Member { func, member } = callee {
                 if let Some(receiver) = values.get(func)
                     && let Some(key) = values.get(member)
                     && let Some(result) =
                         self.try_provable_primordial_call(body, block, receiver, key, values, args)?
                 {
-                    return Ok(vec![result]);
+                    return Ok(result);
                 }
             }
             return self

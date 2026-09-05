@@ -2770,6 +2770,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     /// core is called directly; on mismatch, `fallback` produces the blocks
     /// for the ordinary generic-dispatch path.
     #[allow(clippy::too_many_arguments)]
+    /// One runtime tag check, then either a direct unboxed-core call (fast
+    /// arm) or the generic `CallRef` dispatch (fallback arm). The two arms
+    /// produce different representations — raw f64/i32 versus boxed anyref
+    /// — so they are returned as two continuations and the caller's
+    /// remaining statements lower once per representation.
     fn guarded_primordial_call(
         &mut self,
         body: &mut FunctionBody,
@@ -2798,8 +2803,6 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let check = body.add_block();
         let slow = body.add_block();
         let fast = body.add_block();
-        let join = body.add_block();
-        let joined = body.add_blockparam(join, self.repr.value);
         body.set_terminator(
             block,
             Terminator::CondBr {
@@ -2855,63 +2858,80 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             },
         );
         // Fast path: convert each argument at its position (missing/undefined
-        // → NaN matches the generic adapters' `read_arg_number` semantics) and
-        // call the unboxed core.
-        let mut blocks = vec![fast];
-        let mut core_args = Vec::with_capacity(args.len());
-        for arg in args.iter() {
-            let block = *blocks.last().expect("non-empty");
-            let (next, converted) = self.unbox_or_nan(body, block, arg)?;
-            core_args.push(converted);
-            blocks.push(next);
-        }
-        let core = self.ensure_primordial_fast_core(expected_tag)?;
-        let last = *blocks.last().expect("non-empty");
-        let call_args = self.pad_core_args(body, last, &core_args, core)?;
-        let result = body.add_op(
-            last,
-            Operator::Call {
-                function_index: core,
-            },
-            &call_args,
-            &[Type::F64],
-        );
-        let boxed = self.box_value(
-            body,
-            last,
-            &LowerValue::Wasm {
-                value: result,
-                kind: ValueKind::Number,
-            },
-        )?;
-        body.set_terminator(
-            last,
-            Terminator::Br {
-                target: BlockTarget {
-                    block: join,
-                    args: vec![boxed],
+        // → NaN matches the generic adapters' `read_arg_number` semantics)
+        // and call the unboxed core. The raw result stays raw: the caller
+        // boxes it only where the value actually escapes.
+        let mut continuations = Vec::with_capacity(2);
+        if expected_tag == TAG_ARRAY_IS_ARRAY {
+            // The boolean core takes a single boxed `anyref`.
+            let raw = match args.first() {
+                Some(arg) => self.box_value(body, fast, arg)?,
+                None => body.add_op(
+                    fast,
+                    Operator::RefNull {
+                        ty: self.repr.value,
+                    },
+                    &[],
+                    &[self.repr.value],
+                ),
+            };
+            let core = self.ensure_is_array_fast_core()?;
+            let result = body.add_op(
+                fast,
+                Operator::Call {
+                    function_index: core,
                 },
-            },
-        );
+                &[raw],
+                &[Type::I32],
+            );
+            continuations.push((
+                fast,
+                LowerValue::Wasm {
+                    value: result,
+                    kind: ValueKind::Boolean,
+                },
+            ));
+        } else {
+            let mut blocks = vec![fast];
+            let mut core_args = Vec::with_capacity(args.len());
+            for arg in args.iter() {
+                let block = *blocks.last().expect("non-empty");
+                let (next, converted) = self.unbox_or_nan(body, block, arg)?;
+                core_args.push(converted);
+                blocks.push(next);
+            }
+            let core = self.ensure_primordial_fast_core(expected_tag)?;
+            let last = *blocks.last().expect("non-empty");
+            let call_args = self.pad_core_args(body, last, &core_args, core)?;
+            let result = body.add_op(
+                last,
+                Operator::Call {
+                    function_index: core,
+                },
+                &call_args,
+                &[Type::F64],
+            );
+            continuations.push((
+                last,
+                LowerValue::Wasm {
+                    value: result,
+                    kind: ValueKind::Number,
+                },
+            ));
+        }
+        // Fallback arm: the generic dispatch result is already a boxed
+        // reference; keep it as its own continuation.
         for (slow_block, slow_value) in fallback(self, body, slow)? {
             let slow_value = self.box_value(body, slow_block, &slow_value)?;
-            body.set_terminator(
+            continuations.push((
                 slow_block,
-                Terminator::Br {
-                    target: BlockTarget {
-                        block: join,
-                        args: vec![slow_value],
-                    },
+                LowerValue::Wasm {
+                    value: slow_value,
+                    kind: ValueKind::Reference,
                 },
-            );
+            ));
         }
-        Ok(vec![(
-            join,
-            LowerValue::Wasm {
-                value: joined,
-                kind: ValueKind::Reference,
-            },
-        )])
+        Ok(continuations)
     }
 
     /// Convert one call argument to the fast core's `f64` ABI. A missing or
@@ -3122,7 +3142,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         key: &LowerValue,
         values: &BTreeMap<SValueId, LowerValue>,
         args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
-    ) -> Result<Option<(Block, LowerValue)>, ConvertError> {
+    ) -> Result<Option<Vec<(Block, LowerValue)>>, ConvertError> {
         // 1. Receiver must be the unshadowed identifier read.
         let LowerValue::ReferenceKey { key: namespace, .. } = receiver else {
             return Ok(None);
@@ -3151,9 +3171,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             // ruled out statically, so verify the callee's primordial tag at
             // runtime and fall back to generic dispatch on mismatch. One
             // predictable branch replaces the boxing + `CallRef` cost
-            // whenever the callee really is the primordial.
+            // whenever the callee really is the primordial. The fast arm
+            // keeps the core's raw f64/i32 result while the fallback arm
+            // produces the boxed reference — two continuations, refined per
+            // representation.
             let callees = self.get_property_value(body, block, receiver, &member)?;
-            let mut continuations = Vec::with_capacity(callees.len());
+            let mut continuations = Vec::new();
             for (callee_block, callee) in callees {
                 let fallback = |this: &mut Self,
                                 body: &mut FunctionBody,
@@ -3182,10 +3205,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     self.guarded_primordial_call(body, callee_block, &callee, tag, &core_args, fallback)?;
                 continuations.extend(continuation);
             }
-            return Ok(Some((continuations[0].0, continuations[0].1.clone())));
+            return Ok(Some(continuations));
         }
-        // 3. Direct dispatch: unbox each argument, call the core, box the
-        // result. The receiver of an unshadowed primordial method is the
+        // 3. Direct dispatch: unbox each argument, call the core, and keep
+        // the raw result — the caller re-boxes only if the value actually
+        // escapes. The receiver of an unshadowed primordial method is the
         // namespace object itself; `this` is unused by every fast core, so
         // the undefined receiver stays undefined exactly as the generic
         // adapters see it.
@@ -3213,21 +3237,13 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 &[raw],
                 &[Type::I32],
             );
-            let boxed = self.box_value(
-                body,
+            return Ok(Some(vec![(
                 block,
-                &LowerValue::Wasm {
+                LowerValue::Wasm {
                     value: result,
                     kind: ValueKind::Boolean,
                 },
-            )?;
-            return Ok(Some((
-                block,
-                LowerValue::Wasm {
-                    value: boxed,
-                    kind: ValueKind::Reference,
-                },
-            )));
+            )]));
         }
         let mut current = block;
         let mut numeric_args = Vec::with_capacity(core_args.len());
@@ -3247,21 +3263,13 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &call_args,
             &[Type::F64],
         );
-        let boxed = self.box_value(
-            body,
+        Ok(Some(vec![(
             block,
-            &LowerValue::Wasm {
+            LowerValue::Wasm {
                 value: result,
                 kind: ValueKind::Number,
             },
-        )?;
-        Ok(Some((
-            block,
-            LowerValue::Wasm {
-                value: boxed,
-                kind: ValueKind::Reference,
-            },
-        )))
+        )]))
     }
 }
 

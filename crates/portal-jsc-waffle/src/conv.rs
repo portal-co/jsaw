@@ -45,6 +45,7 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
         object_enumerate_keys_helper: None,
         primordial_fast_cores: BTreeMap::new(),
         shadowed_names: BTreeSet::new(),
+        next_function_tag: USER_TAG_BASE,
     };
     converter.collect_shapes(root)?;
     converter.collect_shadowed_names(root, &mut BTreeSet::new());
@@ -143,6 +144,7 @@ pub fn convert_module<'a, 'wasm>(
         object_enumerate_keys_helper: None,
         primordial_fast_cores: BTreeMap::new(),
         shadowed_names: BTreeSet::new(),
+        next_function_tag: USER_TAG_BASE,
     };
     let mut exports = Vec::with_capacity(exported.len());
     for export in exported {
@@ -227,7 +229,18 @@ struct FunctionInfo {
     native: Func,
     adapter: Func,
     arity: usize,
+    /// Stable identity for the function literal this lowering owns: the
+    /// final i32 field of the function struct. Primordials use small tags
+    /// ([`PRIMORDIAL_TAG_BASE`] upward); every user function mints a fresh
+    /// tag above [`USER_TAG_BASE`]. Call sites compare this tag to verify
+    /// "this callee is still exactly this literal" (function references are
+    /// not `eqref`, so `ref.eq` cannot make the comparison).
+    tag: i32,
 }
+
+/// User function tags start far above the primordial tag range so the two
+/// tag spaces can never collide.
+const USER_TAG_BASE: i32 = 1 << 20;
 
 /// A fixed object layout selected from the statically-known property names of
 /// an object literal. Field zero is always the generic trie used for keys the
@@ -409,6 +422,9 @@ struct Converter<'a, 'module, 'wasm> {
     /// collected (including its nested closures). Reset per top-level
     /// function before lowering. See `collect_shadowed_names`.
     shadowed_names: BTreeSet<String>,
+    /// Minting counter for user function literal tags (see
+    /// [`FunctionInfo::tag`]). Primordials occupy the low tag range.
+    next_function_tag: i32,
 }
 
 impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
@@ -546,10 +562,16 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         ));
         let adapter = self.make_adapter(native, arity)?;
 
+        let tag = self.next_function_tag;
+        self.next_function_tag = self
+            .next_function_tag
+            .checked_add(1)
+            .ok_or_else(|| ConvertError::invalid("function tag space exhausted"))?;
         let info = FunctionInfo {
             native,
             adapter,
             arity,
+            tag,
         };
         self.functions.insert(key, info);
         self.pending.push_back(sfunc);
@@ -5707,7 +5729,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         );
         let captured_this = self.box_value(body, block, &this)?;
         let trie = self.anyref(body, block, trie);
-        let tag = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let tag = body.add_op(
+            block,
+            Operator::I32Const {
+                value: info.tag as u32,
+            },
+            &[],
+            &[Type::I32],
+        );
         let value = body.add_op(
             block,
             Operator::StructNew {

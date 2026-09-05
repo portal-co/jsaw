@@ -338,7 +338,7 @@ fn read_arg_raw(
 /// coercion of `undefined`. Values already known to be numbers (the only
 /// case this milestone's callers pass) reuse `as_f64` unchanged.
 fn read_arg_number(
-    &self,
+    &mut self,
     body: &mut FunctionBody,
     block: Block,
     args: Value,
@@ -2937,7 +2937,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     /// Convert one call argument to the fast core's `f64` ABI. A missing or
     /// `undefined` argument becomes `NaN`, matching `read_arg_number`.
     fn unbox_or_nan(
-        &self,
+        &mut self,
         body: &mut FunctionBody,
         block: Block,
         arg: &LowerValue,

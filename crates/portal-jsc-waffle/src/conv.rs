@@ -46,6 +46,7 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
         primordial_fast_cores: BTreeMap::new(),
         shadowed_names: BTreeSet::new(),
         next_function_tag: USER_TAG_BASE,
+        to_number_helper: None,
         return_kinds: BTreeMap::new(),
         current_native_returns: None,
         function_literal_locals: BTreeMap::new(),
@@ -148,6 +149,7 @@ pub fn convert_module<'a, 'wasm>(
         primordial_fast_cores: BTreeMap::new(),
         shadowed_names: BTreeSet::new(),
         next_function_tag: USER_TAG_BASE,
+        to_number_helper: None,
         return_kinds: BTreeMap::new(),
         current_native_returns: None,
         function_literal_locals: BTreeMap::new(),
@@ -507,6 +509,9 @@ struct Converter<'a, 'module, 'wasm> {
     /// Minting counter for user function literal tags (see
     /// [`FunctionInfo::tag`]). Primordials occupy the low tag range.
     next_function_tag: i32,
+    /// Generic `ToNumber` coercion over a boxed value at the `anyref`
+    /// boundary. Generated lazily; see `ensure_to_number_helper`.
+    to_number_helper: Option<Func>,
     /// Memoized static return-representation analysis per source function
     /// (keyed by [`Converter::key`]). See `analyze_return_kinds`.
     return_kinds: BTreeMap<usize, ReturnKinds>,
@@ -682,10 +687,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let mut kinds = ReturnKinds::default();
         let mut visited_blocks = BTreeSet::new();
         self.scan_return_kinds(func, func.entry, &mut kinds, &mut visited_blocks);
-        eprintln!("scan result for func {key}: {kinds:?} over {} blocks", func.cfg.blocks.len());
         self.return_kinds.insert(key, kinds);
-        
-        eprintln!("return kinds of func {key}: {kinds:?}");
         kinds
     }
 
@@ -1138,27 +1140,19 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[context, this, arguments],
             &[self.repr.value],
         );
+        let to_number = self.ensure_to_number_helper()?;
         let number = body.add_op(
             block,
-            Operator::RefCast {
-                ty: self.repr.number_ty(),
+            Operator::Call {
+                function_index: to_number,
             },
             &[result],
-            &[self.repr.number_ty()],
-        );
-        let result = body.add_op(
-            block,
-            Operator::StructGet {
-                sig: self.repr.number,
-                idx: 0,
-            },
-            &[number],
             &[Type::F64],
         );
         body.set_terminator(
             block,
             Terminator::Return {
-                values: vec![result],
+                values: vec![number],
             },
         );
         let func =
@@ -1271,6 +1265,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 continue;
             }
             let sblock = state.source;
+            #[cfg(feature = "lower_trace")]
+            eprintln!("[trace] lowering source block {sblock:?} kinds={:?} term={:?}", state.params, sfunc.cfg.blocks[sblock].postcedent.term);
             let original_block = *blocks
                 .get(&state)
                 .ok_or_else(|| ConvertError::invalid("missing source block mapping"))?;
@@ -2364,7 +2360,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn f64_binary(
-        &self,
+        &mut self,
         body: &mut FunctionBody,
         block: Block,
         left: &LowerValue,
@@ -2380,7 +2376,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn f64_compare(
-        &self,
+        &mut self,
         body: &mut FunctionBody,
         block: Block,
         left: &LowerValue,
@@ -2951,7 +2947,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn as_f64(
-        &self,
+        &mut self,
         body: &mut FunctionBody,
         block: Block,
         value: &LowerValue,
@@ -2963,29 +2959,206 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 body.add_op(block, Operator::F64ConvertI32S, &[value], &[Type::F64])
             }
             ValueKind::Reference => {
-                let boxed = body.add_op(
-                    block,
-                    Operator::RefCast {
-                        ty: self.repr.number_ty(),
-                    },
-                    &[value],
-                    &[self.repr.number_ty()],
-                );
+                let to_number = self.ensure_to_number_helper()?;
                 body.add_op(
                     block,
-                    Operator::StructGet {
-                        sig: self.repr.number,
-                        idx: 0,
+                    Operator::Call {
+                        function_index: to_number,
                     },
-                    &[boxed],
+                    &[value],
                     &[Type::F64],
                 )
             }
         })
     }
 
+    /// Generic numeric coercion of a boxed JS value at the `anyref`
+    /// boundary: the shared JS `ToNumber` surface. Numbers unbox to their
+    /// f64, boxed booleans coerce to `0`/`1`, explicit `null` (the i31
+    /// sentinel) to `0`, `undefined` (the null `anyref`) to `NaN`, and every
+    /// other reference traps — matching the previous inline
+    /// `ref.cast`+`struct.get` behavior for non-numeric objects while no
+    /// longer trapping on values JS itself coerces.
+    fn ensure_to_number_helper(&mut self) -> Result<Func, ConvertError> {
+        if let Some(func) = self.to_number_helper {
+            return Ok(func);
+        }
+        let sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.value],
+            returns: vec![Type::F64],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, sig);
+        let entry = body.entry;
+        let value = body.blocks[entry].params[0].1;
+
+        // Classify once in the entry block; the i32 conditions dominate
+        // every later block, so each branch can test them directly.
+        let is_number = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.number_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let is_boolean = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.boolean_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let is_js_null = self.is_js_null(&mut body, entry, value);
+        let is_undefined = body.add_op(entry, Operator::RefIsNull, &[value], &[Type::I32]);
+
+        // Priority chain: number hit -> unbox f64; boolean hit -> 0/1;
+        // JS null -> 0.0; undefined -> NaN; anything else -> trap.
+        let unbox = body.add_block();
+        let check_boolean = body.add_block();
+        let unbox_boolean = body.add_block();
+        let check_null = body.add_block();
+        let null_hit = body.add_block();
+        let check_undefined = body.add_block();
+        let undefined_hit = body.add_block();
+        let other = body.add_block();
+
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: is_number,
+                if_true: BlockTarget {
+                    block: unbox,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: check_boolean,
+                    args: vec![],
+                },
+            },
+        );
+        let number_struct = body.add_op(
+            unbox,
+            Operator::RefCast {
+                ty: self.repr.number_ty(),
+            },
+            &[value],
+            &[self.repr.number_ty()],
+        );
+        let number = body.add_op(
+            unbox,
+            Operator::StructGet {
+                sig: self.repr.number,
+                idx: 0,
+            },
+            &[number_struct],
+            &[Type::F64],
+        );
+        body.set_terminator(unbox, Terminator::Return { values: vec![number] });
+
+        body.set_terminator(
+            check_boolean,
+            Terminator::CondBr {
+                cond: is_boolean,
+                if_true: BlockTarget {
+                    block: unbox_boolean,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: check_null,
+                    args: vec![],
+                },
+            },
+        );
+        let boolean_struct = body.add_op(
+            unbox_boolean,
+            Operator::RefCast {
+                ty: self.repr.boolean_ty(),
+            },
+            &[value],
+            &[self.repr.boolean_ty()],
+        );
+        let bit = body.add_op(
+            unbox_boolean,
+            Operator::StructGet {
+                sig: self.repr.boolean,
+                idx: 0,
+            },
+            &[boolean_struct],
+            &[Type::I32],
+        );
+        let boolean_number = body.add_op(
+            unbox_boolean,
+            Operator::F64ConvertI32S,
+            &[bit],
+            &[Type::F64],
+        );
+        body.set_terminator(
+            unbox_boolean,
+            Terminator::Return {
+                values: vec![boolean_number],
+            },
+        );
+
+        body.set_terminator(
+            check_null,
+            Terminator::CondBr {
+                cond: is_js_null,
+                if_true: BlockTarget {
+                    block: null_hit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: check_undefined,
+                    args: vec![],
+                },
+            },
+        );
+        let zero = body.add_op(null_hit, Operator::F64Const { value: 0.0f64.to_bits() }, &[], &[Type::F64]);
+        body.set_terminator(null_hit, Terminator::Return { values: vec![zero] });
+
+        body.set_terminator(
+            check_undefined,
+            Terminator::CondBr {
+                cond: is_undefined,
+                if_true: BlockTarget {
+                    block: undefined_hit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: other,
+                    args: vec![],
+                },
+            },
+        );
+        let nan = body.add_op(
+            undefined_hit,
+            Operator::F64Const {
+                value: f64::NAN.to_bits(),
+            },
+            &[],
+            &[Type::F64],
+        );
+        body.set_terminator(
+            undefined_hit,
+            Terminator::Return { values: vec![nan] },
+        );
+        body.set_terminator(other, Terminator::Unreachable);
+
+        let func = self.module.funcs.push(FuncDecl::Body(
+            sig,
+            format!("js_to_number_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.to_number_helper = Some(func);
+        Ok(func)
+    }
+
+
+
     fn as_i32(
-        &self,
+        &mut self,
         body: &mut FunctionBody,
         block: Block,
         value: &LowerValue,
@@ -7255,6 +7428,54 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 if_false: BlockTarget { block: fallback, args: vec![] },
             },
         );
+        // A primitive fallback may still be a string: strings answer
+        // `length` (and numeric indexes) from their UTF-16 representation,
+        // never from a property lookup. Without this arm a lazily produced
+        // string (`'abc'[1]`) reports `length` as `undefined`.
+        let is_string = body.add_op(
+            fallback,
+            Operator::RefTest { ty: self.repr.string_ty() },
+            &[value],
+            &[Type::I32],
+        );
+        let string = body.add_block();
+        let non_string = body.add_block();
+        body.set_terminator(
+            fallback,
+            Terminator::CondBr {
+                cond: is_string,
+                if_true: BlockTarget { block: string, args: vec![] },
+                if_false: BlockTarget { block: non_string, args: vec![] },
+            },
+        );
+        let string_value = body.add_op(
+            string,
+            Operator::RefCast { ty: self.repr.string_ty() },
+            &[value],
+            &[self.repr.string_ty()],
+        );
+        let (string, string_length_value) = if key == "length" {
+            let len = self.string_length(body, string, string_value)?;
+            (string, len)
+        } else {
+            let index = body.add_op(
+                string,
+                Operator::I32Const {
+                    value: Self::static_array_index(key).unwrap_or(u32::MAX),
+                },
+                &[],
+                &[Type::I32],
+            );
+            self.get_string_index(body, string, string_value, index)?
+        };
+        let string_length_value = self.box_value(body, string, &string_length_value)?;
+        body.set_terminator(
+            string,
+            Terminator::Br {
+                target: BlockTarget { block: join, args: vec![string_length_value] },
+            },
+        );
+        let fallback = non_string;
         let plain = body.add_op(
             object_array,
             Operator::RefCast { ty: self.repr.object_ty() },
@@ -7643,6 +7864,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         }
         let parser = self.ensure_string_index()?;
         let equal = self.ensure_string_equal()?;
+        let object_value = value;
         let is_object = body.add_op(
             block,
             Operator::RefTest {
@@ -7788,10 +8010,58 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 },
             },
         );
-        let (property, property_value) = self.get_dynamic_property(body, property, object, key)?;
-        let property_value = self.box_value(body, property, &property_value)?;
+        // A primitive (non-object) receiver has no property storage, but a
+        // *string* still answers `length` — and a lazily cached string only
+        // exposes its length through the UTF-16 helper, never through a
+        // property lookup. Route the string shape to `string_length` before
+        // the generic miss so `'abc'[1].length` does not read `undefined`.
+        let is_string = body.add_op(
+            property,
+            Operator::RefTest {
+                ty: self.repr.string_ty(),
+            },
+            &[object_value],
+            &[Type::I32],
+        );
+        let string = body.add_block();
+        let other = body.add_block();
         body.set_terminator(
             property,
+            Terminator::CondBr {
+                cond: is_string,
+                if_true: BlockTarget {
+                    block: string,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: other,
+                    args: vec![],
+                },
+            },
+        );
+        let string_value = body.add_op(
+            string,
+            Operator::RefCast {
+                ty: self.repr.string_ty(),
+            },
+            &[object_value],
+            &[self.repr.string_ty()],
+        );
+        let string_length = self.string_length(body, string, string_value)?;
+        let string_length = self.box_value(body, string, &string_length)?;
+        body.set_terminator(
+            string,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![string_length],
+                },
+            },
+        );
+        let (other, property_value) = self.get_dynamic_property(body, other, object, key)?;
+        let property_value = self.box_value(body, other, &property_value)?;
+        body.set_terminator(
+            other,
             Terminator::Br {
                 target: BlockTarget {
                     block: join,
@@ -8884,7 +9154,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn set_array_length(
-        &self,
+        &mut self,
         body: &mut FunctionBody,
         block: Block,
         object: &LowerValue,

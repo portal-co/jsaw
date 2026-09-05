@@ -3,6 +3,9 @@ name = "portal-jsc-waffle"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+lower_trace = []
+
 [dependencies]
 portal-jsc-swc-cfg.workspace = true
 portal-jsc-swc-ssa.workspace = true

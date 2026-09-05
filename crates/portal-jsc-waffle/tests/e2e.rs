@@ -71,6 +71,19 @@ fn lower_module(
         let cfg = CfgModule::try_from(source).expect("CFG lowering should succeed");
         let tac = TModule::try_from(cfg).expect("TAC lowering should succeed");
         let ssa = SModule::try_from(tac).expect("SSA lowering should succeed");
+        #[cfg(feature = "lower_trace")]
+        for (name, f) in ssa.funcs.iter() {
+            eprintln!("[trace] module func {name:?} vals:");
+            for (vid, v) in f.cfg.values.iter() {
+                let t = format!("{:?}", v.value);
+                if !t.contains("SFunc {") && t.starts_with("Item") {
+                    eprintln!("[trace]   v{} = {}", vid.index(), &t[..t.len().min(150)]);
+                }
+            }
+            for (bid, blk) in f.cfg.blocks.iter() {
+                eprintln!("[trace]   SSA BLOCK {bid:?} stmts {:?} term {:?}", blk.stmts.iter().map(|v| v.index()).collect::<Vec<_>>(), blk.postcedent.term);
+            }
+        }
         let mut wasm = Module::empty();
         portal_jsc_waffle::convert_module(&ssa, &mut wasm, options)?;
         Ok(wasm)

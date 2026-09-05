@@ -46,6 +46,8 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
         primordial_fast_cores: BTreeMap::new(),
         shadowed_names: BTreeSet::new(),
         next_function_tag: USER_TAG_BASE,
+        return_kinds: BTreeMap::new(),
+        current_native_returns: None,
     };
     converter.collect_shapes(root)?;
     converter.collect_shadowed_names(root, &mut BTreeSet::new());
@@ -145,6 +147,8 @@ pub fn convert_module<'a, 'wasm>(
         primordial_fast_cores: BTreeMap::new(),
         shadowed_names: BTreeSet::new(),
         next_function_tag: USER_TAG_BASE,
+        return_kinds: BTreeMap::new(),
+        current_native_returns: None,
     };
     let mut exports = Vec::with_capacity(exported.len());
     for export in exported {
@@ -236,11 +240,64 @@ struct FunctionInfo {
     /// "this callee is still exactly this literal" (function references are
     /// not `eqref`, so `ref.eq` cannot make the comparison).
     tag: i32,
+    /// The set of representations every `return` in this function can
+    /// produce. A single-kind set lets the native body return an unboxed
+    /// f64/i32, so direct calls feed raw values into the caller instead of
+    /// re-boxing at every boundary.
+    returns: ReturnKinds,
 }
 
 /// User function tags start far above the primordial tag range so the two
 /// tag spaces can never collide.
 const USER_TAG_BASE: i32 = 1 << 20;
+
+/// The set of [`ValueKind`]s a function's returns may produce. Tracked as a
+/// bitset so multi-kind unions (a `Number` path and a `Reference` path) keep
+/// the boxed ABI while single-kind sets unlock a raw native return type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+struct ReturnKinds(u8);
+
+impl ReturnKinds {
+    const REFERENCE: u8 = 1 << 0;
+    const NUMBER: u8 = 1 << 1;
+    const BOOLEAN: u8 = 1 << 2;
+    const INTEGER: u8 = 1 << 3;
+
+    fn insert(&mut self, kind: ValueKind) {
+        self.0 |= match kind {
+            ValueKind::Reference => Self::REFERENCE,
+            ValueKind::Number => Self::NUMBER,
+            ValueKind::Boolean => Self::BOOLEAN,
+            ValueKind::Integer => Self::INTEGER,
+        };
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// The single possible kind, if the set is exactly one.
+    fn single(self) -> Option<ValueKind> {
+        match self.0 {
+            Self::REFERENCE => Some(ValueKind::Reference),
+            Self::NUMBER => Some(ValueKind::Number),
+            Self::BOOLEAN => Some(ValueKind::Boolean),
+            Self::INTEGER => Some(ValueKind::Integer),
+            _ => None,
+        }
+    }
+
+    /// The Wasm return type for the native body. Only single-kind sets get
+    /// a raw type; multi-kind unions keep the boxed `anyref` ABI because
+    /// the boxed value is the join of the branches.
+    fn native_return_type(self, repr: &Repr) -> Type {
+        match self.single() {
+            Some(ValueKind::Number) => Type::F64,
+            Some(ValueKind::Boolean | ValueKind::Integer) => Type::I32,
+            _ => repr.value,
+        }
+    }
+}
 
 /// A fixed object layout selected from the statically-known property names of
 /// an object literal. Field zero is always the generic trie used for keys the
@@ -425,6 +482,12 @@ struct Converter<'a, 'module, 'wasm> {
     /// Minting counter for user function literal tags (see
     /// [`FunctionInfo::tag`]). Primordials occupy the low tag range.
     next_function_tag: i32,
+    /// Memoized static return-representation analysis per source function
+    /// (keyed by [`Converter::key`]). See `analyze_return_kinds`.
+    return_kinds: BTreeMap<usize, ReturnKinds>,
+    /// The return representation of the native body currently being
+    /// lowered. `None` means the boxed `anyref` ABI.
+    current_native_returns: Option<ValueKind>,
 }
 
 impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
@@ -510,6 +573,211 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         static_primordial_tag_namespace(name).is_some() && !self.shadowed_names.contains(name)
     }
 
+    /// Statically classify every representation a function's `return`
+    /// statements may produce. Deliberately coarse: `Boolean` and `Integer`
+    /// share the i32 Wasm type and no consumer distinguishes them, so one
+    /// bit covers both. `Number` is f64; everything else (objects, strings,
+    /// functions, arrays) is `Reference`.
+    ///
+    /// The result is memoized per source function so call sites can read a
+    /// callee's kinds before (or without) that callee's body being lowered.
+    fn analyze_return_kinds(&mut self, func: &'a SFunc) -> ReturnKinds {
+        let key = Self::key(func);
+        if let Some(kinds) = self.return_kinds.get(&key) {
+            return *kinds;
+        }
+        // Seed a conservative entry first: recursion (direct or mutual, via
+        // the shared function cache) reads this placeholder instead of
+        // looping. A recursive call is always the boxed join anyway.
+        self.return_kinds.insert(key, ReturnKinds::default());
+        let mut kinds = ReturnKinds::default();
+        let mut visited_blocks = BTreeSet::new();
+        self.scan_return_kinds(func, func.entry, &mut kinds, &mut visited_blocks);
+        self.return_kinds.insert(key, kinds);
+        kinds
+    }
+
+    fn scan_return_kinds(
+        &mut self,
+        root: &'a SFunc,
+        block: SBlockId,
+        kinds: &mut ReturnKinds,
+        visited_blocks: &mut BTreeSet<SBlockId>,
+    ) {
+        if !visited_blocks.insert(block) {
+            return;
+        }
+        let sblock = &root.cfg.blocks[block];
+        for stmt in sblock.stmts.iter().copied() {
+            let kind = self.classify_return_value(root, stmt);
+            if let Some(kind) = kind {
+                kinds.insert(kind);
+            }
+            self.scan_nested_return_kinds(root, stmt, kinds);
+        }
+        match &sblock.postcedent.term {
+            TTerm::Return(Some(value)) => {
+                let kind = self.classify_return_value(root, *value);
+                if let Some(kind) = kind {
+                    kinds.insert(kind);
+                }
+            }
+            TTerm::Return(None) | TTerm::Default => kinds.insert(ValueKind::Reference),
+            TTerm::Tail { .. } => kinds.insert(ValueKind::Reference),
+            TTerm::Jmp(target) => {
+                self.scan_return_kinds(root, target.block, kinds, visited_blocks)
+            }
+            TTerm::CondJmp {
+                if_true, if_false, ..
+            } => {
+                self.scan_return_kinds(root, if_true.block, kinds, visited_blocks);
+                self.scan_return_kinds(root, if_false.block, kinds, visited_blocks);
+            }
+            TTerm::Throw(_) | TTerm::Switch { .. } => {}
+        }
+    }
+
+    /// Walk nested closures of a statement so their returns count toward
+    /// *their own* analysis (they are lowered as separate functions), not
+    /// toward the enclosing function's.
+    fn scan_nested_return_kinds(
+        &mut self,
+        root: &'a SFunc,
+        stmt: SValueId,
+        _kinds: &mut ReturnKinds,
+    ) {
+        if let SValue::Item { item, .. } = &root.cfg.values[stmt].value {
+            for nested in item.funcs() {
+                self.analyze_return_kinds(nested);
+            }
+        }
+    }
+
+    /// Classify one returned SSA value lexically. `None` means "any value"
+    /// (the boxed `Reference` join) — an alias into unknown territory.
+    fn classify_return_value(&mut self, root: &'a SFunc, value: SValueId) -> Option<ValueKind> {
+        match &root.cfg.values[value].value {
+            SValue::Item { item, .. } => self.classify_return_item(root, item),
+            SValue::LoadId(_) | SValue::Param { .. } => Some(ValueKind::Reference),
+            SValue::StoreId { .. } | SValue::Assign { .. } => Some(ValueKind::Reference),
+            SValue::EdgeBlocker { value, .. } => self.classify_return_value(root, *value),
+            _ => Some(ValueKind::Reference),
+        }
+    }
+
+    fn classify_return_item(&mut self, root: &'a SFunc, item: &Item<SValueId, SFunc>) -> Option<ValueKind> {
+        match item {
+            Item::Just { id } => self.classify_return_value(root, *id),
+            Item::Lit { lit } => match lit {
+                Lit::Num(_) => Some(ValueKind::Number),
+                Lit::Bool(_) => Some(ValueKind::Boolean),
+                _ => Some(ValueKind::Reference),
+            },
+            Item::Undef | Item::This | Item::Arguments => Some(ValueKind::Reference),
+            Item::Func { .. }
+            | Item::Obj { .. }
+            | Item::Arr { .. }
+            | Item::Class(_)
+            | Item::StaticSubArray { .. }
+            | Item::StaticSubObject { .. }
+            | Item::Meta { .. } => Some(ValueKind::Reference),
+            Item::Mem { .. }
+            | Item::PrivateMem { .. }
+            | Item::HasPrivateMem { .. }
+            | Item::Yield { .. }
+            | Item::Await { .. }
+            | Item::Asm { .. }
+            | Item::New { .. } => Some(ValueKind::Reference),
+            Item::Un { arg, op } => match op {
+                // Numeric coercions keep the raw f64/i32 representations.
+                UnaryOp::Plus | UnaryOp::Minus => self
+                    .classify_return_value(root, *arg)
+                    .filter(|kind| matches!(kind, ValueKind::Number | ValueKind::Boolean | ValueKind::Integer))
+                    .or(Some(ValueKind::Number)),
+                UnaryOp::Bang => Some(ValueKind::Boolean),
+                UnaryOp::Tilde => Some(ValueKind::Integer),
+                UnaryOp::Void | UnaryOp::TypeOf | UnaryOp::Delete => Some(ValueKind::Reference),
+            },
+            Item::Bin { left, right, op } => self.classify_return_bin(root, *left, *right, *op),
+            Item::Select { cond, then, otherwise } => {
+                let then_kind = self.classify_return_value(root, *then);
+                let otherwise_kind = self.classify_return_value(root, *otherwise);
+                match (then_kind, otherwise_kind) {
+                    (Some(a), Some(b)) if a == b => Some(a),
+                    _ => Some(ValueKind::Reference),
+                }
+                .inspect(|_| {
+                    let _ = cond;
+                })
+            }
+            Item::Call { callee, .. } => self.classify_return_call(root, callee),
+            _ => Some(ValueKind::Reference),
+        }
+    }
+
+    fn classify_return_bin(
+        &mut self,
+        root: &'a SFunc,
+        left: SValueId,
+        right: SValueId,
+        op: BinaryOp,
+    ) -> Option<ValueKind> {
+        use BinaryOp::*;
+        match op {
+            Add | Sub | Mul | Div | Mod => {
+                // String concatenation (`+` with a string operand) yields a
+                // string; both operands unknown keeps it conservative.
+                let left_kind = self.classify_return_value(root, left);
+                let right_kind = self.classify_return_value(root, right);
+                if op == Add
+                    && matches!(
+                        (left_kind, right_kind),
+                        (_, Some(ValueKind::Reference)) | (Some(ValueKind::Reference), _)
+                    )
+                {
+                    return Some(ValueKind::Reference);
+                }
+                Some(ValueKind::Number)
+            }
+            Lt | LtEq | Gt | GtEq | EqEq | EqEqEq | NotEq | NotEqEq
+            | InstanceOf | In => Some(ValueKind::Boolean),
+            BitAnd | BitOr | BitXor | LShift | RShift | ZeroFillRShift => Some(ValueKind::Integer),
+            // `**` is ordinary floating-point exponentiation.
+            Exp => Some(ValueKind::Number),
+            LogicalAnd | LogicalOr | NullishCoalescing => {
+                // The result is one of the two operands.
+                let left_kind = self.classify_return_value(root, left);
+                let right_kind = self.classify_return_value(root, right);
+                match (left_kind, right_kind) {
+                    (Some(a), Some(b)) if a == b => Some(a),
+                    _ => Some(ValueKind::Reference),
+                }
+            }
+        }
+    }
+
+    fn classify_return_call(
+        &mut self,
+        root: &'a SFunc,
+        callee: &TCallee<SValueId>,
+    ) -> Option<ValueKind> {
+        match callee {
+            TCallee::Val(value) => {
+                // A direct call to a local function literal or a hoisted
+                // declaration: reuse (or compute) that callee's analysis.
+                if let SValue::Item { item: Item::Func { func, .. }, .. } =
+                    &root.cfg.values[*value].value
+                {
+                    let kinds = self.analyze_return_kinds(func);
+                    return kinds.single();
+                }
+                Some(ValueKind::Reference)
+            }
+            TCallee::Member { .. } | TCallee::PrivateMember { .. } => Some(ValueKind::Reference),
+            _ => Some(ValueKind::Reference),
+        }
+    }
+
     fn register_shape(&mut self, mut keys: Vec<String>) {
         keys.sort();
         keys.dedup();
@@ -543,6 +811,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         }
 
         let arity = sfunc.cfg.blocks[sfunc.entry].params.len();
+        let returns = self.analyze_return_kinds(sfunc);
         let native_sig = self.module.signatures.push(SignatureData::Func {
             params: std::iter::once(self.repr.object_ty())
                 .chain(std::iter::once(self.repr.value))
@@ -551,7 +820,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 .chain(std::iter::once(self.repr.arguments_ty()))
                 .chain(std::iter::repeat_n(self.repr.value, arity))
                 .collect(),
-            returns: vec![self.repr.value],
+            returns: vec![returns.native_return_type(&self.repr)],
             shared: false,
         });
         let native_body = FunctionBody::new(self.module, native_sig);
@@ -572,6 +841,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             adapter,
             arity,
             tag,
+            returns,
         };
         self.functions.insert(key, info);
         self.pending.push_back(sfunc);
@@ -579,6 +849,13 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn make_adapter(&mut self, native: Func, arity: usize) -> Result<Func, ConvertError> {
+        let native_return_type = match &self.module.signatures[self.module.funcs[native].sig()] {
+            SignatureData::Func { returns, .. } => returns
+                .first()
+                .copied()
+                .ok_or_else(|| ConvertError::invalid("native signature has no return"))?,
+            _ => return Err(ConvertError::invalid("native signature is not a func")),
+        };
         let mut body = FunctionBody::new(self.module, self.repr.adapter);
         let context = body.blocks[body.entry].params[0].1;
         let this = body.blocks[body.entry].params[1].1;
@@ -658,14 +935,47 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
 
         let mut call_args = vec![context, this, args];
         call_args.extend(formals);
-        let result = body.add_op(
+        let call_result = body.add_op(
             block,
             Operator::Call {
                 function_index: native,
             },
             &call_args,
-            &[self.repr.value],
+            &[native_return_type],
         );
+        // A raw single-kind native return is re-boxed here — once, at the
+        // adapter boundary — instead of re-coerced at every use site.
+        let result = match native_return_type {
+            Type::F64 => body.add_op(
+                block,
+                Operator::StructNew {
+                    sig: self.repr.number,
+                },
+                &[call_result],
+                &[self.repr.number_ty()],
+            ),
+            Type::I32 => body.add_op(
+                block,
+                Operator::StructNew {
+                    sig: self.repr.boolean,
+                },
+                &[call_result],
+                &[self.repr.boolean_ty()],
+            ),
+            _ => call_result,
+        };
+        let result = if native_return_type == self.repr.value {
+            result
+        } else {
+            body.add_op(
+                block,
+                Operator::RefCast {
+                    ty: self.repr.value,
+                },
+                &[result],
+                &[self.repr.value],
+            )
+        };
         body.set_terminator(
             block,
             Terminator::Return {
@@ -819,7 +1129,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 let body = decl.body_mut().ok_or_else(|| {
                     ConvertError::invalid("generated native function has no body")
                 })?;
-                self.lower_function(sfunc, body)
+                self.current_native_returns = info.returns.single();
+                let result = self.lower_function(sfunc, body);
+                self.current_native_returns = None;
+                result
             };
             self.module.funcs[info.native] = decl;
             result?;
@@ -936,7 +1249,22 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                             }
                             None => self.undef(body, continuation.block),
                         };
-                        let value = self.box_value(body, continuation.block, &value)?;
+                        // The native signature declares the analyzed return
+                        // representation. Single-kind functions return the
+                        // raw value directly; multi-kind functions return
+                        // the boxed join of their branches.
+                        let value = match self.current_native_returns {
+                            Some(kind) => match kind {
+                                ValueKind::Number => self.as_f64(body, continuation.block, &value)?,
+                                ValueKind::Boolean | ValueKind::Integer => {
+                                    self.as_i32(body, continuation.block, &value)?
+                                }
+                                ValueKind::Reference => {
+                                    self.box_value(body, continuation.block, &value)?
+                                }
+                            },
+                            None => self.box_value(body, continuation.block, &value)?,
+                        };
                         body.set_terminator(
                             continuation.block,
                             Terminator::Return {
@@ -1070,7 +1398,18 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 TTerm::Default => {
                     for continuation in continuations {
                         let undef = self.undef(body, continuation.block);
-                        let value = self.box_value(body, continuation.block, &undef)?;
+                        // Implicit fallthrough is `undefined` — a reference,
+                        // so the unboxed i32/f64 return kinds cannot occur
+                        // here and the boxed ABI is always correct for the
+                        // *value*; but the signature may still be raw, in
+                        // which case `undefined` boxes to the declared type.
+                        let value = match self.current_native_returns {
+                            Some(ValueKind::Number) => self.as_f64(body, continuation.block, &undef)?,
+                            Some(ValueKind::Boolean | ValueKind::Integer) => {
+                                self.as_i32(body, continuation.block, &undef)?
+                            }
+                            _ => self.box_value(body, continuation.block, &undef)?,
+                        };
                         body.set_terminator(
                             continuation.block,
                             Terminator::Return {

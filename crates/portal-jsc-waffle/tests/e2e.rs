@@ -1822,3 +1822,265 @@ fn provenance_single_kind_native_returns_raw() {
     assert!(raw_f64, "a single-Number-kind native body must declare an f64 return");
     assert!(boxed, "the Reference-kind callee must keep the boxed ABI");
 }
+
+// ── Multi-module ingestion ────────────────────────────────────────────────
+
+type Fixture<'a> = &'a [(&'a str, &'a str)];
+
+fn lower_modules(
+    fixtures: Fixture<'_>,
+    entry: &str,
+    options: &portal_jsc_waffle::ConvertOptions,
+) -> Result<Module<'static>, portal_jsc_waffle::ConvertError> {
+    GLOBALS.set(&Globals::default(), || {
+        let cm: Lrc<SourceMap> = Lrc::new(SourceMap::default());
+        let mut set = portal_jsc_waffle::ModuleSet::new();
+        for (path, source) in fixtures {
+            let file = cm.new_source_file(
+                Lrc::new(FileName::Custom((*path).into())),
+                (*source).to_owned(),
+            );
+            let mut errors = vec![];
+            let module = parse_file_as_module(
+                &file,
+                Syntax::Es(EsSyntax::default()),
+                EsVersion::Es2022,
+                None,
+                &mut errors,
+            )
+            .expect("module fixture should parse");
+            assert!(errors.is_empty(), "parser diagnostics: {errors:?}");
+            let cfg = CfgModule::try_from(module).expect("CFG lowering should succeed");
+            let tac = TModule::try_from(cfg).expect("TAC lowering should succeed");
+            let ssa = SModule::try_from(tac).expect("SSA lowering should succeed");
+            set.insert(*path, Box::leak(Box::new(ssa)))?;
+        }
+        let mut wasm = Module::empty();
+        portal_jsc_waffle::convert_modules(entry, &set, &mut wasm, options)?;
+        Ok(wasm)
+    })
+}
+
+fn compile_modules(fixtures: Fixture<'_>, entry: &str) -> Module<'static> {
+    lower_modules(fixtures, entry, &portal_jsc_waffle::ConvertOptions::default())
+        .expect("multi-module lowering should succeed")
+}
+
+#[test]
+fn links_cross_module_imports_and_executes_in_all_runtimes() {
+    let fixtures: Fixture<'_> = &[
+        ("main.mjs", "import { add } from './lib.js'; export function run(a) { return add(a, 10); }"),
+        ("lib.js", "export function add(a, b) { return a + b; }"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[5.0], 15.0);
+}
+
+#[test]
+fn links_transitive_import_chains() {
+    let fixtures: Fixture<'_> = &[
+        ("main.mjs", "import { c } from './a.js'; export function run(a) { return c(a) + 1; }"),
+        ("a.js", "import { b } from './b.js'; export function c(v) { return b(v) * 2; }"),
+        ("b.js", "export function b(v) { return v + 3; }"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[4.0], 15.0);
+}
+
+#[test]
+fn links_mutual_recursion_across_modules() {
+    let fixtures: Fixture<'_> = &[
+        (
+            "main.mjs",
+            "import { even } from './parity.js'; export function run(a) { return even(a); }",
+        ),
+        (
+            "parity.js",
+            "import { odd } from './flip.js'; export function even(n) { if (n === 0) return 1; return odd(n - 1); }",
+        ),
+        (
+            "flip.js",
+            "import { even } from './parity.js'; export function odd(n) { if (n === 0) return 0; return even(n - 1); }",
+        ),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[10.0], 1.0);
+    assert_executes_in_all_runtimes(&module, "run", &[7.0], 0.0);
+}
+
+#[test]
+fn links_default_imports() {
+    let fixtures: Fixture<'_> = &[
+        ("main.mjs", "import triple from './lib.js'; export function run(a) { return triple(a); }"),
+        ("lib.js", "export default function(v) { return v * 3; }"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[6.0], 18.0);
+}
+
+#[test]
+fn exports_full_main_module_surface_with_reexports() {
+    let fixtures: Fixture<'_> = &[
+        (
+            "main.mjs",
+            "export { helper as util } from './lib.js'; export * from './extra.js'; export function local() { return 1; } export const constant = 2;",
+        ),
+        ("lib.js", "export function helper() { return 2; }"),
+        ("extra.js", "export function alpha(v) { return v; } export function beta(v) { return v; } export default function() { return 9; }"),
+    ];
+    let options = portal_jsc_waffle::ConvertOptions {
+        gc_export_suffix: Some("$gc".to_owned()),
+        ..Default::default()
+    };
+    let module = lower_modules(fixtures, "main.mjs", &options)
+        .expect("re-export lowering should succeed");
+    validate(&module);
+    let mut names: Vec<_> = module.exports.iter().map(|e| e.name.as_str()).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "alpha", "alpha$gc", "beta", "beta$gc", "local", "local$gc", "util", "util$gc",
+        ],
+        "star re-exports fill the surface minus local names and default; \
+         non-function locals keep only a name reservation"
+    );
+    assert_executes_in_all_runtimes(&module, "alpha", &[1.0], 1.0);
+    assert_executes_in_all_runtimes(&module, "util", &[], 2.0);
+}
+
+#[test]
+fn star_exports_do_not_shadow_local_declarations() {
+    let fixtures: Fixture<'_> = &[
+        ("main.mjs", "export * from './lib.js'; export function pick() { return 1; }"),
+        ("lib.js", "export function pick() { return 2; } export function other() { return 3; }"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    let names: Vec<_> = module.exports.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"other"), "star export survives: {names:?}");
+    assert_executes_in_all_runtimes(&module, "pick", &[], 1.0);
+}
+
+#[test]
+fn rejects_missing_and_bare_module_specifiers() {
+    let missing: Fixture<'_> = &[("main.mjs", "import { x } from './nope.js'; export function run() { return x(); }")];
+    let error = lower_modules(missing, "main.mjs", &Default::default())
+        .expect_err("a missing target module must be rejected");
+    assert!(error.to_string().contains("nope.js"), "{error}");
+    assert!(error.to_string().contains("main.mjs"), "{error}");
+
+    let bare: Fixture<'_> = &[("main.mjs", "import fs from 'fs'; export function run() { return fs(); }")];
+    let error = lower_modules(bare, "main.mjs", &Default::default())
+        .expect_err("a bare specifier must be rejected");
+    assert!(error.to_string().contains("only relative"), "{error}");
+}
+
+#[test]
+fn rejects_unlinkable_import_forms() {
+    let star: Fixture<'_> = &[
+        ("main.mjs", "import * as ns from './lib.js'; export function run() { return ns.f(); }"),
+        ("lib.js", "export function f() { return 1; }"),
+    ];
+    let error = lower_modules(star, "main.mjs", &Default::default())
+        .expect_err("namespace imports must be rejected in this milestone");
+    assert!(error.to_string().contains("namespace"), "{error}");
+
+    let value: Fixture<'_> = &[
+        ("main.mjs", "import { count } from './lib.js'; export function run() { return count + 1; }"),
+        ("lib.js", "export const count = 1;"),
+    ];
+    let error = lower_modules(value, "main.mjs", &Default::default())
+        .expect_err("non-function imports must be rejected");
+    assert!(error.to_string().contains("not a hoisted function"), "{error}");
+
+    let missing_name: Fixture<'_> = &[
+        ("main.mjs", "import { absent } from './lib.js'; export function run() { return absent(); }"),
+        ("lib.js", "export function present() { return 1; }"),
+    ];
+    let error = lower_modules(missing_name, "main.mjs", &Default::default())
+        .expect_err("an unexported name must be rejected");
+    assert!(error.to_string().contains("absent"), "{error}");
+}
+
+#[test]
+fn rejects_unsupported_main_module_export_forms() {
+    let default_expr: Fixture<'_> = &[("main.mjs", "export default 1 + 2;")];
+    let error = lower_modules(default_expr, "main.mjs", &Default::default())
+        .expect_err("export default <expr> must be rejected, not silently skipped");
+    assert!(error.to_string().contains("export default"), "{error}");
+
+    let star_as: Fixture<'_> = &[
+        ("main.mjs", "export * as ns from './lib.js'; export function run() { return 0; }"),
+        ("lib.js", "export function f() { return 1; }"),
+    ];
+    let error = lower_modules(star_as, "main.mjs", &Default::default())
+        .expect_err("export * as ns must be rejected in this milestone");
+    assert!(error.to_string().contains("not supported"), "{error}");
+}
+
+#[test]
+fn rejects_missing_entry_and_duplicate_paths() {
+    let fixtures: Fixture<'_> = &[("lib.js", "export function f() { return 1; }")];
+    let error = lower_modules(fixtures, "absent.mjs", &Default::default())
+        .expect_err("a missing entry must be rejected");
+    assert!(error.to_string().contains("absent.mjs"), "{error}");
+
+    GLOBALS.set(&Globals::default(), || {
+        let cm: Lrc<SourceMap> = Lrc::new(SourceMap::default());
+        let file = cm.new_source_file(
+            Lrc::new(FileName::Custom("a.js".into())),
+            "export function f() { return 1; }".to_owned(),
+        );
+        let mut errors = vec![];
+        let module = parse_file_as_module(
+            &file,
+            Syntax::Es(EsSyntax::default()),
+            EsVersion::Es2022,
+            None,
+            &mut errors,
+        )
+        .expect("module fixture should parse");
+        let cfg = CfgModule::try_from(module).expect("CFG lowering should succeed");
+        let tac = TModule::try_from(cfg).expect("TAC lowering should succeed");
+        let ssa = SModule::try_from(tac).expect("SSA lowering should succeed");
+        let leaked: &'static SModule = Box::leak(Box::new(ssa));
+        let mut set = portal_jsc_waffle::ModuleSet::new();
+        set.insert("a.js", leaked).expect("first insert should succeed");
+        let error = set
+            .insert("a.js", leaked)
+            .expect_err("a duplicate module path must be rejected");
+        assert!(error.to_string().contains("duplicate"), "{error}");
+    });
+}
+
+#[test]
+fn rejects_ambiguous_star_exports() {
+    let fixtures: Fixture<'_> = &[
+        ("main.mjs", "export * from './a.js'; export * from './b.js';"),
+        ("a.js", "export function clash() { return 1; }"),
+        ("b.js", "export function clash() { return 2; }"),
+    ];
+    let error = lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect_err("two different functions under one star-exported name must be rejected");
+    assert!(error.to_string().contains("ambiguous"), "{error}");
+}
+
+#[test]
+fn rejects_circular_reexport_chains() {
+    let fixtures: Fixture<'_> = &[
+        ("main.mjs", "export { ping } from './a.js'; export function run() { return 0; }"),
+        ("a.js", "export { pong } from './b.js'; export const ping = 1;"),
+        ("b.js", "export { ping } from './a.js'; export const pong = 2;"),
+    ];
+    let error = lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect_err("a circular re-export chain must be rejected");
+    assert!(
+        error.to_string().contains("circular") || error.to_string().contains("not a hoisted"),
+        "{error}"
+    );
+}

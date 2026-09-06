@@ -483,6 +483,134 @@ fn ensure_trie_enumerate(&mut self) -> Result<Func, ConvertError> {
     Ok(function)
 }
 
+/// Convert a non-negative `i32` array index to its canonical decimal string
+/// key (`0` -> `"0"`, `12` -> `"12"`, ...), boxed as an ordinary JS string
+/// value. Written into a fixed 10-byte scratch buffer (enough digits for
+/// any `u32`, which bounds every `ArrayLen` result) from the end backward,
+/// then trimmed to the digits actually written — the same
+/// allocate-then-`ArrayCopy`-trim shape [`Self::enumerate_maybe_push_key`]
+/// uses to materialize a runtime-computed string.
+fn index_to_string_key(
+    &mut self,
+    body: &mut FunctionBody,
+    block: Block,
+    index: Value,
+) -> Result<(Block, Value), ConvertError> {
+    const MAX_DIGITS: u32 = 10; // u32::MAX == "4294967295" is 10 digits.
+    let max_digits_const = body.add_op(
+        block,
+        Operator::I32Const {
+            value: MAX_DIGITS,
+        },
+        &[],
+        &[Type::I32],
+    );
+    let scratch = body.add_op(
+        block,
+        Operator::ArrayNewDefault {
+            sig: self.repr.utf8,
+        },
+        &[max_digits_const],
+        &[self.repr.utf8_ty()],
+    );
+    let ten = body.add_op(block, Operator::I32Const { value: 10 }, &[], &[Type::I32]);
+    let zero_byte = body.add_op(
+        block,
+        Operator::I32Const { value: 0x30 },
+        &[],
+        &[Type::I32],
+    );
+    let start_pos = body.add_op(
+        block,
+        Operator::I32Const { value: MAX_DIGITS },
+        &[],
+        &[Type::I32],
+    );
+
+    // Do-while: write at least one digit so `index == 0` produces "0".
+    let loop_block = body.add_block();
+    let pos = body.add_blockparam(loop_block, Type::I32);
+    let remaining = body.add_blockparam(loop_block, Type::I32);
+    body.set_terminator(
+        block,
+        Terminator::Br {
+            target: BlockTarget {
+                block: loop_block,
+                args: vec![start_pos, index],
+            },
+        },
+    );
+    let digit = body.add_op(loop_block, Operator::I32RemU, &[remaining, ten], &[Type::I32]);
+    let byte = body.add_op(loop_block, Operator::I32Add, &[digit, zero_byte], &[Type::I32]);
+    let one = body.add_op(loop_block, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+    let next_pos = body.add_op(loop_block, Operator::I32Sub, &[pos, one], &[Type::I32]);
+    body.add_op(
+        loop_block,
+        Operator::ArraySet {
+            sig: self.repr.utf8,
+        },
+        &[scratch, next_pos, byte],
+        &[],
+    );
+    let next_remaining = body.add_op(loop_block, Operator::I32DivU, &[remaining, ten], &[Type::I32]);
+    let zero_check = body.add_op(loop_block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+    let has_more = body.add_op(loop_block, Operator::I32Ne, &[next_remaining, zero_check], &[Type::I32]);
+    let after = body.add_block();
+    let final_pos = body.add_blockparam(after, Type::I32);
+    body.set_terminator(
+        loop_block,
+        Terminator::CondBr {
+            cond: has_more,
+            if_true: BlockTarget {
+                block: loop_block,
+                args: vec![next_pos, next_remaining],
+            },
+            if_false: BlockTarget {
+                block: after,
+                args: vec![next_pos],
+            },
+        },
+    );
+
+    let digit_count = body.add_op(after, Operator::I32Sub, &[max_digits_const, final_pos], &[Type::I32]);
+    let trimmed = body.add_op(
+        after,
+        Operator::ArrayNewDefault {
+            sig: self.repr.utf8,
+        },
+        &[digit_count],
+        &[self.repr.utf8_ty()],
+    );
+    let zero = body.add_op(after, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+    body.add_op(
+        after,
+        Operator::ArrayCopy {
+            dest: self.repr.utf8,
+            src: self.repr.utf8,
+        },
+        &[trimmed, zero, scratch, final_pos, digit_count],
+        &[],
+    );
+    let utf16_null = body.add_op(
+        after,
+        Operator::RefNull {
+            ty: self.repr.utf16_ty(),
+        },
+        &[],
+        &[self.repr.utf16_ty()],
+    );
+    let key_struct = body.add_op(
+        after,
+        Operator::StructNew {
+            sig: self.repr.string,
+        },
+        &[trimmed, utf16_null],
+        &[self.repr.string_ty()],
+    );
+    let key_value = self.anyref(body, after, key_struct);
+    Ok((after, key_value))
+}
+
 /// Collect an object's own-property keys, dispatching across every
 /// registered shape (whose keys are known at compile time — only the
 /// shape's fallback trie needs a runtime walk) plus the fully generic trie
@@ -493,7 +621,7 @@ fn ensure_object_enumerate_keys(&mut self) -> Result<Func, ConvertError> {
         return Ok(func);
     }
     let sig = self.module.signatures.push(SignatureData::Func {
-        params: vec![self.repr.value, Type::I32],
+        params: vec![self.repr.value, Type::I32, self.repr.arguments_ty()],
         returns: vec![self.repr.arguments_ty()],
         shared: false,
     });
@@ -514,8 +642,75 @@ fn ensure_object_enumerate_keys(&mut self) -> Result<Func, ConvertError> {
         let entry = body.entry;
         let root = body.blocks[entry].params[0].1;
         let only_enumerable = body.blocks[entry].params[1].1;
+        let elements = body.blocks[entry].params[2].1;
 
-        let mut current = entry;
+        // Seed the result with the array's own dense-index keys ("0", "1",
+        // ...) before any named property: [[OwnPropertyKeys]] lists integer
+        // indices in ascending order first. A plain object (`elements`
+        // null) contributes none. Array elements have no per-slot
+        // enumerable/configurable tracking in this engine (unlike named
+        // properties' `Slot` flags), so they are always treated as
+        // enumerable, matching ordinary array-literal/index-assignment
+        // semantics.
+        let no_elements = body.add_op(entry, Operator::RefIsNull, &[elements], &[Type::I32]);
+        let has_elements = body.add_block();
+        let keys_ready = body.add_block();
+        let start_keys = body.add_blockparam(keys_ready, self.repr.arguments_ty());
+        let zero_len = body.add_op(entry, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let no_keys = body.add_op(
+            entry,
+            Operator::ArrayNewDefault {
+                sig: self.repr.arguments,
+            },
+            &[zero_len],
+            &[self.repr.arguments_ty()],
+        );
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: no_elements,
+                if_true: BlockTarget {
+                    block: keys_ready,
+                    args: vec![no_keys],
+                },
+                if_false: BlockTarget {
+                    block: has_elements,
+                    args: vec![],
+                },
+            },
+        );
+        let elements_len = body.add_op(has_elements, Operator::ArrayLen, &[elements], &[Type::I32]);
+        let (after_elements, elements_keys) = self.for_each_index_fold(
+            body,
+            has_elements,
+            elements_len,
+            no_keys,
+            self.repr.arguments_ty(),
+            |this, body, block, i, acc| {
+                let (block, key_value) = this.index_to_string_key(body, block, i)?;
+                let push_func = this.ensure_arguments_push()?;
+                let pushed = body.add_op(
+                    block,
+                    Operator::Call {
+                        function_index: push_func,
+                    },
+                    &[acc, key_value],
+                    &[this.repr.arguments_ty()],
+                );
+                Ok((block, pushed))
+            },
+        )?;
+        body.set_terminator(
+            after_elements,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: keys_ready,
+                    args: vec![elements_keys],
+                },
+            },
+        );
+
+        let mut current = keys_ready;
         for shape in &shapes {
             let matches = body.add_op(
                 current,
@@ -550,17 +745,8 @@ fn ensure_object_enumerate_keys(&mut self) -> Result<Func, ConvertError> {
                 &[root],
                 &[ref_sig(shape.sig)],
             );
-            let zero_len = body.add_op(found, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
-            let empty = body.add_op(
-                found,
-                Operator::ArrayNewDefault {
-                    sig: self.repr.arguments,
-                },
-                &[zero_len],
-                &[self.repr.arguments_ty()],
-            );
             let mut field_block = found;
-            let mut keys_cur = empty;
+            let mut keys_cur = start_keys;
             for (field, name) in shape.keys.iter().enumerate() {
                 let slot = body.add_op(
                     field_block,
@@ -675,20 +861,12 @@ fn ensure_object_enumerate_keys(&mut self) -> Result<Func, ConvertError> {
             &[zero_len],
             &[self.repr.utf8_ty()],
         );
-        let empty_keys = body.add_op(
-            current,
-            Operator::ArrayNewDefault {
-                sig: self.repr.arguments,
-            },
-            &[zero_len],
-            &[self.repr.arguments_ty()],
-        );
         let final_keys = body.add_op(
             current,
             Operator::Call {
                 function_index: trie_enumerate,
             },
-            &[trie_root, empty_prefix, zero_len, empty_keys, only_enumerable],
+            &[trie_root, empty_prefix, zero_len, start_keys, only_enumerable],
             &[self.repr.arguments_ty()],
         );
         body.set_terminator(
@@ -716,6 +894,7 @@ fn enumerate_own_keys(
     only_enumerable: bool,
 ) -> Result<(Block, Value), ConvertError> {
     let (block, root) = self.object_and_root(body, block, target)?;
+    let (block, elements) = self.object_elements(body, block, target)?;
     let func = self.ensure_object_enumerate_keys()?;
     let flag = body.add_op(
         block,
@@ -730,7 +909,7 @@ fn enumerate_own_keys(
         Operator::Call {
             function_index: func,
         },
-        &[root, flag],
+        &[root, flag, elements],
         &[self.repr.arguments_ty()],
     );
     Ok((block, keys))

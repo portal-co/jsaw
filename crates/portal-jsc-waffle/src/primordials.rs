@@ -270,13 +270,25 @@ fn read_arg_raw(
     args: Value,
     index: u32,
 ) -> (Block, Value) {
-    let len = body.add_op(block, Operator::ArrayLen, &[args], &[Type::I32]);
     let idx = body.add_op(
         block,
         Operator::I32Const { value: index },
         &[],
         &[Type::I32],
     );
+    self.read_arg_raw_at(body, block, args, idx)
+}
+
+/// Same as [`Self::read_arg_raw`], but for an index already computed at
+/// runtime (e.g. a loop counter) rather than known at compile time.
+fn read_arg_raw_at(
+    &self,
+    body: &mut FunctionBody,
+    block: Block,
+    args: Value,
+    idx: Value,
+) -> (Block, Value) {
+    let len = body.add_op(block, Operator::ArrayLen, &[args], &[Type::I32]);
     let present = body.add_op(block, Operator::I32LtU, &[idx, len], &[Type::I32]);
     let get = body.add_block();
     let missing = body.add_block();
@@ -344,7 +356,25 @@ fn read_arg_number(
     args: Value,
     index: u32,
 ) -> Result<(Block, Value), ConvertError> {
-    let (join, raw) = self.read_arg_raw(body, block, args, index);
+    let idx = body.add_op(
+        block,
+        Operator::I32Const { value: index },
+        &[],
+        &[Type::I32],
+    );
+    self.read_arg_number_at(body, block, args, idx)
+}
+
+/// Same as [`Self::read_arg_number`], but for an index already computed at
+/// runtime (e.g. a loop counter) rather than known at compile time.
+fn read_arg_number_at(
+    &mut self,
+    body: &mut FunctionBody,
+    block: Block,
+    args: Value,
+    idx: Value,
+) -> Result<(Block, Value), ConvertError> {
+    let (join, raw) = self.read_arg_raw_at(body, block, args, idx);
 
     let is_null = body.add_op(join, Operator::RefIsNull, &[raw], &[Type::I32]);
     let has_value = body.add_block();
@@ -458,13 +488,42 @@ fn math_unary_method(&mut self, name: &str, op: Operator) -> Result<Func, Conver
     })
 }
 
-/// Install a binary `(f64, f64) -> f64` Math method backed by a Wasm float
-/// instruction (`min`, `max`).
-fn math_binary_method(&mut self, name: &str, op: Operator) -> Result<Func, ConvertError> {
+/// Install a variadic Math reduction (`min`, `max`) backed by a Wasm float
+/// instruction. Per spec, `Math.min`/`Math.max` fold over *every* argument
+/// actually passed — an argument simply absent (arity < 2, or > 2 extra
+/// args) must not poison the result to `NaN`, unlike a genuine `undefined`
+/// argument, which does (`Math.min(5)` is `5`, but `Math.min(5, undefined)`
+/// is `NaN`). `identity` is the fold's starting accumulator: `+Infinity` for
+/// `min` and `-Infinity` for `max`, so that zero real arguments yields the
+/// spec-mandated result and one argument passes through unchanged.
+fn math_binary_method(
+    &mut self,
+    name: &str,
+    op: Operator,
+    identity: f64,
+) -> Result<Func, ConvertError> {
     self.build_native_adapter(name, move |this, body, entry, _context, _this_val, args| {
-        let (block, x) = this.read_arg_number(body, entry, args, 0)?;
-        let (block, y) = this.read_arg_number(body, block, args, 1)?;
-        let result = body.add_op(block, op, &[x, y], &[Type::F64]);
+        let len = body.add_op(entry, Operator::ArrayLen, &[args], &[Type::I32]);
+        let init = body.add_op(
+            entry,
+            Operator::F64Const {
+                value: identity.to_bits(),
+            },
+            &[],
+            &[Type::F64],
+        );
+        let (block, result) = this.for_each_index_fold(
+            body,
+            entry,
+            len,
+            init,
+            Type::F64,
+            |this, body, block, i, acc| {
+                let (block, x) = this.read_arg_number_at(body, block, args, i)?;
+                let folded = body.add_op(block, op, &[acc, x], &[Type::F64]);
+                Ok((block, folded))
+            },
+        )?;
         this.return_number(body, block, result);
         Ok(())
     })
@@ -610,9 +669,12 @@ fn build_math_namespace(
         *block = self.set_static_property_value_raw(body, *block, &math, name, &value)?;
     }
 
-    const BINARY: &[(&str, Operator)] = &[("min", Operator::F64Min), ("max", Operator::F64Max)];
-    for (name, op) in BINARY {
-        let func = self.math_binary_method(name, *op)?;
+    const BINARY: &[(&str, Operator, f64)] = &[
+        ("min", Operator::F64Min, f64::INFINITY),
+        ("max", Operator::F64Max, f64::NEG_INFINITY),
+    ];
+    for (name, op, identity) in BINARY {
+        let func = self.math_binary_method(name, *op, *identity)?;
         let (context, _) = math.wasm()?;
         let value = self.primordial_function_value(
             body,
@@ -3155,6 +3217,15 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let Some(tag) = static_primordial_tag(namespace, &member) else {
             return Ok(None);
         };
+        // `Math.min`/`Math.max` are variadic reductions: a missing second
+        // argument must yield the first argument (or the min/max identity
+        // if there are zero arguments), not `NaN`. The fixed-arity fast
+        // core's missing-argument-as-NaN padding (`pad_core_args`) only
+        // agrees with that at exactly 2 arguments, so bail to the generic
+        // (correctly variadic) slow path everywhere else.
+        if matches!(tag, TAG_MATH_MIN | TAG_MATH_MAX) && args.len() != 2 {
+            return Ok(None);
+        }
         // Spread arguments have no position-wise unboxing; leave them generic.
         if args.iter().any(|arg| arg.is_spread) {
             return Ok(None);

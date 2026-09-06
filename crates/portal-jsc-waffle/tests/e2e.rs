@@ -910,6 +910,31 @@ fn executes_math_primordial() {
                 return Math.min(4, 2);
             }
 
+            export function math_min_one_arg() {
+                return Math.min(5);
+            }
+
+            export function math_min_zero_args_is_positive_infinity() {
+                // assert_executes_in_all_runtimes compares via subtraction,
+                // which can't represent an Infinity expectation (Infinity -
+                // Infinity is NaN), so reduce to a 0/1 result instead. The
+                // global `Infinity` identifier isn't implemented by this
+                // engine, so get +Infinity/-Infinity via division instead.
+                return Math.min() === 1 / 0 ? 1 : 0;
+            }
+
+            export function math_max_zero_args_is_negative_infinity() {
+                return Math.max() === -1 / 0 ? 1 : 0;
+            }
+
+            export function math_max_three_args() {
+                return Math.max(1, 2, 10);
+            }
+
+            export function math_min_three_args() {
+                return Math.min(5, 1, 3);
+            }
+
             export function math_sign_negative() {
                 return Math.sign(-7);
             }
@@ -940,6 +965,21 @@ fn executes_math_primordial() {
     assert_executes_in_all_runtimes(&module, "math_trunc", &[], -3.0);
     assert_executes_in_all_runtimes(&module, "math_max", &[], 9.0);
     assert_executes_in_all_runtimes(&module, "math_min", &[], 2.0);
+    assert_executes_in_all_runtimes(&module, "math_min_one_arg", &[], 5.0);
+    assert_executes_in_all_runtimes(
+        &module,
+        "math_min_zero_args_is_positive_infinity",
+        &[],
+        1.0,
+    );
+    assert_executes_in_all_runtimes(
+        &module,
+        "math_max_zero_args_is_negative_infinity",
+        &[],
+        1.0,
+    );
+    assert_executes_in_all_runtimes(&module, "math_max_three_args", &[], 10.0);
+    assert_executes_in_all_runtimes(&module, "math_min_three_args", &[], 1.0);
     assert_executes_in_all_runtimes(&module, "math_sign_negative", &[], -1.0);
     assert_executes_in_all_runtimes(&module, "math_imul_overflow", &[], -1073741824.0);
     assert_executes_in_all_runtimes(&module, "math_fround_exact", &[], 2.0);
@@ -1339,6 +1379,21 @@ fn executes_object_keys() {
                 let keys = Object.keys(obj);
                 return keys.length;
             }
+
+            export function keys_of_array_length() {
+                let arr = [10, 20, 30];
+                let keys = Object.keys(arr);
+                return keys.length;
+            }
+
+            export function keys_of_array_index_value() {
+                // The returned keys must be usable as real string indices
+                // back into the array, not just a correctly-sized array of
+                // placeholders.
+                let arr = [10, 20, 30];
+                let keys = Object.keys(arr);
+                return arr[keys[1]];
+            }
         ",
     );
     validate(&module);
@@ -1346,6 +1401,8 @@ fn executes_object_keys() {
     assert_executes_in_all_runtimes(&module, "keys_first", &[], 9.0);
     assert_executes_in_all_runtimes(&module, "keys_skip_non_enumerable", &[], 1.0);
     assert_executes_in_all_runtimes(&module, "keys_empty", &[], 0.0);
+    assert_executes_in_all_runtimes(&module, "keys_of_array_length", &[], 3.0);
+    assert_executes_in_all_runtimes(&module, "keys_of_array_index_value", &[], 20.0);
 }
 
 #[test]

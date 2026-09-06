@@ -7423,6 +7423,102 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         Ok((join, root))
     }
 
+    /// Companion to [`Self::object_and_root`]: extract an object's dense
+    /// `elements` array. Per the `object` struct's field comment in
+    /// `repr.rs`, a non-null `elements` (field 1) is what distinguishes a
+    /// real Array from a plain object; functions and non-object primitives
+    /// never carry array elements in this engine, so both return a null
+    /// `arguments` reference.
+    fn object_elements(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+    ) -> Result<(Block, Value), ConvertError> {
+        let (object, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            let elements = body.add_op(
+                block,
+                Operator::RefNull {
+                    ty: self.repr.arguments_ty(),
+                },
+                &[],
+                &[self.repr.arguments_ty()],
+            );
+            return Ok((block, elements));
+        }
+        let is_object = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.object_ty(),
+            },
+            &[object],
+            &[Type::I32],
+        );
+        let plain = body.add_block();
+        let other = body.add_block();
+        let join = body.add_block();
+        let elements = body.add_blockparam(join, self.repr.arguments_ty());
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget {
+                    block: plain,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: other,
+                    args: vec![],
+                },
+            },
+        );
+        let object_value = body.add_op(
+            plain,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[object],
+            &[self.repr.object_ty()],
+        );
+        let object_elements = body.add_op(
+            plain,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 1,
+            },
+            &[object_value],
+            &[self.repr.arguments_ty()],
+        );
+        body.set_terminator(
+            plain,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![object_elements],
+                },
+            },
+        );
+        let other_elements = body.add_op(
+            other,
+            Operator::RefNull {
+                ty: self.repr.arguments_ty(),
+            },
+            &[],
+            &[self.repr.arguments_ty()],
+        );
+        body.set_terminator(
+            other,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![other_elements],
+                },
+            },
+        );
+        Ok((join, elements))
+    }
+
     fn get_property_raw(
         &mut self,
         body: &mut FunctionBody,

@@ -84,13 +84,9 @@ pub enum Execution {
 /// Execute the compiled variant's run entry under wasmtime with an
 /// epoch-based timeout.
 pub fn execute(bytes: &[u8], timeout: Duration) -> anyhow::Result<Execution> {
-    use wasmtime::{Config, Engine, Instance, Module as WasmtimeModule, Store, Val};
+    use wasmtime::{Instance, Module as WasmtimeModule, Store, Val};
 
-    let mut config = Config::new();
-    config.wasm_gc(true);
-    config.wasm_function_references(true);
-    config.epoch_interruption(true);
-    let engine = Engine::new(&config).map_err(wasmtime_error_to_anyhow)?;
+    let engine = shared_engine();
     // Drive the epoch from a background thread at ~1ms granularity; the
     // store budget is set in epochs below.
     let engine_epoch = engine.clone();
@@ -104,8 +100,7 @@ pub fn execute(bytes: &[u8], timeout: Duration) -> anyhow::Result<Execution> {
     });
 
     let result = (|| -> anyhow::Result<Execution> {
-        let module =
-            WasmtimeModule::new(&engine, bytes).map_err(wasmtime_error_to_anyhow)?;
+        let module = WasmtimeModule::new(&engine, bytes).map_err(wasmtime_error_to_anyhow)?;
         let mut store = Store::new(&engine, ());
         store.set_epoch_deadline(epochs_for(timeout));
         // On deadline, report a timeout rather than trapping by default.
@@ -145,6 +140,25 @@ fn epochs_for(timeout: Duration) -> u64 {
 
 fn wasmtime_error_to_anyhow(error: wasmtime::Error) -> anyhow::Error {
     anyhow::anyhow!(error.to_string())
+}
+
+/// One shared engine for the whole run. Profiling (sample(1)) showed
+/// per-variant `Engine::new` plus Cranelift's egraph optimization pass
+/// dominating wall time on the generated WasmGC; opt level `none` skips
+/// exactly that pass (irrelevant for our tiny test bodies) and the shared
+/// engine amortizes setup across thousands of variants.
+fn shared_engine() -> wasmtime::Engine {
+    static ENGINE: std::sync::OnceLock<wasmtime::Engine> = std::sync::OnceLock::new();
+    ENGINE
+        .get_or_init(|| {
+            let mut config = wasmtime::Config::new();
+            config.wasm_gc(true);
+            config.wasm_function_references(true);
+            config.epoch_interruption(true);
+            config.cranelift_opt_level(wasmtime::OptLevel::None);
+            wasmtime::Engine::new(&config).expect("wasmtime engine should initialize")
+        })
+        .clone()
 }
 
 /// Locate the test262 harness directory. The 2026 upstream layout keeps

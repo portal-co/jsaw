@@ -1988,3 +1988,4 @@ fn executes_typeof_unary() {
     assert_executes_in_all_runtimes(&module, "type_of_number", &[], 1.0);
     assert_executes_in_all_runtimes(&module, "type_of_string", &[], 1.0);
 }
+

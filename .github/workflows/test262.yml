@@ -1,0 +1,65 @@
+name: test262
+
+on:
+  push:
+    branches: [master, main, feat/test262]
+  pull_request:
+    paths:
+      - "crates/portal-jsc-waffle/**"
+      - "crates/test262-runner/**"
+      - ".github/workflows/test262.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    name: Waffle e2e (wasmtime)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+      - name: cargo test -p portal-jsc-waffle
+        run: cargo test -p portal-jsc-waffle
+
+  test262:
+    name: test262 subset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+      - name: Clone test262 at pinned revision
+        run: |
+          REV=$(cat harness/test262/test262-rev)
+          git clone --depth 1 https://github.com/tc39/test262.git "$RUNNER_TEMP/test262"
+          git -C "$RUNNER_TEMP/test262" fetch --depth 1 origin "$REV"
+          git -C "$RUNNER_TEMP/test262" checkout --detach FETCH_HEAD
+      - name: Run test262 subset (informational)
+        # The baseline manifest gates only once introduced (plan Phase 3);
+        # for now the subset run is informational and never fails the build.
+        run: |
+          cargo run -q -p test262-runner -- \
+            --test262-root "$RUNNER_TEMP/test262" \
+            --suite built-ins/Math \
+            --suite language/expressions/addition \
+            --timeout-ms 2000 \
+            --report test262-report.json
+        continue-on-error: true
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test262-report
+          path: test262-report.json

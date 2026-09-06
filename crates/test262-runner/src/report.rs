@@ -127,22 +127,38 @@ pub fn classify(variant: &Variant, outcome: Result<Execution, anyhow::Error>) ->
                         ),
                     ),
                 },
-                Execution::Trapped(text) => match &expected {
+                Execution::Trapped(raw) => {
+                    // Distill the wasmtime error to its root cause: the
+                    // backtrace Decorates every failure, the actionable
+                    // reason follows "wasm trap:".
+                    let text = raw
+                        .split("wasm trap:")
+                        .last()
+                        .unwrap_or(&raw)
+                        .trim()
+                        .to_owned();
+                    let text = text.lines().last().unwrap_or("").to_owned();
+                    let text = if text.is_empty() { raw.clone() } else { text };
+                    match &expected {
                     // Error-type fidelity across the wasm boundary is not
                     // implemented yet: any trap counts as the expected
                     // failure only for runtime-negative tests whose type we
                     // could not check — recorded as pass with detail, since
                     // failing-as-expected is the common case.
-                    Some(negative) if negative.phase == "runtime" => (
-                        Status::Pass,
-                        format!("trapped (expected {} {}): {text}", negative.phase, negative.kind),
-                    ),
-                    Some(negative) => (
-                        Status::Fail,
-                        format!("trapped, expected {} failure: {text}", negative.phase),
-                    ),
-                    None => (Status::Fail, format!("trapped: {text}")),
-                },
+                        Some(negative) if negative.phase == "runtime" => (
+                            Status::Pass,
+                            format!(
+                                "trapped (expected {} {}): {text}",
+                                negative.phase, negative.kind
+                            ),
+                        ),
+                        Some(negative) => (
+                            Status::Fail,
+                            format!("trapped, expected {} failure: {text}", negative.phase),
+                        ),
+                        None => (Status::Fail, format!("trapped: {text}")),
+                    }
+                }
                 Execution::Timeout => (Status::Fail, "timed out".to_owned()),
             };
             TestResult {

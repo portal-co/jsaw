@@ -1989,3 +1989,33 @@ fn executes_typeof_unary() {
     assert_executes_in_all_runtimes(&module, "type_of_string", &[], 1.0);
 }
 
+
+#[test]
+fn debug_raw_trap_text() {
+    let harness = std::fs::read_to_string("/tmp/test262-full/harness/assert.js").unwrap();
+    let test = std::fs::read_to_string("/tmp/test262-full/test/built-ins/Math/E/prop-desc.js").unwrap();
+    let source = format!("{harness}\n{test}");
+    let options = portal_jsc_waffle::ConvertOptions {
+        run_entry_export: Some("run".to_owned()),
+        ..Default::default()
+    };
+    let module = lower_module(&source, &options).expect("lowering");
+    validate(&module);
+    let bytes = wasm_bytes(&module);
+    let mut config = wasmtime::Config::new();
+    config.wasm_gc(true);
+    config.wasm_function_references(true);
+    config.cranelift_opt_level(wasmtime::OptLevel::None);
+    let engine = wasmtime::Engine::new(&config).unwrap();
+    let wmod = wasmtime::Module::new(&engine, &bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let inst = wasmtime::Instance::new(&mut store, &wmod, &[]).unwrap();
+    let f = inst.get_func(&mut store, "run").unwrap();
+    let mut out = [wasmtime::Val::I32(0)];
+    match f.call(&mut store, &[], &mut out) {
+        Ok(()) => eprintln!("completed"),
+        Err(e) => {
+            eprintln!("ALT: {e:#}");
+        }
+    }
+}

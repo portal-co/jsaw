@@ -131,13 +131,16 @@ pub fn classify(variant: &Variant, outcome: Result<Execution, anyhow::Error>) ->
                     // Distill the wasmtime error to its root cause: the
                     // backtrace Decorates every failure, the actionable
                     // reason follows "wasm trap:".
-                    let text = raw
-                        .split("wasm trap:")
-                        .last()
-                        .unwrap_or(&raw)
-                        .trim()
-                        .to_owned();
-                    let text = text.lines().last().unwrap_or("").to_owned();
+                    let text = match raw.split("wasm trap:").nth(1) {
+                        // "reason\n    0: backtrace..." — keep the reason.
+                        Some(rest) => rest.lines().next().unwrap_or("").trim().to_owned(),
+                        None => raw
+                            .lines()
+                            .last()
+                            .unwrap_or(&raw)
+                            .trim()
+                            .to_owned(),
+                    };
                     let text = if text.is_empty() { raw.clone() } else { text };
                     match &expected {
                     // Error-type fidelity across the wasm boundary is not

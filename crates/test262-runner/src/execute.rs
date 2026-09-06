@@ -118,7 +118,7 @@ pub fn execute(bytes: &[u8], timeout: Duration) -> anyhow::Result<Execution> {
                 ref value => Err(anyhow::anyhow!("run entry returned {value:?}")),
             },
             Err(error) => {
-                let text = error.to_string();
+                let text = format!("{error:#}");
                 if text.contains("epoch deadline reached") {
                     Ok(Execution::Timeout)
                 } else {
@@ -139,6 +139,9 @@ fn epochs_for(timeout: Duration) -> u64 {
 }
 
 fn wasmtime_error_to_anyhow(error: wasmtime::Error) -> anyhow::Error {
+    // wasmtime's no_std Error renders the trap reason inline in Display
+    // (last frame: "...: wasm trap: <reason>"); there is no source chain to
+    // walk because `wasmtime::Error` does not implement `StdError`.
     anyhow::anyhow!(error.to_string())
 }
 

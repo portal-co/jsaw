@@ -381,3 +381,65 @@ the mechanics:
 - **Wasmtime/Node parity** on `return_call` with struct returns — both
   runtimes already execute struct-returning calls in the suite; the
   harness compares f64 results in both engines as before.
+
+---
+
+## Milestone 4 — as built (implementation notes)
+
+Landed essentially per §4.1–§4.3 with these refinements:
+
+- **Analysis cycle handling uses an explicit in-progress set** rather
+  than the empty-placeholder heuristic: `analysis_in_progress` tracks the
+  functions currently being scanned; a tail edge back into one is
+  `TailCalleeKinds::InProgress` and contributes nothing (the back edge
+  forwards exactly the cycle's own return values). A completed-but-empty
+  analysis also falls back to `Unknown`.
+- **Provable-callee resolution matches the lowering arm exactly**
+  (`tail_callee_kinds`): a direct `Item::Func` literal, a
+  single-assignment local's `LoadId`, a self-recursive name, or an import
+  binding. Unknown callee kinds insert `Reference` — the plan's
+  conservative fallback.
+- **Fresh/guarded dispatch unified under one eligibility check**
+  (`can_return_call`): callee kinds ⊆ caller kinds *and* equal native
+  return types. Mismatches downgrade through
+  `emit_direct_tail_downgrade` (direct call + per-kind unpack +
+  `convert_returned_value`), a helper now shared with the
+  `Return`/`Default` terminators so the ABI-conversion rules live in one
+  place.
+- **The generic adapter fallback is ABI-aware, not caller-pinned.** The
+  plan kept `ReturnCallRef{adapter}` for boxed callers only; the build
+  additionally converts through a `CallRef{adapter}` +
+  `convert_returned_value` + `Return` sequence in raw/union callers, so
+  every shape of unknown-callee tail is correct (pinned by
+  `unknown_tail_callee_falls_back_to_reference`).
+- **Import bindings became provenance-fresh.** ESM bindings cannot be
+  rebound, so their loads now mint `FunctionRef { fresh: true }` objects
+  (previously fresh: false + a tag check that always passed). This is
+  what lets cross-module tail chains dispatch straight to the linked
+  native (the old guarded slow arm would have kept a generic adapter hop).
+- **`function_object` now marks `fresh: false` during analysis**
+  (`analysis_in_progress` non-empty): a nested literal minted mid-analysis
+  must not make a cycle's tail edge look provable before the cycle's kinds
+  exist. At lowering time (the only objects that actually execute) the
+  literal origin is statically known, so `fresh: true` applies. Found by
+  the debug audit; soundness-critical for the cycle rules above.
+- **Field naming**: `Repr` gains `adapter_value` (the adapter signature's
+  `anyref` return type) so `CallRef`-to-adapter sites type the result
+  explicitly instead of assuming `repr.value`.
+
+### Tests
+
+- `raw_tail_recursion_stays_raw_and_constant_stack` — raw f64 ABI +
+  self-`return_call` inspection + depth 100000 in both runtimes.
+- `union_tail_recursion_forwards_untouched` — `{Number, Reference}` core
+  tails itself on the union ABI at depth 100000, both parities exact.
+- `unknown_tail_callee_falls_back_to_reference` — parameter-callee tail
+  stays correct (boxed fallback).
+- `mismatched_tail_abis_downgrade_and_stay_correct` — `{Number}` caller
+  into a union callee: framed downgrade, both arms exact.
+- `cross_module_tail_chain_executes_on_both_parities` — import-bound
+  mutual tail cycle, exact on both parities.
+- `tail_call_out_of_multi_kind_caller_downgrades_to_call_and_pack`
+  (Milestone 3) flipped: the downgrade is now direct union→union
+  forwarding; comment updated, values unchanged.
+- Full suite: 76 passed (71 baseline + 5 new).

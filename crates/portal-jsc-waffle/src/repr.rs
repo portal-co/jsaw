@@ -46,6 +46,9 @@ pub(crate) struct Repr {
     pub(crate) typed_f32: Signature,
     pub(crate) typed_f64: Signature,
     pub(crate) adapter: Signature,
+    /// The adapter signature's return type (`anyref`), so call sites can
+    /// type a `CallRef`/`ReturnCallRef` to the adapter explicitly.
+    pub(crate) adapter_value: Type,
     /// Tagged union a mixed-return core returns: `tag` selects which of
     /// `r` (a boxed value), `i` (a raw i32 from a boolean or an integer
     /// computation), and `f` (a raw f64) is live. Only functions whose
@@ -247,6 +250,7 @@ impl Repr {
             returns: vec![value],
             shared: false,
         });
+        let adapter_value = value;
         let function = module.signatures.push(SignatureData::Struct {
             fields: vec![],
             shared: false,
@@ -328,6 +332,7 @@ impl Repr {
             typed_f32,
             typed_f64,
             adapter,
+            adapter_value,
             multi,
         }
     }

@@ -47,7 +47,9 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
         to_number_helper: None,
         add_helper: None,
         return_kinds: BTreeMap::new(),
+        analysis_in_progress: BTreeSet::new(),
         current_native_returns: ReturnType::Boxed,
+        current_return_kinds: ReturnKinds::default(),
         function_literal_locals: BTreeMap::new(),
         function_self_names: BTreeMap::new(),
         lowering_function: None,
@@ -203,7 +205,9 @@ pub fn convert_modules<'a, 'wasm>(
         to_number_helper: None,
         add_helper: None,
         return_kinds: BTreeMap::new(),
+        analysis_in_progress: BTreeSet::new(),
         current_native_returns: ReturnType::Boxed,
+        current_return_kinds: ReturnKinds::default(),
         function_literal_locals: BTreeMap::new(),
         function_self_names: BTreeMap::new(),
         lowering_function: None,
@@ -315,6 +319,21 @@ impl ReturnKinds {
         }
     }
 
+    fn union_with(&mut self, other: ReturnKinds) {
+        self.0 |= other.0;
+    }
+
+    fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Every kind in `other` is also possible here. The tail dispatch's
+    /// `ReturnCall` eligibility check: a forwarded callee value must only
+    /// ever carry tags the caller's own consumers branch on.
+    fn is_subset_of(self, other: ReturnKinds) -> bool {
+        self.0 & !other.0 == 0
+    }
+
     fn contains(self, kind: ValueKind) -> bool {
         let bit = match kind {
             ValueKind::Reference => Self::REFERENCE,
@@ -361,6 +380,18 @@ const MULTI_FIELD_TAG: usize = 0;
 const MULTI_FIELD_REF: usize = 1;
 const MULTI_FIELD_I32: usize = 2;
 const MULTI_FIELD_F64: usize = 3;
+
+/// Outcome of resolving a tail callee for return-kind analysis.
+enum TailCalleeKinds {
+    /// The callee's analyzed kinds contribute directly.
+    Provable(ReturnKinds),
+    /// The callee is part of the cycle currently being analyzed; its
+    /// edge contributes nothing new.
+    InProgress,
+    /// The callee's representation is not statically provable; only
+    /// the boxed reference join is safe.
+    Unknown,
+}
 
 /// The declared return representation of the native body currently being
 /// lowered, driving every `Return`-side conversion.
@@ -610,9 +641,17 @@ struct Converter<'a, 'module, 'wasm> {
     /// Memoized static return-representation analysis per source function
     /// (keyed by [`Converter::key`]). See `analyze_return_kinds`.
     return_kinds: BTreeMap<usize, ReturnKinds>,
+    /// Functions whose return-kind analysis is currently being scanned.
+    /// A tail edge back into one of these is a recursion cycle: it
+    /// contributes the caller's own kinds, not the (still empty)
+    /// placeholder.
+    analysis_in_progress: BTreeSet<usize>,
     /// The return representation of the native body currently being
     /// lowered.
     current_native_returns: ReturnType,
+    /// The analyzed kinds behind [`Self::current_native_returns`], kept
+    /// alongside so the tail dispatch can check callee-kind containment.
+    current_return_kinds: ReturnKinds,
     /// Variable names whose only write in the current function tree stores
     /// one specific function literal (`let f = function () {...}` with no
     /// reassignment anywhere, including nested closures). A load of such a
@@ -813,24 +852,13 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         self.return_kinds.insert(key, ReturnKinds::default());
         let mut kinds = ReturnKinds::default();
         let mut visited_blocks = BTreeSet::new();
+        self.analysis_in_progress.insert(key);
         self.scan_return_kinds(func, func.entry, &mut kinds, &mut visited_blocks);
+        self.analysis_in_progress.remove(&key);
         // A return site the classifier cannot pin down (an alias, a load,
         // a parameter) packs the union's reference tag at runtime, so the
         // reference kind is always possible in a multi-return core.
         if kinds.is_multi_union() {
-            kinds.insert(ValueKind::Reference);
-        }
-        // Tail-call interlock: `ReturnCallRef` through the universal
-        // adapter requires the caller's native return to stay the boxed
-        // `anyref`, so a tail-carrying function is pinned to the boxed ABI
-        // even when its other returns look like a raw union.
-        if func.cfg.blocks.iter().any(|(_, block)| {
-            matches!(
-                &block.postcedent.term,
-                TTerm::Tail { .. }
-            )
-        }) {
-            kinds = ReturnKinds::default();
             kinds.insert(ValueKind::Reference);
         }
         self.return_kinds.insert(key, kinds);
@@ -879,7 +907,20 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 }
             }
             TTerm::Return(None) | TTerm::Default => kinds.insert(ValueKind::Reference),
-            TTerm::Tail { .. } => kinds.insert(ValueKind::Reference),
+            TTerm::Tail { callee, .. } => match self.tail_callee_kinds(root, callee) {
+                TailCalleeKinds::Provable(callee_kinds) => {
+                    // A tail edge forwards the callee's values as this
+                    // function's own returns: whatever the callee can
+                    // return, the caller now can.
+                    kinds.union_with(callee_kinds);
+                }
+                // A provable callee still being analyzed is this function
+                // itself mid-cycle (or its mutual partner). Its tail edge
+                // forwards exactly the values the cycle's own return
+                // sites pack, so the accumulator needs nothing new.
+                TailCalleeKinds::InProgress => {}
+                TailCalleeKinds::Unknown => kinds.insert(ValueKind::Reference),
+            },
             TTerm::Jmp(target) => {
                 self.scan_return_kinds(root, target.block, kinds, visited_blocks)
             }
@@ -891,6 +932,66 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             }
             TTerm::Throw(_) | TTerm::Switch { .. } => {}
         }
+    }
+
+    /// The analyzed return kinds of a tail callee. `TCallee::Val` pointing
+    /// at a function literal (directly, or through a single-assignment
+    /// local binding) is provable and reuses that callee's own analysis;
+    /// everything else — member calls, unknown values, a completed-but-empty
+    /// analysis — falls back to the boxed reference join, since anything
+    /// can come back from an unprovable callee.
+    fn tail_callee_kinds(
+        &mut self,
+        root: &'a SFunc,
+        callee: &TCallee<SValueId>,
+    ) -> TailCalleeKinds {
+        let TCallee::Val(value) = callee else {
+            return TailCalleeKinds::Unknown;
+        };
+        let callee_sfunc: Option<&'a SFunc> =
+            match &root.cfg.values[*value].value {
+                // A direct function literal.
+                SValue::Item { item: Item::Func { func, .. }, .. } => Some(func),
+                // A load of a single-assignment function-literal local, a
+                // self-recursive name, or an import binding: the same
+                // provenance the lowering arm accepts.
+                SValue::LoadId(id) => {
+                    let is_self_name = self
+                        .lowering_function_key
+                        .is_some_and(|current| {
+                            self.function_self_names
+                                .get(&current)
+                                .is_some_and(|name| name == id)
+                        });
+                    if is_self_name {
+                        self.lowering_function
+                    } else if let Some(literal) = self.function_literal_locals.get(id).copied() {
+                        Some(literal)
+                    } else if let Some(target) = self
+                        .import_tables
+                        .get(&self.current_module)
+                        .and_then(|table| table.get(id))
+                    {
+                        Some(target.function)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+        let Some(func) = callee_sfunc else {
+            return TailCalleeKinds::Unknown;
+        };
+        if self.analysis_in_progress.contains(&Self::key(func)) {
+            return TailCalleeKinds::InProgress;
+        }
+        let kinds = self.analyze_return_kinds(func);
+        if kinds.is_empty() {
+            // A completed analysis with no kinds (throw-only bodies) cannot
+            // promise a representation; stay conservative.
+            return TailCalleeKinds::Unknown;
+        }
+        TailCalleeKinds::Provable(kinds)
     }
 
     /// A return site the classifier could not pin to one kind (a mixed
@@ -1471,8 +1572,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     ConvertError::invalid("generated native function has no body")
                 })?;
                 self.current_native_returns = ReturnType::from_kinds(info.returns);
+                self.current_return_kinds = info.returns;
                 let result = self.lower_function(sfunc, body);
                 self.current_native_returns = ReturnType::Boxed;
+                self.current_return_kinds = ReturnKinds::default();
                 result
             };
             self.module.funcs[info.native] = decl;
@@ -1599,22 +1702,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         // raw value directly; multi-kind functions pack the
                         // classified kind's tag and payload into the union;
                         // everything else returns the boxed join.
-                        let value = match self.current_native_returns {
-                            ReturnType::F64 => self.as_f64(body, continuation.block, &value)?,
-                            ReturnType::I32 => self.as_i32(body, continuation.block, &value)?,
-                            ReturnType::Boxed => {
-                                self.box_value(body, continuation.block, &value)?
-                            }
-                            ReturnType::Multi => {
-                                let kind = value.kind()?;
-                                self.pack_multi_return(
-                                    body,
-                                    continuation.block,
-                                    &value,
-                                    kind,
-                                )?
-                            }
-                        };
+                        let value = self.convert_returned_value(
+                            body,
+                            continuation.block,
+                            &value,
+                            self.current_return_kinds,
+                        )?;
                         body.set_terminator(
                             continuation.block,
                             Terminator::Return {
@@ -1725,13 +1818,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     for continuation in continuations {
                         // A statically-known callee (provenance-tracked
                         // function literal) tail-calls its native body
-                        // directly — the only O(1) host-stack form, since
-                        // the generic adapter plain-calls the native after
-                        // the frame-replacing `ReturnCallRef` hop. Anything
-                        // else keeps the generic adapter tail call, which
-                        // is always semantically valid from a boxed-return
-                        // caller (the analysis classifies every
-                        // `Tail`-carrying function as `Reference`).
+                        // directly — the O(1) host-stack form. Anything
+                        // else keeps the generic adapter tail call when
+                        // this caller is boxed, or a framed direct call
+                        // plus ABI conversion when it is not.
                         if self
                             .try_tail_dispatch(
                                 body,
@@ -1746,7 +1836,32 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         {
                             continue;
                         }
-                        for (block, context, receiver, array, code) in self.lower_call_parts(
+                        if matches!(self.current_native_returns, ReturnType::Boxed) {
+                            for (block, call_context, receiver, array, code) in self.lower_call_parts(
+                                body,
+                                continuation.block,
+                                context,
+                                this.clone(),
+                                &continuation.values,
+                                callee,
+                                args,
+                            )? {
+                                body.set_terminator(
+                                    block,
+                                    Terminator::ReturnCallRef {
+                                        sig: self.repr.adapter,
+                                        args: vec![call_context, receiver, array, code],
+                                    },
+                                );
+                            }
+                            continue;
+                        }
+                        // A raw or union caller cannot `ReturnCallRef` the
+                        // boxed adapter (its `anyref` return would not
+                        // typecheck). Call through the adapter generically
+                        // and convert the boxed result to this caller's
+                        // ABI before returning.
+                        for (block, call_context, receiver, array, code) in self.lower_call_parts(
                             body,
                             continuation.block,
                             context,
@@ -1755,11 +1870,27 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                             callee,
                             args,
                         )? {
+                            let result = body.add_op(
+                                block,
+                                Operator::CallRef {
+                                    sig_index: self.repr.adapter,
+                                },
+                                &[call_context, receiver, array, code],
+                                &[self.repr.value],
+                            );
+                            let value = self.convert_returned_value(
+                                body,
+                                block,
+                                &LowerValue::Wasm {
+                                    value: result,
+                                    kind: ValueKind::Reference,
+                                },
+                                self.current_return_kinds,
+                            )?;
                             body.set_terminator(
                                 block,
-                                Terminator::ReturnCallRef {
-                                    sig: self.repr.adapter,
-                                    args: vec![context, receiver, array, code],
+                                Terminator::Return {
+                                    values: vec![value],
                                 },
                             );
                         }
@@ -1775,25 +1906,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         // boxed reference at the value level, so the raw
                         // single-kind ABIs convert it and the union packs
                         // it under its reference tag.
-                        let value = match self.current_native_returns {
-                            ReturnType::F64 => self.as_f64(body, continuation.block, &undef)?,
-                            ReturnType::I32 => self.as_i32(body, continuation.block, &undef)?,
-                            ReturnType::Boxed => {
-                                self.box_value(body, continuation.block, &undef)?
-                            }
-                            ReturnType::Multi => {
-                                let boxed = self.box_value(body, continuation.block, &undef)?;
-                                self.pack_multi_return(
-                                    body,
-                                    continuation.block,
-                                    &LowerValue::Wasm {
-                                        value: boxed,
-                                        kind: ValueKind::Reference,
-                                    },
-                                    ValueKind::Reference,
-                                )?
-                            }
-                        };
+                        let value = self.convert_returned_value(
+                            body,
+                            continuation.block,
+                            &undef,
+                            self.current_return_kinds,
+                        )?;
                         body.set_terminator(
                             continuation.block,
                             Terminator::Return {
@@ -1894,31 +2012,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 // separate loads within one activation; acceptable while
                 // module top-level state (a shared per-module context) does
                 // not exist yet.
-                if self
-                    .import_tables
-                    .get(&self.current_module)
-                    .is_some_and(|table| table.contains_key(id))
-                {
-                    let target = self.import_tables[&self.current_module][&id].clone();
-                    let info = self.ensure_function(target.function, &target.module)?;
-                    let value = self.function_object_from_info(
-                        body,
-                        block,
-                        context,
-                        this,
-                        info,
-                        false, // a hoisted declaration is never an arrow
-                        false, // call sites keep their tag check
-                    )?;
-                    return Ok(vec![(block, value)]);
-                }
-                // A self-recursive function's own name resolves to the
-                // function literal itself: the enclosing scope stored the
-                // literal under this name exactly once, and the name cannot
-                // be rebound inside the body before the load executes
-                // (recursion re-enters after the binding exists). Mark the
-                // loaded function fresh so tail position can skip the tag
-                // check entirely.
+                // Import bindings are handled by the literal-resolution
+                // path below (they mint a provenance-fresh function
+                // object); everything else resolves through the ordinary
+                // context property read.
                 let is_self_name = self
                     .lowering_function_key
                     .is_some_and(|current| {
@@ -1949,6 +2046,30 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                             // first call and re-entry sees the same object.
                             fresh: is_self_name,
                         }
+                    } else if self
+                        .import_tables
+                        .get(&self.current_module)
+                        .is_some_and(|table| table.contains_key(id))
+                    {
+                        // An import binding resolves once, at link time, and
+                        // can never be rebound: its origin is statically
+                        // proven, so call sites (including tail position)
+                        // may dispatch with no tag check. Minting per load
+                        // diverges from ESM object identity across separate
+                        // loads within one activation; acceptable while
+                        // module top-level state (a shared per-module
+                        // context) does not exist yet.
+                        let target = self.import_tables[&self.current_module][id].clone();
+                        let info = self.ensure_function(target.function, &target.module)?;
+                        self.function_object_from_info(
+                            body,
+                            block,
+                            context,
+                            this.clone(),
+                            info,
+                            false, // a hoisted declaration is never an arrow
+                            true,  // proven origin: the binding cannot be rebound
+                        )?
                     } else {
                         LowerValue::ReferenceKey { value, key: key.clone() }
                     };
@@ -7142,8 +7263,17 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         arrow: bool,
     ) -> Result<LowerValue, ConvertError> {
         let module = self.current_module.clone();
+        let in_analysis = !self.analysis_in_progress.is_empty();
         let info = self.ensure_function(func, &module)?;
-        self.function_object_from_info(body, block, context, this, info, arrow, true)
+        // During return-kind analysis, `fresh: true` on a nested literal's
+        // object would make an in-progress cycle's tail edge look provable
+        // before the cycle's kinds exist (the baseline's raw/union
+        // ReturnCallRef hazard); `fresh: false` keeps the tag check. When
+        // the same function object is minted later at lowering time, the
+        // literal origin is statically known and immutable, so the tag
+        // check is skipped.
+        let fresh = !in_analysis;
+        self.function_object_from_info(body, block, context, this, info, arrow, fresh)
     }
 
     fn function_object_from_info(
@@ -10107,17 +10237,71 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         Ok((this, arguments, formals))
     }
 
+    /// Tail-position call to a provenance-known callee whose native ABI
+    /// does not match this caller's: lower a plain direct call (splitting
+    /// a multi-union result per tag) and convert each result to the
+    /// caller's declared ABI before returning. Same semantics as the
+    /// frame-replacing form; the frame is kept.
+    fn emit_direct_tail_downgrade(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        context: Value,
+        info: FunctionInfo,
+        this: LowerValue,
+        values: &BTreeMap<SValueId, LowerValue>,
+        args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
+    ) -> Result<(), ConvertError> {
+        for (result_block, result) in
+            self.direct_native_call(body, block, context, info, this, values, args)?
+        {
+            let value = self
+                .convert_returned_value(body, result_block, &result, self.current_return_kinds)?;
+            body.set_terminator(
+                result_block,
+                Terminator::Return {
+                    values: vec![value],
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Convert one lowered value into this function's declared native
+    /// return representation: raw single-kind ABIs coerce, the boxed ABI
+    /// boxes, and the union ABI packs the value's classified kind's tag
+    /// and payload. Shared by the `Return`/`Default` terminators and the
+    /// tail-dispatch downgrade, so the conversion rules live in one place.
+    fn convert_returned_value(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        value: &LowerValue,
+        returns: ReturnKinds,
+    ) -> Result<Value, ConvertError> {
+        match ReturnType::from_kinds(returns) {
+            ReturnType::F64 => self.as_f64(body, block, value),
+            ReturnType::I32 => self.as_i32(body, block, value),
+            ReturnType::Boxed => self.box_value(body, block, value),
+            ReturnType::Multi => {
+                let kind = value.kind()?;
+                self.pack_multi_return(body, block, value, kind)
+            }
+        }
+    }
+
     /// Emit a tail-position call when the callee is statically known.
     ///
     /// `ReturnCallRef` through the generic adapter preserves the tail call
     /// semantically but still accumulates one host frame per hop (the
     /// adapter plain-calls the native body), so deep tail recursion only
     /// becomes O(1) host-stack when the dispatch goes *straight* to a
-    /// native body with `ReturnCall`. That is legal only when the caller's
-    /// declared return type equals the callee's: the return-kind analysis
-    /// classifies every `Tail`-carrying function as boxed (`Reference`),
-    /// so this dispatch refuses raw-returning callees and lets the caller
-    /// fall back to a plain call + boxed return.
+    /// native body with `ReturnCall`. That is legal when the callee's
+    /// native return type equals the caller's and the callee's analyzed
+    /// kinds are contained in the caller's — a raw core tails a raw core,
+    /// a union core tails a union core with a kind superset. Otherwise the
+    /// call is framed (direct call + ABI conversion + `Return`), which is
+    /// correct but not frame-replacing.
     ///
     /// Returns `Some(())` when the tail call was fully lowered into the
     /// given blocks; `None` means the caller must lower the generic
@@ -10134,7 +10318,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     ) -> Result<Option<()>, ConvertError> {
         // Only simple (non-spread) calls to provenance-tracked function
         // values can dispatch directly; everything else keeps the generic
-        // adapter tail call.
+        // adapter tail call (its emission sites type-check the caller's
+        // ABI: boxed callers `ReturnCallRef` it, raw/union callers convert
+        // the boxed result before returning).
         if args.iter().any(|arg| arg.is_spread) {
             return Ok(None);
         }
@@ -10148,24 +10334,36 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             return Ok(None);
         };
         let info = *info;
-        let raw_returns = info.returns.single() != Some(ValueKind::Reference);
+        // Eligibility of the frame-replacing direct tail call: the callee's
+        // native ABI must equal this caller's, and the callee's possible
+        // value kinds must not exceed what the caller's own consumers
+        // branch on (the forwarded union's tags ride inside the caller's
+        // declared set).
+        let caller_returns = self.current_return_kinds;
+        let callee_returns = info.returns;
+        let can_return_call = callee_returns.is_subset_of(caller_returns)
+            && callee_returns.native_return_type(&self.repr)
+                == caller_returns.native_return_type(&self.repr);
         if *fresh {
             // A literal allocated by the current statement cannot have
-            // been rebound: dispatch straight to its native body.
-            if raw_returns {
-                return Ok(None);
+            // been rebound: dispatch straight to its native body when the
+            // ABIs match, otherwise call it directly and convert its
+            // result to this caller's ABI (framed, still provenance-fast).
+            if can_return_call {
+                let (this_value, arguments, formals) =
+                    self.build_native_call_args(body, block, info, this, values, args)?;
+                let mut call_args = vec![context, this_value, arguments];
+                call_args.extend(formals);
+                body.set_terminator(
+                    block,
+                    Terminator::ReturnCall {
+                        func: info.native,
+                        args: call_args,
+                    },
+                );
+                return Ok(Some(()));
             }
-            let (this_value, arguments, formals) =
-                self.build_native_call_args(body, block, info, this, values, args)?;
-            let mut call_args = vec![context, this_value, arguments];
-            call_args.extend(formals);
-            body.set_terminator(
-                block,
-                Terminator::ReturnCall {
-                    func: info.native,
-                    args: call_args,
-                },
-            );
+            self.emit_direct_tail_downgrade(body, block, context, info, this, values, args)?;
             return Ok(Some(()));
         }
         // Retained origin: the binding could have been rebound. Verify the
@@ -10241,23 +10439,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 },
             },
         );
-        if raw_returns {
-            // A raw-returning native cannot appear in this boxed caller's
-            // tail position (`ReturnCall` must match return types). Lower a
-            // plain call whose boxed result the caller returns; semantics
-            // are identical, only the frame is kept.
-            for (fast_block, result) in
-                self.direct_native_call(body, fast, context, info, this.clone(), values, args)?
-            {
-                let boxed = self.box_value(body, fast_block, &result)?;
-                body.set_terminator(
-                    fast_block,
-                    Terminator::Return {
-                        values: vec![boxed],
-                    },
-                );
-            }
-        } else {
+        if can_return_call {
             let (this_value, arguments, formals) =
                 self.build_native_call_args(body, fast, info, this.clone(), values, args)?;
             let mut call_args = vec![context, this_value, arguments];
@@ -10269,21 +10451,54 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     args: call_args,
                 },
             );
+        } else {
+            self.emit_direct_tail_downgrade(
+                body,
+                fast,
+                context,
+                info,
+                this.clone(),
+                values,
+                args,
+            )?;
         }
-        // The slow arm keeps the generic adapter tail call: the dispatch
-        // table entry, the captured context, the effective receiver, and a
-        // fresh arguments array. Emitted after the fast arm so each arm's
-        // ops land on its own block.
+        // The slow arm handles an unknown runtime identity (the binding
+        // may have been rebound). From a boxed caller it keeps the generic
+        // adapter tail call; from a raw or union caller the adapter's
+        // `anyref` return would not typecheck, so the tail is kept by
+        // calling the adapter and converting the boxed result to this
+        // caller's ABI before returning (framed, correct).
         let (slow_context, slow_this, slow_code, _arrow) =
             self.callable_parts(body, slow, callee_value, this)?;
         let slow_array = self.make_arguments(body, slow, values, args)?;
-        body.set_terminator(
-            slow,
-            Terminator::ReturnCallRef {
-                sig: self.repr.adapter,
-                args: vec![slow_context, slow_this, slow_array, slow_code],
-            },
-        );
+        if matches!(self.current_native_returns, ReturnType::Boxed) {
+            body.set_terminator(
+                slow,
+                Terminator::ReturnCallRef {
+                    sig: self.repr.adapter,
+                    args: vec![slow_context, slow_this, slow_array, slow_code],
+                },
+            );
+        } else {
+            let result = body.add_op(
+                slow,
+                Operator::CallRef {
+                    sig_index: self.repr.adapter,
+                },
+                &[slow_context, slow_this, slow_array, slow_code],
+                &[self.repr.adapter_value],
+            );
+            let value = self.convert_returned_value(
+                body,
+                slow,
+                &LowerValue::Wasm {
+                    value: result,
+                    kind: ValueKind::Reference,
+                },
+                self.current_return_kinds,
+            )?;
+            body.set_terminator(slow, Terminator::Return { values: vec![value] });
+        }
         Ok(Some(()))
     }
 

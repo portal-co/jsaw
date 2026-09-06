@@ -2485,10 +2485,11 @@ fn multi_kind_singleton_regression_no_union_in_all_single_module() {
 
 #[test]
 fn tail_call_out_of_multi_kind_caller_downgrades_to_call_and_pack() {
-    // middle is multi-kind AND contains a tail call. The tail-call
-    // interlock pins middle's ABI to boxed (a ReturnCallRef through the
-    // adapter requires an anyref return), so the tail must downgrade to a
-    // plain call + packed union return, preserving the value semantics.
+    // middle is multi-kind AND contains a tail call. With tail-kind
+    // unioning (Milestone 4) middle's tail into the same-set union core
+    // pick is a direct frame-replacing `ReturnCall` (same union struct,
+    // kinds contained) — the former interlock downgrade no longer fires;
+    // this test now pins the forwarding behavior and the value semantics.
     let module = compile_module(
         "
             export function run(x) {
@@ -2534,4 +2535,183 @@ fn multi_call_site_splits_into_tag_continuations_per_payload_kind() {
         })
     }).count();
     assert!(multi_ret_count >= 1, "at least one native must return the multi union");
+}
+
+#[test]
+fn raw_tail_recursion_stays_raw_and_constant_stack() {
+    // A self-recursive core whose kinds are provably {Number} keeps the
+    // raw f64 ABI *and* the frame-replacing tail: the callee's native
+    // return type equals the caller's, so `return f(n - 1)` is a direct
+    // `return_call` with no boxing anywhere on the recursion path.
+    let module = compile_module(
+        "
+            export function run(n) {
+                let f = function(k) {
+                    if (k <= 0) { return 0; }
+                    return f(k - 1);
+                };
+                return f(n);
+            }
+        ",
+    );
+    validate(&module);
+    // The f native must return raw f64 and tail-call itself: find the
+    // body whose signature returns f64 and check it contains a
+    // `return_call` to its own function index.
+    let mut raw_f64 = false;
+    let mut self_tail = false;
+    for (fid, decl) in module.funcs.entries() {
+        let FuncDecl::Body(sig, name, body) = decl else {
+            continue;
+        };
+        if !name.starts_with("js_body") {
+            continue;
+        }
+        let is_raw = matches!(
+            &module.signatures[*sig],
+            SignatureData::Func { returns, .. } if returns.first() == Some(&Type::F64)
+        );
+        if !is_raw {
+            continue;
+        }
+        raw_f64 = true;
+        for block in body.blocks.iter() {
+            if let Terminator::ReturnCall { func, .. } = body.blocks[block].terminator.terminator {
+                if func == fid {
+                    self_tail = true;
+                }
+            }
+        }
+    }
+    assert!(raw_f64, "self-recursive core should keep the raw f64 ABI");
+    assert!(
+        self_tail,
+        "self-tail should be a direct return_call to the same native"
+    );
+    let bytes = wasm_bytes(&module);
+    for (runtime, result) in [
+        ("Wasmtime", execute_in_wasmtime(&bytes, "run", &[100_000.0])),
+        ("Node.js", execute_in_node(&bytes, "run", &[100_000.0])),
+    ] {
+        assert_eq!(result, 0.0, "{runtime} raw tail recursion at depth 100000");
+    }
+}
+
+#[test]
+fn union_tail_recursion_forwards_untouched() {
+    // A self-recursive core returning a number on one branch and null on
+    // the other analyzes as {Number, Reference}: the union ABI. Its own
+    // tail forwards the packed union as-is (same struct type, kinds
+    // contained), so the recursion path must have no tag-splitting. The
+    // O(1) stack claim is observed by executing at depth 100000.
+    let module = compile_module(
+        "
+            export function run(n) {
+                let f = function(k) {
+                    if (k <= 0) { return null; }
+                    if (k === 1) { return 1.5; }
+                    return f(k - 2);
+                };
+                return f(n);
+            }
+        ",
+    );
+    validate(&module);
+    let bytes = wasm_bytes(&module);
+    // f(6): 6 -> 4 -> 2 -> 0 => null (ToNumber(null) = 0)
+    assert_eq!(execute_in_wasmtime(&bytes, "run", &[6.0]), 0.0);
+    // f(7): 7 -> 5 -> 3 -> 1 => 1.5
+    assert_eq!(execute_in_wasmtime(&bytes, "run", &[7.0]), 1.5);
+    // Depth 100000 only survives if the tail is frame-replacing.
+    for (runtime, result) in [
+        ("Wasmtime", execute_in_wasmtime(&bytes, "run", &[100_000.0])),
+        ("Node.js", execute_in_node(&bytes, "run", &[100_000.0])),
+    ] {
+        assert_eq!(result, 0.0, "{runtime} union tail recursion at depth 100000");
+    }
+}
+
+#[test]
+fn unknown_tail_callee_falls_back_to_reference() {
+    // A tail call to a callee whose provenance is unknown (a parameter
+    // holding an arbitrary function) must not promise a raw/union ABI:
+    // the boxed join is the only safe claim. The unknown-callee tail
+    // keeps a generic adapter hop from a boxed caller and everything
+    // still executes correctly.
+    let module = compile_module(
+        "
+            export function run(n) {
+                let go = function(cb, k) {
+                    if (k <= 0) { return 42; }
+                    return cb(cb, k - 1);
+                };
+                return go(go, n);
+            }
+        ",
+    );
+    validate(&module);
+    let bytes = wasm_bytes(&module);
+    for (runtime, result) in [
+        ("Wasmtime", execute_in_wasmtime(&bytes, "run", &[500.0])),
+        ("Node.js", execute_in_node(&bytes, "run", &[500.0])),
+    ] {
+        assert_eq!(result, 42.0, "{runtime} unknown-callee tail recursion");
+    }
+}
+
+#[test]
+fn mismatched_tail_abis_downgrade_and_stay_correct() {
+    // A {Number}-only core tail-calls a {Number, Reference} union core:
+    // the callee's kinds are not contained in the caller's, so the tail
+    // downgrades to a framed direct call + convert + return — correct on
+    // both arms, just not frame-replacing (bounded depth here).
+    let module = compile_module(
+        "
+            export function run(n) {
+                let pick = function(k) {
+                    if (k <= 0) { return null; }
+                    return 2.5;
+                };
+                let consumer = function(k) {
+                    if (k <= 0) { return 7; }
+                    return pick(k - 1);
+                };
+                let v = consumer(n);
+                return v === null ? 0 : v + 1;
+            }
+        ",
+    );
+    validate(&module);
+    let bytes = wasm_bytes(&module);
+    // run(3): consumer(3) -> pick(2) = 2.5 -> +1 = 3.5
+    assert_eq!(execute_in_wasmtime(&bytes, "run", &[3.0]), 3.5);
+    // run(-1): consumer(-1) = 7 -> 8
+    assert_eq!(execute_in_wasmtime(&bytes, "run", &[-1.0]), 8.0);
+}
+
+#[test]
+fn cross_module_tail_chain_executes_on_both_parities() {
+    // An import binding's origin is statically proven (ESM bindings
+    // cannot be rebound), so a cross-module tail dispatches straight to
+    // the linked native body where the ABIs match. Values must be exact
+    // on both parities of the even/odd-style cycle.
+    let fixtures: Fixture<'_> = &[
+        (
+            "main.mjs",
+            "import { down } from './a.js'; export function run(n) { return down(n); }",
+        ),
+        (
+            "a.js",
+            "import { up } from './b.js'; export function down(n) { if (n <= 0) return 1; return up(n - 1); }",
+        ),
+        (
+            "b.js",
+            "import { down } from './a.js'; export function up(n) { if (n <= 0) return 2; return down(n - 1); }",
+        ),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    let bytes = wasm_bytes(&module);
+    assert_eq!(execute_in_wasmtime(&bytes, "run", &[101.0]), 2.0);
+    assert_eq!(execute_in_wasmtime(&bytes, "run", &[100.0]), 1.0);
 }

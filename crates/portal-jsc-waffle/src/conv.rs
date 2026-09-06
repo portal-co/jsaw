@@ -47,7 +47,7 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
         to_number_helper: None,
         add_helper: None,
         return_kinds: BTreeMap::new(),
-        current_native_returns: None,
+        current_native_returns: ReturnType::Boxed,
         function_literal_locals: BTreeMap::new(),
         function_self_names: BTreeMap::new(),
         lowering_function: None,
@@ -203,7 +203,7 @@ pub fn convert_modules<'a, 'wasm>(
         to_number_helper: None,
         add_helper: None,
         return_kinds: BTreeMap::new(),
-        current_native_returns: None,
+        current_native_returns: ReturnType::Boxed,
         function_literal_locals: BTreeMap::new(),
         function_self_names: BTreeMap::new(),
         lowering_function: None,
@@ -300,14 +300,93 @@ impl ReturnKinds {
         }
     }
 
-    /// The Wasm return type for the native body. Only single-kind sets get
-    /// a raw type; multi-kind unions keep the boxed `anyref` ABI because
-    /// the boxed value is the join of the branches.
+    /// The Wasm return type for the native body. Single-kind sets get a
+    /// raw type; a genuinely multi-representation set returns the tagged
+    /// union (payload slots per kind); everything else keeps the boxed
+    /// `anyref` ABI because the boxed value is the join of the branches.
     fn native_return_type(self, repr: &Repr) -> Type {
+        if self.is_multi_union() {
+            return repr.multi_ty();
+        }
         match self.single() {
             Some(ValueKind::Number) => Type::F64,
             Some(ValueKind::Boolean | ValueKind::Integer) => Type::I32,
             _ => repr.value,
+        }
+    }
+
+    fn contains(self, kind: ValueKind) -> bool {
+        let bit = match kind {
+            ValueKind::Reference => Self::REFERENCE,
+            ValueKind::Number => Self::NUMBER,
+            ValueKind::Boolean => Self::BOOLEAN,
+            ValueKind::Integer => Self::INTEGER,
+        };
+        self.0 & bit != 0
+    }
+
+    /// True when the returns mix at least two of the three payload-slot
+    /// groups the union carries: boxed references, the i32 slot (booleans
+    /// and integers), and raw f64. Two kinds sharing the i32 slot
+    /// ({Boolean, Integer}) stay boxed — a raw i32 cannot say which box to
+    /// rebuild at an unboxing boundary — and everything else keeps today's
+    /// single raw or boxed ABI.
+    fn is_multi_union(self) -> bool {
+        let mut groups = 0;
+        if self.0 & Self::REFERENCE != 0 {
+            groups += 1;
+        }
+        if self.0 & (Self::BOOLEAN | Self::INTEGER) != 0 {
+            groups += 1;
+        }
+        if self.0 & Self::NUMBER != 0 {
+            groups += 1;
+        }
+        groups >= 2
+    }
+}
+
+/// Tag constants for the [`Repr::multi`] union's `tag` field. Only the
+/// tagged payload slot is valid; the others carry unspecified defaults.
+/// Boolean and Integer get distinct tags even though both ride the `i`
+/// slot: unboxing at an adapter boundary must know whether to rebuild a
+/// boolean box or a number box, and `=== true` observes the difference.
+pub(crate) const MULTI_TAG_REF: i32 = 0;
+pub(crate) const MULTI_TAG_BOOL: i32 = 1;
+pub(crate) const MULTI_TAG_INT: i32 = 2;
+pub(crate) const MULTI_TAG_F64: i32 = 3;
+
+/// Field indices of the [`Repr::multi`] struct (layout: tag, r, i, f).
+const MULTI_FIELD_TAG: usize = 0;
+const MULTI_FIELD_REF: usize = 1;
+const MULTI_FIELD_I32: usize = 2;
+const MULTI_FIELD_F64: usize = 3;
+
+/// The declared return representation of the native body currently being
+/// lowered, driving every `Return`-side conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReturnType {
+    /// Raw f64 (a provably `Number`-only core).
+    F64,
+    /// Raw i32 (a provably boolean/integer-only core).
+    I32,
+    /// Boxed `anyref` (the conservative join; also every tail-carrying
+    /// function and every function the analysis could not pin down).
+    Boxed,
+    /// The [`Repr::multi`] tagged union: returns pack their classified
+    /// kind's tag and payload; callers branch on the tag.
+    Multi,
+}
+
+impl ReturnType {
+    fn from_kinds(kinds: ReturnKinds) -> Self {
+        if kinds.is_multi_union() {
+            return Self::Multi;
+        }
+        match kinds.single() {
+            Some(ValueKind::Number) => Self::F64,
+            Some(ValueKind::Boolean | ValueKind::Integer) => Self::I32,
+            _ => Self::Boxed,
         }
     }
 }
@@ -532,8 +611,8 @@ struct Converter<'a, 'module, 'wasm> {
     /// (keyed by [`Converter::key`]). See `analyze_return_kinds`.
     return_kinds: BTreeMap<usize, ReturnKinds>,
     /// The return representation of the native body currently being
-    /// lowered. `None` means the boxed `anyref` ABI.
-    current_native_returns: Option<ValueKind>,
+    /// lowered.
+    current_native_returns: ReturnType,
     /// Variable names whose only write in the current function tree stores
     /// one specific function literal (`let f = function () {...}` with no
     /// reassignment anywhere, including nested closures). A load of such a
@@ -642,8 +721,6 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         ..
                     } = &func.cfg.values[*val].value
                     {
-                        #[cfg(feature = "lower_trace")]
-                        eprintln!("[selfname] inserted");
                         self.function_self_names
                             .entry(Self::key(literal))
                             .or_insert(target.clone());
@@ -737,8 +814,42 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let mut kinds = ReturnKinds::default();
         let mut visited_blocks = BTreeSet::new();
         self.scan_return_kinds(func, func.entry, &mut kinds, &mut visited_blocks);
+        // A return site the classifier cannot pin down (an alias, a load,
+        // a parameter) packs the union's reference tag at runtime, so the
+        // reference kind is always possible in a multi-return core.
+        if kinds.is_multi_union() {
+            kinds.insert(ValueKind::Reference);
+        }
+        // Tail-call interlock: `ReturnCallRef` through the universal
+        // adapter requires the caller's native return to stay the boxed
+        // `anyref`, so a tail-carrying function is pinned to the boxed ABI
+        // even when its other returns look like a raw union.
+        if func.cfg.blocks.iter().any(|(_, block)| {
+            matches!(
+                &block.postcedent.term,
+                TTerm::Tail { .. }
+            )
+        }) {
+            kinds = ReturnKinds::default();
+            kinds.insert(ValueKind::Reference);
+        }
         self.return_kinds.insert(key, kinds);
         kinds
+    }
+
+    /// The analyzed return kinds of the source function behind a lowered
+    /// native body. The adapter and direct call sites unpack a multi-return
+    /// union per tag, and need the producing function's kind set to know
+    /// which tags are possible (the rest is `unreachable`).
+    fn multi_kinds_of(&self, native: Func) -> ReturnKinds {
+        // `make_adapter` runs while `info` is being built, so the reverse
+        // native -> key lookup is threaded through the call instead of
+        // searched here.
+        self.functions
+            .values()
+            .find(|info| info.native == native)
+            .map(|info| info.returns)
+            .unwrap_or_default()
     }
 
     fn scan_return_kinds(
@@ -758,8 +869,13 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         match &sblock.postcedent.term {
             TTerm::Return(Some(value)) => {
                 let kind = self.classify_return_value(root, *value);
-                if let Some(kind) = kind {
-                    kinds.insert(kind);
+                match kind {
+                    Some(kind) => kinds.insert(kind),
+                    // A mixed select/logical site produces whichever arm's
+                    // kind ran; insert both arms' kinds so the union stays
+                    // precise (the value's own packing follows the refined
+                    // continuation kind at lowering time).
+                    None => self.insert_mixed_site_kinds(root, *value, kinds),
                 }
             }
             TTerm::Return(None) | TTerm::Default => kinds.insert(ValueKind::Reference),
@@ -774,6 +890,37 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 self.scan_return_kinds(root, if_false.block, kinds, visited_blocks);
             }
             TTerm::Throw(_) | TTerm::Switch { .. } => {}
+        }
+    }
+
+    /// A return site the classifier could not pin to one kind (a mixed
+    /// select or logical operator) still has *arm-wise* kinds: insert every
+    /// arm's kind. Falls back to the boxed reference join only when even
+    /// the arms cannot be classified.
+    fn insert_mixed_site_kinds(&mut self, root: &'a SFunc, value: SValueId, kinds: &mut ReturnKinds) {
+        let mut inserted = false;
+        if let SValue::Item { item, .. } = &root.cfg.values[value].value {
+            let arms: Vec<SValueId> = match item {
+                Item::Select { then, otherwise, .. } => vec![*then, *otherwise],
+                Item::Bin { left, right, op }
+                    if matches!(
+                        op,
+                        BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::NullishCoalescing
+                    ) =>
+                {
+                    vec![*left, *right]
+                }
+                _ => vec![],
+            };
+            for arm in arms {
+                if let Some(kind) = self.classify_return_value(root, arm) {
+                    kinds.insert(kind);
+                    inserted = true;
+                }
+            }
+        }
+        if !inserted {
+            kinds.insert(ValueKind::Reference);
         }
     }
 
@@ -838,7 +985,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 let otherwise_kind = self.classify_return_value(root, *otherwise);
                 match (then_kind, otherwise_kind) {
                     (Some(a), Some(b)) if a == b => Some(a),
-                    _ => Some(ValueKind::Reference),
+                    // Mixed arms: `None` — the caller (scan_return_kinds)
+                    // resolves this by inserting both arm kinds.
+                    _ => None,
                 }
                 .inspect(|_| {
                     let _ = cond;
@@ -884,7 +1033,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 let right_kind = self.classify_return_value(root, right);
                 match (left_kind, right_kind) {
                     (Some(a), Some(b)) if a == b => Some(a),
-                    _ => Some(ValueKind::Reference),
+                    _ => None,
                 }
             }
         }
@@ -903,6 +1052,13 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     &root.cfg.values[*value].value
                 {
                     let kinds = self.analyze_return_kinds(func);
+                    // A multi-return callee's kind is a runtime tag, not a
+                    // static fact: the call site's value packs under the
+                    // reference tag (and, when the call site splits, the
+                    // split arms carry the precise kinds).
+                    if kinds.is_multi_union() {
+                        return None;
+                    }
                     return kinds.single();
                 }
                 Some(ValueKind::Reference)
@@ -967,6 +1123,20 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             format!("js_body_{}", self.module.funcs.len()),
             native_body,
         ));
+        // `make_adapter` unpacks a multi-return union per tag and needs the
+        // producing function's analyzed kinds; register the provisional
+        // info (tag refined below) so the reverse lookup finds it.
+        let provisional_tag = self.next_function_tag;
+        self.functions.insert(
+            key,
+            FunctionInfo {
+                native,
+                adapter: native, // placeholder; refined after make_adapter returns
+                arity,
+                tag: provisional_tag,
+                returns,
+            },
+        );
         let adapter = self.make_adapter(native, arity)?;
 
         let tag = self.next_function_tag;
@@ -981,6 +1151,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             tag,
             returns,
         };
+        // Replaces the provisional entry registered before `make_adapter`.
         self.functions.insert(key, info);
         self.module_of_function
             .insert(key, module.to_string());
@@ -1084,7 +1255,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[native_return_type],
         );
         // A raw single-kind native return is re-boxed here — once, at the
-        // adapter boundary — instead of re-coerced at every use site.
+        // adapter boundary — instead of re-coerced at every use site. A
+        // multi-return union is unpacked per tag: only the producing
+        // function's analyzed kinds can appear, so the chain is exhausted
+        // with `unreachable`.
         let result = match native_return_type {
             Type::F64 => body.add_op(
                 block,
@@ -1104,7 +1278,36 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             ),
             _ => call_result,
         };
-        let result = if native_return_type == self.repr.value {
+        let mut result_block = block;
+        let result = if native_return_type == self.repr.multi_ty() {
+            // A multi-return native's union must become the boxed join
+            // here: the adapter's pinned signature returns `anyref`, and
+            // every generic `CallRef` site consumes that. Boolean and
+            // Integer rebuild *different* boxes (the `=== true` observer),
+            // so the tags carry the distinction.
+            let kind_sets = self.multi_kinds_of(native);
+            let parts = self.unpack_multi_return(&mut body, block, call_result, kind_sets)?;
+            let join = body.add_block();
+            let boxed = body.add_blockparam(join, self.repr.value);
+            for (arm, value) in parts {
+                // `box_value` already normalizes to the adapter's exact
+                // nullable `anyref`, so the join needs no trailing cast.
+                let boxed_value = self.box_value(&mut body, arm, &value)?;
+                body.set_terminator(
+                    arm,
+                    Terminator::Br {
+                        target: BlockTarget {
+                            block: join,
+                            args: vec![boxed_value],
+                        },
+                    },
+                );
+            }
+            // The blockparam value is final here: `Return` replaces the
+            // provisional terminator on the join.
+            result_block = join;
+            boxed
+        } else if native_return_type == self.repr.value {
             result
         } else {
             body.add_op(
@@ -1117,7 +1320,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             )
         };
         body.set_terminator(
-            block,
+            result_block,
             Terminator::Return {
                 values: vec![result],
             },
@@ -1267,9 +1470,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 let body = decl.body_mut().ok_or_else(|| {
                     ConvertError::invalid("generated native function has no body")
                 })?;
-                self.current_native_returns = info.returns.single();
+                self.current_native_returns = ReturnType::from_kinds(info.returns);
                 let result = self.lower_function(sfunc, body);
-                self.current_native_returns = None;
+                self.current_native_returns = ReturnType::Boxed;
                 result
             };
             self.module.funcs[info.native] = decl;
@@ -1393,19 +1596,24 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         };
                         // The native signature declares the analyzed return
                         // representation. Single-kind functions return the
-                        // raw value directly; multi-kind functions return
-                        // the boxed join of their branches.
+                        // raw value directly; multi-kind functions pack the
+                        // classified kind's tag and payload into the union;
+                        // everything else returns the boxed join.
                         let value = match self.current_native_returns {
-                            Some(kind) => match kind {
-                                ValueKind::Number => self.as_f64(body, continuation.block, &value)?,
-                                ValueKind::Boolean | ValueKind::Integer => {
-                                    self.as_i32(body, continuation.block, &value)?
-                                }
-                                ValueKind::Reference => {
-                                    self.box_value(body, continuation.block, &value)?
-                                }
-                            },
-                            None => self.box_value(body, continuation.block, &value)?,
+                            ReturnType::F64 => self.as_f64(body, continuation.block, &value)?,
+                            ReturnType::I32 => self.as_i32(body, continuation.block, &value)?,
+                            ReturnType::Boxed => {
+                                self.box_value(body, continuation.block, &value)?
+                            }
+                            ReturnType::Multi => {
+                                let kind = value.kind()?;
+                                self.pack_multi_return(
+                                    body,
+                                    continuation.block,
+                                    &value,
+                                    kind,
+                                )?
+                            }
                         };
                         body.set_terminator(
                             continuation.block,
@@ -1563,17 +1771,28 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 TTerm::Default => {
                     for continuation in continuations {
                         let undef = self.undef(body, continuation.block);
-                        // Implicit fallthrough is `undefined` — a reference,
-                        // so the unboxed i32/f64 return kinds cannot occur
-                        // here and the boxed ABI is always correct for the
-                        // *value*; but the signature may still be raw, in
-                        // which case `undefined` boxes to the declared type.
+                        // Implicit fallthrough is `undefined` — always a
+                        // boxed reference at the value level, so the raw
+                        // single-kind ABIs convert it and the union packs
+                        // it under its reference tag.
                         let value = match self.current_native_returns {
-                            Some(ValueKind::Number) => self.as_f64(body, continuation.block, &undef)?,
-                            Some(ValueKind::Boolean | ValueKind::Integer) => {
-                                self.as_i32(body, continuation.block, &undef)?
+                            ReturnType::F64 => self.as_f64(body, continuation.block, &undef)?,
+                            ReturnType::I32 => self.as_i32(body, continuation.block, &undef)?,
+                            ReturnType::Boxed => {
+                                self.box_value(body, continuation.block, &undef)?
                             }
-                            _ => self.box_value(body, continuation.block, &undef)?,
+                            ReturnType::Multi => {
+                                let boxed = self.box_value(body, continuation.block, &undef)?;
+                                self.pack_multi_return(
+                                    body,
+                                    continuation.block,
+                                    &LowerValue::Wasm {
+                                        value: boxed,
+                                        kind: ValueKind::Reference,
+                                    },
+                                    ValueKind::Reference,
+                                )?
+                            }
                         };
                         body.set_terminator(
                             continuation.block,
@@ -1700,8 +1919,6 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 // (recursion re-enters after the binding exists). Mark the
                 // loaded function fresh so tail position can skip the tag
                 // check entirely.
-                #[cfg(feature = "lower_trace")]
-                eprintln!("[selfcheck] key={key:?} lower_key={:?} names={:?}", self.lowering_function_key, self.function_self_names);
                 let is_self_name = self
                     .lowering_function_key
                     .is_some_and(|current| {
@@ -1907,7 +2124,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                                     values,
                                     args,
                                 )?;
-                                return Ok(vec![result]);
+                                return Ok(result);
                             }
                             let adapter_sig = self.repr.adapter;
                             let adapter_value_ty = self.repr.value;
@@ -3633,6 +3850,153 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[value],
             &[self.repr.value],
         ))
+    }
+
+    /// Pack a classified return value into the [`Repr::multi`] tagged
+    /// union: the kind's tag plus the value in its payload slot (boxed,
+    /// raw i32, or raw f64). Only used by native bodies whose declared
+    /// return ABI is the union.
+    fn pack_multi_return(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        value: &LowerValue,
+        kind: ValueKind,
+    ) -> Result<Value, ConvertError> {
+        let (value, actual) = value.wasm()?;
+        debug_assert_eq!(kind, actual, "multi-return packing expects the classified kind");
+        let (tag, r, i, f) = match kind {
+            ValueKind::Reference => {
+                let boxed = self.anyref(body, block, value);
+                (MULTI_TAG_REF, Some(boxed), None, None)
+            }
+            ValueKind::Boolean => (MULTI_TAG_BOOL, None, Some(value), None),
+            ValueKind::Integer => (MULTI_TAG_INT, None, Some(value), None),
+            ValueKind::Number => (MULTI_TAG_F64, None, None, Some(value)),
+        };
+        let undef = |body: &mut FunctionBody, ty: Type| {
+            body.add_op(
+                block,
+                Operator::RefNull { ty },
+                &[],
+                &[ty],
+            )
+        };
+        let r = match r {
+            Some(v) => v,
+            None => undef(body, self.repr.value),
+        };
+        let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let i = i.unwrap_or(zero);
+        let zero_f = body.add_op(
+            block,
+            Operator::F64Const {
+                value: 0.0f64.to_bits(),
+            },
+            &[],
+            &[Type::F64],
+        );
+        let f = f.unwrap_or(zero_f);
+        let tag = body.add_op(
+            block,
+            Operator::I32Const {
+                value: tag as u32,
+            },
+            &[],
+            &[Type::I32],
+        );
+        Ok(body.add_op(
+            block,
+            Operator::StructNew { sig: self.repr.multi },
+            &[tag, r, i, f],
+            &[self.repr.multi_ty()],
+        ))
+    }
+
+    /// Split a [`Repr::multi`] union value into one continuation per kind
+    /// the producing function's analysis proved possible. Each continuation
+    /// block extracts the tagged payload slot into a [`LowerValue`] with
+    /// that exact kind, so the rest of the source statement lowers once per
+    /// representation — the runtime-tag generalization of the static
+    /// continuation splits. The set is exhausted with `unreachable`: the
+    /// return-side packing only ever tags kinds in the analyzed set.
+    fn unpack_multi_return(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        result: Value,
+        kinds: ReturnKinds,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let tag = body.add_op(
+            block,
+            Operator::StructGet {
+                sig: self.repr.multi,
+                idx: MULTI_FIELD_TAG,
+            },
+            &[result],
+            &[Type::I32],
+        );
+        let mut parts = Vec::new();
+        let mut check = block;
+        for (tag_value, kind) in [
+            (MULTI_TAG_REF, ValueKind::Reference),
+            (MULTI_TAG_BOOL, ValueKind::Boolean),
+            (MULTI_TAG_INT, ValueKind::Integer),
+            (MULTI_TAG_F64, ValueKind::Number),
+        ] {
+            if !kinds.contains(kind) {
+                continue;
+            }
+            let matches = body.add_op(
+                check,
+                Operator::I32Const {
+                    value: tag_value as u32,
+                },
+                &[],
+                &[Type::I32],
+            );
+            let matches = body.add_op(check, Operator::I32Eq, &[tag, matches], &[Type::I32]);
+            let arm = body.add_block();
+            let next = body.add_block();
+            body.set_terminator(
+                check,
+                Terminator::CondBr {
+                    cond: matches,
+                    if_true: BlockTarget {
+                        block: arm,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: next,
+                        args: vec![],
+                    },
+                },
+            );
+            let (idx, payload_ty) = match kind {
+                ValueKind::Reference => (MULTI_FIELD_REF, self.repr.value),
+                ValueKind::Boolean | ValueKind::Integer => (MULTI_FIELD_I32, Type::I32),
+                ValueKind::Number => (MULTI_FIELD_F64, Type::F64),
+            };
+            let payload = body.add_op(
+                arm,
+                Operator::StructGet {
+                    sig: self.repr.multi,
+                    idx,
+                },
+                &[result],
+                &[payload_ty],
+            );
+            parts.push((
+                arm,
+                LowerValue::Wasm {
+                    value: payload,
+                    kind,
+                },
+            ));
+            check = next;
+        }
+        body.set_terminator(check, Terminator::Unreachable);
+        Ok(parts)
     }
 
     fn anyref(&self, body: &mut FunctionBody, block: Block, value: Value) -> Value {
@@ -9665,7 +10029,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         this: LowerValue,
         values: &BTreeMap<SValueId, LowerValue>,
         args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
-    ) -> Result<(Block, LowerValue), ConvertError> {
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
         if args.iter().any(|arg| arg.is_spread) {
             return Err(ConvertError::unsupported("spread argument", ()));
         }
@@ -9681,8 +10045,16 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &call_args,
             &[info.returns.native_return_type(&self.repr)],
         );
+        if info.returns.is_multi_union() {
+            // The union's kind is a runtime tag. Split into one
+            // continuation per possible kind, each carrying the extracted
+            // payload with its exact representation, so the rest of the
+            // source statement consumes a raw f64/i32/boxed value without
+            // a re-box round trip.
+            return self.unpack_multi_return(body, block, result, info.returns);
+        }
         let kind = info.returns.single().unwrap_or(ValueKind::Reference);
-        Ok((block, LowerValue::Wasm { value: result, kind }))
+        Ok(vec![(block, LowerValue::Wasm { value: result, kind })])
     }
 
     /// Build the arguments of a direct dispatch to a function literal's
@@ -9874,15 +10246,17 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             // tail position (`ReturnCall` must match return types). Lower a
             // plain call whose boxed result the caller returns; semantics
             // are identical, only the frame is kept.
-            let (fast_block, result) =
-                self.direct_native_call(body, fast, context, info, this.clone(), values, args)?;
-            let boxed = self.box_value(body, fast_block, &result)?;
-            body.set_terminator(
-                fast_block,
-                Terminator::Return {
-                    values: vec![boxed],
-                },
-            );
+            for (fast_block, result) in
+                self.direct_native_call(body, fast, context, info, this.clone(), values, args)?
+            {
+                let boxed = self.box_value(body, fast_block, &result)?;
+                body.set_terminator(
+                    fast_block,
+                    Terminator::Return {
+                        values: vec![boxed],
+                    },
+                );
+            }
         } else {
             let (this_value, arguments, formals) =
                 self.build_native_call_args(body, fast, info, this.clone(), values, args)?;
@@ -10006,9 +10380,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             },
         );
         let mut continuations = Vec::with_capacity(2);
-        let (fast_block, fast_value) =
-            self.direct_native_call(body, fast, context, info, this, values, args)?;
-        continuations.push((fast_block, fast_value));
+        continuations.extend(self.direct_native_call(body, fast, context, info, this, values, args)?);
         for (slow_block, slow_value) in fallback(self, body, slow)? {
             let slow_value = self.box_value(body, slow_block, &slow_value)?;
             continuations.push((

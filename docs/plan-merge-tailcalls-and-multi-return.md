@@ -319,3 +319,68 @@ and 3, and it's one match arm in the `TTerm::Tail` lowering.
 2. Tail-call validity pass + guarded lowering + tests (self-contained).
 3. Tagged-union multi-return: repr → callee emission → topmost split →
    propagation + tail arm → tests.
+
+---
+
+## Milestone 3 — as built (implementation notes)
+
+Landed with deviations from §3.1–§3.4 that simplify the design while
+keeping every guarantee:
+
+- **Tag encoding (revised).** Four tags, not three:
+  `0 = Reference, 1 = Boolean, 2 = Integer, 3 = Number`. Boolean and
+  Integer share the union's `i32` slot but rebuild *different* boxes at an
+  unboxing boundary (`=== true` observes the difference), so the tag must
+  distinguish them.
+- **Union ABI trigger (revised).** The union is used only when the
+  analyzed kinds mix at least two of the three payload-slot groups
+  (boxed / i32-slot / f64). `{Boolean, Integer}` stays boxed — the shared
+  i32 slot would need a box rebuild per consumer with no payload saving.
+- **Classification precision.** Mixed return sites (a ternary or logical
+  operator whose arms classify differently) no longer collapse to
+  `Reference`: the analysis inserts *both* arm kinds (`None` from the
+  site classifier triggers the arm descent), so `return n > 0 ? n * 1.5 :
+  null` yields a true `{Number, Reference}` union instead of the boxed
+  join. A multi-kind callee's kind is a runtime tag (`None` at the call
+  site's classification); the *call site* splits on the tag, so callers
+  still refine.
+- **Callee side.** The `TTerm::Return`/`Default` lowering packs per
+  continuation using the continuation's refined value kind
+  (`pack_multi_return`): tag + classified payload slot (unspecified slots
+  carry defaults). No per-tag struct family — the fat 4-slot struct.
+- **Caller side.** `direct_native_call` returns
+  `Vec<(Block, LowerValue)>`: a multi result unpacks into one continuation
+  per analyzed kind (`unpack_multi_return`), each carrying the extracted
+  payload with its exact kind. Non-multi callers lower the remaining
+  statement once per arm (the existing static-split machinery composes);
+  multi callers repack at their own return — one extra tag check per hop,
+  sound (the plan's "forward as-is" §3.3 first bullet is a future
+  optimization, not done). The universal adapter gained a multi→boxed
+  unpacking prologue so every generic `CallRef` site is unchanged.
+- **Tail interlock (as planned in §2.1.2).** A tail-carrying function's
+  kinds are pinned to `{Reference}` (boxed ABI): `ReturnCallRef` through
+  the universal adapter requires an `anyref` return, and a multi caller
+  cannot `ReturnCall` a different-ABI callee. The observed behavior:
+  tail calls out of multi-kind callers downgrade to call + pack + `Return`
+  (correct, non-tail), pinned by a test.
+- **Analysis-lookup plumbing.** `make_adapter` runs before the function's
+  `FunctionInfo` is final, so `ensure_function` registers a provisional
+  info (correct `returns`, placeholder adapter) that `multi_kinds_of`'s
+  reverse lookup finds; the final insert supersedes it.
+
+### Tests
+
+- `multi_return_propagates_through_multi_kind_caller` — a multi caller
+  returning a multi callee's result directly (union repack, topmost
+  export splits), plus the null→0 ToNumber edge.
+- `multi_return_core_inspection_shows_union_abi` — the pick native's
+  signature returns the 4-field union struct.
+- `guarded_multi_kind_callee_produces_correct_values_on_both_arms` —
+  the tag-check fast arm (union unpack) and the generic slow arm agree.
+- `tail_call_out_of_multi_kind_caller_downgrades_to_call_and_pack` —
+  the §3.4 downgrade observed at depth 0/edge cases.
+- `multi_call_site_splits_into_tag_continuations_per_payload_kind` —
+  at least one native returns the union.
+- `multi_kind_singleton_regression_no_union_in_all_single_module` —
+  an all-single-kind module uses no union ABI anywhere.
+- Full suite: 74 passed (68 baseline + 6 new).

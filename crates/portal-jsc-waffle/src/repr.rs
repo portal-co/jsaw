@@ -46,6 +46,12 @@ pub(crate) struct Repr {
     pub(crate) typed_f32: Signature,
     pub(crate) typed_f64: Signature,
     pub(crate) adapter: Signature,
+    /// Tagged union a mixed-return core returns: `tag` selects which of
+    /// `r` (a boxed value), `i` (a raw i32 from a boolean or an integer
+    /// computation), and `f` (a raw f64) is live. Only functions whose
+    /// returns provably produce more than one representation get this ABI;
+    /// single-kind cores keep raw f64/i32 and everything else stays boxed.
+    pub(crate) multi: Signature,
 }
 
 /// The supported Number-backed typed-array constructors.  The discriminant
@@ -227,6 +233,15 @@ impl Repr {
             fields: vec![field(Type::I32)],
             shared: false,
         });
+        let multi = module.signatures.push(SignatureData::Struct {
+            fields: vec![
+                field(Type::I32),
+                field(value),
+                field(Type::I32),
+                field(Type::F64),
+            ],
+            shared: false,
+        });
         let adapter = module.signatures.push(SignatureData::Func {
             params: vec![ref_sig(object), value, ref_sig(arguments)],
             returns: vec![value],
@@ -313,7 +328,12 @@ impl Repr {
             typed_f32,
             typed_f64,
             adapter,
+            multi,
         }
+    }
+
+    pub(crate) fn multi_ty(self) -> Type {
+        ref_sig(self.multi)
     }
 
     pub(crate) fn object_ty(self) -> Type {

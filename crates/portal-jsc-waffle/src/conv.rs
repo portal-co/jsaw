@@ -1,296 +1,10366 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
-    iter::once,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     mem::take,
 };
 
-use portal_jsc_swc_ssa::{SFunc, SValue};
-use portal_jsc_swc_tac::{Item, TTerm};
-use portal_jsc_swc_util::common::asm::types::Sign;
-use portal_pc_waffle::{Module, Operator, StorageType, Type, Value, WithMutablility, WithNullable};
+use portal_jsc_swc_ssa::{
+    SBlockId, SFunc, SValue, SValueId, STarget,
+    module::{ExportSpec, SModule},
+};
+use portal_jsc_swc_tac::{Item, LId, PropKey, PropVal, TCallee, TTerm};
+use portal_pc_waffle::{
+    Block, BlockTarget, EntityRef, Export, ExportKind, Func, FuncDecl, FunctionBody, HeapType, Module,
+    Operator, SignatureData, Table, TableData, Terminator, Type, Value, WithNullable,
+};
+use swc_ecma_ast::{BinaryOp, Lit, UnaryOp};
 
-use crate::repr::trie::Tries;
+use crate::repr::{ConvertError, FUNCTION_FIELD_TAG, JS_NULL_SENTINEL, Repr, TypedArrayKind, field, ref_sig};
 
-pub fn convert<'a>(root: &'a SFunc, module: &mut Module) {
-    let mut t = Tries::default();
-    let object = module
-        .signatures
-        .push(portal_pc_waffle::SignatureData::Struct {
-            fields: vec![],
-            shared: false,
-        });
-    let obj_trie = t.get(
+/// Convert jsaw-core SSA into a WasmGC module.
+///
+/// The generated module has no exports. Use [`convert_module`] for ES-module
+/// lowering with generated Wasm exports.
+pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result<(), ConvertError> {
+    let repr = Repr::new(module);
+    let mut converter = Converter {
         module,
-        Type::Heap(WithNullable {
-            value: portal_pc_waffle::HeapType::Sig { sig_index: object },
-            nullable: true,
-        }),
-    );
-    let obj_trie_get = t.get_getter(
-        module,
-        Type::Heap(WithNullable {
-            value: portal_pc_waffle::HeapType::Sig { sig_index: object },
-            nullable: true,
-        }),
-    );
-    let obj_trie_set = t.get_setter(
-        module,
-        Type::Heap(WithNullable {
-            value: portal_pc_waffle::HeapType::Sig { sig_index: object },
-            nullable: true,
-        }),
-    );
-    let ctx = module
-        .signatures
-        .push(portal_pc_waffle::SignatureData::Struct {
-            fields: vec![WithMutablility {
-                mutable: true,
-                value: StorageType::Val(Type::Heap(WithNullable {
-                    nullable: true,
-                    value: portal_pc_waffle::HeapType::Sig {
-                        sig_index: obj_trie,
-                    },
-                })),
-            }],
-            shared: false,
-        });
-
-    module.signatures[object] = portal_pc_waffle::SignatureData::Struct {
-        fields: vec![WithMutablility {
-            mutable: true,
-            value: portal_pc_waffle::StorageType::Val(Type::Heap(WithNullable {
-                nullable: true,
-                value: portal_pc_waffle::HeapType::Sig {
-                    sig_index: obj_trie,
-                },
-            })),
-        }],
-        shared: false,
+        repr,
+        functions: BTreeMap::new(),
+        pending: VecDeque::new(),
+        lowered: BTreeSet::new(),
+        ref_table: None,
+        string_equal: None,
+        strict_equality_helper: None,
+        string_concat: None,
+        string_utf16: None,
+        string_index: None,
+        trie_clone: None,
+        shapes: Vec::new(),
+        property_helpers: None,
+        truthy_helper: None,
+        native_function_cache: BTreeMap::new(),
+        context_builder: None,
+        arguments_push_helper: None,
+        trie_enumerate_helper: None,
+        object_enumerate_keys_helper: None,
+        primordial_fast_cores: BTreeMap::new(),
+        shadowed_names: BTreeSet::new(),
+        next_function_tag: USER_TAG_BASE,
+        to_number_helper: None,
+        typeof_helper: None,
+        add_helper: None,
+        return_kinds: BTreeMap::new(),
+        current_native_returns: None,
+        function_literal_locals: BTreeMap::new(),
     };
-    let mut workqueue = VecDeque::new();
-    workqueue.push_back((root, root.entry));
-    let mut fcache: BTreeMap<
-        usize,
-        (
-            portal_pc_waffle::Func,
-            BTreeMap<portal_jsc_swc_ssa::SBlockId, portal_pc_waffle::Block>,
-        ),
-    > = BTreeMap::new();
-    macro_rules! fcache {
-        ($sfunc:expr) => {
-            match $sfunc {
-                //HACK: pointers to SFunc are stable, so we can use them as keys in the cache
-                sfunc => fcache
-                    .entry(sfunc as *const SFunc as usize)
-                    .or_insert_with(|| {
-                        let sig = module
-                            .signatures
-                            .push(portal_pc_waffle::SignatureData::Func {
-                                params: once(Type::Heap(WithNullable {
-                                    nullable: true,
-                                    value: portal_pc_waffle::HeapType::Sig { sig_index: ctx },
-                                }))
-                                .chain(sfunc.cfg.blocks[sfunc.entry].params.iter().map(|_| {
-                                    Type::Heap(WithNullable {
-                                        nullable: true,
-                                        value: portal_pc_waffle::HeapType::Sig {
-                                            sig_index: object,
-                                        },
-                                    })
-                                }))
-                                .collect(),
-                                returns: vec![Type::Heap(WithNullable {
-                                    nullable: true,
-                                    value: portal_pc_waffle::HeapType::Sig { sig_index: object },
-                                })],
-                                shared: false,
-                            });
-                        let func = portal_pc_waffle::FunctionBody::new(module, sig);
-                        let mut map = BTreeMap::new();
-                        map.insert(sfunc.entry, func.entry);
-                        let func = module.funcs.push(portal_pc_waffle::FuncDecl::Body(
-                            sig,
-                            format!("func_{}", module.funcs.len()),
-                            func,
-                        ));
-                        (func, map)
-                    }),
-            }
-        };
-    }
-    macro_rules! bcache {
-        ($func:expr, $cache:expr, $sblock:expr, $sfunc:expr) => {
-            match $func {
-                func => match $cache {
-                    cache => match $sblock {
-                        sblock => match $sfunc {
-                            sfunc => *cache.entry(sblock).or_insert_with(|| {
-                                let func = module
-                                    .funcs
-                                    .get_mut(func)
-                                    .and_then(|a| a.body_mut())
-                                    .unwrap();
-                                let b = func.add_block();
-                                func.add_blockparam(
-                                    b,
-                                    Type::Heap(WithNullable {
-                                        nullable: true,
-                                        value: portal_pc_waffle::HeapType::Sig { sig_index: ctx },
-                                    }),
-                                );
-                                for _ in &sfunc.cfg.blocks[sblock].params {
-                                    func.add_blockparam(
-                                        b,
-                                        Type::Heap(WithNullable {
-                                            nullable: true,
-                                            value: portal_pc_waffle::HeapType::Sig {
-                                                sig_index: object,
-                                            },
-                                        }),
-                                    );
-                                }
-                                b
-                            }),
-                        },
-                    },
-                },
-            }
-        };
-    }
-    while let Some((sfunc, mut sblock)) = workqueue.pop_front() {
-        let (func, cache) = fcache!(sfunc);
-        let func = *func;
-        let mut block = bcache!(func, cache, sblock, &sfunc);
-        let mut vals = sfunc.cfg.blocks[sblock]
-            .params
-            .iter()
-            .map(|a| a.0)
-            .zip(
-                module.funcs[func].body().unwrap().blocks[block].params[1..]
-                    .iter()
-                    .map(|a| a.1),
-            )
-            .collect::<BTreeMap<_, _>>();
-        let mut ctxv = module.funcs[func].body().unwrap().blocks[block].params[0].1;
-        let mut blkset = [(block, vals)].into_iter().collect::<BTreeMap<_, _>>();
-        loop {
-            for stmt in sfunc.cfg.blocks[sblock].stmts.iter().cloned() {
-                for (mut block, mut vals) in take(&mut blkset) {
-                    let val: portal_pc_waffle::Value = match &sfunc.cfg.values[stmt].value {
-                        SValue::Item { item, span } => match item {
-                            Item::Just { id } => vals.get(id).cloned().unwrap_or_else(|| {
-                                panic!("undefined value: {:?} at {:?}", id, span)
-                            }),
-                            Item::Undef => {
-                                let ty = Type::Heap(WithNullable {
-                                    nullable: true,
-                                    value: portal_pc_waffle::HeapType::Sig { sig_index: object },
-                                });
-                                module.funcs[func].body_mut().unwrap().add_op(
-                                    block,
-                                    Operator::RefNull { ty: ty.clone() },
-                                    &[],
-                                    &[ty],
-                                )
-                            }
-                            _ => todo!("unsupported item: {:?}", item),
-                        },
-                        SValue::LoadId(i) => {
-                            let mut scopev = module.funcs[func].body_mut().unwrap().add_op(
-                                block,
-                                Operator::StructGet { sig: ctx, idx: 0 },
-                                &[ctxv],
-                                &[Type::Heap(WithNullable {
-                                    nullable: true,
-                                    value: portal_pc_waffle::HeapType::Sig {
-                                        sig_index: obj_trie,
-                                    },
-                                })],
-                            );
-                            for n in i.0.as_bytes().iter().cloned() {
-                                //TODO: support null tries
-                                scopev = module.funcs[func].body_mut().unwrap().add_op(
-                                    block,
-                                    Operator::StructGet {
-                                        sig: obj_trie,
-                                        idx: (n as usize) + 1,
-                                    },
-                                    &[scopev],
-                                    &[Type::Heap(WithNullable {
-                                        nullable: true,
-                                        value: portal_pc_waffle::HeapType::Sig {
-                                            sig_index: obj_trie,
-                                        },
-                                    })],
-                                );
-                            }
-                            module.funcs[func].body_mut().unwrap().add_op(
-                                block,
-                                Operator::StructGet {
-                                    sig: obj_trie,
-                                    idx: 0,
-                                },
-                                &[scopev],
-                                &[Type::Heap(WithNullable {
-                                    nullable: true,
-                                    value: portal_pc_waffle::HeapType::Sig { sig_index: object },
-                                })],
-                            )
-                        }
-                        _ => todo!("unsupported statement: {:?}", sfunc.cfg.values[stmt].value),
-                    };
-                    vals.insert(stmt, val);
-                    blkset.insert(block, vals);
-                }
-            }
-            let mut needs_break = true;
-            for (block, vals) in take(&mut blkset) {
-                let terminator = match &sfunc.cfg.blocks[sblock].postcedent.term {
-                    TTerm::Jmp(t) => {
-                        needs_break = false;
-                        sblock = t.block;
-                        blkset.insert(
-                            block,
-                            sfunc.cfg.blocks[sblock]
-                                .params
-                                .iter()
-                                .map(|a| a.0)
-                                .zip(t.args.iter().filter_map(|a| vals.get(a)).cloned())
-                                .collect::<BTreeMap<_, _>>(),
-                        );
-                        continue;
-                    }
-                    TTerm::Return(r) => match r {
-                        Some(r) => portal_pc_waffle::Terminator::Return {
-                            values: vec![vals.get(r).cloned().unwrap_or_else(|| {
-                                panic!("undefined return value: {:?} at block {:?}", r, block)
-                            })],
-                        },
-                        None => {
-                            let ty = Type::Heap(WithNullable {
-                                nullable: true,
-                                value: portal_pc_waffle::HeapType::Sig { sig_index: object },
-                            });
-                            portal_pc_waffle::Terminator::Return {
-                                values: vec![module.funcs[func].body_mut().unwrap().add_op(
-                                    block,
-                                    Operator::RefNull { ty: ty.clone() },
-                                    &[],
-                                    &[ty],
-                                )],
-                            }
-                        }
-                    },
-                    _ => todo!("unsupported terminator"),
-                };
-                module.funcs[func]
-                    .body_mut()
-                    .unwrap()
-                    .set_terminator(block, terminator);
-            }
-            if needs_break {
-                break;
-            }
+    converter.collect_shapes(root)?;
+    converter.collect_shadowed_names(root, &mut BTreeSet::new());
+    converter.ensure_function(root)?;
+    converter.lower_all()
+}
+
+/// Controls the public Wasm ABI generated by [`convert_module`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConvertOptions {
+    /// Emit a direct `f64 × arity -> f64` export for every exported source
+    /// function. This is enabled by default because it is the host-callable
+    /// ABI for the initial lowering surface.
+    pub numeric_exports: bool,
+    /// When present, additionally export each function's internal WasmGC
+    /// adapter as `<ES export name><suffix>`. The adapter has the existing
+    /// `(context, this, arguments-array) -> value` ABI and is intended only
+    /// for embedders that can construct the internal GC values.
+    pub gc_export_suffix: Option<String>,
+    /// When present, export the module's top-level body as a zero-argument
+    /// function under this name. The entry runs the script portion of the
+    /// module with a fresh context (primordials pre-populated) and returns
+    /// an `i32` status: `0` on normal completion, `1` when the body threw
+    /// (throw lowering is not yet supported, so a throw currently surfaces
+    /// as a compile error instead — the status exists for future use).
+    pub run_entry_export: Option<String>,
+}
+
+impl Default for ConvertOptions {
+    fn default() -> Self {
+        Self {
+            numeric_exports: true,
+            gc_export_suffix: None,
+            run_entry_export: None,
         }
     }
 }
+
+/// Lower an ES module and expose its function exports through Wasm exports.
+///
+/// Named exports, renamed local function exports, and default function exports
+/// are supported. Other export forms remain module metadata only and do not
+/// receive a Wasm function export in this first ABI slice.
+pub fn convert_module<'a, 'wasm>(
+    source: &'a SModule,
+    module: &mut Module<'wasm>,
+    options: &ConvertOptions,
+) -> Result<(), ConvertError> {
+    if options
+        .gc_export_suffix
+        .as_ref()
+        .is_some_and(String::is_empty)
+    {
+        return Err(ConvertError::invalid(
+            "the internal GC export suffix must not be empty",
+        ));
+    }
+
+    let exported = source_function_exports(source);
+    let mut declared_names = source_export_names(source);
+    declared_names.extend(module.exports.iter().map(|export| export.name.clone()));
+    let mut generated_names = BTreeSet::new();
+    for export in &exported {
+        if !generated_names.insert(export.name.clone()) {
+            return Err(ConvertError::invalid(format!(
+                "duplicate Wasm export name {:?}",
+                export.name
+            )));
+        }
+    }
+    if let Some(suffix) = &options.gc_export_suffix {
+        for export in &exported {
+            let name = format!("{}{suffix}", export.name);
+            if declared_names.contains(&name) || !generated_names.insert(name.clone()) {
+                return Err(ConvertError::invalid(format!(
+                    "internal GC export name {:?} collides with an existing export",
+                    name
+                )));
+            }
+        }
+    }
+
+    let repr = Repr::new(module);
+    let mut converter = Converter {
+        module,
+        repr,
+        functions: BTreeMap::new(),
+        pending: VecDeque::new(),
+        lowered: BTreeSet::new(),
+        ref_table: None,
+        string_equal: None,
+        strict_equality_helper: None,
+        string_concat: None,
+        string_utf16: None,
+        string_index: None,
+        trie_clone: None,
+        shapes: Vec::new(),
+        property_helpers: None,
+        truthy_helper: None,
+        native_function_cache: BTreeMap::new(),
+        context_builder: None,
+        arguments_push_helper: None,
+        trie_enumerate_helper: None,
+        object_enumerate_keys_helper: None,
+        primordial_fast_cores: BTreeMap::new(),
+        shadowed_names: BTreeSet::new(),
+        next_function_tag: USER_TAG_BASE,
+        to_number_helper: None,
+        typeof_helper: None,
+        add_helper: None,
+        return_kinds: BTreeMap::new(),
+        current_native_returns: None,
+        function_literal_locals: BTreeMap::new(),
+    };
+    let mut exports = Vec::with_capacity(exported.len());
+    for export in exported {
+        converter.collect_shapes(export.function)?;
+        converter.shadowed_names.clear();
+        let mut visited = BTreeSet::new();
+        converter.collect_shadowed_names(export.function, &mut visited);
+        exports.push((export.name, converter.ensure_function(export.function)?));
+    }
+    converter.lower_all()?;
+
+    if let Some(entry_name) = &options.run_entry_export {
+        converter.collect_shapes(&source.body)?;
+        let info = converter.ensure_function(&source.body)?;
+        converter.lower_all()?;
+        converter.export_run_entry(entry_name, info)?;
+    }
+
+    for (name, info) in exports {
+        if options.numeric_exports {
+            converter.export_numeric_function(&name, info)?;
+        }
+        if let Some(suffix) = &options.gc_export_suffix {
+            converter.module.exports.push(Export {
+                name: format!("{name}{suffix}"),
+                kind: ExportKind::Func(info.adapter),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct SourceFunctionExport<'a> {
+    name: String,
+    function: &'a SFunc,
+}
+
+fn source_function_exports(source: &SModule) -> Vec<SourceFunctionExport<'_>> {
+    source
+        .exports
+        .iter()
+        .filter_map(|export| match export {
+            ExportSpec::Local {
+                local, exported, ..
+            } => source
+                .funcs
+                .get(&local.0)
+                .map(|function| SourceFunctionExport {
+                    name: exported.to_string(),
+                    function,
+                }),
+            ExportSpec::DefaultFunc { func_name } => {
+                source
+                    .funcs
+                    .get(func_name)
+                    .map(|function| SourceFunctionExport {
+                        name: "default".to_owned(),
+                        function,
+                    })
+            }
+            ExportSpec::DefaultExpr { .. }
+            | ExportSpec::Reexport { .. }
+            | ExportSpec::ReexportAll { .. } => None,
+        })
+        .collect()
+}
+
+fn source_export_names(source: &SModule) -> BTreeSet<String> {
+    source
+        .exports
+        .iter()
+        .flat_map(|export| match export {
+            ExportSpec::Local { exported, .. } => vec![exported.to_string()],
+            ExportSpec::DefaultFunc { .. } | ExportSpec::DefaultExpr { .. } => {
+                vec!["default".to_owned()]
+            }
+            ExportSpec::Reexport { names, .. } => names
+                .iter()
+                .map(|(_, exported)| exported.to_string())
+                .collect(),
+            ExportSpec::ReexportAll { ns, .. } => ns.iter().map(ToString::to_string).collect(),
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FunctionInfo {
+    native: Func,
+    adapter: Func,
+    arity: usize,
+    /// Stable identity for the function literal this lowering owns: the
+    /// final i32 field of the function struct. Primordials use small tags
+    /// ([`PRIMORDIAL_TAG_BASE`] upward); every user function mints a fresh
+    /// tag above [`USER_TAG_BASE`]. Call sites compare this tag to verify
+    /// "this callee is still exactly this literal" (function references are
+    /// not `eqref`, so `ref.eq` cannot make the comparison).
+    tag: i32,
+    /// The set of representations every `return` in this function can
+    /// produce. A single-kind set lets the native body return an unboxed
+    /// f64/i32, so direct calls feed raw values into the caller instead of
+    /// re-boxing at every boundary.
+    returns: ReturnKinds,
+}
+
+/// User function tags start far above the primordial tag range so the two
+/// tag spaces can never collide.
+const USER_TAG_BASE: i32 = 1 << 20;
+
+/// The set of [`ValueKind`]s a function's returns may produce. Tracked as a
+/// bitset so multi-kind unions (a `Number` path and a `Reference` path) keep
+/// the boxed ABI while single-kind sets unlock a raw native return type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+struct ReturnKinds(u8);
+
+impl ReturnKinds {
+    const REFERENCE: u8 = 1 << 0;
+    const NUMBER: u8 = 1 << 1;
+    const BOOLEAN: u8 = 1 << 2;
+    const INTEGER: u8 = 1 << 3;
+
+    fn insert(&mut self, kind: ValueKind) {
+        self.0 |= match kind {
+            ValueKind::Reference => Self::REFERENCE,
+            ValueKind::Number => Self::NUMBER,
+            ValueKind::Boolean => Self::BOOLEAN,
+            ValueKind::Integer => Self::INTEGER,
+        };
+    }
+
+    /// The single possible kind, if the set is exactly one.
+    fn single(self) -> Option<ValueKind> {
+        match self.0 {
+            Self::REFERENCE => Some(ValueKind::Reference),
+            Self::NUMBER => Some(ValueKind::Number),
+            Self::BOOLEAN => Some(ValueKind::Boolean),
+            Self::INTEGER => Some(ValueKind::Integer),
+            _ => None,
+        }
+    }
+
+    /// The Wasm return type for the native body. Only single-kind sets get
+    /// a raw type; multi-kind unions keep the boxed `anyref` ABI because
+    /// the boxed value is the join of the branches.
+    fn native_return_type(self, repr: &Repr) -> Type {
+        match self.single() {
+            Some(ValueKind::Number) => Type::F64,
+            Some(ValueKind::Boolean | ValueKind::Integer) => Type::I32,
+            _ => repr.value,
+        }
+    }
+}
+
+/// A fixed object layout selected from the statically-known property names of
+/// an object literal. Field zero is always the generic trie used for keys the
+/// shape does not own; subsequent fields mirror `keys` in sorted order.
+#[derive(Clone, Debug)]
+struct ShapeInfo {
+    keys: Vec<String>,
+    sig: portal_pc_waffle::Signature,
+    lookup: Option<Func>,
+    set: Option<Func>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PropertyHelpers {
+    lookup: Func,
+    trie_lookup: Func,
+    set: Func,
+    trie_set: Func,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ValueKind {
+    /// A raw Wasm f64 JavaScript number.
+    Number,
+    /// A raw Wasm i32 JavaScript boolean.
+    Boolean,
+    /// A raw Wasm i32 resulting from an integer/bitwise computation.
+    Integer,
+    /// A nullable WasmGC reference at a JavaScript value boundary.
+    Reference,
+}
+
+/// A source block together with the representation of its incoming phi
+/// values. The same SSA block can be lowered more than once when its callers
+/// disagree, preserving raw f64/i32 paths whenever they agree.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct BlkSet {
+    source: SBlockId,
+    params: Vec<ValueKind>,
+}
+
+#[derive(Clone, Debug)]
+enum LowerValue {
+    Wasm {
+        value: Value,
+        kind: ValueKind,
+    },
+    /// A context lookup that can still be used as a static member-key. The
+    /// jsaw TAC represents both `obj.name` and an identifier lookup as a
+    /// `LoadId`; retaining the identifier here disambiguates it at the use.
+    ReferenceKey {
+        value: Value,
+        key: String,
+    },
+    /// A raw numeric literal, retained long enough to be used as an
+    /// ECMAScript-formatted static property key as well as a number.
+    NumberLiteral {
+        value: Value,
+        key: String,
+    },
+    /// A string literal is both an ordinary runtime value and, until it
+    /// crosses an alias/control-flow boundary, a statically known member key.
+    String {
+        value: Value,
+        key: String,
+        bytes: Vec<u8>,
+    },
+    /// A function value whose *origin* is statically known: a specific
+    /// lowered source function (and therefore a specific [`FunctionInfo`]).
+    /// The value is still an ordinary function object at runtime; the origin
+    /// lets a call site verify "this callee is still exactly that literal"
+    /// with a tag check and dispatch its native body directly. `fresh` marks
+    /// a literal allocated by the current statement, which needs no check.
+    FunctionRef {
+        value: Value,
+        info: FunctionInfo,
+        fresh: bool,
+    },
+    /// An object literal whose function-valued members are statically known
+    /// (by property key), enabling guarded direct method dispatch: the tag
+    /// check verifies the slot still holds the original method even if the
+    /// object escaped and its members were overwritten.
+    ObjectLiteral {
+        value: Value,
+        methods: std::rc::Rc<BTreeMap<String, FunctionInfo>>,
+    },
+}
+
+/// One Wasm control-flow continuation while lowering a source SSA block.
+///
+/// A source value may split into distinct raw primitive and reference paths.
+/// Keeping a separate value map for each path lets subsequent source
+/// statements be emitted with the representation refined by that split.
+#[derive(Clone, Debug)]
+struct Continuation {
+    block: Block,
+    values: BTreeMap<SValueId, LowerValue>,
+}
+
+impl LowerValue {
+    fn wasm(&self) -> Result<(Value, ValueKind), ConvertError> {
+        match self {
+            Self::Wasm { value, kind } => Ok((*value, *kind)),
+            Self::ReferenceKey { value, .. } => Ok((*value, ValueKind::Reference)),
+            Self::NumberLiteral { value, .. } => Ok((*value, ValueKind::Number)),
+            Self::String { value, .. } => Ok((*value, ValueKind::Reference)),
+            Self::FunctionRef { value, .. } | Self::ObjectLiteral { value, .. } => {
+                Ok((*value, ValueKind::Reference))
+            }
+        }
+    }
+
+    /// An alias is a runtime JavaScript value, not syntax in a member-key
+    /// position. Drop any source-only static-key metadata at that boundary.
+    fn runtime(self) -> Self {
+        match self {
+            Self::NumberLiteral { value, .. } => Self::Wasm {
+                value,
+                kind: ValueKind::Number,
+            },
+            Self::ReferenceKey { value, .. } => Self::Wasm {
+                value,
+                kind: ValueKind::Reference,
+            },
+            // Strings are immutable, so retaining their byte identity across
+            // an alias remains sound and lets `+` use the UTF-8 concat path.
+            value @ Self::String { .. } => value,
+            // Function origins and object-literal method tables survive
+            // aliasing: the runtime tag check at each call site is what
+            // proves the binding is unchanged, and a copied reference is
+            // still the same object the check can verify.
+            value @ Self::FunctionRef { .. } | value @ Self::ObjectLiteral { .. } => value,
+            value => value,
+        }
+    }
+
+    fn kind(&self) -> Result<ValueKind, ConvertError> {
+        self.wasm().map(|(_, kind)| kind)
+    }
+}
+
+struct Converter<'a, 'module, 'wasm> {
+    module: &'module mut Module<'wasm>,
+    repr: Repr,
+    functions: BTreeMap<usize, FunctionInfo>,
+    pending: VecDeque<&'a SFunc>,
+    lowered: BTreeSet<usize>,
+    /// A declaration-only table makes every adapter legal as a `ref.func`
+    /// target under Wasm's typed-function-reference validation rules.
+    ref_table: Option<Table>,
+    /// Bytewise WTF-8 string equality used for shape-key checks and runtime
+    /// property lookup. It is generated only when a member lookup needs it.
+    string_equal: Option<Func>,
+    /// Full strict equality (`===`) over two boxed values. Generated only
+    /// when a comparison cannot be resolved by the static fast paths.
+    strict_equality_helper: Option<Func>,
+    /// UTF-8 byte-array concatenation. Its result intentionally starts with
+    /// no UTF-16 cache so existing indexing/length machinery owns caching.
+    string_concat: Option<Func>,
+    /// Lazy UTF-16 cache initializer for string indexing and length.
+    string_utf16: Option<Func>,
+    /// Canonical JavaScript array-index parser for runtime string keys.
+    string_index: Option<Func>,
+    /// Temporary compatibility helper for static object-rest lowering.  The
+    /// helper copies generic fallback tries used by shape materialization.
+    trie_clone: Option<Func>,
+    /// Every statically-known object-literal layout. These are registered
+    /// before lowering so generic dispatch can test the complete set.
+    shapes: Vec<ShapeInfo>,
+    /// The small deep module shared by static and computed property access.
+    property_helpers: Option<PropertyHelpers>,
+    /// Generic JS `ToBoolean` for a value already known to be a reference.
+    /// Distinguishes a boxed `false` (falsy) from every other non-null
+    /// reference (truthy) — plain null-ness alone isn't enough once a value
+    /// crosses a function-call/property-read boundary and loses its
+    /// unboxed `ValueKind`.
+    truthy_helper: Option<Func>,
+    /// Native primordial method bodies (`Math.sqrt`, `Reflect.get`, ...),
+    /// keyed by the label passed to `build_native_adapter`. A fresh lexical
+    /// context is built per exported function, but the underlying Wasm
+    /// function bodies are identical every time, so this cache is what
+    /// keeps that from regenerating (and re-validating/re-compiling) the
+    /// entire primordial surface once per export.
+    native_function_cache: BTreeMap<String, Func>,
+    /// `new_context_with_primordials`'s body, hoisted into its own function
+    /// so every export emits one `call` rather than a full inlined copy of
+    /// the entire namespace-construction sequence (Wasm reference-typed
+    /// globals aren't supported by this backend, so each call still
+    /// allocates a fresh context at runtime — this only shares the
+    /// generated *code*, not the runtime value).
+    context_builder: Option<Func>,
+    /// Appends a value to a growable `arguments`-typed array, reallocating
+    /// when full. See `enumerate.rs`.
+    arguments_push_helper: Option<Func>,
+    /// Recursively walks a generic property trie collecting own-property
+    /// keys. See `enumerate.rs`.
+    trie_enumerate_helper: Option<Func>,
+    /// Collects an object's own-property keys across every registered
+    /// shape plus the generic trie fallback. See `enumerate.rs`.
+    object_enumerate_keys_helper: Option<Func>,
+    /// Fast cores for provably-primordial call sites, keyed by primordial
+    /// tag. See `primordials.rs` for the tag assignment and the guarded /
+    /// provable call-emission paths.
+    primordial_fast_cores: BTreeMap<i32, Func>,
+    /// Variable names assigned somewhere in the function currently being
+    /// collected (including its nested closures). Reset per top-level
+    /// function before lowering. See `collect_shadowed_names`.
+    shadowed_names: BTreeSet<String>,
+    /// Minting counter for user function literal tags (see
+    /// [`FunctionInfo::tag`]). Primordials occupy the low tag range.
+    next_function_tag: i32,
+    /// Generic `ToNumber` coercion over a boxed value at the `anyref`
+    /// boundary. Generated lazily; see `ensure_to_number_helper`.
+    to_number_helper: Option<Func>,
+    typeof_helper: Option<Func>,
+    /// Runtime `+` over boxed values (string concat vs numeric add).
+    /// Generated lazily; see `ensure_add_helper`.
+    add_helper: Option<Func>,
+    /// Memoized static return-representation analysis per source function
+    /// (keyed by [`Converter::key`]). See `analyze_return_kinds`.
+    return_kinds: BTreeMap<usize, ReturnKinds>,
+    /// The return representation of the native body currently being
+    /// lowered. `None` means the boxed `anyref` ABI.
+    current_native_returns: Option<ValueKind>,
+    /// Variable names whose only write in the current function tree stores
+    /// one specific function literal (`let f = function () {...}` with no
+    /// reassignment anywhere, including nested closures). A load of such a
+    /// name produces a [`LowerValue::FunctionRef`] whose tag check proves
+    /// the binding is unchanged at call time. Reset per top-level function.
+    function_literal_locals: BTreeMap<String, &'a SFunc>,
+}
+
+impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
+    fn key(func: &SFunc) -> usize {
+        func as *const SFunc as usize
+    }
+
+    /// Discover every layout whose key set is known without evaluating user
+    /// code. A computed key is deliberately left generic: its value may be
+    /// observable and the existing lowering already treats it as a runtime
+    /// property access.
+    fn collect_shapes(&mut self, func: &'a SFunc) -> Result<(), ConvertError> {
+        let mut visited = BTreeSet::new();
+        self.collect_shapes_from_function(func, &mut visited)
+    }
+
+    fn collect_shapes_from_function(
+        &mut self,
+        func: &'a SFunc,
+        visited: &mut BTreeSet<usize>,
+    ) -> Result<(), ConvertError> {
+        if !visited.insert(Self::key(func)) {
+            return Ok(());
+        }
+        for (_, value) in func.cfg.values.iter() {
+            let SValue::Item { item, .. } = &value.value else {
+                continue;
+            };
+            if let Item::Obj { members } = item {
+                let Some(keys) = members
+                    .iter()
+                    .map(|(key, _)| match key {
+                        PropKey::Lit(key) => Some(key.sym.to_string()),
+                        PropKey::Computed(_) => None,
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    continue;
+                };
+                self.register_shape(keys);
+            }
+            for nested in item.funcs() {
+                self.collect_shapes_from_function(nested, visited)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record every variable name a function (transitively, including its
+    /// nested closures) assigns. A primordial name that is never assigned in
+    /// an enclosing scope chain cannot be shadowed, so call sites can skip
+    /// the runtime tag check entirely. Collected into `shadowed_names`.
+    fn collect_shadowed_names(
+        &mut self,
+        func: &'a SFunc,
+        visited: &mut BTreeSet<usize>,
+    ) {
+        self.collect_shadowed_names_nested(func, visited, false)
+    }
+
+    fn collect_shadowed_names_nested(
+        &mut self,
+        func: &'a SFunc,
+        visited: &mut BTreeSet<usize>,
+        nested: bool,
+    ) {
+        if !visited.insert(Self::key(func)) {
+            return;
+        }
+        for (_, value) in func.cfg.values.iter() {
+            match &value.value {
+                SValue::StoreId { target, val } => {
+                    self.shadowed_names.insert(target.0.to_string());
+                    // Only the top-level function's own stores can vouch for
+                    // a single-assignment literal; a nested closure's store
+                    // makes the name ambiguous from the outside.
+                    if !nested {
+                        self.note_function_literal_local(&target.0.to_string(), *val, func);
+                    } else {
+                        self.function_literal_locals.remove(&target.0.to_string());
+                    }
+                }
+                SValue::Item { item, .. } => {
+                    for closure in item.funcs() {
+                        self.collect_shadowed_names_nested(closure, visited, true);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Function-declaration bodies assign their own name in the enclosing
+        // scope only at the module level, which the exported-function ABI
+        // never lowers; parameters and locals live on the context object and
+        // go through `StoreId` already. Hoisted `function name()` forms are
+        // therefore not separately tracked here.
+    }
+
+    /// Record `name` as a single-assignment function-literal local when its
+    /// only write stores one specific function literal. Any second write to
+    /// the name drops the entry (the same conservative taint pattern as
+    /// `collect_shadowed_names`). A nested closure's write makes the name
+    /// ambiguous too — its `val` index resolves in the nested cfg, so treat
+    /// any store whose value is not found in *this* function's arena as a
+    /// disqualifier.
+    fn note_function_literal_local(&mut self, name: &str, val: SValueId, func: &'a SFunc) {
+        let literal: Option<&'a SFunc> = match &func.cfg.values[val].value {
+            SValue::Item {
+                item: Item::Func { func: literal, .. },
+                ..
+            } => Some(literal),
+            // An alias of a function literal also retains the origin.
+            SValue::Item {
+                item: Item::Just { id },
+                ..
+            } => match &func.cfg.values[*id].value {
+                SValue::Item {
+                    item: Item::Func { func: literal, .. },
+                    ..
+                } => Some(literal),
+                _ => None,
+            },
+            _ => None,
+        };
+        match (self.function_literal_locals.get(name).copied(), literal) {
+            (None, Some(literal)) => {
+                self.function_literal_locals.insert(name.to_string(), literal);
+            }
+            // A non-literal first store, or any second store, disqualifies.
+            (None, None) | (Some(_), _) => {
+                self.function_literal_locals.remove(name);
+            }
+        }
+    }
+
+    /// Can the named identifier resolve to a primordial without any runtime
+    /// check? True when neither this function nor any nested closure assigns
+    /// that name — the context property then stays exactly the primordial
+    /// value `new_context_with_primordials` installed.
+    fn primordial_is_provable(&self, name: &str) -> bool {
+        static_primordial_tag_namespace(name).is_some() && !self.shadowed_names.contains(name)
+    }
+
+    /// Statically classify every representation a function's `return`
+    /// statements may produce. Deliberately coarse: `Boolean` and `Integer`
+    /// share the i32 Wasm type and no consumer distinguishes them, so one
+    /// bit covers both. `Number` is f64; everything else (objects, strings,
+    /// functions, arrays) is `Reference`.
+    ///
+    /// The result is memoized per source function so call sites can read a
+    /// callee's kinds before (or without) that callee's body being lowered.
+    fn analyze_return_kinds(&mut self, func: &'a SFunc) -> ReturnKinds {
+        let key = Self::key(func);
+        if let Some(kinds) = self.return_kinds.get(&key) {
+            return *kinds;
+        }
+        // Seed a conservative entry first: recursion (direct or mutual, via
+        // the shared function cache) reads this placeholder instead of
+        // looping. A recursive call is always the boxed join anyway.
+        self.return_kinds.insert(key, ReturnKinds::default());
+        let mut kinds = ReturnKinds::default();
+        let mut visited_blocks = BTreeSet::new();
+        self.scan_return_kinds(func, func.entry, &mut kinds, &mut visited_blocks);
+        self.return_kinds.insert(key, kinds);
+        kinds
+    }
+
+    fn scan_return_kinds(
+        &mut self,
+        root: &'a SFunc,
+        block: SBlockId,
+        kinds: &mut ReturnKinds,
+        visited_blocks: &mut BTreeSet<SBlockId>,
+    ) {
+        if !visited_blocks.insert(block) {
+            return;
+        }
+        let sblock = &root.cfg.blocks[block];
+        for stmt in sblock.stmts.iter().copied() {
+            self.scan_nested_return_kinds(root, stmt);
+        }
+        match &sblock.postcedent.term {
+            TTerm::Return(Some(value)) => {
+                let kind = self.classify_return_value(root, *value);
+                if let Some(kind) = kind {
+                    kinds.insert(kind);
+                }
+            }
+            TTerm::Return(None) | TTerm::Default => kinds.insert(ValueKind::Reference),
+            TTerm::Tail { .. } => kinds.insert(ValueKind::Reference),
+            TTerm::Jmp(target) => {
+                self.scan_return_kinds(root, target.block, kinds, visited_blocks)
+            }
+            TTerm::CondJmp {
+                if_true, if_false, ..
+            } => {
+                self.scan_return_kinds(root, if_true.block, kinds, visited_blocks);
+                self.scan_return_kinds(root, if_false.block, kinds, visited_blocks);
+            }
+            TTerm::Throw(_) | TTerm::Switch { .. } => {}
+        }
+    }
+
+    /// Analyze the nested closures of a statement so their returns count
+    /// toward *their own* analysis (they are lowered as separate functions).
+    fn scan_nested_return_kinds(&mut self, root: &'a SFunc, stmt: SValueId) {
+        if let SValue::Item { item, .. } = &root.cfg.values[stmt].value {
+            for nested in item.funcs() {
+                self.analyze_return_kinds(nested);
+            }
+        }
+    }
+
+    /// Classify one returned SSA value lexically. `None` means "any value"
+    /// (the boxed `Reference` join) — an alias into unknown territory.
+    fn classify_return_value(&mut self, root: &'a SFunc, value: SValueId) -> Option<ValueKind> {
+        match &root.cfg.values[value].value {
+            SValue::Item { item, .. } => self.classify_return_item(root, item),
+            SValue::LoadId(_) | SValue::Param { .. } => Some(ValueKind::Reference),
+            SValue::StoreId { .. } | SValue::Assign { .. } => Some(ValueKind::Reference),
+            SValue::EdgeBlocker { value, .. } => self.classify_return_value(root, *value),
+            _ => Some(ValueKind::Reference),
+        }
+    }
+
+    fn classify_return_item(&mut self, root: &'a SFunc, item: &Item<SValueId, SFunc>) -> Option<ValueKind> {
+        match item {
+            Item::Just { id } => self.classify_return_value(root, *id),
+            Item::Lit { lit } => match lit {
+                Lit::Num(_) => Some(ValueKind::Number),
+                Lit::Bool(_) => Some(ValueKind::Boolean),
+                _ => Some(ValueKind::Reference),
+            },
+            Item::Undef | Item::This | Item::Arguments => Some(ValueKind::Reference),
+            Item::Func { .. }
+            | Item::Obj { .. }
+            | Item::Arr { .. }
+            | Item::Class(_)
+            | Item::StaticSubArray { .. }
+            | Item::StaticSubObject { .. }
+            | Item::Meta { .. } => Some(ValueKind::Reference),
+            Item::Mem { .. }
+            | Item::PrivateMem { .. }
+            | Item::HasPrivateMem { .. }
+            | Item::Yield { .. }
+            | Item::Await { .. }
+            | Item::Asm { .. }
+            | Item::New { .. } => Some(ValueKind::Reference),
+            Item::Un { arg, op } => match op {
+                // Numeric coercions keep the raw f64/i32 representations.
+                UnaryOp::Plus | UnaryOp::Minus => self
+                    .classify_return_value(root, *arg)
+                    .filter(|kind| matches!(kind, ValueKind::Number | ValueKind::Boolean | ValueKind::Integer))
+                    .or(Some(ValueKind::Number)),
+                UnaryOp::Bang => Some(ValueKind::Boolean),
+                UnaryOp::Tilde => Some(ValueKind::Integer),
+                UnaryOp::Void | UnaryOp::TypeOf | UnaryOp::Delete => Some(ValueKind::Reference),
+            },
+            Item::Bin { left, right, op } => self.classify_return_bin(root, *left, *right, *op),
+            Item::Select { cond, then, otherwise } => {
+                let then_kind = self.classify_return_value(root, *then);
+                let otherwise_kind = self.classify_return_value(root, *otherwise);
+                match (then_kind, otherwise_kind) {
+                    (Some(a), Some(b)) if a == b => Some(a),
+                    _ => Some(ValueKind::Reference),
+                }
+                .inspect(|_| {
+                    let _ = cond;
+                })
+            }
+            Item::Call { callee, .. } => self.classify_return_call(root, callee),
+            _ => Some(ValueKind::Reference),
+        }
+    }
+
+    fn classify_return_bin(
+        &mut self,
+        root: &'a SFunc,
+        left: SValueId,
+        right: SValueId,
+        op: BinaryOp,
+    ) -> Option<ValueKind> {
+        use BinaryOp::*;
+        match op {
+            Add | Sub | Mul | Div | Mod => {
+                // String concatenation (`+` with a string operand) yields a
+                // string; both operands unknown keeps it conservative.
+                let left_kind = self.classify_return_value(root, left);
+                let right_kind = self.classify_return_value(root, right);
+                if op == Add
+                    && matches!(
+                        (left_kind, right_kind),
+                        (_, Some(ValueKind::Reference)) | (Some(ValueKind::Reference), _)
+                    )
+                {
+                    return Some(ValueKind::Reference);
+                }
+                Some(ValueKind::Number)
+            }
+            Lt | LtEq | Gt | GtEq | EqEq | EqEqEq | NotEq | NotEqEq
+            | InstanceOf | In => Some(ValueKind::Boolean),
+            BitAnd | BitOr | BitXor | LShift | RShift | ZeroFillRShift => Some(ValueKind::Integer),
+            // `**` is ordinary floating-point exponentiation.
+            Exp => Some(ValueKind::Number),
+            LogicalAnd | LogicalOr | NullishCoalescing => {
+                // The result is one of the two operands.
+                let left_kind = self.classify_return_value(root, left);
+                let right_kind = self.classify_return_value(root, right);
+                match (left_kind, right_kind) {
+                    (Some(a), Some(b)) if a == b => Some(a),
+                    _ => Some(ValueKind::Reference),
+                }
+            }
+        }
+    }
+
+    fn classify_return_call(
+        &mut self,
+        root: &'a SFunc,
+        callee: &TCallee<SValueId>,
+    ) -> Option<ValueKind> {
+        match callee {
+            TCallee::Val(value) => {
+                // A direct call to a local function literal or a hoisted
+                // declaration: reuse (or compute) that callee's analysis.
+                if let SValue::Item { item: Item::Func { func, .. }, .. } =
+                    &root.cfg.values[*value].value
+                {
+                    let kinds = self.analyze_return_kinds(func);
+                    return kinds.single();
+                }
+                Some(ValueKind::Reference)
+            }
+            TCallee::Member { .. } | TCallee::PrivateMember { .. } => Some(ValueKind::Reference),
+            _ => Some(ValueKind::Reference),
+        }
+    }
+
+    fn register_shape(&mut self, mut keys: Vec<String>) {
+        keys.sort();
+        keys.dedup();
+        // An empty literal has no direct-field win; its generic trie remains
+        // the shallowest representation.
+        if keys.is_empty() || self.shapes.iter().any(|shape| shape.keys == keys) {
+            return;
+        }
+        let sig = self.module.signatures.push(SignatureData::Struct {
+            fields: std::iter::once(field(self.repr.trie_ty()))
+                .chain(keys.iter().map(|_| field(self.repr.slot_ty())))
+                .collect(),
+            shared: false,
+        });
+        self.shapes.push(ShapeInfo {
+            keys,
+            sig,
+            lookup: None,
+            set: None,
+        });
+    }
+
+    fn shape_index(&self, keys: &[String]) -> Option<usize> {
+        self.shapes.iter().position(|shape| shape.keys == keys)
+    }
+
+    fn ensure_function(&mut self, sfunc: &'a SFunc) -> Result<FunctionInfo, ConvertError> {
+        let key = Self::key(sfunc);
+        if let Some(info) = self.functions.get(&key) {
+            return Ok(*info);
+        }
+
+        let arity = sfunc.cfg.blocks[sfunc.entry].params.len();
+        let returns = self.analyze_return_kinds(sfunc);
+        let native_sig = self.module.signatures.push(SignatureData::Func {
+            params: std::iter::once(self.repr.object_ty())
+                .chain(std::iter::once(self.repr.value))
+                // The unnormalized argument array remains available to the
+                // native body as JavaScript's `arguments` binding.
+                .chain(std::iter::once(self.repr.arguments_ty()))
+                .chain(std::iter::repeat_n(self.repr.value, arity))
+                .collect(),
+            returns: vec![returns.native_return_type(&self.repr)],
+            shared: false,
+        });
+        let native_body = FunctionBody::new(self.module, native_sig);
+        let native = self.module.funcs.push(FuncDecl::Body(
+            native_sig,
+            format!("js_body_{}", self.module.funcs.len()),
+            native_body,
+        ));
+        let adapter = self.make_adapter(native, arity)?;
+
+        let tag = self.next_function_tag;
+        self.next_function_tag = self
+            .next_function_tag
+            .checked_add(1)
+            .ok_or_else(|| ConvertError::invalid("function tag space exhausted"))?;
+        let info = FunctionInfo {
+            native,
+            adapter,
+            arity,
+            tag,
+            returns,
+        };
+        self.functions.insert(key, info);
+        self.pending.push_back(sfunc);
+        Ok(*self.functions.get(&key).expect("just inserted"))
+    }
+
+    fn make_adapter(&mut self, native: Func, arity: usize) -> Result<Func, ConvertError> {
+        let native_return_type = match &self.module.signatures[self.module.funcs[native].sig()] {
+            SignatureData::Func { returns, .. } => returns
+                .first()
+                .copied()
+                .ok_or_else(|| ConvertError::invalid("native signature has no return"))?,
+            _ => return Err(ConvertError::invalid("native signature is not a func")),
+        };
+        let mut body = FunctionBody::new(self.module, self.repr.adapter);
+        let context = body.blocks[body.entry].params[0].1;
+        let this = body.blocks[body.entry].params[1].1;
+        let args = body.blocks[body.entry].params[2].1;
+        let mut block = body.entry;
+        let mut formals = Vec::with_capacity(arity);
+
+        // Read each formal lazily. The conditional avoids an out-of-bounds
+        // array.get and implements ordinary missing-argument semantics.
+        for index in 0..arity {
+            let len = body.add_op(block, Operator::ArrayLen, &[args], &[Type::I32]);
+            let idx = body.add_op(
+                block,
+                Operator::I32Const {
+                    value: u32::try_from(index)
+                        .map_err(|_| ConvertError::invalid("too many formals"))?,
+                },
+                &[],
+                &[Type::I32],
+            );
+            let present = body.add_op(block, Operator::I32LtU, &[idx, len], &[Type::I32]);
+            let get = body.add_block();
+            let missing = body.add_block();
+            let join = body.add_block();
+            let formal = body.add_blockparam(join, self.repr.value);
+            body.set_terminator(
+                block,
+                Terminator::CondBr {
+                    cond: present,
+                    if_true: BlockTarget {
+                        block: get,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: missing,
+                        args: vec![],
+                    },
+                },
+            );
+            let value = body.add_op(
+                get,
+                Operator::ArrayGet {
+                    sig: self.repr.arguments,
+                },
+                &[args, idx],
+                &[self.repr.value],
+            );
+            body.set_terminator(
+                get,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![value],
+                    },
+                },
+            );
+            let undef = body.add_op(
+                missing,
+                Operator::RefNull {
+                    ty: self.repr.value,
+                },
+                &[],
+                &[self.repr.value],
+            );
+            body.set_terminator(
+                missing,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![undef],
+                    },
+                },
+            );
+            block = join;
+            formals.push(formal);
+        }
+
+        let mut call_args = vec![context, this, args];
+        call_args.extend(formals);
+        let call_result = body.add_op(
+            block,
+            Operator::Call {
+                function_index: native,
+            },
+            &call_args,
+            &[native_return_type],
+        );
+        // A raw single-kind native return is re-boxed here — once, at the
+        // adapter boundary — instead of re-coerced at every use site.
+        let result = match native_return_type {
+            Type::F64 => body.add_op(
+                block,
+                Operator::StructNew {
+                    sig: self.repr.number,
+                },
+                &[call_result],
+                &[self.repr.number_ty()],
+            ),
+            Type::I32 => body.add_op(
+                block,
+                Operator::StructNew {
+                    sig: self.repr.boolean,
+                },
+                &[call_result],
+                &[self.repr.boolean_ty()],
+            ),
+            _ => call_result,
+        };
+        let result = if native_return_type == self.repr.value {
+            result
+        } else {
+            body.add_op(
+                block,
+                Operator::RefCast {
+                    ty: self.repr.value,
+                },
+                &[result],
+                &[self.repr.value],
+            )
+        };
+        body.set_terminator(
+            block,
+            Terminator::Return {
+                values: vec![result],
+            },
+        );
+
+        let adapter = self.module.funcs.push(FuncDecl::Body(
+            self.repr.adapter,
+            format!("js_adapter_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.declare_function_reference(adapter);
+        Ok(adapter)
+    }
+
+    /// Export a host-callable numeric wrapper around a native JavaScript
+    /// function body. The wrapper intentionally has a conventional Wasm ABI;
+    /// callers never need to construct the internal GC object/value types.
+    fn export_numeric_function(
+        &mut self,
+        name: &str,
+        info: FunctionInfo,
+    ) -> Result<(), ConvertError> {
+        let signature = self.module.signatures.push(SignatureData::Func {
+            params: vec![Type::F64; info.arity],
+            returns: vec![Type::F64],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, signature);
+        let block = body.entry;
+        let params = body.blocks[block]
+            .params
+            .iter()
+            .map(|(_, value)| *value)
+            .collect::<Vec<_>>();
+        // Function declarations in the first public ABI receive a fresh
+        // lexical context, pre-populated with the primordial globals
+        // (`Math`, `Array`, ...). Top-level values and re-exports are not
+        // part of this function-only export surface yet.
+        let context_builder = self.ensure_context_builder()?;
+        let context = body.add_op(
+            block,
+            Operator::Call {
+                function_index: context_builder,
+            },
+            &[],
+            &[self.repr.object_ty()],
+        );
+        let this = self.undef(&mut body, block);
+        let (this, _) = this.wasm()?;
+        let mut arguments = Vec::with_capacity(params.len());
+        for value in params {
+            let boxed = self.box_value(
+                &mut body,
+                block,
+                &LowerValue::Wasm {
+                    value,
+                    kind: ValueKind::Number,
+                },
+            )?;
+            arguments.push(boxed);
+        }
+        let arguments = body.add_op(
+            block,
+            Operator::ArrayNewFixed {
+                sig: self.repr.arguments,
+                num: arguments.len(),
+            },
+            &arguments,
+            &[self.repr.arguments_ty()],
+        );
+        let result = body.add_op(
+            block,
+            Operator::Call {
+                function_index: info.adapter,
+            },
+            &[context, this, arguments],
+            &[self.repr.value],
+        );
+        let to_number = self.ensure_to_number_helper()?;
+        let number = body.add_op(
+            block,
+            Operator::Call {
+                function_index: to_number,
+            },
+            &[result],
+            &[Type::F64],
+        );
+        body.set_terminator(
+            block,
+            Terminator::Return {
+                values: vec![number],
+            },
+        );
+        let func =
+            self.module
+                .funcs
+                .push(FuncDecl::Body(signature, format!("js_export_{name}"), body));
+        self.module.exports.push(Export {
+            name: name.to_owned(),
+            kind: ExportKind::Func(func),
+        });
+        Ok(())
+    }
+
+    /// Emit the zero-argument run entry used by test runners: it executes
+    /// the module's top-level body in a fresh primordial-populated context
+    /// and reports an `i32` status (`0` = completed, `1` = threw).
+    ///
+    /// The body's native function is called directly with unboxed (empty)
+    /// formals; going through the `CallRef` adapter loses the fresh context
+    /// because the adapter reads its context from the callee's captured
+    /// function object, not from the caller's `context` parameter.
+    fn export_run_entry(&mut self, name: &str, info: FunctionInfo) -> Result<(), ConvertError> {
+        let signature = self.module.signatures.push(SignatureData::Func {
+            params: vec![],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, signature);
+        let block = body.entry;
+        let context_builder = self.ensure_context_builder()?;
+        let context = body.add_op(
+            block,
+            Operator::Call {
+                function_index: context_builder,
+            },
+            &[],
+            &[self.repr.object_ty()],
+        );
+        let this = self.undef(&mut body, block);
+        let (this, _) = this.wasm()?;
+        let arguments = body.add_op(
+            block,
+            Operator::ArrayNewFixed {
+                sig: self.repr.arguments,
+                num: 0,
+            },
+            &[],
+            &[self.repr.arguments_ty()],
+        );
+        // Native signature: (context, this/undefined, arguments, formals...).
+        let call = body.add_op(
+            block,
+            Operator::Call {
+                function_index: info.native,
+            },
+            &[context, this, arguments],
+            &[self.repr.value],
+        );
+        // The native result is discarded; the entry's contract only
+        // reports a completion status.
+        body.add_op(
+            block,
+            Operator::Call {
+                function_index: info.native,
+            },
+            &[context, this, arguments],
+            &[self.repr.value],
+        );
+        let status = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        body.set_terminator(
+            block,
+            Terminator::Return {
+                values: vec![status],
+            },
+        );
+        let func = self
+            .module
+            .funcs
+            .push(FuncDecl::Body(signature, format!("js_run_{name}"), body));
+        self.module.exports.push(Export {
+            name: name.to_owned(),
+            kind: ExportKind::Func(func),
+        });
+        Ok(())
+    }
+
+    fn declare_function_reference(&mut self, func: Func) {
+        if let Some(table) = self.ref_table {
+            let table = &mut self.module.tables[table];
+            let elements = table
+                .func_elements
+                .as_mut()
+                .expect("generated ref-function table should have elements");
+            elements.push(func);
+            table.initial = elements.len() as u64;
+            return;
+        }
+        let table = self.module.tables.push(TableData {
+            ty: Type::Heap(WithNullable {
+                value: HeapType::FuncRef,
+                nullable: true,
+            }),
+            initial: 1,
+            max: None,
+            func_elements: Some(vec![func]),
+            table64: false,
+        });
+        self.ref_table = Some(table);
+    }
+
+    fn lower_all(&mut self) -> Result<(), ConvertError> {
+        while let Some(sfunc) = self.pending.pop_front() {
+            let key = Self::key(sfunc);
+            if !self.lowered.insert(key) {
+                continue;
+            }
+            let info = *self
+                .functions
+                .get(&key)
+                .ok_or_else(|| ConvertError::invalid("missing function cache entry"))?;
+            let mut decl = take(&mut self.module.funcs[info.native]);
+            let result = {
+                let body = decl.body_mut().ok_or_else(|| {
+                    ConvertError::invalid("generated native function has no body")
+                })?;
+                self.current_native_returns = info.returns.single();
+                let result = self.lower_function(sfunc, body);
+                self.current_native_returns = None;
+                result
+            };
+            self.module.funcs[info.native] = decl;
+            result?;
+        }
+        Ok(())
+    }
+
+    fn lower_function(
+        &mut self,
+        sfunc: &'a SFunc,
+        body: &mut FunctionBody,
+    ) -> Result<(), ConvertError> {
+        let mut blocks = BTreeMap::new();
+        let entry_state = BlkSet {
+            source: sfunc.entry,
+            params: vec![ValueKind::Reference; sfunc.cfg.blocks[sfunc.entry].params.len()],
+        };
+        blocks.insert(entry_state.clone(), body.entry);
+        let mut pending = VecDeque::from([entry_state]);
+        let mut lowered = BTreeSet::new();
+        let context = body.blocks[body.entry].params[0].1;
+        let this = LowerValue::Wasm {
+            value: body.blocks[body.entry].params[1].1,
+            kind: ValueKind::Reference,
+        };
+        // Keep the ABI's raw argument array private to adapters/native entry
+        // code. Source-level `arguments` is one stable object wrapper sharing
+        // that component, so named fields and resized elements persist for
+        // the whole activation.
+        let arguments = LowerValue::Wasm {
+            value: self.new_array_object(body, body.entry, body.blocks[body.entry].params[2].1)?,
+            kind: ValueKind::Reference,
+        };
+        // jsaw's entry shim parameters may be referenced directly from later
+        // blocks without being explicit jump arguments. Keep them available
+        // while lowering every source block.
+        let entry_values = sfunc.cfg.blocks[sfunc.entry]
+            .params
+            .iter()
+            .zip(body.blocks[body.entry].params.iter().skip(3))
+            .map(|((source, _), (_, value))| {
+                (
+                    *source,
+                    LowerValue::Wasm {
+                        value: *value,
+                        kind: ValueKind::Reference,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        while let Some(state) = pending.pop_front() {
+            if !lowered.insert(state.clone()) {
+                continue;
+            }
+            let sblock = state.source;
+            #[cfg(feature = "lower_trace")]
+            eprintln!("[trace] lowering source block {sblock:?} kinds={:?} term={:?}", state.params, sfunc.cfg.blocks[sblock].postcedent.term);
+            let original_block = *blocks
+                .get(&state)
+                .ok_or_else(|| ConvertError::invalid("missing source block mapping"))?;
+            let mut values = entry_values.clone();
+            // Native bodies prepend the captured lexical context, effective
+            // receiver, and original argument array. Source SSA parameters
+            // begin after those ABI-only parameters in the entry shim.
+            let target_params = body.blocks[original_block].params.iter();
+            let target_params = if sblock == sfunc.entry {
+                target_params.skip(3)
+            } else {
+                target_params.skip(0)
+            };
+            for (((source, _), (_, wasm)), kind) in sfunc.cfg.blocks[sblock]
+                .params
+                .iter()
+                .zip(target_params)
+                .zip(state.params.iter().copied())
+            {
+                values.insert(*source, LowerValue::Wasm { value: *wasm, kind });
+            }
+
+            let mut continuations = vec![Continuation {
+                block: original_block,
+                values,
+            }];
+
+            for stmt in sfunc.cfg.blocks[sblock].stmts.iter().copied() {
+                let mut next = Vec::new();
+                for continuation in continuations {
+                    for (block, value) in self.lower_statement(
+                        body,
+                        continuation.block,
+                        context,
+                        this.clone(),
+                        arguments.clone(),
+                        &continuation.values,
+                        &sfunc.cfg.values[stmt].value,
+                    )? {
+                        let mut values = continuation.values.clone();
+                        values.insert(stmt, value);
+                        next.push(Continuation { block, values });
+                    }
+                }
+                continuations = next;
+            }
+
+            match &sfunc.cfg.blocks[sblock].postcedent.term {
+                TTerm::Return(value) => {
+                    for continuation in continuations {
+                        let value = match value {
+                            Some(value) => {
+                                continuation.values.get(value).cloned().ok_or_else(|| {
+                                    ConvertError::invalid(format!(
+                                        "undefined return value {value:?}"
+                                    ))
+                                })?
+                            }
+                            None => self.undef(body, continuation.block),
+                        };
+                        // The native signature declares the analyzed return
+                        // representation. Single-kind functions return the
+                        // raw value directly; multi-kind functions return
+                        // the boxed join of their branches.
+                        let value = match self.current_native_returns {
+                            Some(kind) => match kind {
+                                ValueKind::Number => self.as_f64(body, continuation.block, &value)?,
+                                ValueKind::Boolean | ValueKind::Integer => {
+                                    self.as_i32(body, continuation.block, &value)?
+                                }
+                                ValueKind::Reference => {
+                                    self.box_value(body, continuation.block, &value)?
+                                }
+                            },
+                            None => self.box_value(body, continuation.block, &value)?,
+                        };
+                        body.set_terminator(
+                            continuation.block,
+                            Terminator::Return {
+                                values: vec![value],
+                            },
+                        );
+                    }
+                }
+                TTerm::Jmp(target) => {
+                    for continuation in continuations {
+                        let args = target
+                            .args
+                            .iter()
+                            .map(|value| {
+                                continuation
+                                    .values
+                                    .get(value)
+                                    .ok_or_else(|| ConvertError::invalid("undefined jump argument"))
+                                    .cloned()
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let target_block = self.target_block(
+                            sfunc,
+                            body,
+                            &mut blocks,
+                            &mut pending,
+                            target.block,
+                            &args,
+                        )?;
+                        let args = self.lower_block_args(body, continuation.block, args)?;
+                        body.set_terminator(
+                            continuation.block,
+                            Terminator::Br {
+                                target: BlockTarget {
+                                    block: target_block,
+                                    args,
+                                },
+                            },
+                        );
+                    }
+                }
+                TTerm::CondJmp {
+                    cond,
+                    if_true,
+                    if_false,
+                } => {
+                    for continuation in continuations {
+                        let cond = continuation
+                            .values
+                            .get(cond)
+                            .ok_or_else(|| ConvertError::invalid("undefined branch condition"))?;
+                        let cond = self.as_condition(body, continuation.block, cond)?;
+                        let true_args = if_true
+                            .args
+                            .iter()
+                            .map(|value| {
+                                continuation.values.get(value).cloned().ok_or_else(|| {
+                                    ConvertError::invalid("undefined branch argument")
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let false_args = if_false
+                            .args
+                            .iter()
+                            .map(|value| {
+                                continuation.values.get(value).cloned().ok_or_else(|| {
+                                    ConvertError::invalid("undefined branch argument")
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let true_block = self.target_block(
+                            sfunc,
+                            body,
+                            &mut blocks,
+                            &mut pending,
+                            if_true.block,
+                            &true_args,
+                        )?;
+                        let false_block = self.target_block(
+                            sfunc,
+                            body,
+                            &mut blocks,
+                            &mut pending,
+                            if_false.block,
+                            &false_args,
+                        )?;
+                        let true_args =
+                            self.lower_block_args(body, continuation.block, true_args)?;
+                        let false_args =
+                            self.lower_block_args(body, continuation.block, false_args)?;
+                        body.set_terminator(
+                            continuation.block,
+                            Terminator::CondBr {
+                                cond,
+                                if_true: BlockTarget {
+                                    block: true_block,
+                                    args: true_args,
+                                },
+                                if_false: BlockTarget {
+                                    block: false_block,
+                                    args: false_args,
+                                },
+                            },
+                        );
+                    }
+                }
+                TTerm::Tail { callee, args } => {
+                    for continuation in continuations {
+                        for (block, context, receiver, array, code) in self.lower_call_parts(
+                            body,
+                            continuation.block,
+                            context,
+                            this.clone(),
+                            &continuation.values,
+                            callee,
+                            args,
+                        )? {
+                            body.set_terminator(
+                                block,
+                                Terminator::ReturnCallRef {
+                                    sig: self.repr.adapter,
+                                    args: vec![context, receiver, array, code],
+                                },
+                            );
+                        }
+                    }
+                }
+                // The jsaw pipeline leaves a `Default` terminator on an
+                // implicit JavaScript fallthrough. Its observable result is
+                // `undefined`, not an unreachable Wasm edge.
+                TTerm::Default => {
+                    for continuation in continuations {
+                        let undef = self.undef(body, continuation.block);
+                        // Implicit fallthrough is `undefined` — a reference,
+                        // so the unboxed i32/f64 return kinds cannot occur
+                        // here and the boxed ABI is always correct for the
+                        // *value*; but the signature may still be raw, in
+                        // which case `undefined` boxes to the declared type.
+                        let value = match self.current_native_returns {
+                            Some(ValueKind::Number) => self.as_f64(body, continuation.block, &undef)?,
+                            Some(ValueKind::Boolean | ValueKind::Integer) => {
+                                self.as_i32(body, continuation.block, &undef)?
+                            }
+                            _ => self.box_value(body, continuation.block, &undef)?,
+                        };
+                        body.set_terminator(
+                            continuation.block,
+                            Terminator::Return {
+                                values: vec![value],
+                            },
+                        );
+                    }
+                }
+                TTerm::Throw(value) => {
+                    // Throw lowering without an exception table: evaluate
+                    // the thrown value for its side effects, then trap. The
+                    // host runner distinguishes JS throws from internal
+                    // traps once catch handling exists (see
+                    // docs/plan-test262-compatibility.md Phase 1.4).
+                    for continuation in continuations {
+                        let thrown = continuation
+                            .values
+                            .get(value)
+                            .cloned()
+                            .ok_or_else(|| ConvertError::invalid("undefined throw value"))?;
+                        let _ = self.box_value(body, continuation.block, &thrown)?;
+                        body.set_terminator(
+                            continuation.block,
+                            Terminator::Unreachable,
+                        );
+                    }
+                }
+                TTerm::Switch {
+                    x,
+                    blocks: cases,
+                    default,
+                } => {
+                    for continuation in continuations {
+                        let subject = continuation
+                            .values
+                            .get(x)
+                            .cloned()
+                            .ok_or_else(|| ConvertError::invalid("undefined switch subject"))?;
+                        // Build the arm list up front; the default arm is a
+                        // marker handled last without a comparison.
+                        let mut arms: Vec<(SValueId, &STarget<SValueId, SBlockId>)> =
+                            Vec::with_capacity(cases.len() + 1);
+                        for (case_value, target) in cases {
+                            arms.push((*case_value, target));
+                        }
+                        let default_target: &STarget<SValueId, SBlockId> = default;
+                        // Sequential strict-equality chain. Each compare
+                        // after the first runs in the previous arm's
+                        // fallthrough block; a failed final compare routes
+                        // to the default target.
+                        let mut current_block = continuation.block;
+                        let mut current_values = continuation.values.clone();
+                        for (index, (case_value, target)) in arms.iter().enumerate() {
+                            let case = current_values
+                                .get(case_value)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    ConvertError::invalid("undefined switch case value")
+                                })?;
+                            let equal =
+                                self.strict_equality(body, current_block, &subject, &case, false)?;
+                            let (equal, _) = equal.wasm()?;
+                            let equal = self.as_condition(
+                                body,
+                                current_block,
+                                &LowerValue::Wasm {
+                                    value: equal,
+                                    kind: ValueKind::Boolean,
+                                },
+                            )?;
+                            let target_args = target
+                                .args
+                                .iter()
+                                .map(|value| {
+                                    current_values
+                                        .get(value)
+                                        .ok_or_else(|| {
+                                            ConvertError::invalid("undefined switch arm argument")
+                                        })
+                                        .cloned()
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let target_block = self.target_block(
+                                sfunc,
+                                body,
+                                &mut blocks,
+                                &mut pending,
+                                target.block,
+                                &target_args,
+                            )?;
+                            let target_args =
+                                self.lower_block_args(body, current_block, target_args)?;
+                            let is_last_case = index + 1 == arms.len();
+                            let fallthrough_block = body.add_block();
+                            body.set_terminator(
+                                current_block,
+                                Terminator::CondBr {
+                                    cond: equal,
+                                    if_true: BlockTarget {
+                                        block: target_block,
+                                        args: target_args,
+                                    },
+                                    if_false: BlockTarget {
+                                        block: fallthrough_block,
+                                        args: vec![],
+                                    },
+                                },
+                            );
+                            current_block = fallthrough_block;
+                            let _ = is_last_case;
+                        }
+                        // Route the exhausted chain to the default target.
+                        let default_args = default_target
+                            .args
+                            .iter()
+                            .map(|value| {
+                                current_values
+                                    .get(value)
+                                    .ok_or_else(|| {
+                                        ConvertError::invalid("undefined switch arm argument")
+                                    })
+                                    .cloned()
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let default_block = self.target_block(
+                            sfunc,
+                            body,
+                            &mut blocks,
+                            &mut pending,
+                            default_target.block,
+                            &default_args,
+                        )?;
+                        let default_args =
+                            self.lower_block_args(body, current_block, default_args)?;
+                        body.set_terminator(
+                            current_block,
+                            Terminator::Br {
+                                target: BlockTarget {
+                                    block: default_block,
+                                    args: default_args,
+                                },
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn target_block(
+        &self,
+        sfunc: &SFunc,
+        body: &mut FunctionBody,
+        blocks: &mut BTreeMap<BlkSet, Block>,
+        pending: &mut VecDeque<BlkSet>,
+        source: SBlockId,
+        args: &[LowerValue],
+    ) -> Result<Block, ConvertError> {
+        let state = BlkSet {
+            source,
+            params: args
+                .iter()
+                .map(LowerValue::kind)
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        if state.params.len() != sfunc.cfg.blocks[source].params.len() {
+            return Err(ConvertError::invalid(
+                "jump argument count did not match its target",
+            ));
+        }
+        if let Some(block) = blocks.get(&state) {
+            return Ok(*block);
+        }
+        let block = body.add_block();
+        for kind in &state.params {
+            body.add_blockparam(block, self.wasm_type(*kind));
+        }
+        blocks.insert(state.clone(), block);
+        pending.push_back(state);
+        Ok(block)
+    }
+
+    fn wasm_type(&self, kind: ValueKind) -> Type {
+        match kind {
+            ValueKind::Number => Type::F64,
+            ValueKind::Boolean | ValueKind::Integer => Type::I32,
+            ValueKind::Reference => self.repr.value,
+        }
+    }
+
+    fn lower_block_args(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        args: Vec<LowerValue>,
+    ) -> Result<Vec<Value>, ConvertError> {
+        args.into_iter()
+            .map(|value| match value.kind()? {
+                ValueKind::Reference => self.box_value(body, block, &value),
+                ValueKind::Number => self.as_f64(body, block, &value),
+                ValueKind::Boolean => self.as_condition(body, block, &value),
+                ValueKind::Integer => self.as_i32(body, block, &value),
+            })
+            .collect()
+    }
+
+    fn lower_statement(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        context: Value,
+        this: LowerValue,
+        arguments: LowerValue,
+        values: &BTreeMap<SValueId, LowerValue>,
+        source: &'a SValue,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        match source {
+            SValue::Item { item, span } => {
+                self.lower_item(body, block, context, this, arguments, values, item, span)
+            }
+            SValue::LoadId(id) => {
+                let key = id.0.to_string();
+                let literal = self.function_literal_locals.get(&key).copied();
+                let mut results = Vec::new();
+                for (block, value) in self.get_property(body, block, context, &key)? {
+                    let (value, _) = value.wasm()?;
+                    // A single-assignment function-literal local keeps its
+                    // origin: the call site's tag check proves the context
+                    // slot still holds the literal at runtime.
+                    let value = if let Some(literal) = literal {
+                        let info = self.ensure_function(literal)?;
+                        LowerValue::FunctionRef {
+                            value,
+                            info,
+                            fresh: false,
+                        }
+                    } else {
+                        LowerValue::ReferenceKey { value, key: key.clone() }
+                    };
+                    results.push((block, value));
+                }
+                Ok(results)
+            }
+            SValue::StoreId { target, val } => {
+                let value = values
+                    .get(val)
+                    .ok_or_else(|| ConvertError::invalid("undefined stored value"))?;
+                Ok(self
+                    .set_property(body, block, context, &target.0.to_string(), value)?
+                    .into_iter()
+                    .map(|block| (block, value.clone()))
+                    .collect())
+            }
+            SValue::Assign { target, val } => {
+                let value = values
+                    .get(val)
+                    .ok_or_else(|| ConvertError::invalid("undefined assignment value"))?;
+                match target {
+                    LId::Member { obj, mem } => {
+                        let object = values
+                            .get(obj)
+                            .ok_or_else(|| ConvertError::invalid("undefined assignment object"))?;
+                        let key = values.get(&mem[0]).ok_or_else(|| {
+                            ConvertError::invalid("undefined assignment property key")
+                        })?;
+                        let blocks = match self.key_of(key) {
+                            Ok(key) => self.set_property_value(body, block, object, &key, value)?,
+                            Err(_) => match key.kind()? {
+                                ValueKind::Number | ValueKind::Integer | ValueKind::Boolean => {
+                                    let index = self.numeric_index(body, block, key)?;
+                                    self.set_numeric_member(body, block, object, index, value)?
+                                }
+                                ValueKind::Reference => {
+                                    let key = self.dynamic_string_key(body, block, key)?;
+                                    self.set_string_member(body, block, object, key, value)?
+                                }
+                            }
+                        };
+                        Ok(blocks
+                            .into_iter()
+                            .map(|block| (block, value.clone()))
+                            .collect())
+                    }
+                    _ => Err(ConvertError::unsupported("non-member assignment", ())),
+                }
+            }
+            SValue::EdgeBlocker { value, .. } => Ok(vec![(
+                block,
+                values
+                    .get(value)
+                    .cloned()
+                    .ok_or_else(|| ConvertError::invalid("undefined edge-blocker value"))?,
+            )]),
+            SValue::Param { .. } => {
+                Err(ConvertError::invalid("block parameter used as a statement"))
+            }
+            _ => Err(ConvertError::unsupported("new SSA value form", ())),
+        }
+    }
+
+    fn lower_item(
+        &mut self,
+        body: &mut FunctionBody,
+        mut block: Block,
+        context: Value,
+        this: LowerValue,
+        arguments: LowerValue,
+        values: &BTreeMap<SValueId, LowerValue>,
+        item: &'a Item<SValueId, SFunc>,
+        span: &impl std::fmt::Debug,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        if let Item::Select {
+            cond,
+            then,
+            otherwise,
+        } = item
+        {
+            let cond = values
+                .get(cond)
+                .ok_or_else(|| ConvertError::invalid("undefined select condition"))?;
+            let then = values
+                .get(then)
+                .cloned()
+                .ok_or_else(|| ConvertError::invalid("undefined select value"))?
+                .runtime();
+            let otherwise = values
+                .get(otherwise)
+                .cloned()
+                .ok_or_else(|| ConvertError::invalid("undefined select value"))?
+                .runtime();
+            return self.select_continuations(body, block, cond, then, otherwise);
+        }
+        if let Item::Bin { left, right, op } = item {
+            if matches!(
+                op,
+                BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::NullishCoalescing
+            ) {
+                let left = values
+                    .get(left)
+                    .cloned()
+                    .ok_or_else(|| ConvertError::invalid("undefined binary lhs"))?
+                    .runtime();
+                let right = values
+                    .get(right)
+                    .cloned()
+                    .ok_or_else(|| ConvertError::invalid("undefined binary rhs"))?
+                    .runtime();
+                return self.logical_continuations(body, block, left, right, *op);
+            }
+        }
+        if let Item::Mem { obj, mem } = item {
+            let object = values
+                .get(obj)
+                .ok_or_else(|| ConvertError::invalid("undefined member object"))?;
+            let key = values
+                .get(mem)
+                .ok_or_else(|| ConvertError::invalid("undefined member key"))?;
+            return match self.key_of(key) {
+                Ok(key) => self.get_property_value(body, block, object, &key),
+                Err(_) => match key.kind()? {
+                    ValueKind::Number | ValueKind::Integer | ValueKind::Boolean => {
+                        let index = self.numeric_index(body, block, key)?;
+                        self.get_numeric_member(body, block, object, index)
+                    }
+                    ValueKind::Reference => {
+                        let key = self.dynamic_string_key(body, block, key)?;
+                        self.get_string_member(body, block, object, key)
+                    }
+                },
+            };
+        }
+        if let Item::Call { callee, args } = item {
+            // Provable primordial call: the callee is `<unshadowed
+            // primordial>.<member-with-fast-core>` — skip the lookup, the
+            // arguments array, and the `CallRef` dispatch entirely. Proven
+            // sites produce one raw-representation continuation; guarded
+            // sites split into raw-fast and boxed-slow continuations.
+            if let TCallee::Member { func, member } = callee {
+                if let Some(receiver) = values.get(func)
+                    && let Some(key) = values.get(member)
+                    && let Some(result) =
+                        self.try_provable_primordial_call(body, block, receiver, key, values, args)?
+                {
+                    return Ok(result);
+                }
+            }
+            // Direct dispatch for provenance-tracked function values: local
+            // function-literal variables and object-literal methods. One
+            // tag check (or none, for a freshly allocated literal) proves
+            // the callee is still the original literal.
+            if !args.iter().any(|arg| arg.is_spread) {
+                match callee {
+                    TCallee::Val(value) => {
+                        if let Some(callee_value) = values.get(value)
+                            && let LowerValue::FunctionRef { info, fresh, .. } = callee_value
+                        {
+                            let info = *info;
+                            let fresh = *fresh;
+                            let callee_value = callee_value.clone();
+                            if fresh {
+                                // A literal allocated by the current
+                                // statement cannot have been rebound.
+                                let result = self.direct_native_call(
+                                    body,
+                                    block,
+                                    context,
+                                    info,
+                                    this.clone(),
+                                    values,
+                                    args,
+                                )?;
+                                return Ok(vec![result]);
+                            }
+                            let adapter_sig = self.repr.adapter;
+                            let adapter_value_ty = self.repr.value;
+                            let fallback = |conv: &mut Self,
+                                            body: &mut FunctionBody,
+                                            slow: Block|
+                             -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+                                let callees = conv.lower_call_parts(
+                                    body,
+                                    slow,
+                                    context,
+                                    this.clone(),
+                                    values,
+                                    callee,
+                                    args,
+                                )?;
+                                Ok(callees
+                                    .into_iter()
+                                    .map(|(block, ctx, recv, array, code)| {
+                                        let value = body.add_op(
+                                            block,
+                                            Operator::CallRef {
+                                                sig_index: adapter_sig,
+                                            },
+                                            &[ctx, recv, array, code],
+                                            &[adapter_value_ty],
+                                        );
+                                        (
+                                            block,
+                                            LowerValue::Wasm {
+                                                value,
+                                                kind: ValueKind::Reference,
+                                            },
+                                        )
+                                    })
+                                    .collect())
+                            };
+                            let result = self.guarded_function_ref_call(
+                                body,
+                                block,
+                                callee_value,
+                                info,
+                                context,
+                                this.clone(),
+                                values,
+                                args,
+                                fallback,
+                            )?;
+                            return Ok(result);
+                        }
+                    }
+                    TCallee::Member { func, member } => {
+                        if let Some(receiver) = values.get(func)
+                            && let LowerValue::ObjectLiteral { methods, .. } = receiver
+                            && let Some(key_value) = values.get(member)
+                            && let Ok(key) = self.key_of(key_value)
+                            && let Some(&info) = methods.get(&key)
+                        {
+                            // Load the method through the ordinary lookup
+                            // (shape/trie machinery, correct for every
+                            // receiver), then guard on the tag.
+                            let callees =
+                                self.get_property_value(body, block, receiver, &key)?;
+                            let mut continuations = Vec::new();
+                            for (callee_block, callee_value) in callees {
+                                let fallback_callee = callee_value.clone();
+                                let fallback = |this: &mut Self,
+                                                body: &mut FunctionBody,
+                                                slow: Block|
+                                 -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+                                    let (ctx, this_v, code, _arrow) = this.callable_parts(
+                                        body,
+                                        slow,
+                                        &fallback_callee,
+                                        receiver.clone(),
+                                    )?;
+                                    let array = this.make_arguments(body, slow, values, args)?;
+                                    let value = body.add_op(
+                                        slow,
+                                        Operator::CallRef {
+                                            sig_index: this.repr.adapter,
+                                        },
+                                        &[ctx, this_v, array, code],
+                                        &[this.repr.value],
+                                    );
+                                    Ok(vec![(
+                                        slow,
+                                        LowerValue::Wasm {
+                                            value,
+                                            kind: ValueKind::Reference,
+                                        },
+                                    )])
+                                };
+                                let result = self.guarded_function_ref_call(
+                                    body,
+                                    callee_block,
+                                    callee_value,
+                                    info,
+                                    context,
+                                    receiver.clone(),
+                                    values,
+                                    args,
+                                    fallback,
+                                )?;
+                                continuations.extend(result);
+                            }
+                            return Ok(continuations);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return self
+                .lower_call_parts(body, block, context, this.clone(), values, callee, args)?
+                .into_iter()
+                .map(|(block, context, receiver, array, code)| {
+                    let value = body.add_op(
+                        block,
+                        Operator::CallRef {
+                            sig_index: self.repr.adapter,
+                        },
+                        &[context, receiver, array, code],
+                        &[self.repr.value],
+                    );
+                    Ok((
+                        block,
+                        LowerValue::Wasm {
+                            value,
+                            kind: ValueKind::Reference,
+                        },
+                    ))
+                })
+                .collect();
+        }
+        if let Item::StaticSubObject { wrapped, keys } = item {
+            let wrapped = values
+                .get(wrapped)
+                .ok_or_else(|| ConvertError::invalid("undefined static subobject source"))?;
+            return self.static_subobject(body, block, values, wrapped, keys);
+        }
+
+        let value = match item {
+            Item::Just { id } => values
+                .get(id)
+                .cloned()
+                .ok_or_else(|| ConvertError::invalid("undefined alias value"))?
+                .runtime(),
+            Item::Undef => self.undef(body, block),
+            Item::Lit { lit } => self.literal(body, block, lit, span)?,
+            Item::This => this,
+            Item::Func { func, arrow } => {
+                self.function_object(body, block, context, this, func, *arrow)?
+            }
+            Item::Obj { members } => self.object_literal(
+                body,
+                &mut block,
+                context,
+                this.clone(),
+                values,
+                members,
+                span,
+            )?,
+            Item::Arr { members } => {
+                let elements = self.make_arguments(body, block, values, members)?;
+                LowerValue::Wasm {
+                    value: self.new_array_object(body, block, elements)?,
+                    kind: ValueKind::Reference,
+                }
+            }
+            Item::Arguments => arguments,
+            Item::Mem { .. } => unreachable!("member reads were lowered as continuations"),
+            Item::StaticSubArray {
+                begin,
+                end,
+                wrapped,
+            } => {
+                let wrapped = values
+                    .get(wrapped)
+                    .ok_or_else(|| ConvertError::invalid("undefined static subarray source"))?;
+                let (next, value) = self.static_subarray(body, block, wrapped, *begin, *end)?;
+                block = next;
+                value
+            }
+            Item::StaticSubObject { .. } => {
+                unreachable!("object rest was lowered as continuations")
+            }
+            Item::Call { .. } => unreachable!("calls were lowered as continuations"),
+            Item::New { class, args } => {
+                // Provable typed-array construction: `new Uint8Array(...)`
+                // with an unshadowed global goes straight to the per-kind
+                // fast core (see `try_provable_typed_constructor`).
+                if let Some(callee) = values.get(class) {
+                    if let Some(result) =
+                        self.try_provable_typed_constructor(body, block, callee, values, args)?
+                    {
+                        return Ok(vec![result]);
+                    }
+                }
+                let callee = values
+                    .get(class)
+                    .ok_or_else(|| ConvertError::invalid("undefined constructor"))?;
+                let receiver = self.new_object(body, block)?;
+                let (ctx, _default_this, code, arrow) =
+                    self.callable_parts(body, block, callee, this.clone())?;
+                let is_arrow = arrow;
+                // A construct of an arrow function is invalid JavaScript. The
+                // generated trap also keeps a dynamic callable from silently
+                // acquiring constructor semantics.
+                let reject = body.add_block();
+                let invoke = body.add_block();
+                let join = body.add_block();
+                let joined = body.add_blockparam(join, self.repr.value);
+                body.set_terminator(
+                    block,
+                    Terminator::CondBr {
+                        cond: is_arrow,
+                        if_true: BlockTarget {
+                            block: reject,
+                            args: vec![],
+                        },
+                        if_false: BlockTarget {
+                            block: invoke,
+                            args: vec![],
+                        },
+                    },
+                );
+                body.set_terminator(reject, Terminator::Unreachable);
+                let array = self.make_plain_arguments(body, invoke, values, args)?;
+                let receiver_value = self.box_value(body, invoke, &receiver)?;
+                let result = body.add_op(
+                    invoke,
+                    Operator::CallRef {
+                        sig_index: self.repr.adapter,
+                    },
+                    &[ctx, receiver_value, array, code],
+                    &[self.repr.value],
+                );
+                let object = body.add_op(
+                    invoke,
+                    Operator::RefTest {
+                        ty: self.repr.object_ty(),
+                    },
+                    &[result],
+                    &[Type::I32],
+                );
+                let function = body.add_op(
+                    invoke,
+                    Operator::RefTest {
+                        ty: self.repr.function_ty(),
+                    },
+                    &[result],
+                    &[Type::I32],
+                );
+                let override_result =
+                    body.add_op(invoke, Operator::I32Or, &[object, function], &[Type::I32]);
+                let explicit = body.add_block();
+                let implicit = body.add_block();
+                body.set_terminator(
+                    invoke,
+                    Terminator::CondBr {
+                        cond: override_result,
+                        if_true: BlockTarget {
+                            block: explicit,
+                            args: vec![],
+                        },
+                        if_false: BlockTarget {
+                            block: implicit,
+                            args: vec![],
+                        },
+                    },
+                );
+                body.set_terminator(
+                    explicit,
+                    Terminator::Br {
+                        target: BlockTarget {
+                            block: join,
+                            args: vec![result],
+                        },
+                    },
+                );
+                let receiver_result = self.box_value(body, implicit, &receiver)?;
+                body.set_terminator(
+                    implicit,
+                    Terminator::Br {
+                        target: BlockTarget {
+                            block: join,
+                            args: vec![receiver_result],
+                        },
+                    },
+                );
+                block = join;
+                LowerValue::Wasm {
+                    value: joined,
+                    kind: ValueKind::Reference,
+                }
+            }
+            Item::Bin { left, right, op } => self.binary(
+                body,
+                block,
+                values
+                    .get(left)
+                    .ok_or_else(|| ConvertError::invalid("undefined binary lhs"))?,
+                values
+                    .get(right)
+                    .ok_or_else(|| ConvertError::invalid("undefined binary rhs"))?,
+                *op,
+                span,
+            )?,
+            Item::Un { arg, op } => self.unary(
+                body,
+                block,
+                values
+                    .get(arg)
+                    .ok_or_else(|| ConvertError::invalid("undefined unary operand"))?,
+                *op,
+                span,
+            )?,
+            Item::Select { .. } => unreachable!("select was handled above"),
+            Item::PrivateMem { .. }
+            | Item::HasPrivateMem { .. }
+            | Item::Class(_)
+            | Item::Yield { .. }
+            | Item::Await { .. }
+            | Item::Asm { .. }
+            | Item::Meta { .. } => {
+                return Err(ConvertError::unsupported(format!("{item:?}"), span));
+            }
+            _ => return Err(ConvertError::unsupported("new item form", span)),
+        };
+        Ok(vec![(block, value)])
+    }
+
+    /// Preserve raw Wasm representations across a reference/primitive select.
+    ///
+    /// An `anyref` select would box the primitive arm and lose the fact that
+    /// later statements must treat the two arms differently.  Split the Wasm
+    /// control flow instead; `lower_function` subsequently emits the source
+    /// block's remaining statements for each refined continuation.
+    fn select_continuations(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        cond: &LowerValue,
+        then: LowerValue,
+        otherwise: LowerValue,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let cond = self.as_condition(body, block, cond)?;
+        self.select_continuations_for_condition(body, block, cond, then, otherwise)
+    }
+
+    fn logical_continuations(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        left: LowerValue,
+        right: LowerValue,
+        op: BinaryOp,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        match op {
+            BinaryOp::LogicalAnd => {
+                let cond = self.as_condition(body, block, &left)?;
+                self.select_continuations_for_condition(body, block, cond, right, left)
+            }
+            BinaryOp::LogicalOr => {
+                let cond = self.as_condition(body, block, &left)?;
+                self.select_continuations_for_condition(body, block, cond, left, right)
+            }
+            BinaryOp::NullishCoalescing => {
+                let (value, kind) = left.wasm()?;
+                if kind != ValueKind::Reference {
+                    return Ok(vec![(block, left)]);
+                }
+                let is_null = body.add_op(block, Operator::RefIsNull, &[value], &[Type::I32]);
+                self.select_continuations_for_condition(body, block, is_null, right, left)
+            }
+            _ => unreachable!("only logical binary operators are routed here"),
+        }
+    }
+
+    fn select_continuations_for_condition(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        cond: Value,
+        then: LowerValue,
+        otherwise: LowerValue,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let then_kind = then.kind()?;
+        let otherwise_kind = otherwise.kind()?;
+        if (then_kind == ValueKind::Reference) != (otherwise_kind == ValueKind::Reference) {
+            let if_true = body.add_block();
+            let if_false = body.add_block();
+            body.set_terminator(
+                block,
+                Terminator::CondBr {
+                    cond,
+                    if_true: BlockTarget {
+                        block: if_true,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: if_false,
+                        args: vec![],
+                    },
+                },
+            );
+            return Ok(vec![(if_true, then), (if_false, otherwise)]);
+        }
+
+        let then = self.box_value(body, block, &then)?;
+        let otherwise = self.box_value(body, block, &otherwise)?;
+        let value = body.add_op(
+            block,
+            Operator::TypedSelect {
+                ty: self.repr.value,
+            },
+            &[then, otherwise, cond],
+            &[self.repr.value],
+        );
+        Ok(vec![(
+            block,
+            LowerValue::Wasm {
+                value,
+                kind: ValueKind::Reference,
+            },
+        )])
+    }
+
+    fn literal(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        lit: &Lit,
+        span: &impl std::fmt::Debug,
+    ) -> Result<LowerValue, ConvertError> {
+        Ok(match lit {
+            Lit::Num(number) => {
+                let value = body.add_op(
+                    block,
+                    Operator::F64Const {
+                        value: number.value.to_bits(),
+                    },
+                    &[],
+                    &[Type::F64],
+                );
+                let mut key = ryu_js::Buffer::new();
+                LowerValue::NumberLiteral {
+                    value,
+                    key: key.format(number.value).to_owned(),
+                }
+            }
+            Lit::Bool(boolean) => LowerValue::Wasm {
+                value: body.add_op(
+                    block,
+                    Operator::I32Const {
+                        value: u32::from(boolean.value),
+                    },
+                    &[],
+                    &[Type::I32],
+                ),
+                kind: ValueKind::Boolean,
+            },
+            // JS `null` is a distinct value from `undefined`; see
+            // [`Self::js_null`] for the representation choice.
+            Lit::Null(_) => self.js_null(body, block),
+            Lit::Str(string) => LowerValue::String {
+                value: self.new_string(body, block, string.value.as_wtf8().as_bytes())?,
+                key: string.value.to_string_lossy().into_owned(),
+                bytes: string.value.as_wtf8().as_bytes().to_vec(),
+            },
+            _ => return Err(ConvertError::unsupported(format!("literal {lit:?}"), span)),
+        })
+    }
+
+    /// Materialize an `Add` operand as a string-struct reference for the
+    /// runtime-concat path. Statically string-typed operands already hold
+    /// the struct; reference operands passed the preceding `ref.test`
+    /// string check, so the cast cannot fail.
+    fn string_operand_for_concat(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        operand: &LowerValue,
+        wasm: Value,
+        is_static_string: bool,
+    ) -> Result<Value, ConvertError> {
+        if is_static_string && !matches!(operand, LowerValue::String { .. }) {
+            return Ok(wasm);
+        }
+        match operand {
+            LowerValue::String { value, .. } => Ok(*value),
+            _ => Ok(body.add_op(
+                block,
+                Operator::RefCast {
+                    ty: self.repr.string_ty(),
+                },
+                &[wasm],
+                &[self.repr.string_ty()],
+            )),
+        }
+    }
+
+    fn binary(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        left: &LowerValue,
+        right: &LowerValue,
+        op: BinaryOp,
+        span: &impl std::fmt::Debug,
+    ) -> Result<LowerValue, ConvertError> {
+        use BinaryOp::*;
+        match op {
+            Add => {
+                // Static string concat: both operands are known literals.
+                if matches!(left, LowerValue::String { .. })
+                    && matches!(right, LowerValue::String { .. })
+                {
+                    let (left, _) = left.wasm()?;
+                    let (right, _) = right.wasm()?;
+                    let concat = self.ensure_string_concat()?;
+                    let string = body.add_op(
+                        block,
+                        Operator::Call {
+                            function_index: concat,
+                        },
+                        &[left, right],
+                        &[self.repr.string_ty()],
+                    );
+                    return Ok(LowerValue::Wasm {
+                        value: self.anyref(body, block, string),
+                        kind: ValueKind::Reference,
+                    });
+                }
+                // A member read on a string loses its static string
+                // representation at the block boundary (`'x' + 'abc'[1]`),
+                // so `+` over a reference operand must decide
+                // concatenation vs numeric addition at runtime. The
+                // shared helper takes boxed operands and returns one
+                // boxed result; `binary` cannot branch, so all of the
+                // dispatch lives inside the helper.
+                let (left_wasm, left_kind) = left.wasm()?;
+                let (right_wasm, right_kind) = right.wasm()?;
+                if left_kind == ValueKind::Reference || right_kind == ValueKind::Reference {
+                    let add = self.ensure_add_helper()?;
+                    let left_value = self.box_value(body, block, left)?;
+                    let right_value = self.box_value(body, block, right)?;
+                    let sum = body.add_op(
+                        block,
+                        Operator::Call {
+                            function_index: add,
+                        },
+                        &[left_value, right_value],
+                        &[self.repr.value],
+                    );
+                    return Ok(LowerValue::Wasm {
+                        value: sum,
+                        kind: ValueKind::Reference,
+                    });
+                }
+                self.f64_binary(body, block, left, right, Operator::F64Add)
+            }
+            Sub => self.f64_binary(body, block, left, right, Operator::F64Sub),
+            Mul => self.f64_binary(body, block, left, right, Operator::F64Mul),
+            Div => self.f64_binary(body, block, left, right, Operator::F64Div),
+            Mod => {
+                let left = self.as_f64(body, block, left)?;
+                let right = self.as_f64(body, block, right)?;
+                let div = body.add_op(block, Operator::F64Div, &[left, right], &[Type::F64]);
+                let trunc = body.add_op(block, Operator::F64Trunc, &[div], &[Type::F64]);
+                let product = body.add_op(block, Operator::F64Mul, &[trunc, right], &[Type::F64]);
+                Ok(LowerValue::Wasm {
+                    value: body.add_op(block, Operator::F64Sub, &[left, product], &[Type::F64]),
+                    kind: ValueKind::Number,
+                })
+            }
+            Lt => self.f64_compare(body, block, left, right, Operator::F64Lt),
+            LtEq => self.f64_compare(body, block, left, right, Operator::F64Le),
+            Gt => self.f64_compare(body, block, left, right, Operator::F64Gt),
+            GtEq => self.f64_compare(body, block, left, right, Operator::F64Ge),
+            EqEq | EqEqEq | NotEq | NotEqEq => {
+                self.equality(body, block, left, right, matches!(op, NotEq | NotEqEq))
+            }
+            BitAnd | BitOr | BitXor | LShift | RShift | ZeroFillRShift => {
+                let left = self.as_i32(body, block, left)?;
+                let right = self.as_i32(body, block, right)?;
+                let operator = match op {
+                    BitAnd => Operator::I32And,
+                    BitOr => Operator::I32Or,
+                    BitXor => Operator::I32Xor,
+                    LShift => Operator::I32Shl,
+                    RShift => Operator::I32ShrS,
+                    ZeroFillRShift => Operator::I32ShrU,
+                    _ => unreachable!(),
+                };
+                Ok(LowerValue::Wasm {
+                    value: body.add_op(block, operator, &[left, right], &[Type::I32]),
+                    kind: ValueKind::Integer,
+                })
+            }
+            LogicalAnd | LogicalOr => {
+                let cond = self.as_condition(body, block, left)?;
+                let left = self.box_value(body, block, left)?;
+                let right = self.box_value(body, block, right)?;
+                let args = if op == LogicalAnd {
+                    [right, left, cond]
+                } else {
+                    [left, right, cond]
+                };
+                Ok(LowerValue::Wasm {
+                    value: body.add_op(
+                        block,
+                        Operator::TypedSelect {
+                            ty: self.repr.value,
+                        },
+                        &args,
+                        &[self.repr.value],
+                    ),
+                    kind: ValueKind::Reference,
+                })
+            }
+            NullishCoalescing => {
+                let (left_value, left_kind) = left.wasm()?;
+                if left_kind != ValueKind::Reference {
+                    return Ok(left.clone());
+                }
+                let null = body.add_op(block, Operator::RefIsNull, &[left_value], &[Type::I32]);
+                let left = self.box_value(body, block, left)?;
+                let right = self.box_value(body, block, right)?;
+                Ok(LowerValue::Wasm {
+                    value: body.add_op(
+                        block,
+                        Operator::TypedSelect {
+                            ty: self.repr.value,
+                        },
+                        &[right, left, null],
+                        &[self.repr.value],
+                    ),
+                    kind: ValueKind::Reference,
+                })
+            }
+            Exp | In | InstanceOf => Err(ConvertError::unsupported(
+                format!("binary operator {op:?}"),
+                span,
+            )),
+        }
+    }
+
+    fn f64_binary(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        left: &LowerValue,
+        right: &LowerValue,
+        operator: Operator,
+    ) -> Result<LowerValue, ConvertError> {
+        let left = self.as_f64(body, block, left)?;
+        let right = self.as_f64(body, block, right)?;
+        Ok(LowerValue::Wasm {
+            value: body.add_op(block, operator, &[left, right], &[Type::F64]),
+            kind: ValueKind::Number,
+        })
+    }
+
+    fn f64_compare(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        left: &LowerValue,
+        right: &LowerValue,
+        operator: Operator,
+    ) -> Result<LowerValue, ConvertError> {
+        let left = self.as_f64(body, block, left)?;
+        let right = self.as_f64(body, block, right)?;
+        Ok(LowerValue::Wasm {
+            value: body.add_op(block, operator, &[left, right], &[Type::I32]),
+            kind: ValueKind::Boolean,
+        })
+    }
+
+    fn unary(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        arg: &LowerValue,
+        op: UnaryOp,
+        span: &impl std::fmt::Debug,
+    ) -> Result<LowerValue, ConvertError> {
+        Ok(match op {
+            UnaryOp::Plus => LowerValue::Wasm {
+                value: self.as_f64(body, block, arg)?,
+                kind: ValueKind::Number,
+            },
+            UnaryOp::Minus => {
+                let arg = self.as_f64(body, block, arg)?;
+                LowerValue::Wasm {
+                    value: body.add_op(block, Operator::F64Neg, &[arg], &[Type::F64]),
+                    kind: ValueKind::Number,
+                }
+            }
+            UnaryOp::Bang => {
+                let arg = self.as_condition(body, block, arg)?;
+                LowerValue::Wasm {
+                    value: body.add_op(block, Operator::I32Eqz, &[arg], &[Type::I32]),
+                    kind: ValueKind::Boolean,
+                }
+            }
+            UnaryOp::Tilde => {
+                let arg = self.as_i32(body, block, arg)?;
+                let all = body.add_op(
+                    block,
+                    Operator::I32Const { value: u32::MAX },
+                    &[],
+                    &[Type::I32],
+                );
+                LowerValue::Wasm {
+                    value: body.add_op(block, Operator::I32Xor, &[arg, all], &[Type::I32]),
+                    kind: ValueKind::Integer,
+                }
+            }
+            UnaryOp::Void => self.undef(body, block),
+            UnaryOp::TypeOf => self.type_of(body, block, arg)?,
+            UnaryOp::Delete => {
+                return Err(ConvertError::unsupported(
+                    format!("unary operator {op:?}"),
+                    span,
+                ));
+            }
+        })
+    }
+
+    /// JS `typeof value` — returns one of the eight typeof result strings.
+    /// The classification helper consults the static kind when the operand
+    /// already holds one; otherwise the runtime helper classifies the boxed
+    /// value.
+    fn type_of(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        arg: &LowerValue,
+    ) -> Result<LowerValue, ConvertError> {
+        // Statically-known primitives short-circuit without a helper call.
+        match arg {
+            LowerValue::String { .. } => {
+                return Ok(self.type_of_string_const(body, block, "string"));
+            }
+            LowerValue::Wasm { kind, .. } => {
+                let name: Option<&str> = match kind {
+                    ValueKind::Number => Some("number"),
+                    ValueKind::Boolean | ValueKind::Integer => Some("boolean"),
+                    ValueKind::Reference => None,
+                };
+                if let Some(name) = name {
+                    return Ok(self.type_of_string_const(body, block, name));
+                }
+            }
+            _ => {}
+        }
+        // ReferenceKey (a boxed primitive read from a context slot) and
+        // FunctionRef both still need the runtime classification for full
+        // fidelity; consult the helper with the boxed value.
+        let boxed = self.box_value(body, block, arg)?;
+        let helper = self.ensure_typeof_helper()?;
+        let name = body.add_op(
+            block,
+            Operator::Call {
+                function_index: helper,
+            },
+            &[boxed],
+            &[self.repr.string_ty()],
+        );
+        Ok(LowerValue::String {
+            value: name,
+            key: String::new(),
+            bytes: Vec::new(),
+        })
+    }
+
+    fn type_of_string_const(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        name: &str,
+    ) -> LowerValue {
+        let value = self
+            .new_string(body, block, name.as_bytes())
+            .expect("typeof result names are ASCII");
+        LowerValue::String {
+            value,
+            key: name.to_owned(),
+            bytes: name.as_bytes().to_vec(),
+        }
+    }
+
+    /// Runtime `typeof` on a boxed value: `undefined` → "undefined",
+    /// JS null → "object", number → "number", boolean → "boolean",
+    /// string → "string", function struct → "function", anything else →
+    /// "object". BigInt/symbol are not representable yet.
+    fn ensure_typeof_helper(&mut self) -> Result<Func, ConvertError> {
+        if let Some(func) = self.typeof_helper {
+            return Ok(func);
+        }
+        let sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.value],
+            returns: vec![self.repr.string_ty()],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, sig);
+        let entry = body.entry;
+        let value = body.blocks[entry].params[0].1;
+
+        let is_undefined = body.add_op(entry, Operator::RefIsNull, &[value], &[Type::I32]);
+        let is_js_null = self.is_js_null(&mut body, entry, value);
+        let is_number = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.number_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let is_boolean = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.boolean_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let is_string = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.string_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let is_function = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.function_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+
+        // Compose a priority code: typeof = min(matching arm) with the
+        // precedence undefined < null < boolean < number < string < function
+        // < object. The tests are mutually exclusive except function vs the
+        // generic object catch-all, handled by ordering.
+        let undefined_code = body.add_op(entry, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let null_code = body.add_op(
+            entry,
+            Operator::I32Const { value: 1 },
+            &[],
+            &[Type::I32],
+        );
+        let bool_code = body.add_op(
+            entry,
+            Operator::I32Const { value: 2 },
+            &[],
+            &[Type::I32],
+        );
+        let number_code = body.add_op(
+            entry,
+            Operator::I32Const { value: 3 },
+            &[],
+            &[Type::I32],
+        );
+        let string_code = body.add_op(
+            entry,
+            Operator::I32Const { value: 4 },
+            &[],
+            &[Type::I32],
+        );
+        let function_code = body.add_op(
+            entry,
+            Operator::I32Const { value: 5 },
+            &[],
+            &[Type::I32],
+        );
+        let object_code = body.add_op(
+            entry,
+            Operator::I32Const { value: 6 },
+            &[],
+            &[Type::I32],
+        );
+
+        // code = is_undefined ? 0 : is_js_null ? 1 : is_boolean ? 2 :
+        //        is_number ? 3 : is_string ? 4 : is_function ? 5 : 6
+        // The tests are mutually exclusive, so a select chain works.
+        let mut code = object_code;
+        for (test, matching) in [
+            (is_function, function_code),
+            (is_string, string_code),
+            (is_number, number_code),
+            (is_boolean, bool_code),
+            (is_js_null, null_code),
+            (is_undefined, undefined_code),
+        ] {
+            code = body.add_op(
+                entry,
+                Operator::Select,
+                &[matching, code, test],
+                &[Type::I32],
+            );
+        }
+
+        // Map the code to a string constant via a conditional-branch chain:
+        // each arm compares the code and returns on match, falling through
+        // to the next arm otherwise. The final "object" arm is the default.
+        let names = [
+            "undefined", "object", "boolean", "number", "string", "function",
+        ];
+        let mut current = entry;
+        for (index, name) in names.iter().enumerate() {
+            let index_const = body.add_op(
+                current,
+                Operator::I32Const {
+                    value: index as u32,
+                },
+                &[],
+                &[Type::I32],
+            );
+            let matches = body.add_op(current, Operator::I32Eq, &[code, index_const], &[Type::I32]);
+            let string = self.new_string(&mut body, current, name.as_bytes())?;
+            let hit = body.add_block();
+            let next = body.add_block();
+            body.set_terminator(
+                current,
+                Terminator::CondBr {
+                    cond: matches,
+                    if_true: BlockTarget {
+                        block: hit,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: next,
+                        args: vec![],
+                    },
+                },
+            );
+            body.set_terminator(hit, Terminator::Return { values: vec![string] });
+            current = next;
+        }
+        // Default arm: "object".
+        let object_string = self.new_string(&mut body, current, b"object")?;
+        body.set_terminator(
+            current,
+            Terminator::Return {
+                values: vec![object_string],
+            },
+        );
+        let function = self.module.funcs.push(FuncDecl::Body(
+            sig,
+            format!("js_typeof_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.typeof_helper = Some(function);
+        Ok(function)
+    }
+
+    fn equality(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        left: &LowerValue,
+        right: &LowerValue,
+        negated: bool,
+    ) -> Result<LowerValue, ConvertError> {
+        let strict = self.strict_equality(body, block, left, right, negated)?;
+        Ok(strict)
+    }
+
+    /// JS `===` / `!==`. Static primitive combinations compare by value
+    /// inline; any comparison involving a value of statically unknown kind
+    /// goes through [`Self::ensure_strict_equality_helper`], which applies
+    /// the full strict-equality algorithm to boxed values — including the
+    /// cases the previous single-`RefEq` fallback got wrong (boxed primitives
+    /// crossing a call/property boundary, and string content equality).
+    ///
+    /// Loose `==` deliberately routes here too for now: it already didn't
+    /// coerce in the reference fallback, and the numeric/boolean paths cover
+    /// the overwhelmingly common `x == 1`-style comparisons. Full loose
+    /// coercion (e.g. `"5" == 5`) remains a known deviation.
+    fn strict_equality(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        left: &LowerValue,
+        right: &LowerValue,
+        negated: bool,
+    ) -> Result<LowerValue, ConvertError> {
+        let (left_value, left_kind) = left.wasm()?;
+        let (right_value, right_kind) = right.wasm()?;
+        let value = match (left_kind, right_kind) {
+            (ValueKind::Number, ValueKind::Number) => body.add_op(
+                block,
+                if negated {
+                    Operator::F64Ne
+                } else {
+                    Operator::F64Eq
+                },
+                &[left_value, right_value],
+                &[Type::I32],
+            ),
+            (ValueKind::Boolean | ValueKind::Integer, ValueKind::Boolean | ValueKind::Integer) => {
+                body.add_op(
+                    block,
+                    if negated {
+                        Operator::I32Ne
+                    } else {
+                        Operator::I32Eq
+                    },
+                    &[left_value, right_value],
+                    &[Type::I32],
+                )
+            }
+            // Statically-known string vs string compares content (two equal
+            // string structs are distinct allocations, so `ref.eq` would be
+            // wrong). Reuses the shape/property byte-equality helper.
+            (ValueKind::Reference, ValueKind::Reference)
+                if matches!(left, LowerValue::String { .. })
+                    && matches!(right, LowerValue::String { .. }) =>
+            {
+                let equal = self.ensure_string_equal()?;
+                let equal = body.add_op(
+                    block,
+                    Operator::Call { function_index: equal },
+                    &[left_value, right_value],
+                    &[Type::I32],
+                );
+                if negated {
+                    body.add_op(block, Operator::I32Eqz, &[equal], &[Type::I32])
+                } else {
+                    equal
+                }
+            }
+            // Any remaining statically-known cross-kind combination (string
+            // vs number, boolean vs string, ...) can never be strict-equal:
+            // strict equality never coerces.
+            //
+            // But a `Reference` whose kind is unknown may hold a boxed
+            // primitive (a value that crossed a call/property boundary), so
+            // reference-vs-primitive must still go through the runtime
+            // helper with the primitive side boxed.
+            (_, _) if matches!(left_kind, ValueKind::Reference)
+                || matches!(right_kind, ValueKind::Reference) =>
+            {
+                let helper = self.ensure_strict_equality_helper()?;
+                let left = self.box_value(body, block, left)?;
+                let right = self.box_value(body, block, right)?;
+                let equal = body.add_op(
+                    block,
+                    Operator::Call { function_index: helper },
+                    &[left, right],
+                    &[Type::I32],
+                );
+                if negated {
+                    body.add_op(block, Operator::I32Eqz, &[equal], &[Type::I32])
+                } else {
+                    equal
+                }
+            }
+            _ => {
+                let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+                // `negated` inverts: `1 !== 2` is true. XOR the constant.
+                if negated {
+                    body.add_op(block, Operator::I32Eqz, &[zero], &[Type::I32])
+                } else {
+                    zero
+                }
+            }
+        };
+        Ok(LowerValue::Wasm {
+            value,
+            kind: ValueKind::Boolean,
+        })
+    }
+
+    /// Full strict equality (`SameValueNonNumeric` plus numeric equality)
+    /// over two boxed values at the `anyref` boundary. Handles every
+    /// combination the inline fast paths cannot prove statically:
+    /// unbox-and-compare for primitives, content equality for strings,
+    /// `ref.eq` for genuine references, and i31-sentinel checks for JS
+    /// `null` (distinguishing it from `undefined`, the null `anyref`).
+    fn ensure_strict_equality_helper(&mut self) -> Result<Func, ConvertError> {
+        if let Some(func) = self.strict_equality_helper {
+            return Ok(func);
+        }
+        let sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.value, self.repr.value],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, sig);
+        let entry = body.entry;
+        let left = body.blocks[entry].params[0].1;
+        let right = body.blocks[entry].params[1].1;
+
+        // Classify both operands once. A non-null `ref.test` returns 0 for
+        // the null `anyref` (undefined) as well, so every later test already
+        // excludes `undefined` without a separate null arm.
+        let left_number = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.number_non_null_ty(),
+            },
+            &[left],
+            &[Type::I32],
+        );
+        let right_number = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.number_non_null_ty(),
+            },
+            &[right],
+            &[Type::I32],
+        );
+        let number_pair = body.add_op(
+            entry,
+            Operator::I32And,
+            &[left_number, right_number],
+            &[Type::I32],
+        );
+        let left_string = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.string_non_null_ty(),
+            },
+            &[left],
+            &[Type::I32],
+        );
+        let right_string = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.string_non_null_ty(),
+            },
+            &[right],
+            &[Type::I32],
+        );
+        let string_pair = body.add_op(
+            entry,
+            Operator::I32And,
+            &[left_string, right_string],
+            &[Type::I32],
+        );
+        let left_boolean = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.boolean_non_null_ty(),
+            },
+            &[left],
+            &[Type::I32],
+        );
+        let right_boolean = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.boolean_non_null_ty(),
+            },
+            &[right],
+            &[Type::I32],
+        );
+        let boolean_pair = body.add_op(
+            entry,
+            Operator::I32And,
+            &[left_boolean, right_boolean],
+            &[Type::I32],
+        );
+        let left_js_null = self.is_js_null(&mut body, entry, left);
+        let right_js_null = self.is_js_null(&mut body, entry, right);
+
+        // Chain of pairwise tests. Within each matched pair the casts are
+        // safe; an unmatched value cannot equal the other side (a primitive
+        // never strict-equals a different primitive or a reference), so each
+        // miss contributes a constant 0 and control continues to the next
+        // test. Values of different kinds and any reference/primitive mix
+        // never reach the wrong branch.
+        let join = body.add_block();
+        let result = body.add_blockparam(join, Type::I32);
+
+        let mut miss_block = entry;
+
+        // 1. Numbers: unbox and compare. `F64Eq` gives correct `NaN !== NaN`
+        //    and `+0 === -0` semantics for free.
+        let number_test = body.add_block();
+        body.set_terminator(
+            miss_block,
+            Terminator::CondBr {
+                cond: number_pair,
+                if_true: BlockTarget {
+                    block: number_test,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: number_test,
+                    args: vec![],
+                },
+            },
+        );
+        let number_miss = body.add_block();
+        let number_hit = body.add_block();
+        body.set_terminator(
+            number_test,
+            Terminator::CondBr {
+                cond: number_pair,
+                if_true: BlockTarget {
+                    block: number_hit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: number_miss,
+                    args: vec![],
+                },
+            },
+        );
+        let left_num = body.add_op(
+            number_hit,
+            Operator::RefCast {
+                ty: self.repr.number_ty(),
+            },
+            &[left],
+            &[self.repr.number_ty()],
+        );
+        let right_num = body.add_op(
+            number_hit,
+            Operator::RefCast {
+                ty: self.repr.number_ty(),
+            },
+            &[right],
+            &[self.repr.number_ty()],
+        );
+        let left_bits = body.add_op(
+            number_hit,
+            Operator::StructGet {
+                sig: self.repr.number,
+                idx: 0,
+            },
+            &[left_num],
+            &[Type::F64],
+        );
+        let right_bits = body.add_op(
+            number_hit,
+            Operator::StructGet {
+                sig: self.repr.number,
+                idx: 0,
+            },
+            &[right_num],
+            &[Type::F64],
+        );
+        let number_equal = body.add_op(
+            number_hit,
+            Operator::F64Eq,
+            &[left_bits, right_bits],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            number_hit,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![number_equal],
+                },
+            },
+        );
+        miss_block = number_miss;
+
+        // 2. Strings: content equality through the byte-compare helper.
+        let string_hit = body.add_block();
+        let string_miss = body.add_block();
+        body.set_terminator(
+            miss_block,
+            Terminator::CondBr {
+                cond: string_pair,
+                if_true: BlockTarget {
+                    block: string_hit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: string_miss,
+                    args: vec![],
+                },
+            },
+        );
+        let left_str = body.add_op(
+            string_hit,
+            Operator::RefCast {
+                ty: self.repr.string_ty(),
+            },
+            &[left],
+            &[self.repr.string_ty()],
+        );
+        let right_str = body.add_op(
+            string_hit,
+            Operator::RefCast {
+                ty: self.repr.string_ty(),
+            },
+            &[right],
+            &[self.repr.string_ty()],
+        );
+        let string_equal = self.ensure_string_equal()?;
+        let strings_equal = body.add_op(
+            string_hit,
+            Operator::Call {
+                function_index: string_equal,
+            },
+            &[left_str, right_str],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            string_hit,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![strings_equal],
+                },
+            },
+        );
+        miss_block = string_miss;
+
+        // 3. Booleans: unbox and compare bits.
+        let boolean_hit = body.add_block();
+        let boolean_miss = body.add_block();
+        body.set_terminator(
+            miss_block,
+            Terminator::CondBr {
+                cond: boolean_pair,
+                if_true: BlockTarget {
+                    block: boolean_hit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: boolean_miss,
+                    args: vec![],
+                },
+            },
+        );
+        let left_bool = body.add_op(
+            boolean_hit,
+            Operator::RefCast {
+                ty: self.repr.boolean_ty(),
+            },
+            &[left],
+            &[self.repr.boolean_ty()],
+        );
+        let right_bool = body.add_op(
+            boolean_hit,
+            Operator::RefCast {
+                ty: self.repr.boolean_ty(),
+            },
+            &[right],
+            &[self.repr.boolean_ty()],
+        );
+        let left_bit = body.add_op(
+            boolean_hit,
+            Operator::StructGet {
+                sig: self.repr.boolean,
+                idx: 0,
+            },
+            &[left_bool],
+            &[Type::I32],
+        );
+        let right_bit = body.add_op(
+            boolean_hit,
+            Operator::StructGet {
+                sig: self.repr.boolean,
+                idx: 0,
+            },
+            &[right_bool],
+            &[Type::I32],
+        );
+        let boolean_equal = body.add_op(
+            boolean_hit,
+            Operator::I32Eq,
+            &[left_bit, right_bit],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            boolean_hit,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![boolean_equal],
+                },
+            },
+        );
+        miss_block = boolean_miss;
+
+        // 4. JS null: two i31 sentinels with the same payload are equal to
+        //    each other and to nothing else (undefined is the null `anyref`,
+        //    so it never passes the i31 test).
+        let null_hit = body.add_block();
+        let null_miss = body.add_block();
+        let either_js_null = body.add_op(
+            miss_block,
+            Operator::I32Or,
+            &[left_js_null, right_js_null],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            miss_block,
+            Terminator::CondBr {
+                cond: either_js_null,
+                if_true: BlockTarget {
+                    block: null_hit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: null_miss,
+                    args: vec![],
+                },
+            },
+        );
+        let nulls_equal = body.add_op(
+            null_hit,
+            Operator::I32And,
+            &[left_js_null, right_js_null],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            null_hit,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![nulls_equal],
+                },
+            },
+        );
+
+        // 5. Genuine references: `ref.eq`. Requires `eqref` operands, so cast
+        //    both sides; every value this backend produces (struct, array,
+        //    i31, null) is an eqref subtype, so the cast cannot trap.
+        let eq = self.repr.eq_ty();
+        let left_eq = body.add_op(null_miss, Operator::RefCast { ty: eq }, &[left], &[eq]);
+        let right_eq = body.add_op(null_miss, Operator::RefCast { ty: eq }, &[right], &[eq]);
+        let references_equal = body.add_op(
+            null_miss,
+            Operator::RefEq,
+            &[left_eq, right_eq],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            null_miss,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![references_equal],
+                },
+            },
+        );
+
+        body.set_terminator(
+            join,
+            Terminator::Return {
+                values: vec![result],
+            },
+        );
+
+        let func = self.module.funcs.push(FuncDecl::Body(
+            sig,
+            format!("js_strict_equal_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.strict_equality_helper = Some(func);
+        Ok(func)
+    }
+
+    fn as_f64(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        value: &LowerValue,
+    ) -> Result<Value, ConvertError> {
+        let (value, kind) = value.wasm()?;
+        Ok(match kind {
+            ValueKind::Number => value,
+            ValueKind::Boolean | ValueKind::Integer => {
+                body.add_op(block, Operator::F64ConvertI32S, &[value], &[Type::F64])
+            }
+            ValueKind::Reference => {
+                let to_number = self.ensure_to_number_helper()?;
+                body.add_op(
+                    block,
+                    Operator::Call {
+                        function_index: to_number,
+                    },
+                    &[value],
+                    &[Type::F64],
+                )
+            }
+        })
+    }
+
+    /// Generic numeric coercion of a boxed JS value at the `anyref`
+    /// boundary: the shared JS `ToNumber` surface. Numbers unbox to their
+    /// f64, boxed booleans coerce to `0`/`1`, explicit `null` (the i31
+    /// sentinel) to `0`, `undefined` (the null `anyref`) to `NaN`, and every
+    /// other reference traps — matching the previous inline
+    /// `ref.cast`+`struct.get` behavior for non-numeric objects while no
+    /// longer trapping on values JS itself coerces.
+    fn ensure_to_number_helper(&mut self) -> Result<Func, ConvertError> {
+        if let Some(func) = self.to_number_helper {
+            return Ok(func);
+        }
+        let sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.value],
+            returns: vec![Type::F64],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, sig);
+        let entry = body.entry;
+        let value = body.blocks[entry].params[0].1;
+
+        // Classify once in the entry block; the i32 conditions dominate
+        // every later block, so each branch can test them directly.
+        let is_number = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.number_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let is_boolean = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.boolean_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let is_js_null = self.is_js_null(&mut body, entry, value);
+        let is_undefined = body.add_op(entry, Operator::RefIsNull, &[value], &[Type::I32]);
+
+        // Priority chain: number hit -> unbox f64; boolean hit -> 0/1;
+        // JS null -> 0.0; undefined -> NaN; anything else -> trap.
+        let unbox = body.add_block();
+        let check_boolean = body.add_block();
+        let unbox_boolean = body.add_block();
+        let check_null = body.add_block();
+        let null_hit = body.add_block();
+        let check_undefined = body.add_block();
+        let undefined_hit = body.add_block();
+        let other = body.add_block();
+
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: is_number,
+                if_true: BlockTarget {
+                    block: unbox,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: check_boolean,
+                    args: vec![],
+                },
+            },
+        );
+        let number_struct = body.add_op(
+            unbox,
+            Operator::RefCast {
+                ty: self.repr.number_ty(),
+            },
+            &[value],
+            &[self.repr.number_ty()],
+        );
+        let number = body.add_op(
+            unbox,
+            Operator::StructGet {
+                sig: self.repr.number,
+                idx: 0,
+            },
+            &[number_struct],
+            &[Type::F64],
+        );
+        body.set_terminator(unbox, Terminator::Return { values: vec![number] });
+
+        body.set_terminator(
+            check_boolean,
+            Terminator::CondBr {
+                cond: is_boolean,
+                if_true: BlockTarget {
+                    block: unbox_boolean,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: check_null,
+                    args: vec![],
+                },
+            },
+        );
+        let boolean_struct = body.add_op(
+            unbox_boolean,
+            Operator::RefCast {
+                ty: self.repr.boolean_ty(),
+            },
+            &[value],
+            &[self.repr.boolean_ty()],
+        );
+        let bit = body.add_op(
+            unbox_boolean,
+            Operator::StructGet {
+                sig: self.repr.boolean,
+                idx: 0,
+            },
+            &[boolean_struct],
+            &[Type::I32],
+        );
+        let boolean_number = body.add_op(
+            unbox_boolean,
+            Operator::F64ConvertI32S,
+            &[bit],
+            &[Type::F64],
+        );
+        body.set_terminator(
+            unbox_boolean,
+            Terminator::Return {
+                values: vec![boolean_number],
+            },
+        );
+
+        body.set_terminator(
+            check_null,
+            Terminator::CondBr {
+                cond: is_js_null,
+                if_true: BlockTarget {
+                    block: null_hit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: check_undefined,
+                    args: vec![],
+                },
+            },
+        );
+        let zero = body.add_op(null_hit, Operator::F64Const { value: 0.0f64.to_bits() }, &[], &[Type::F64]);
+        body.set_terminator(null_hit, Terminator::Return { values: vec![zero] });
+
+        body.set_terminator(
+            check_undefined,
+            Terminator::CondBr {
+                cond: is_undefined,
+                if_true: BlockTarget {
+                    block: undefined_hit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: other,
+                    args: vec![],
+                },
+            },
+        );
+        let nan = body.add_op(
+            undefined_hit,
+            Operator::F64Const {
+                value: f64::NAN.to_bits(),
+            },
+            &[],
+            &[Type::F64],
+        );
+        body.set_terminator(
+            undefined_hit,
+            Terminator::Return { values: vec![nan] },
+        );
+        // Per spec, ToNumber of a plain object is NaN (ToPrimitive
+        // yields "[object Object]", which parses as NaN). Any reference
+        // shape this helper does not otherwise recognize — objects,
+        // functions, unhandled strings — follows that same NaN result
+        // rather than trapping.
+        let object_nan = body.add_op(
+            other,
+            Operator::F64Const {
+                value: f64::NAN.to_bits(),
+            },
+            &[],
+            &[Type::F64],
+        );
+        body.set_terminator(other, Terminator::Return { values: vec![object_nan] });
+
+        let func = self.module.funcs.push(FuncDecl::Body(
+            sig,
+            format!("js_to_number_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.to_number_helper = Some(func);
+        Ok(func)
+    }
+
+
+
+    fn as_i32(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        value: &LowerValue,
+    ) -> Result<Value, ConvertError> {
+        let (value, kind) = value.wasm()?;
+        Ok(match kind {
+            ValueKind::Boolean | ValueKind::Integer => value,
+            ValueKind::Number => body.add_op(block, Operator::I32TruncF64S, &[value], &[Type::I32]),
+            ValueKind::Reference => {
+                let boxed = LowerValue::Wasm { value, kind };
+                let number = self.as_f64(body, block, &boxed)?;
+                body.add_op(block, Operator::I32TruncF64S, &[number], &[Type::I32])
+            }
+        })
+    }
+
+    fn as_condition(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        value: &LowerValue,
+    ) -> Result<Value, ConvertError> {
+        let (value, kind) = value.wasm()?;
+        Ok(match kind {
+            ValueKind::Boolean | ValueKind::Integer => value,
+            ValueKind::Number => {
+                let zero = body.add_op(
+                    block,
+                    Operator::F64Const {
+                        value: 0.0f64.to_bits(),
+                    },
+                    &[],
+                    &[Type::F64],
+                );
+                body.add_op(block, Operator::F64Ne, &[value, zero], &[Type::I32])
+            }
+            ValueKind::Reference => {
+                let helper = self.ensure_truthy_helper()?;
+                body.add_op(
+                    block,
+                    Operator::Call {
+                        function_index: helper,
+                    },
+                    &[value],
+                    &[Type::I32],
+                )
+            }
+        })
+    }
+
+    /// Generic JS `ToBoolean` for a value already at the `anyref` boundary.
+    /// Only a boxed `false` and `null`/`undefined` are falsy here — every
+    /// other reference (object, function, string, boxed non-zero number) is
+    /// truthy. Lazily generated as its own function (rather than inlined at
+    /// every `as_condition` call site) so callers keep their existing
+    /// single-block, non-branching contract.
+    fn ensure_truthy_helper(&mut self) -> Result<Func, ConvertError> {
+        if let Some(func) = self.truthy_helper {
+            return Ok(func);
+        }
+        let sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.value],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, sig);
+        let entry = body.entry;
+        let value = body.blocks[entry].params[0].1;
+        let is_null = body.add_op(entry, Operator::RefIsNull, &[value], &[Type::I32]);
+        let non_null = body.add_block();
+        let is_null_block = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: is_null,
+                if_true: BlockTarget {
+                    block: is_null_block,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: non_null,
+                    args: vec![],
+                },
+            },
+        );
+        let zero = body.add_op(is_null_block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        body.set_terminator(
+            is_null_block,
+            Terminator::Return { values: vec![zero] },
+        );
+
+        let boolean_non_null_ty = Type::Heap(WithNullable {
+            value: HeapType::Sig {
+                sig_index: self.repr.boolean,
+            },
+            nullable: false,
+        });
+        let is_boolean = body.add_op(
+            non_null,
+            Operator::RefTest {
+                ty: boolean_non_null_ty,
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let unbox = body.add_block();
+        let truthy = body.add_block();
+        body.set_terminator(
+            non_null,
+            Terminator::CondBr {
+                cond: is_boolean,
+                if_true: BlockTarget {
+                    block: unbox,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: truthy,
+                    args: vec![],
+                },
+            },
+        );
+        let boxed = body.add_op(
+            unbox,
+            Operator::RefCast {
+                ty: self.repr.boolean_ty(),
+            },
+            &[value],
+            &[self.repr.boolean_ty()],
+        );
+        let bit = body.add_op(
+            unbox,
+            Operator::StructGet {
+                sig: self.repr.boolean,
+                idx: 0,
+            },
+            &[boxed],
+            &[Type::I32],
+        );
+        body.set_terminator(unbox, Terminator::Return { values: vec![bit] });
+        let one = body.add_op(truthy, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        body.set_terminator(truthy, Terminator::Return { values: vec![one] });
+
+        let func = self.module.funcs.push(FuncDecl::Body(
+            sig,
+            format!("js_truthy_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.truthy_helper = Some(func);
+        Ok(func)
+    }
+
+    fn undef(&self, body: &mut FunctionBody, block: Block) -> LowerValue {
+        LowerValue::Wasm {
+            value: body.add_op(
+                block,
+                Operator::RefNull {
+                    ty: self.repr.value,
+                },
+                &[],
+                &[self.repr.value],
+            ),
+            kind: ValueKind::Reference,
+        }
+    }
+
+    /// The JS `null` value. `undefined` keeps the null `anyref`, so `null`
+    /// needs its own representation: an [`JS_NULL_SENTINEL`] i31. That makes
+    /// `x === null` a `ref.test (ref i31)`, keeps `null === null` and
+    /// `null === undefined` trivially correct under `ref.eq` (equal and
+    /// unequal respectively), and costs one constant plus one instruction.
+    fn js_null(&self, body: &mut FunctionBody, block: Block) -> LowerValue {
+        let sentinel = body.add_op(
+            block,
+            Operator::I32Const {
+                value: JS_NULL_SENTINEL as u32,
+            },
+            &[],
+            &[Type::I32],
+        );
+        LowerValue::Wasm {
+            value: body.add_op(block, Operator::RefI31, &[sentinel], &[self.repr.value]),
+            kind: ValueKind::Reference,
+        }
+    }
+
+    /// `value === JS null` as a raw i32 condition. Used by strict equality,
+    /// the truthiness helper's caller-adjacent fast paths, and any primordial
+    /// that must distinguish "absent" from "explicitly null".
+    fn is_js_null(&self, body: &mut FunctionBody, block: Block, value: Value) -> Value {
+        body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.i31_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        )
+    }
+
+    fn box_value(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        value: &LowerValue,
+    ) -> Result<Value, ConvertError> {
+        let (value, kind) = value.wasm()?;
+        let value = match kind {
+            ValueKind::Reference => value,
+            ValueKind::Number => body.add_op(
+                block,
+                Operator::StructNew {
+                    sig: self.repr.number,
+                },
+                &[value],
+                &[self.repr.number_ty()],
+            ),
+            ValueKind::Boolean => body.add_op(
+                block,
+                Operator::StructNew {
+                    sig: self.repr.boolean,
+                },
+                &[value],
+                &[self.repr.boolean_ty()],
+            ),
+            ValueKind::Integer => {
+                let number = body.add_op(block, Operator::F64ConvertI32S, &[value], &[Type::F64]);
+                body.add_op(
+                    block,
+                    Operator::StructNew {
+                        sig: self.repr.number,
+                    },
+                    &[number],
+                    &[self.repr.number_ty()],
+                )
+            }
+        };
+        // Waffle's reducer requires exact block/call argument types. Normalize
+        // every heap escape to the ABI's nullable `anyref`, even when the
+        // underlying value is a more precise object, function, or box type.
+        Ok(body.add_op(
+            block,
+            Operator::RefCast {
+                ty: self.repr.value,
+            },
+            &[value],
+            &[self.repr.value],
+        ))
+    }
+
+    fn anyref(&self, body: &mut FunctionBody, block: Block, value: Value) -> Value {
+        body.add_op(
+            block,
+            Operator::RefCast {
+                ty: self.repr.value,
+            },
+            &[value],
+            &[self.repr.value],
+        )
+    }
+
+    fn new_trie(&self, body: &mut FunctionBody, block: Block) -> Result<Value, ConvertError> {
+        Ok(body.add_op(
+            block,
+            Operator::StructNewDefault {
+                sig: self.repr.trie,
+            },
+            &[],
+            &[self.repr.trie_ty()],
+        ))
+    }
+
+    fn clone_trie(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        trie: Value,
+    ) -> Result<Value, ConvertError> {
+        let function = self.ensure_trie_clone_function()?;
+        Ok(body.add_op(
+            block,
+            Operator::Call {
+                function_index: function,
+            },
+            &[trie],
+            &[self.repr.trie_ty()],
+        ))
+    }
+
+    fn ensure_trie_clone_function(&mut self) -> Result<Func, ConvertError> {
+        if let Some(function) = self.trie_clone {
+            return Ok(function);
+        }
+        let signature = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.trie_ty()],
+            returns: vec![self.repr.trie_ty()],
+            shared: false,
+        });
+        let body = FunctionBody::new(self.module, signature);
+        let function = self.module.funcs.push(FuncDecl::Body(
+            signature,
+            format!("js_clone_trie_{}", self.module.funcs.len()),
+            body,
+        ));
+        // Record the function before filling its body so every present child
+        // can recursively call the same helper.
+        self.trie_clone = Some(function);
+
+        let mut declaration = take(&mut self.module.funcs[function]);
+        let result = (|| {
+            let body = declaration.body_mut().ok_or_else(|| {
+                ConvertError::invalid("generated trie-clone function has no body")
+            })?;
+            let mut block = body.entry;
+            let source = body.blocks[block].params[0].1;
+            let target = self.new_trie(body, block)?;
+            let value = body.add_op(
+                block,
+                Operator::StructGet {
+                    sig: self.repr.trie,
+                    idx: 0,
+                },
+                &[source],
+                &[self.repr.slot_ty()],
+            );
+            body.add_op(
+                block,
+                Operator::StructSet {
+                    sig: self.repr.trie,
+                    idx: 0,
+                },
+                &[target, value],
+                &[],
+            );
+
+            for byte in u8::MIN..=u8::MAX {
+                let child = body.add_op(
+                    block,
+                    Operator::StructGet {
+                        sig: self.repr.trie,
+                        idx: usize::from(byte) + 1,
+                    },
+                    &[source],
+                    &[self.repr.value],
+                );
+                let missing = body.add_op(block, Operator::RefIsNull, &[child], &[Type::I32]);
+                let absent = body.add_block();
+                let present = body.add_block();
+                let join = body.add_block();
+                let copied = body.add_blockparam(join, self.repr.value);
+                body.set_terminator(
+                    block,
+                    Terminator::CondBr {
+                        cond: missing,
+                        if_true: BlockTarget {
+                            block: absent,
+                            args: vec![],
+                        },
+                        if_false: BlockTarget {
+                            block: present,
+                            args: vec![],
+                        },
+                    },
+                );
+                body.set_terminator(
+                    absent,
+                    Terminator::Br {
+                        target: BlockTarget {
+                            block: join,
+                            args: vec![child],
+                        },
+                    },
+                );
+                let child = body.add_op(
+                    present,
+                    Operator::RefCast {
+                        ty: self.repr.trie_ty(),
+                    },
+                    &[child],
+                    &[self.repr.trie_ty()],
+                );
+                let child = body.add_op(
+                    present,
+                    Operator::Call {
+                        function_index: function,
+                    },
+                    &[child],
+                    &[self.repr.trie_ty()],
+                );
+                let child = body.add_op(
+                    present,
+                    Operator::RefCast {
+                        ty: self.repr.value,
+                    },
+                    &[child],
+                    &[self.repr.value],
+                );
+                body.set_terminator(
+                    present,
+                    Terminator::Br {
+                        target: BlockTarget {
+                            block: join,
+                            args: vec![child],
+                        },
+                    },
+                );
+                body.add_op(
+                    join,
+                    Operator::StructSet {
+                        sig: self.repr.trie,
+                        idx: usize::from(byte) + 1,
+                    },
+                    &[target, copied],
+                    &[],
+                );
+                block = join;
+            }
+            body.set_terminator(
+                block,
+                Terminator::Return {
+                    values: vec![target],
+                },
+            );
+            Ok(())
+        })();
+        self.module.funcs[function] = declaration;
+        result?;
+        Ok(function)
+    }
+
+    fn new_object(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+    ) -> Result<LowerValue, ConvertError> {
+        let trie = self.new_trie(body, block)?;
+        let root = self.anyref(body, block, trie);
+        self.new_object_with_root(body, block, root)
+    }
+
+    fn new_object_with_root(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        root: Value,
+    ) -> Result<LowerValue, ConvertError> {
+        let elements = body.add_op(
+            block,
+            Operator::RefNull {
+                ty: self.repr.arguments_ty(),
+            },
+            &[],
+            &[self.repr.arguments_ty()],
+        );
+        let properties = body.add_op(
+            block,
+            Operator::RefNull { ty: self.repr.value },
+            &[],
+            &[self.repr.value],
+        );
+        let typed_data = body.add_op(
+            block,
+            Operator::RefNull { ty: self.repr.value },
+            &[],
+            &[self.repr.value],
+        );
+        let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let object = body.add_op(
+            block,
+            Operator::StructNew {
+                sig: self.repr.object,
+            },
+            &[root, elements, properties, typed_data, zero, zero, zero],
+            &[self.repr.object_ty()],
+        );
+        Ok(LowerValue::Wasm {
+            value: object,
+            kind: ValueKind::Reference,
+        })
+    }
+
+    fn new_descriptor(&self, body: &mut FunctionBody, block: Block) -> Value {
+        let absent_getter = body.add_op(
+            block,
+            Operator::RefNull {
+                ty: self.repr.value,
+            },
+            &[],
+            &[self.repr.value],
+        );
+        let absent_setter = body.add_op(
+            block,
+            Operator::RefNull {
+                ty: self.repr.value,
+            },
+            &[],
+            &[self.repr.value],
+        );
+        body.add_op(
+            block,
+            Operator::StructNew {
+                sig: self.repr.descriptor,
+            },
+            &[absent_getter, absent_setter],
+            &[self.repr.descriptor_ty()],
+        )
+    }
+
+    fn new_shape(&self, body: &mut FunctionBody, block: Block, index: usize) -> Result<Value, ConvertError> {
+        let shape = self
+            .shapes
+            .get(index)
+            .ok_or_else(|| ConvertError::invalid("unknown generated object shape"))?;
+        let fallback = self.new_trie(body, block)?;
+        let mut fields = Vec::with_capacity(shape.keys.len() + 1);
+        fields.push(fallback);
+        for _ in &shape.keys {
+            fields.push(body.add_op(
+                block,
+                Operator::RefNull {
+                    ty: self.repr.slot_ty(),
+                },
+                &[],
+                &[self.repr.slot_ty()],
+            ));
+        }
+        let shape = body.add_op(
+            block,
+            Operator::StructNew { sig: shape.sig },
+            &fields,
+            &[ref_sig(shape.sig)],
+        );
+        Ok(self.anyref(body, block, shape))
+    }
+
+    /// Wrap a value in a fresh property slot carrying the given attribute
+    /// flags (a dynamic i32, e.g. one already loaded from an existing slot).
+    fn new_slot(&self, body: &mut FunctionBody, block: Block, value: Value, flags: Value) -> Value {
+        body.add_op(
+            block,
+            Operator::StructNew {
+                sig: self.repr.slot,
+            },
+            &[value, flags],
+            &[self.repr.slot_ty()],
+        )
+    }
+
+    /// Like [`Self::new_slot`], but for a flags bitset known at generation
+    /// time (an [`crate::repr::SLOT_WRITABLE`]-style constant combination).
+    fn new_slot_literal(&self, body: &mut FunctionBody, block: Block, value: Value, flags: i32) -> Value {
+        let flags = body.add_op(
+            block,
+            Operator::I32Const {
+                value: flags as u32,
+            },
+            &[],
+            &[Type::I32],
+        );
+        self.new_slot(body, block, value, flags)
+    }
+
+    /// Unwrap a (possibly null) property slot into the value it stores. An
+    /// absent slot (no such own property) becomes the same null `value` a
+    /// bare-value trie bucket used to represent directly, before slots
+    /// existed.
+    fn unwrap_slot(&self, body: &mut FunctionBody, block: Block, slot: Value) -> (Block, Value) {
+        let is_null = body.add_op(block, Operator::RefIsNull, &[slot], &[Type::I32]);
+        let absent = body.add_block();
+        let present = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_null,
+                if_true: BlockTarget {
+                    block: absent,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: present,
+                    args: vec![],
+                },
+            },
+        );
+        let undef = body.add_op(
+            absent,
+            Operator::RefNull {
+                ty: self.repr.value,
+            },
+            &[],
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            absent,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![undef],
+                },
+            },
+        );
+        let cast = body.add_op(
+            present,
+            Operator::RefCast {
+                ty: self.repr.slot_non_null_ty(),
+            },
+            &[slot],
+            &[self.repr.slot_non_null_ty()],
+        );
+        let value = body.add_op(
+            present,
+            Operator::StructGet {
+                sig: self.repr.slot,
+                idx: 0,
+            },
+            &[cast],
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            present,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![value],
+                },
+            },
+        );
+        (join, result)
+    }
+
+    /// Extract a (possibly null) property slot's attribute flags, defaulting
+    /// to [`crate::repr::SLOT_FLAGS_DEFAULT`] for an absent slot (a brand new
+    /// own property behaves as ordinary/unrestricted until told otherwise).
+    fn slot_flags_or_default(&self, body: &mut FunctionBody, block: Block, slot: Value) -> (Block, Value) {
+        let is_null = body.add_op(block, Operator::RefIsNull, &[slot], &[Type::I32]);
+        let absent = body.add_block();
+        let present = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, Type::I32);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_null,
+                if_true: BlockTarget {
+                    block: absent,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: present,
+                    args: vec![],
+                },
+            },
+        );
+        let default = body.add_op(
+            absent,
+            Operator::I32Const {
+                value: crate::repr::SLOT_FLAGS_DEFAULT as u32,
+            },
+            &[],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            absent,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![default],
+                },
+            },
+        );
+        let cast = body.add_op(
+            present,
+            Operator::RefCast {
+                ty: self.repr.slot_non_null_ty(),
+            },
+            &[slot],
+            &[self.repr.slot_non_null_ty()],
+        );
+        let flags = body.add_op(
+            present,
+            Operator::StructGet {
+                sig: self.repr.slot,
+                idx: 1,
+            },
+            &[cast],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            present,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![flags],
+                },
+            },
+        );
+        (join, result)
+    }
+
+    /// Perform the trie/shape "set" only if `flags` says the slot is
+    /// writable — silently a no-op otherwise (non-strict-mode assignment to
+    /// a non-writable property). `flags` should come from
+    /// [`Self::slot_flags_or_default`] applied to the property's existing
+    /// slot, so a brand-new property (which defaults to writable) is never
+    /// blocked.
+    fn write_slot_if_writable(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        root: Value,
+        key: Value,
+        slot: Value,
+        flags: Value,
+        offset: Value,
+    ) -> Result<Block, ConvertError> {
+        let helpers = self.ensure_property_helpers()?;
+        let writable = self.slot_flag_bit(body, block, flags, crate::repr::SLOT_WRITABLE);
+        let do_write = body.add_block();
+        let join = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: writable,
+                if_true: BlockTarget {
+                    block: do_write,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: join,
+                    args: vec![],
+                },
+            },
+        );
+        body.add_op(
+            do_write,
+            Operator::Call {
+                function_index: helpers.set,
+            },
+            &[root, key, slot, offset],
+            &[],
+        );
+        body.set_terminator(
+            do_write,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![],
+                },
+            },
+        );
+        Ok(join)
+    }
+
+    /// Arrays are ordinary objects whose second header field carries the
+    /// element component.  This deliberately gives them the same static
+    /// property trie as object literals.
+    fn new_array_object(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        elements: Value,
+    ) -> Result<Value, ConvertError> {
+        let trie = self.new_trie(body, block)?;
+        let trie = self.anyref(body, block, trie);
+        let properties = body.add_op(
+            block,
+            Operator::RefNull { ty: self.repr.value },
+            &[],
+            &[self.repr.value],
+        );
+        let typed_data = body.add_op(
+            block,
+            Operator::RefNull { ty: self.repr.value },
+            &[],
+            &[self.repr.value],
+        );
+        let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        Ok(body.add_op(
+            block,
+            Operator::StructNew {
+                sig: self.repr.object,
+            },
+            &[trie, elements, properties, typed_data, zero, zero, zero],
+            &[self.repr.object_ty()],
+        ))
+    }
+
+    fn new_string(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        bytes: &[u8],
+    ) -> Result<Value, ConvertError> {
+        let bytes = bytes
+            .iter()
+            .map(|byte| {
+                body.add_op(
+                    block,
+                    Operator::I32Const {
+                        value: u32::from(*byte),
+                    },
+                    &[],
+                    &[Type::I32],
+                )
+            })
+            .collect::<Vec<_>>();
+        let bytes = body.add_op(
+            block,
+            Operator::ArrayNewFixed {
+                sig: self.repr.utf8,
+                num: bytes.len(),
+            },
+            &bytes,
+            &[self.repr.utf8_ty()],
+        );
+        let cache = body.add_op(
+            block,
+            Operator::RefNull {
+                ty: self.repr.utf16_ty(),
+            },
+            &[],
+            &[self.repr.utf16_ty()],
+        );
+        Ok(body.add_op(
+            block,
+            Operator::StructNew {
+                sig: self.repr.string,
+            },
+            &[bytes, cache],
+            &[self.repr.string_ty()],
+        ))
+    }
+
+    /// Shared runtime `+` over two boxed values: if both operands are
+    /// strings, concatenate; otherwise coerce both through the shared
+    /// ToNumber surface and add. Returns one boxed result, so a single
+    /// `Call` with no local branching serves every dynamic `+` site.
+    fn ensure_add_helper(&mut self) -> Result<Func, ConvertError> {
+        if let Some(func) = self.add_helper {
+            return Ok(func);
+        }
+        let signature = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.value, self.repr.value],
+            returns: vec![self.repr.value],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let left = body.blocks[entry].params[0].1;
+        let right = body.blocks[entry].params[1].1;
+
+        let left_string = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.string_ty(),
+            },
+            &[left],
+            &[Type::I32],
+        );
+        let right_string = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.string_ty(),
+            },
+            &[right],
+            &[Type::I32],
+        );
+        let both = body.add_op(entry, Operator::I32And, &[left_string, right_string], &[Type::I32]);
+        let concat = body.add_block();
+        let numeric = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: both,
+                if_true: BlockTarget { block: concat, args: vec![] },
+                if_false: BlockTarget { block: numeric, args: vec![] },
+            },
+        );
+
+        let concat_fn = self.ensure_string_concat()?;
+        let left_string_ref = body.add_op(
+            concat,
+            Operator::RefCast {
+                ty: self.repr.string_ty(),
+            },
+            &[left],
+            &[self.repr.string_ty()],
+        );
+        let right_string_ref = body.add_op(
+            concat,
+            Operator::RefCast {
+                ty: self.repr.string_ty(),
+            },
+            &[right],
+            &[self.repr.string_ty()],
+        );
+        let string = body.add_op(
+            concat,
+            Operator::Call {
+                function_index: concat_fn,
+            },
+            &[left_string_ref, right_string_ref],
+            &[self.repr.string_ty()],
+        );
+        let string_result = body.add_op(
+            concat,
+            Operator::RefCast { ty: self.repr.value },
+            &[string],
+            &[self.repr.value],
+        );
+        body.set_terminator(concat, Terminator::Return { values: vec![string_result] });
+
+        let to_number = self.ensure_to_number_helper()?;
+        let left_number = body.add_op(
+            numeric,
+            Operator::Call {
+                function_index: to_number,
+            },
+            &[left],
+            &[Type::F64],
+        );
+        let right_number = body.add_op(
+            numeric,
+            Operator::Call {
+                function_index: to_number,
+            },
+            &[right],
+            &[Type::F64],
+        );
+        let sum = body.add_op(numeric, Operator::F64Add, &[left_number, right_number], &[Type::F64]);
+        let boxed = body.add_op(
+            numeric,
+            Operator::StructNew { sig: self.repr.number },
+            &[sum],
+            &[self.repr.number_ty()],
+        );
+        let boxed_result = body.add_op(
+            numeric,
+            Operator::RefCast { ty: self.repr.value },
+            &[boxed],
+            &[self.repr.value],
+        );
+        body.set_terminator(numeric, Terminator::Return { values: vec![boxed_result] });
+
+        let func = self.module.funcs.push(FuncDecl::Body(
+            signature,
+            format!("js_add_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.add_helper = Some(func);
+        Ok(func)
+    }
+
+    fn ensure_string_concat(&mut self) -> Result<Func, ConvertError> {
+        if let Some(function) = self.string_concat {
+            return Ok(function);
+        }
+        let signature = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.string_ty(), self.repr.string_ty()],
+            returns: vec![self.repr.string_ty()],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let left = body.blocks[entry].params[0].1;
+        let right = body.blocks[entry].params[1].1;
+        let left_bytes = body.add_op(
+            entry,
+            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            &[left],
+            &[self.repr.utf8_ty()],
+        );
+        let right_bytes = body.add_op(
+            entry,
+            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            &[right],
+            &[self.repr.utf8_ty()],
+        );
+        let left_len = body.add_op(entry, Operator::ArrayLen, &[left_bytes], &[Type::I32]);
+        let right_len = body.add_op(entry, Operator::ArrayLen, &[right_bytes], &[Type::I32]);
+        let total = body.add_op(entry, Operator::I32Add, &[left_len, right_len], &[Type::I32]);
+        let bytes = body.add_op(
+            entry,
+            Operator::ArrayNewDefault { sig: self.repr.utf8 },
+            &[total],
+            &[self.repr.utf8_ty()],
+        );
+        let zero = body.add_op(entry, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        body.add_op(
+            entry,
+            Operator::ArrayCopy {
+                dest: self.repr.utf8,
+                src: self.repr.utf8,
+            },
+            &[bytes, zero, left_bytes, zero, left_len],
+            &[],
+        );
+        body.add_op(
+            entry,
+            Operator::ArrayCopy {
+                dest: self.repr.utf8,
+                src: self.repr.utf8,
+            },
+            &[bytes, left_len, right_bytes, zero, right_len],
+            &[],
+        );
+        let cache = body.add_op(
+            entry,
+            Operator::RefNull {
+                ty: self.repr.utf16_ty(),
+            },
+            &[],
+            &[self.repr.utf16_ty()],
+        );
+        let string = body.add_op(
+            entry,
+            Operator::StructNew { sig: self.repr.string },
+            &[bytes, cache],
+            &[self.repr.string_ty()],
+        );
+        body.set_terminator(entry, Terminator::Return { values: vec![string] });
+        let function = self.module.funcs.push(FuncDecl::Body(
+            signature,
+            format!("js_string_concat_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.string_concat = Some(function);
+        Ok(function)
+    }
+
+    fn utf16_unit_from_wtf8(bytes: &[u8], target: u32) -> Option<u16> {
+        let mut offset = 0usize;
+        let mut index = 0u32;
+        while offset < bytes.len() {
+            let first = bytes[offset];
+            let (code_point, width) = if first < 0x80 {
+                (u32::from(first), 1)
+            } else if first < 0xe0 {
+                (
+                    (u32::from(first & 0x1f) << 6) | u32::from(bytes[offset + 1] & 0x3f),
+                    2,
+                )
+            } else if first < 0xf0 {
+                (
+                    (u32::from(first & 0x0f) << 12)
+                        | (u32::from(bytes[offset + 1] & 0x3f) << 6)
+                        | u32::from(bytes[offset + 2] & 0x3f),
+                    3,
+                )
+            } else {
+                (
+                    (u32::from(first & 0x07) << 18)
+                        | (u32::from(bytes[offset + 1] & 0x3f) << 12)
+                        | (u32::from(bytes[offset + 2] & 0x3f) << 6)
+                        | u32::from(bytes[offset + 3] & 0x3f),
+                    4,
+                )
+            };
+            if code_point <= 0xffff {
+                if index == target {
+                    return u16::try_from(code_point).ok();
+                }
+                index += 1;
+            } else {
+                let pair = code_point - 0x1_0000;
+                let high = 0xd800 | u16::try_from(pair >> 10).ok()?;
+                let low = 0xdc00 | u16::try_from(pair & 0x3ff).ok()?;
+                if index == target {
+                    return Some(high);
+                }
+                if index + 1 == target {
+                    return Some(low);
+                }
+                index += 2;
+            }
+            offset += width;
+        }
+        None
+    }
+
+    fn wtf8_for_utf16_unit(unit: u16) -> Vec<u8> {
+        let unit = u32::from(unit);
+        if unit < 0x80 {
+            vec![unit as u8]
+        } else if unit < 0x800 {
+            vec![(0xc0 | (unit >> 6)) as u8, (0x80 | (unit & 0x3f)) as u8]
+        } else {
+            vec![
+                (0xe0 | (unit >> 12)) as u8,
+                (0x80 | ((unit >> 6) & 0x3f)) as u8,
+                (0x80 | (unit & 0x3f)) as u8,
+            ]
+        }
+    }
+
+    fn literal_string_index(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        bytes: &[u8],
+        index: u32,
+    ) -> Result<LowerValue, ConvertError> {
+        let Some(unit) = Self::utf16_unit_from_wtf8(bytes, index) else {
+            return Ok(self.undef(body, block));
+        };
+        let bytes = Self::wtf8_for_utf16_unit(unit);
+        let key = String::from_utf8_lossy(&bytes).into_owned();
+        Ok(LowerValue::String {
+            value: self.new_string(body, block, &bytes)?,
+            key,
+            bytes,
+        })
+    }
+
+    fn ensure_string_utf16(&mut self) -> Result<Func, ConvertError> {
+        if let Some(function) = self.string_utf16 {
+            return Ok(function);
+        }
+        let signature = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.string_ty()],
+            returns: vec![self.repr.utf16_ty()],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let string = body.blocks[entry].params[0].1;
+        let cache = body.add_op(
+            entry,
+            Operator::StructGet { sig: self.repr.string, idx: 1 },
+            &[string],
+            &[self.repr.utf16_ty()],
+        );
+        let cached = body.add_block();
+        let compute = body.add_block();
+        let absent = body.add_op(entry, Operator::RefIsNull, &[cache], &[Type::I32]);
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: absent,
+                if_true: BlockTarget { block: compute, args: vec![] },
+                if_false: BlockTarget { block: cached, args: vec![] },
+            },
+        );
+        body.set_terminator(cached, Terminator::Return { values: vec![cache] });
+
+        let bytes = body.add_op(
+            compute,
+            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            &[string],
+            &[self.repr.utf8_ty()],
+        );
+        let byte_length = body.add_op(compute, Operator::ArrayLen, &[bytes], &[Type::I32]);
+        let scan = body.add_block();
+        let position = body.add_blockparam(scan, Type::I32);
+        let units = body.add_blockparam(scan, Type::I32);
+        let zero = body.add_op(compute, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        body.set_terminator(
+            compute,
+            Terminator::Br {
+                target: BlockTarget { block: scan, args: vec![zero, zero] },
+            },
+        );
+        let complete = body.add_op(scan, Operator::I32GeU, &[position, byte_length], &[Type::I32]);
+        let allocate = body.add_block();
+        let step = body.add_block();
+        body.set_terminator(
+            scan,
+            Terminator::CondBr {
+                cond: complete,
+                if_true: BlockTarget { block: allocate, args: vec![] },
+                if_false: BlockTarget { block: step, args: vec![] },
+            },
+        );
+        let byte = body.add_op(
+            step,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, position],
+            &[Type::I32],
+        );
+        let ascii_limit = body.add_op(step, Operator::I32Const { value: 0x80 }, &[], &[Type::I32]);
+        let two_limit = body.add_op(step, Operator::I32Const { value: 0xe0 }, &[], &[Type::I32]);
+        let four_limit = body.add_op(step, Operator::I32Const { value: 0xf0 }, &[], &[Type::I32]);
+        let one = body.add_op(step, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        let two = body.add_op(step, Operator::I32Const { value: 2 }, &[], &[Type::I32]);
+        let three = body.add_op(step, Operator::I32Const { value: 3 }, &[], &[Type::I32]);
+        let four = body.add_op(step, Operator::I32Const { value: 4 }, &[], &[Type::I32]);
+        let is_ascii = body.add_op(step, Operator::I32LtU, &[byte, ascii_limit], &[Type::I32]);
+        let is_two = body.add_op(step, Operator::I32LtU, &[byte, two_limit], &[Type::I32]);
+        let is_three = body.add_op(step, Operator::I32LtU, &[byte, four_limit], &[Type::I32]);
+        let multi_width = body.add_op(
+            step,
+            Operator::TypedSelect { ty: Type::I32 },
+            &[two, three, is_two],
+            &[Type::I32],
+        );
+        let multi_width = body.add_op(
+            step,
+            Operator::TypedSelect { ty: Type::I32 },
+            &[multi_width, four, is_three],
+            &[Type::I32],
+        );
+        let width = body.add_op(
+            step,
+            Operator::TypedSelect { ty: Type::I32 },
+            &[one, multi_width, is_ascii],
+            &[Type::I32],
+        );
+        let multi_units = body.add_op(
+            step,
+            Operator::TypedSelect { ty: Type::I32 },
+            &[one, two, is_three],
+            &[Type::I32],
+        );
+        let added_units = body.add_op(
+            step,
+            Operator::TypedSelect { ty: Type::I32 },
+            &[one, multi_units, is_ascii],
+            &[Type::I32],
+        );
+        let next_position = body.add_op(step, Operator::I32Add, &[position, width], &[Type::I32]);
+        let next_units = body.add_op(step, Operator::I32Add, &[units, added_units], &[Type::I32]);
+        body.set_terminator(
+            step,
+            Terminator::Br {
+                target: BlockTarget { block: scan, args: vec![next_position, next_units] },
+            },
+        );
+        let allocated = body.add_op(
+            allocate,
+            Operator::ArrayNewDefault { sig: self.repr.utf16 },
+            &[units],
+            &[self.repr.utf16_ty()],
+        );
+        body.add_op(
+            allocate,
+            Operator::StructSet { sig: self.repr.string, idx: 1 },
+            &[string, allocated],
+            &[],
+        );
+        let fill = body.add_block();
+        let fill_position = body.add_blockparam(fill, Type::I32);
+        let fill_unit = body.add_blockparam(fill, Type::I32);
+        body.set_terminator(
+            allocate,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: fill,
+                    args: vec![zero, zero],
+                },
+            },
+        );
+        let filled = body.add_op(
+            fill,
+            Operator::I32GeU,
+            &[fill_position, byte_length],
+            &[Type::I32],
+        );
+        let filled_return = body.add_block();
+        let fill_step = body.add_block();
+        body.set_terminator(
+            fill,
+            Terminator::CondBr {
+                cond: filled,
+                if_true: BlockTarget {
+                    block: filled_return,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: fill_step,
+                    args: vec![],
+                },
+            },
+        );
+        body.set_terminator(
+            filled_return,
+            Terminator::Return {
+                values: vec![allocated],
+            },
+        );
+        let first = body.add_op(
+            fill_step,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, fill_position],
+            &[Type::I32],
+        );
+        // The fill loop is a separate continuation from the counting loop,
+        // so keep its constants local to a block that dominates every decode
+        // case below.
+        let fill_ascii_limit = body.add_op(
+            fill_step,
+            Operator::I32Const { value: 0x80 },
+            &[],
+            &[Type::I32],
+        );
+        let fill_two_limit = body.add_op(
+            fill_step,
+            Operator::I32Const { value: 0xe0 },
+            &[],
+            &[Type::I32],
+        );
+        let fill_four_limit = body.add_op(
+            fill_step,
+            Operator::I32Const { value: 0xf0 },
+            &[],
+            &[Type::I32],
+        );
+        let fill_one = body.add_op(
+            fill_step,
+            Operator::I32Const { value: 1 },
+            &[],
+            &[Type::I32],
+        );
+        let fill_two = body.add_op(
+            fill_step,
+            Operator::I32Const { value: 2 },
+            &[],
+            &[Type::I32],
+        );
+        let fill_three = body.add_op(
+            fill_step,
+            Operator::I32Const { value: 3 },
+            &[],
+            &[Type::I32],
+        );
+        let fill_four = body.add_op(
+            fill_step,
+            Operator::I32Const { value: 4 },
+            &[],
+            &[Type::I32],
+        );
+        let ascii = body.add_op(
+            fill_step,
+            Operator::I32LtU,
+            &[first, fill_ascii_limit],
+            &[Type::I32],
+        );
+        let write_ascii = body.add_block();
+        let multi_byte = body.add_block();
+        body.set_terminator(
+            fill_step,
+            Terminator::CondBr {
+                cond: ascii,
+                if_true: BlockTarget {
+                    block: write_ascii,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: multi_byte,
+                    args: vec![],
+                },
+            },
+        );
+        body.add_op(
+            write_ascii,
+            Operator::ArraySet { sig: self.repr.utf16 },
+            &[allocated, fill_unit, first],
+            &[],
+        );
+        let ascii_position = body.add_op(
+            write_ascii,
+            Operator::I32Add,
+            &[fill_position, fill_one],
+            &[Type::I32],
+        );
+        let ascii_unit = body.add_op(
+            write_ascii,
+            Operator::I32Add,
+            &[fill_unit, fill_one],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            write_ascii,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: fill,
+                    args: vec![ascii_position, ascii_unit],
+                },
+            },
+        );
+        let is_two = body.add_op(
+            multi_byte,
+            Operator::I32LtU,
+            &[first, fill_two_limit],
+            &[Type::I32],
+        );
+        let write_two = body.add_block();
+        let three_or_four = body.add_block();
+        body.set_terminator(
+            multi_byte,
+            Terminator::CondBr {
+                cond: is_two,
+                if_true: BlockTarget {
+                    block: write_two,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: three_or_four,
+                    args: vec![],
+                },
+            },
+        );
+        let is_three = body.add_op(
+            three_or_four,
+            Operator::I32LtU,
+            &[first, fill_four_limit],
+            &[Type::I32],
+        );
+        let write_three = body.add_block();
+        let write_four = body.add_block();
+        body.set_terminator(
+            three_or_four,
+            Terminator::CondBr {
+                cond: is_three,
+                if_true: BlockTarget {
+                    block: write_three,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: write_four,
+                    args: vec![],
+                },
+            },
+        );
+
+        let mask_six = body.add_op(
+            write_two,
+            Operator::I32Const { value: 0x3f },
+            &[],
+            &[Type::I32],
+        );
+        let mask_five = body.add_op(
+            write_two,
+            Operator::I32Const { value: 0x1f },
+            &[],
+            &[Type::I32],
+        );
+        let shift_six = body.add_op(
+            write_two,
+            Operator::I32Const { value: 6 },
+            &[],
+            &[Type::I32],
+        );
+        let second_position = body.add_op(
+            write_two,
+            Operator::I32Add,
+            &[fill_position, fill_one],
+            &[Type::I32],
+        );
+        let second = body.add_op(
+            write_two,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, second_position],
+            &[Type::I32],
+        );
+        let first_payload = body.add_op(
+            write_two,
+            Operator::I32And,
+            &[first, mask_five],
+            &[Type::I32],
+        );
+        let high = body.add_op(
+            write_two,
+            Operator::I32Shl,
+            &[first_payload, shift_six],
+            &[Type::I32],
+        );
+        let second_payload = body.add_op(
+            write_two,
+            Operator::I32And,
+            &[second, mask_six],
+            &[Type::I32],
+        );
+        let unit = body.add_op(
+            write_two,
+            Operator::I32Or,
+            &[high, second_payload],
+            &[Type::I32],
+        );
+        body.add_op(
+            write_two,
+            Operator::ArraySet { sig: self.repr.utf16 },
+            &[allocated, fill_unit, unit],
+            &[],
+        );
+        let two_position = body.add_op(
+            write_two,
+            Operator::I32Add,
+            &[fill_position, fill_two],
+            &[Type::I32],
+        );
+        let two_unit = body.add_op(
+            write_two,
+            Operator::I32Add,
+            &[fill_unit, fill_one],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            write_two,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: fill,
+                    args: vec![two_position, two_unit],
+                },
+            },
+        );
+
+        let mask_six = body.add_op(
+            write_three,
+            Operator::I32Const { value: 0x3f },
+            &[],
+            &[Type::I32],
+        );
+        let mask_four = body.add_op(
+            write_three,
+            Operator::I32Const { value: 0x0f },
+            &[],
+            &[Type::I32],
+        );
+        let shift_six = body.add_op(
+            write_three,
+            Operator::I32Const { value: 6 },
+            &[],
+            &[Type::I32],
+        );
+        let shift_twelve = body.add_op(
+            write_three,
+            Operator::I32Const { value: 12 },
+            &[],
+            &[Type::I32],
+        );
+        let second_position = body.add_op(
+            write_three,
+            Operator::I32Add,
+            &[fill_position, fill_one],
+            &[Type::I32],
+        );
+        let third_position = body.add_op(
+            write_three,
+            Operator::I32Add,
+            &[fill_position, fill_two],
+            &[Type::I32],
+        );
+        let second = body.add_op(
+            write_three,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, second_position],
+            &[Type::I32],
+        );
+        let third = body.add_op(
+            write_three,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, third_position],
+            &[Type::I32],
+        );
+        let first_payload = body.add_op(
+            write_three,
+            Operator::I32And,
+            &[first, mask_four],
+            &[Type::I32],
+        );
+        let high = body.add_op(
+            write_three,
+            Operator::I32Shl,
+            &[first_payload, shift_twelve],
+            &[Type::I32],
+        );
+        let second_payload = body.add_op(
+            write_three,
+            Operator::I32And,
+            &[second, mask_six],
+            &[Type::I32],
+        );
+        let middle = body.add_op(
+            write_three,
+            Operator::I32Shl,
+            &[second_payload, shift_six],
+            &[Type::I32],
+        );
+        let high_middle = body.add_op(
+            write_three,
+            Operator::I32Or,
+            &[high, middle],
+            &[Type::I32],
+        );
+        let third_payload = body.add_op(
+            write_three,
+            Operator::I32And,
+            &[third, mask_six],
+            &[Type::I32],
+        );
+        let unit = body.add_op(
+            write_three,
+            Operator::I32Or,
+            &[high_middle, third_payload],
+            &[Type::I32],
+        );
+        body.add_op(
+            write_three,
+            Operator::ArraySet { sig: self.repr.utf16 },
+            &[allocated, fill_unit, unit],
+            &[],
+        );
+        let three_position = body.add_op(
+            write_three,
+            Operator::I32Add,
+            &[fill_position, fill_three],
+            &[Type::I32],
+        );
+        let three_unit = body.add_op(
+            write_three,
+            Operator::I32Add,
+            &[fill_unit, fill_one],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            write_three,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: fill,
+                    args: vec![three_position, three_unit],
+                },
+            },
+        );
+
+        let mask_six = body.add_op(
+            write_four,
+            Operator::I32Const { value: 0x3f },
+            &[],
+            &[Type::I32],
+        );
+        let mask_three = body.add_op(
+            write_four,
+            Operator::I32Const { value: 0x07 },
+            &[],
+            &[Type::I32],
+        );
+        let shift_six = body.add_op(
+            write_four,
+            Operator::I32Const { value: 6 },
+            &[],
+            &[Type::I32],
+        );
+        let shift_twelve = body.add_op(
+            write_four,
+            Operator::I32Const { value: 12 },
+            &[],
+            &[Type::I32],
+        );
+        let shift_eighteen = body.add_op(
+            write_four,
+            Operator::I32Const { value: 18 },
+            &[],
+            &[Type::I32],
+        );
+        let second_position = body.add_op(
+            write_four,
+            Operator::I32Add,
+            &[fill_position, fill_one],
+            &[Type::I32],
+        );
+        let third_position = body.add_op(
+            write_four,
+            Operator::I32Add,
+            &[fill_position, fill_two],
+            &[Type::I32],
+        );
+        let fourth_position = body.add_op(
+            write_four,
+            Operator::I32Add,
+            &[fill_position, fill_three],
+            &[Type::I32],
+        );
+        let second = body.add_op(
+            write_four,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, second_position],
+            &[Type::I32],
+        );
+        let third = body.add_op(
+            write_four,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, third_position],
+            &[Type::I32],
+        );
+        let fourth = body.add_op(
+            write_four,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, fourth_position],
+            &[Type::I32],
+        );
+        let first_payload = body.add_op(
+            write_four,
+            Operator::I32And,
+            &[first, mask_three],
+            &[Type::I32],
+        );
+        let high = body.add_op(
+            write_four,
+            Operator::I32Shl,
+            &[first_payload, shift_eighteen],
+            &[Type::I32],
+        );
+        let second_payload = body.add_op(
+            write_four,
+            Operator::I32And,
+            &[second, mask_six],
+            &[Type::I32],
+        );
+        let middle_high = body.add_op(
+            write_four,
+            Operator::I32Shl,
+            &[second_payload, shift_twelve],
+            &[Type::I32],
+        );
+        let third_payload = body.add_op(
+            write_four,
+            Operator::I32And,
+            &[third, mask_six],
+            &[Type::I32],
+        );
+        let middle_low = body.add_op(
+            write_four,
+            Operator::I32Shl,
+            &[third_payload, shift_six],
+            &[Type::I32],
+        );
+        let high_middle = body.add_op(
+            write_four,
+            Operator::I32Or,
+            &[high, middle_high],
+            &[Type::I32],
+        );
+        let high_middle_low = body.add_op(
+            write_four,
+            Operator::I32Or,
+            &[high_middle, middle_low],
+            &[Type::I32],
+        );
+        let fourth_payload = body.add_op(
+            write_four,
+            Operator::I32And,
+            &[fourth, mask_six],
+            &[Type::I32],
+        );
+        let code_point = body.add_op(
+            write_four,
+            Operator::I32Or,
+            &[high_middle_low, fourth_payload],
+            &[Type::I32],
+        );
+        let surrogate_offset = body.add_op(
+            write_four,
+            Operator::I32Const { value: 0x1_0000 },
+            &[],
+            &[Type::I32],
+        );
+        let pair = body.add_op(
+            write_four,
+            Operator::I32Sub,
+            &[code_point, surrogate_offset],
+            &[Type::I32],
+        );
+        let ten = body.add_op(
+            write_four,
+            Operator::I32Const { value: 10 },
+            &[],
+            &[Type::I32],
+        );
+        let high_base = body.add_op(
+            write_four,
+            Operator::I32Const { value: 0xd800 },
+            &[],
+            &[Type::I32],
+        );
+        let low_base = body.add_op(
+            write_four,
+            Operator::I32Const { value: 0xdc00 },
+            &[],
+            &[Type::I32],
+        );
+        let low_mask = body.add_op(
+            write_four,
+            Operator::I32Const { value: 0x3ff },
+            &[],
+            &[Type::I32],
+        );
+        let high_payload = body.add_op(
+            write_four,
+            Operator::I32ShrU,
+            &[pair, ten],
+            &[Type::I32],
+        );
+        let high_unit = body.add_op(
+            write_four,
+            Operator::I32Or,
+            &[high_base, high_payload],
+            &[Type::I32],
+        );
+        let low_payload = body.add_op(
+            write_four,
+            Operator::I32And,
+            &[pair, low_mask],
+            &[Type::I32],
+        );
+        let low_unit = body.add_op(
+            write_four,
+            Operator::I32Or,
+            &[low_base, low_payload],
+            &[Type::I32],
+        );
+        body.add_op(
+            write_four,
+            Operator::ArraySet { sig: self.repr.utf16 },
+            &[allocated, fill_unit, high_unit],
+            &[],
+        );
+        let low_index = body.add_op(
+            write_four,
+            Operator::I32Add,
+            &[fill_unit, fill_one],
+            &[Type::I32],
+        );
+        body.add_op(
+            write_four,
+            Operator::ArraySet { sig: self.repr.utf16 },
+            &[allocated, low_index, low_unit],
+            &[],
+        );
+        let four_position = body.add_op(
+            write_four,
+            Operator::I32Add,
+            &[fill_position, fill_four],
+            &[Type::I32],
+        );
+        let four_unit = body.add_op(
+            write_four,
+            Operator::I32Add,
+            &[fill_unit, fill_two],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            write_four,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: fill,
+                    args: vec![four_position, four_unit],
+                },
+            },
+        );
+        let function = self.module.funcs.push(FuncDecl::Body(
+            signature,
+            format!("js_string_utf16_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.string_utf16 = Some(function);
+        Ok(function)
+    }
+
+    fn string_length(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        string: Value,
+    ) -> Result<LowerValue, ConvertError> {
+        let helper = self.ensure_string_utf16()?;
+        let utf16 = body.add_op(
+            block,
+            Operator::Call { function_index: helper },
+            &[string],
+            &[self.repr.utf16_ty()],
+        );
+        let length = body.add_op(block, Operator::ArrayLen, &[utf16], &[Type::I32]);
+        let length = body.add_op(block, Operator::F64ConvertI32S, &[length], &[Type::F64]);
+        let length = body.add_op(
+            block,
+            Operator::StructNew { sig: self.repr.number },
+            &[length],
+            &[self.repr.number_ty()],
+        );
+        Ok(LowerValue::Wasm {
+            value: body.add_op(
+                block,
+                Operator::RefCast { ty: self.repr.value },
+                &[length],
+                &[self.repr.value],
+            ),
+            kind: ValueKind::Reference,
+        })
+    }
+
+    fn get_string_index(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        string: Value,
+        index: Value,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        let helper = self.ensure_string_utf16()?;
+        let units = body.add_op(
+            block,
+            Operator::Call {
+                function_index: helper,
+            },
+            &[string],
+            &[self.repr.utf16_ty()],
+        );
+        let length = body.add_op(block, Operator::ArrayLen, &[units], &[Type::I32]);
+        let in_bounds = body.add_op(block, Operator::I32LtU, &[index, length], &[Type::I32]);
+        let present = body.add_block();
+        let missing = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: in_bounds,
+                if_true: BlockTarget {
+                    block: present,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: missing,
+                    args: vec![],
+                },
+            },
+        );
+        let unit = body.add_op(
+            present,
+            Operator::ArrayGet {
+                sig: self.repr.utf16,
+            },
+            &[units, index],
+            &[Type::I32],
+        );
+        let ascii_limit = body.add_op(
+            present,
+            Operator::I32Const { value: 0x80 },
+            &[],
+            &[Type::I32],
+        );
+        let two_limit = body.add_op(
+            present,
+            Operator::I32Const { value: 0x800 },
+            &[],
+            &[Type::I32],
+        );
+        let ascii = body.add_op(present, Operator::I32LtU, &[unit, ascii_limit], &[Type::I32]);
+        let one_byte = body.add_block();
+        let more_bytes = body.add_block();
+        body.set_terminator(
+            present,
+            Terminator::CondBr {
+                cond: ascii,
+                if_true: BlockTarget {
+                    block: one_byte,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: more_bytes,
+                    args: vec![],
+                },
+            },
+        );
+        let two_bytes = body.add_block();
+        let three_bytes = body.add_block();
+        let two_byte = body.add_op(
+            more_bytes,
+            Operator::I32LtU,
+            &[unit, two_limit],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            more_bytes,
+            Terminator::CondBr {
+                cond: two_byte,
+                if_true: BlockTarget {
+                    block: two_bytes,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: three_bytes,
+                    args: vec![],
+                },
+            },
+        );
+
+        let one_bytes = body.add_op(
+            one_byte,
+            Operator::ArrayNewFixed {
+                sig: self.repr.utf8,
+                num: 1,
+            },
+            &[unit],
+            &[self.repr.utf8_ty()],
+        );
+        let one_cache = body.add_op(
+            one_byte,
+            Operator::ArrayNewFixed {
+                sig: self.repr.utf16,
+                num: 1,
+            },
+            &[unit],
+            &[self.repr.utf16_ty()],
+        );
+        let one_string = body.add_op(
+            one_byte,
+            Operator::StructNew {
+                sig: self.repr.string,
+            },
+            &[one_bytes, one_cache],
+            &[self.repr.string_ty()],
+        );
+        let one_string = body.add_op(
+            one_byte,
+            Operator::RefCast {
+                ty: self.repr.value,
+            },
+            &[one_string],
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            one_byte,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![one_string],
+                },
+            },
+        );
+
+        let six = body.add_op(
+            two_bytes,
+            Operator::I32Const { value: 6 },
+            &[],
+            &[Type::I32],
+        );
+        let prefix = body.add_op(
+            two_bytes,
+            Operator::I32Const { value: 0xc0 },
+            &[],
+            &[Type::I32],
+        );
+        let continuation = body.add_op(
+            two_bytes,
+            Operator::I32Const { value: 0x80 },
+            &[],
+            &[Type::I32],
+        );
+        let mask = body.add_op(
+            two_bytes,
+            Operator::I32Const { value: 0x3f },
+            &[],
+            &[Type::I32],
+        );
+        let high = body.add_op(two_bytes, Operator::I32ShrU, &[unit, six], &[Type::I32]);
+        let first = body.add_op(two_bytes, Operator::I32Or, &[prefix, high], &[Type::I32]);
+        let low = body.add_op(two_bytes, Operator::I32And, &[unit, mask], &[Type::I32]);
+        let second = body.add_op(
+            two_bytes,
+            Operator::I32Or,
+            &[continuation, low],
+            &[Type::I32],
+        );
+        let two_bytes_array = body.add_op(
+            two_bytes,
+            Operator::ArrayNewFixed {
+                sig: self.repr.utf8,
+                num: 2,
+            },
+            &[first, second],
+            &[self.repr.utf8_ty()],
+        );
+        let two_cache = body.add_op(
+            two_bytes,
+            Operator::ArrayNewFixed {
+                sig: self.repr.utf16,
+                num: 1,
+            },
+            &[unit],
+            &[self.repr.utf16_ty()],
+        );
+        let two_string = body.add_op(
+            two_bytes,
+            Operator::StructNew {
+                sig: self.repr.string,
+            },
+            &[two_bytes_array, two_cache],
+            &[self.repr.string_ty()],
+        );
+        let two_string = body.add_op(
+            two_bytes,
+            Operator::RefCast {
+                ty: self.repr.value,
+            },
+            &[two_string],
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            two_bytes,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![two_string],
+                },
+            },
+        );
+
+        let six = body.add_op(
+            three_bytes,
+            Operator::I32Const { value: 6 },
+            &[],
+            &[Type::I32],
+        );
+        let twelve = body.add_op(
+            three_bytes,
+            Operator::I32Const { value: 12 },
+            &[],
+            &[Type::I32],
+        );
+        let prefix = body.add_op(
+            three_bytes,
+            Operator::I32Const { value: 0xe0 },
+            &[],
+            &[Type::I32],
+        );
+        let continuation = body.add_op(
+            three_bytes,
+            Operator::I32Const { value: 0x80 },
+            &[],
+            &[Type::I32],
+        );
+        let mask = body.add_op(
+            three_bytes,
+            Operator::I32Const { value: 0x3f },
+            &[],
+            &[Type::I32],
+        );
+        let first_payload = body.add_op(
+            three_bytes,
+            Operator::I32ShrU,
+            &[unit, twelve],
+            &[Type::I32],
+        );
+        let first = body.add_op(
+            three_bytes,
+            Operator::I32Or,
+            &[prefix, first_payload],
+            &[Type::I32],
+        );
+        let middle_shifted = body.add_op(
+            three_bytes,
+            Operator::I32ShrU,
+            &[unit, six],
+            &[Type::I32],
+        );
+        let middle_payload = body.add_op(
+            three_bytes,
+            Operator::I32And,
+            &[middle_shifted, mask],
+            &[Type::I32],
+        );
+        let second = body.add_op(
+            three_bytes,
+            Operator::I32Or,
+            &[continuation, middle_payload],
+            &[Type::I32],
+        );
+        let final_payload = body.add_op(
+            three_bytes,
+            Operator::I32And,
+            &[unit, mask],
+            &[Type::I32],
+        );
+        let third = body.add_op(
+            three_bytes,
+            Operator::I32Or,
+            &[continuation, final_payload],
+            &[Type::I32],
+        );
+        let three_bytes_array = body.add_op(
+            three_bytes,
+            Operator::ArrayNewFixed {
+                sig: self.repr.utf8,
+                num: 3,
+            },
+            &[first, second, third],
+            &[self.repr.utf8_ty()],
+        );
+        let three_cache = body.add_op(
+            three_bytes,
+            Operator::ArrayNewFixed {
+                sig: self.repr.utf16,
+                num: 1,
+            },
+            &[unit],
+            &[self.repr.utf16_ty()],
+        );
+        let three_string = body.add_op(
+            three_bytes,
+            Operator::StructNew {
+                sig: self.repr.string,
+            },
+            &[three_bytes_array, three_cache],
+            &[self.repr.string_ty()],
+        );
+        let three_string = body.add_op(
+            three_bytes,
+            Operator::RefCast {
+                ty: self.repr.value,
+            },
+            &[three_string],
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            three_bytes,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![three_string],
+                },
+            },
+        );
+        let undef = self.undef(body, missing);
+        let undef = self.box_value(body, missing, &undef)?;
+        body.set_terminator(
+            missing,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![undef],
+                },
+            },
+        );
+        Ok((
+            join,
+            LowerValue::Wasm {
+                value: result,
+                kind: ValueKind::Reference,
+            },
+        ))
+    }
+
+    /// Parse the canonical string forms that JavaScript treats as array
+    /// indices. `u32::MAX` is the sole invalid-key sentinel, leaving the
+    /// complete JavaScript array-index range representable.
+    fn ensure_string_index(&mut self) -> Result<Func, ConvertError> {
+        if let Some(function) = self.string_index {
+            return Ok(function);
+        }
+        const INVALID: u32 = u32::MAX;
+        let signature = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.string_ty()],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let string = body.blocks[entry].params[0].1;
+        let bytes = body.add_op(
+            entry,
+            Operator::StructGet {
+                sig: self.repr.string,
+                idx: 0,
+            },
+            &[string],
+            &[self.repr.utf8_ty()],
+        );
+        let length = body.add_op(entry, Operator::ArrayLen, &[bytes], &[Type::I32]);
+        let zero = body.add_op(entry, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let empty = body.add_op(entry, Operator::I32Eq, &[length, zero], &[Type::I32]);
+        let invalid = body.add_block();
+        let nonempty = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: empty,
+                if_true: BlockTarget {
+                    block: invalid,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: nonempty,
+                    args: vec![],
+                },
+            },
+        );
+        let invalid_value = body.add_op(
+            invalid,
+            Operator::I32Const { value: INVALID },
+            &[],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            invalid,
+            Terminator::Return {
+                values: vec![invalid_value],
+            },
+        );
+        let parse_first = body.add_block();
+        body.set_terminator(
+            nonempty,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: parse_first,
+                    args: vec![],
+                },
+            },
+        );
+
+        let first = body.add_op(
+            parse_first,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, zero],
+            &[Type::I32],
+        );
+        let char_zero = body.add_op(
+            parse_first,
+            Operator::I32Const { value: u32::from(b'0') },
+            &[],
+            &[Type::I32],
+        );
+        let char_one = body.add_op(
+            parse_first,
+            Operator::I32Const { value: u32::from(b'1') },
+            &[],
+            &[Type::I32],
+        );
+        let char_nine = body.add_op(
+            parse_first,
+            Operator::I32Const { value: u32::from(b'9') },
+            &[],
+            &[Type::I32],
+        );
+        let first_is_zero = body.add_op(
+            parse_first,
+            Operator::I32Eq,
+            &[first, char_zero],
+            &[Type::I32],
+        );
+        let zero_first = body.add_block();
+        let nonzero_first = body.add_block();
+        body.set_terminator(
+            parse_first,
+            Terminator::CondBr {
+                cond: first_is_zero,
+                if_true: BlockTarget {
+                    block: zero_first,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: nonzero_first,
+                    args: vec![],
+                },
+            },
+        );
+        let one = body.add_op(
+            zero_first,
+            Operator::I32Const { value: 1 },
+            &[],
+            &[Type::I32],
+        );
+        let zero_is_canonical = body.add_op(
+            zero_first,
+            Operator::I32Eq,
+            &[length, one],
+            &[Type::I32],
+        );
+        let zero_result = body.add_block();
+        body.set_terminator(
+            zero_first,
+            Terminator::CondBr {
+                cond: zero_is_canonical,
+                if_true: BlockTarget {
+                    block: zero_result,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: invalid,
+                    args: vec![],
+                },
+            },
+        );
+        let zero_value = body.add_op(
+            zero_result,
+            Operator::I32Const { value: 0 },
+            &[],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            zero_result,
+            Terminator::Return {
+                values: vec![zero_value],
+            },
+        );
+        let first_at_least_one = body.add_op(
+            nonzero_first,
+            Operator::I32GeU,
+            &[first, char_one],
+            &[Type::I32],
+        );
+        let first_at_most_nine = body.add_op(
+            nonzero_first,
+            Operator::I32LeU,
+            &[first, char_nine],
+            &[Type::I32],
+        );
+        let first_is_digit = body.add_op(
+            nonzero_first,
+            Operator::I32And,
+            &[first_at_least_one, first_at_most_nine],
+            &[Type::I32],
+        );
+        let loop_start = body.add_block();
+        let position = body.add_blockparam(loop_start, Type::I32);
+        let value = body.add_blockparam(loop_start, Type::I32);
+        let first_value = body.add_op(
+            nonzero_first,
+            Operator::I32Sub,
+            &[first, char_zero],
+            &[Type::I32],
+        );
+        let start_position = body.add_op(
+            nonzero_first,
+            Operator::I32Const { value: 1 },
+            &[],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            nonzero_first,
+            Terminator::CondBr {
+                cond: first_is_digit,
+                if_true: BlockTarget {
+                    block: loop_start,
+                    args: vec![start_position, first_value],
+                },
+                if_false: BlockTarget {
+                    block: invalid,
+                    args: vec![],
+                },
+            },
+        );
+        let complete = body.add_op(
+            loop_start,
+            Operator::I32GeU,
+            &[position, length],
+            &[Type::I32],
+        );
+        let parsed = body.add_block();
+        let digit = body.add_block();
+        body.set_terminator(
+            loop_start,
+            Terminator::CondBr {
+                cond: complete,
+                if_true: BlockTarget {
+                    block: parsed,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: digit,
+                    args: vec![],
+                },
+            },
+        );
+        body.set_terminator(parsed, Terminator::Return { values: vec![value] });
+        let byte = body.add_op(
+            digit,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, position],
+            &[Type::I32],
+        );
+        let at_least_zero = body.add_op(
+            digit,
+            Operator::I32GeU,
+            &[byte, char_zero],
+            &[Type::I32],
+        );
+        let at_most_nine = body.add_op(
+            digit,
+            Operator::I32LeU,
+            &[byte, char_nine],
+            &[Type::I32],
+        );
+        let is_digit = body.add_op(
+            digit,
+            Operator::I32And,
+            &[at_least_zero, at_most_nine],
+            &[Type::I32],
+        );
+        let valid_digit = body.add_block();
+        body.set_terminator(
+            digit,
+            Terminator::CondBr {
+                cond: is_digit,
+                if_true: BlockTarget {
+                    block: valid_digit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: invalid,
+                    args: vec![],
+                },
+            },
+        );
+        let digit_value = body.add_op(
+            valid_digit,
+            Operator::I32Sub,
+            &[byte, char_zero],
+            &[Type::I32],
+        );
+        let overflow_prefix = body.add_op(
+            valid_digit,
+            Operator::I32Const { value: 429_496_729 },
+            &[],
+            &[Type::I32],
+        );
+        let overflow_digit = body.add_op(
+            valid_digit,
+            Operator::I32Const { value: 4 },
+            &[],
+            &[Type::I32],
+        );
+        let too_large = body.add_op(
+            valid_digit,
+            Operator::I32GtU,
+            &[value, overflow_prefix],
+            &[Type::I32],
+        );
+        let at_limit = body.add_op(
+            valid_digit,
+            Operator::I32Eq,
+            &[value, overflow_prefix],
+            &[Type::I32],
+        );
+        let final_digit_too_large = body.add_op(
+            valid_digit,
+            Operator::I32GtU,
+            &[digit_value, overflow_digit],
+            &[Type::I32],
+        );
+        let limit_overflow = body.add_op(
+            valid_digit,
+            Operator::I32And,
+            &[at_limit, final_digit_too_large],
+            &[Type::I32],
+        );
+        let overflow = body.add_op(
+            valid_digit,
+            Operator::I32Or,
+            &[too_large, limit_overflow],
+            &[Type::I32],
+        );
+        let continue_parse = body.add_block();
+        body.set_terminator(
+            valid_digit,
+            Terminator::CondBr {
+                cond: overflow,
+                if_true: BlockTarget {
+                    block: invalid,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: continue_parse,
+                    args: vec![],
+                },
+            },
+        );
+        let ten = body.add_op(
+            continue_parse,
+            Operator::I32Const { value: 10 },
+            &[],
+            &[Type::I32],
+        );
+        let one = body.add_op(
+            continue_parse,
+            Operator::I32Const { value: 1 },
+            &[],
+            &[Type::I32],
+        );
+        let multiplied = body.add_op(
+            continue_parse,
+            Operator::I32Mul,
+            &[value, ten],
+            &[Type::I32],
+        );
+        let next_value = body.add_op(
+            continue_parse,
+            Operator::I32Add,
+            &[multiplied, digit_value],
+            &[Type::I32],
+        );
+        let next_position = body.add_op(
+            continue_parse,
+            Operator::I32Add,
+            &[position, one],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            continue_parse,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: loop_start,
+                    args: vec![next_position, next_value],
+                },
+            },
+        );
+        let function = self.module.funcs.push(FuncDecl::Body(
+            signature,
+            format!("js_string_index_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.string_index = Some(function);
+        Ok(function)
+    }
+
+    fn ensure_string_equal(&mut self) -> Result<Func, ConvertError> {
+        if let Some(function) = self.string_equal {
+            return Ok(function);
+        }
+        let signature = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.string_ty(), self.repr.string_ty()],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let left = body.blocks[entry].params[0].1;
+        let right = body.blocks[entry].params[1].1;
+        let left_bytes = body.add_op(
+            entry,
+            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            &[left],
+            &[self.repr.utf8_ty()],
+        );
+        let right_bytes = body.add_op(
+            entry,
+            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            &[right],
+            &[self.repr.utf8_ty()],
+        );
+        let left_len = body.add_op(entry, Operator::ArrayLen, &[left_bytes], &[Type::I32]);
+        let right_len = body.add_op(entry, Operator::ArrayLen, &[right_bytes], &[Type::I32]);
+        let lengths_match = body.add_op(entry, Operator::I32Eq, &[left_len, right_len], &[Type::I32]);
+        let compare = body.add_block();
+        let unequal = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: lengths_match,
+                if_true: BlockTarget { block: compare, args: vec![] },
+                if_false: BlockTarget { block: unequal, args: vec![] },
+            },
+        );
+        let zero = body.add_op(unequal, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        body.set_terminator(unequal, Terminator::Return { values: vec![zero] });
+        let loop_block = body.add_block();
+        let index = body.add_blockparam(loop_block, Type::I32);
+        let zero = body.add_op(compare, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        body.set_terminator(
+            compare,
+            Terminator::Br {
+                target: BlockTarget { block: loop_block, args: vec![zero] },
+            },
+        );
+        let complete = body.add_op(loop_block, Operator::I32GeU, &[index, left_len], &[Type::I32]);
+        let equal = body.add_block();
+        let step = body.add_block();
+        body.set_terminator(
+            loop_block,
+            Terminator::CondBr {
+                cond: complete,
+                if_true: BlockTarget { block: equal, args: vec![] },
+                if_false: BlockTarget { block: step, args: vec![] },
+            },
+        );
+        let one = body.add_op(equal, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        body.set_terminator(equal, Terminator::Return { values: vec![one] });
+        let left_byte = body.add_op(
+            step,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[left_bytes, index],
+            &[Type::I32],
+        );
+        let right_byte = body.add_op(
+            step,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[right_bytes, index],
+            &[Type::I32],
+        );
+        let same = body.add_op(step, Operator::I32Eq, &[left_byte, right_byte], &[Type::I32]);
+        let next = body.add_block();
+        body.set_terminator(
+            step,
+            Terminator::CondBr {
+                cond: same,
+                if_true: BlockTarget { block: next, args: vec![] },
+                if_false: BlockTarget { block: unequal, args: vec![] },
+            },
+        );
+        let one = body.add_op(next, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        let next_index = body.add_op(next, Operator::I32Add, &[index, one], &[Type::I32]);
+        body.set_terminator(
+            next,
+            Terminator::Br {
+                target: BlockTarget { block: loop_block, args: vec![next_index] },
+            },
+        );
+        let function = self.module.funcs.push(FuncDecl::Body(
+            signature,
+            format!("js_string_equal_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.string_equal = Some(function);
+        Ok(function)
+    }
+
+    /// Generate the complete property-dispatch module after shape discovery.
+    /// `lookup` and `set` accept an `anyref` root; their concrete trie
+    /// counterparts keep byte traversal small, while every shape hand-off is
+    /// a Wasm tail call.
+    fn ensure_property_helpers(&mut self) -> Result<PropertyHelpers, ConvertError> {
+        if let Some(helpers) = self.property_helpers {
+            return Ok(helpers);
+        }
+
+        let equal = self.ensure_string_equal()?;
+        let lookup_sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.value, self.repr.string_ty(), Type::I32],
+            returns: vec![self.repr.slot_ty()],
+            shared: false,
+        });
+        let trie_lookup_sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.trie_ty(), self.repr.string_ty(), Type::I32],
+            returns: vec![self.repr.slot_ty()],
+            shared: false,
+        });
+        let set_sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.value, self.repr.string_ty(), self.repr.slot_ty(), Type::I32],
+            returns: vec![],
+            shared: false,
+        });
+        let trie_set_sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![
+                self.repr.trie_ty(),
+                self.repr.string_ty(),
+                self.repr.slot_ty(),
+                Type::I32,
+            ],
+            returns: vec![],
+            shared: false,
+        });
+
+        // Allocate every declaration first: generic trie helpers and the
+        // shape helpers tail-call each other.
+        let lookup = self.module.funcs.push(FuncDecl::Body(
+            lookup_sig,
+            format!("js_property_lookup_{}", self.module.funcs.len()),
+            FunctionBody::new(self.module, lookup_sig),
+        ));
+        let trie_lookup = self.module.funcs.push(FuncDecl::Body(
+            trie_lookup_sig,
+            format!("js_property_trie_lookup_{}", self.module.funcs.len()),
+            FunctionBody::new(self.module, trie_lookup_sig),
+        ));
+        let set = self.module.funcs.push(FuncDecl::Body(
+            set_sig,
+            format!("js_property_set_{}", self.module.funcs.len()),
+            FunctionBody::new(self.module, set_sig),
+        ));
+        let trie_set = self.module.funcs.push(FuncDecl::Body(
+            trie_set_sig,
+            format!("js_property_trie_set_{}", self.module.funcs.len()),
+            FunctionBody::new(self.module, trie_set_sig),
+        ));
+        let helpers = PropertyHelpers {
+            lookup,
+            trie_lookup,
+            set,
+            trie_set,
+        };
+
+        for index in 0..self.shapes.len() {
+            let shape = self.shapes[index].clone();
+            let lookup_sig = self.module.signatures.push(SignatureData::Func {
+                params: vec![ref_sig(shape.sig), self.repr.string_ty(), Type::I32],
+                returns: vec![self.repr.slot_ty()],
+                shared: false,
+            });
+            let set_sig = self.module.signatures.push(SignatureData::Func {
+                params: vec![
+                    ref_sig(shape.sig),
+                    self.repr.string_ty(),
+                    self.repr.slot_ty(),
+                    Type::I32,
+                ],
+                returns: vec![],
+                shared: false,
+            });
+            let lookup_func = self.module.funcs.push(FuncDecl::Body(
+                lookup_sig,
+                format!("js_shape_lookup_{}", index),
+                FunctionBody::new(self.module, lookup_sig),
+            ));
+            let set_func = self.module.funcs.push(FuncDecl::Body(
+                set_sig,
+                format!("js_shape_set_{}", index),
+                FunctionBody::new(self.module, set_sig),
+            ));
+            self.shapes[index].lookup = Some(lookup_func);
+            self.shapes[index].set = Some(set_func);
+        }
+        self.property_helpers = Some(helpers);
+
+        for index in 0..self.shapes.len() {
+            let shape = self.shapes[index].clone();
+            self.emit_shape_lookup(index, &shape, helpers, equal)?;
+            self.emit_shape_set(index, &shape, helpers, equal)?;
+        }
+        self.emit_property_lookup(helpers)?;
+        self.emit_property_set(helpers)?;
+        self.emit_trie_lookup(helpers)?;
+        self.emit_trie_set(helpers)?;
+        Ok(helpers)
+    }
+
+    fn emit_shape_lookup(
+        &mut self,
+        index: usize,
+        shape: &ShapeInfo,
+        helpers: PropertyHelpers,
+        equal: Func,
+    ) -> Result<(), ConvertError> {
+        let function = shape
+            .lookup
+            .ok_or_else(|| ConvertError::invalid("shape lookup declaration missing"))?;
+        let signature = self.module.funcs[function].sig();
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let instance = body.blocks[entry].params[0].1;
+        let key = body.blocks[entry].params[1].1;
+        let offset = body.blocks[entry].params[2].1;
+        let mut current = entry;
+        for (field, name) in shape.keys.iter().enumerate() {
+            let candidate = self.new_string(&mut body, current, name.as_bytes())?;
+            let matches = body.add_op(
+                current,
+                Operator::Call {
+                    function_index: equal,
+                },
+                &[key, candidate],
+                &[Type::I32],
+            );
+            let found = body.add_block();
+            let next = body.add_block();
+            body.set_terminator(
+                current,
+                Terminator::CondBr {
+                    cond: matches,
+                    if_true: BlockTarget { block: found, args: vec![] },
+                    if_false: BlockTarget { block: next, args: vec![] },
+                },
+            );
+            let value = body.add_op(
+                found,
+                Operator::StructGet {
+                    sig: shape.sig,
+                    idx: field + 1,
+                },
+                &[instance],
+                &[self.repr.slot_ty()],
+            );
+            body.set_terminator(found, Terminator::Return { values: vec![value] });
+            current = next;
+        }
+        let fallback = body.add_op(
+            current,
+            Operator::StructGet { sig: shape.sig, idx: 0 },
+            &[instance],
+            &[self.repr.trie_ty()],
+        );
+        body.set_terminator(
+            current,
+            Terminator::ReturnCall {
+                func: helpers.trie_lookup,
+                args: vec![fallback, key, offset],
+            },
+        );
+        self.module.funcs[function] = FuncDecl::Body(
+            signature,
+            format!("js_shape_lookup_{index}"),
+            body,
+        );
+        Ok(())
+    }
+
+    fn emit_shape_set(
+        &mut self,
+        index: usize,
+        shape: &ShapeInfo,
+        helpers: PropertyHelpers,
+        equal: Func,
+    ) -> Result<(), ConvertError> {
+        let function = shape
+            .set
+            .ok_or_else(|| ConvertError::invalid("shape setter declaration missing"))?;
+        let signature = self.module.funcs[function].sig();
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let instance = body.blocks[entry].params[0].1;
+        let key = body.blocks[entry].params[1].1;
+        let value = body.blocks[entry].params[2].1;
+        let offset = body.blocks[entry].params[3].1;
+        let mut current = entry;
+        for (field, name) in shape.keys.iter().enumerate() {
+            let candidate = self.new_string(&mut body, current, name.as_bytes())?;
+            let matches = body.add_op(
+                current,
+                Operator::Call {
+                    function_index: equal,
+                },
+                &[key, candidate],
+                &[Type::I32],
+            );
+            let found = body.add_block();
+            let next = body.add_block();
+            body.set_terminator(
+                current,
+                Terminator::CondBr {
+                    cond: matches,
+                    if_true: BlockTarget { block: found, args: vec![] },
+                    if_false: BlockTarget { block: next, args: vec![] },
+                },
+            );
+            body.add_op(
+                found,
+                Operator::StructSet {
+                    sig: shape.sig,
+                    idx: field + 1,
+                },
+                &[instance, value],
+                &[],
+            );
+            body.set_terminator(found, Terminator::Return { values: vec![] });
+            current = next;
+        }
+        let fallback = body.add_op(
+            current,
+            Operator::StructGet { sig: shape.sig, idx: 0 },
+            &[instance],
+            &[self.repr.trie_ty()],
+        );
+        body.set_terminator(
+            current,
+            Terminator::ReturnCall {
+                func: helpers.trie_set,
+                args: vec![fallback, key, value, offset],
+            },
+        );
+        self.module.funcs[function] = FuncDecl::Body(
+            signature,
+            format!("js_shape_set_{index}"),
+            body,
+        );
+        Ok(())
+    }
+
+    fn emit_property_lookup(&mut self, helpers: PropertyHelpers) -> Result<(), ConvertError> {
+        let signature = self.module.funcs[helpers.lookup].sig();
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let root = body.blocks[entry].params[0].1;
+        let key = body.blocks[entry].params[1].1;
+        let offset = body.blocks[entry].params[2].1;
+        let mut current = entry;
+        for shape in &self.shapes {
+            let matches = body.add_op(
+                current,
+                Operator::RefTest {
+                    ty: ref_sig(shape.sig),
+                },
+                &[root],
+                &[Type::I32],
+            );
+            let found = body.add_block();
+            let next = body.add_block();
+            body.set_terminator(
+                current,
+                Terminator::CondBr {
+                    cond: matches,
+                    if_true: BlockTarget { block: found, args: vec![] },
+                    if_false: BlockTarget { block: next, args: vec![] },
+                },
+            );
+            let shape_value = body.add_op(
+                found,
+                Operator::RefCast { ty: ref_sig(shape.sig) },
+                &[root],
+                &[ref_sig(shape.sig)],
+            );
+            body.set_terminator(
+                found,
+                Terminator::ReturnCall {
+                    func: shape.lookup.ok_or_else(|| ConvertError::invalid("shape lookup missing"))?,
+                    args: vec![shape_value, key, offset],
+                },
+            );
+            current = next;
+        }
+        let trie = body.add_op(
+            current,
+            Operator::RefCast {
+                ty: self.repr.trie_ty(),
+            },
+            &[root],
+            &[self.repr.trie_ty()],
+        );
+        body.set_terminator(
+            current,
+            Terminator::ReturnCall {
+                func: helpers.trie_lookup,
+                args: vec![trie, key, offset],
+            },
+        );
+        self.module.funcs[helpers.lookup] = FuncDecl::Body(
+            signature,
+            format!("js_property_lookup_{}", helpers.lookup.index()),
+            body,
+        );
+        Ok(())
+    }
+
+    fn emit_property_set(&mut self, helpers: PropertyHelpers) -> Result<(), ConvertError> {
+        let signature = self.module.funcs[helpers.set].sig();
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let root = body.blocks[entry].params[0].1;
+        let key = body.blocks[entry].params[1].1;
+        let value = body.blocks[entry].params[2].1;
+        let offset = body.blocks[entry].params[3].1;
+        let mut current = entry;
+        for shape in &self.shapes {
+            let matches = body.add_op(
+                current,
+                Operator::RefTest {
+                    ty: ref_sig(shape.sig),
+                },
+                &[root],
+                &[Type::I32],
+            );
+            let found = body.add_block();
+            let next = body.add_block();
+            body.set_terminator(
+                current,
+                Terminator::CondBr {
+                    cond: matches,
+                    if_true: BlockTarget { block: found, args: vec![] },
+                    if_false: BlockTarget { block: next, args: vec![] },
+                },
+            );
+            let shape_value = body.add_op(
+                found,
+                Operator::RefCast { ty: ref_sig(shape.sig) },
+                &[root],
+                &[ref_sig(shape.sig)],
+            );
+            body.set_terminator(
+                found,
+                Terminator::ReturnCall {
+                    func: shape.set.ok_or_else(|| ConvertError::invalid("shape setter missing"))?,
+                    args: vec![shape_value, key, value, offset],
+                },
+            );
+            current = next;
+        }
+        let trie = body.add_op(
+            current,
+            Operator::RefCast {
+                ty: self.repr.trie_ty(),
+            },
+            &[root],
+            &[self.repr.trie_ty()],
+        );
+        body.set_terminator(
+            current,
+            Terminator::ReturnCall {
+                func: helpers.trie_set,
+                args: vec![trie, key, value, offset],
+            },
+        );
+        self.module.funcs[helpers.set] = FuncDecl::Body(
+            signature,
+            format!("js_property_set_{}", helpers.set.index()),
+            body,
+        );
+        Ok(())
+    }
+
+    fn emit_trie_lookup(&mut self, helpers: PropertyHelpers) -> Result<(), ConvertError> {
+        let signature = self.module.funcs[helpers.trie_lookup].sig();
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let trie = body.blocks[entry].params[0].1;
+        let key = body.blocks[entry].params[1].1;
+        let offset = body.blocks[entry].params[2].1;
+        let bytes = body.add_op(
+            entry,
+            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            &[key],
+            &[self.repr.utf8_ty()],
+        );
+        let length = body.add_op(entry, Operator::ArrayLen, &[bytes], &[Type::I32]);
+        let complete = body.add_op(entry, Operator::I32GeU, &[offset, length], &[Type::I32]);
+        let terminal = body.add_block();
+        let step = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: complete,
+                if_true: BlockTarget { block: terminal, args: vec![] },
+                if_false: BlockTarget { block: step, args: vec![] },
+            },
+        );
+        let result = body.add_op(
+            terminal,
+            Operator::StructGet { sig: self.repr.trie, idx: 0 },
+            &[trie],
+            &[self.repr.slot_ty()],
+        );
+        body.set_terminator(terminal, Terminator::Return { values: vec![result] });
+        let byte = body.add_op(
+            step,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, offset],
+            &[Type::I32],
+        );
+        let one = body.add_op(step, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        let next_offset = body.add_op(step, Operator::I32Add, &[offset, one], &[Type::I32]);
+        self.emit_trie_lookup_byte_chain(&mut body, step, trie, key, next_offset, byte, helpers);
+        self.module.funcs[helpers.trie_lookup] = FuncDecl::Body(
+            signature,
+            format!("js_property_trie_lookup_{}", helpers.trie_lookup.index()),
+            body,
+        );
+        Ok(())
+    }
+
+    fn emit_trie_lookup_byte_chain(
+        &self,
+        body: &mut FunctionBody,
+        start: Block,
+        trie: Value,
+        key: Value,
+        next_offset: Value,
+        byte: Value,
+        helpers: PropertyHelpers,
+    ) {
+        let mut current = start;
+        for raw in 0..=u8::MAX {
+            let selected = if raw == u8::MAX {
+                current
+            } else {
+                let candidate = body.add_op(
+                    current,
+                    Operator::I32Const {
+                        value: u32::from(raw),
+                    },
+                    &[],
+                    &[Type::I32],
+                );
+                let matches = body.add_op(
+                    current,
+                    Operator::I32Eq,
+                    &[byte, candidate],
+                    &[Type::I32],
+                );
+                let selected = body.add_block();
+                let next = body.add_block();
+                body.set_terminator(
+                    current,
+                    Terminator::CondBr {
+                        cond: matches,
+                        if_true: BlockTarget { block: selected, args: vec![] },
+                        if_false: BlockTarget { block: next, args: vec![] },
+                    },
+                );
+                current = next;
+                selected
+            };
+            let child = body.add_op(
+                selected,
+                Operator::StructGet {
+                    sig: self.repr.trie,
+                    idx: usize::from(raw) + 1,
+                },
+                &[trie],
+                &[self.repr.value],
+            );
+            let missing = body.add_op(selected, Operator::RefIsNull, &[child], &[Type::I32]);
+            let absent = body.add_block();
+            let present = body.add_block();
+            body.set_terminator(
+                selected,
+                Terminator::CondBr {
+                    cond: missing,
+                    if_true: BlockTarget { block: absent, args: vec![] },
+                    if_false: BlockTarget { block: present, args: vec![] },
+                },
+            );
+            let undef = body.add_op(
+                absent,
+                Operator::RefNull {
+                    ty: self.repr.slot_ty(),
+                },
+                &[],
+                &[self.repr.slot_ty()],
+            );
+            body.set_terminator(absent, Terminator::Return { values: vec![undef] });
+            body.set_terminator(
+                present,
+                Terminator::ReturnCall {
+                    func: helpers.lookup,
+                    args: vec![child, key, next_offset],
+                },
+            );
+        }
+    }
+
+    fn emit_trie_set(&mut self, helpers: PropertyHelpers) -> Result<(), ConvertError> {
+        let signature = self.module.funcs[helpers.trie_set].sig();
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let trie = body.blocks[entry].params[0].1;
+        let key = body.blocks[entry].params[1].1;
+        let value = body.blocks[entry].params[2].1;
+        let offset = body.blocks[entry].params[3].1;
+        let bytes = body.add_op(
+            entry,
+            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            &[key],
+            &[self.repr.utf8_ty()],
+        );
+        let length = body.add_op(entry, Operator::ArrayLen, &[bytes], &[Type::I32]);
+        let complete = body.add_op(entry, Operator::I32GeU, &[offset, length], &[Type::I32]);
+        let terminal = body.add_block();
+        let step = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: complete,
+                if_true: BlockTarget { block: terminal, args: vec![] },
+                if_false: BlockTarget { block: step, args: vec![] },
+            },
+        );
+        body.add_op(
+            terminal,
+            Operator::StructSet { sig: self.repr.trie, idx: 0 },
+            &[trie, value],
+            &[],
+        );
+        body.set_terminator(terminal, Terminator::Return { values: vec![] });
+        let byte = body.add_op(
+            step,
+            Operator::ArrayGetU { sig: self.repr.utf8 },
+            &[bytes, offset],
+            &[Type::I32],
+        );
+        let one = body.add_op(step, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        let next_offset = body.add_op(step, Operator::I32Add, &[offset, one], &[Type::I32]);
+        self.emit_trie_set_byte_chain(
+            &mut body,
+            step,
+            trie,
+            key,
+            value,
+            next_offset,
+            byte,
+            helpers,
+        );
+        self.module.funcs[helpers.trie_set] = FuncDecl::Body(
+            signature,
+            format!("js_property_trie_set_{}", helpers.trie_set.index()),
+            body,
+        );
+        Ok(())
+    }
+
+    fn emit_trie_set_byte_chain(
+        &self,
+        body: &mut FunctionBody,
+        start: Block,
+        trie: Value,
+        key: Value,
+        value: Value,
+        next_offset: Value,
+        byte: Value,
+        helpers: PropertyHelpers,
+    ) {
+        let mut current = start;
+        for raw in 0..=u8::MAX {
+            let selected = if raw == u8::MAX {
+                current
+            } else {
+                let candidate = body.add_op(
+                    current,
+                    Operator::I32Const {
+                        value: u32::from(raw),
+                    },
+                    &[],
+                    &[Type::I32],
+                );
+                let matches = body.add_op(
+                    current,
+                    Operator::I32Eq,
+                    &[byte, candidate],
+                    &[Type::I32],
+                );
+                let selected = body.add_block();
+                let next = body.add_block();
+                body.set_terminator(
+                    current,
+                    Terminator::CondBr {
+                        cond: matches,
+                        if_true: BlockTarget { block: selected, args: vec![] },
+                        if_false: BlockTarget { block: next, args: vec![] },
+                    },
+                );
+                current = next;
+                selected
+            };
+            let child = body.add_op(
+                selected,
+                Operator::StructGet {
+                    sig: self.repr.trie,
+                    idx: usize::from(raw) + 1,
+                },
+                &[trie],
+                &[self.repr.value],
+            );
+            let missing = body.add_op(selected, Operator::RefIsNull, &[child], &[Type::I32]);
+            let allocate = body.add_block();
+            let present = body.add_block();
+            body.set_terminator(
+                selected,
+                Terminator::CondBr {
+                    cond: missing,
+                    if_true: BlockTarget { block: allocate, args: vec![] },
+                    if_false: BlockTarget { block: present, args: vec![] },
+                },
+            );
+            let allocated = body.add_op(
+                allocate,
+                Operator::StructNewDefault { sig: self.repr.trie },
+                &[],
+                &[self.repr.trie_ty()],
+            );
+            let allocated_ref = self.anyref(body, allocate, allocated);
+            body.add_op(
+                allocate,
+                Operator::StructSet {
+                    sig: self.repr.trie,
+                    idx: usize::from(raw) + 1,
+                },
+                &[trie, allocated_ref],
+                &[],
+            );
+            body.set_terminator(
+                allocate,
+                Terminator::ReturnCall {
+                    func: helpers.set,
+                    args: vec![allocated_ref, key, value, next_offset],
+                },
+            );
+            body.set_terminator(
+                present,
+                Terminator::ReturnCall {
+                    func: helpers.set,
+                    args: vec![child, key, value, next_offset],
+                },
+            );
+        }
+    }
+
+    fn function_object(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        context: Value,
+        this: LowerValue,
+        func: &'a SFunc,
+        arrow: bool,
+    ) -> Result<LowerValue, ConvertError> {
+        let info = self.ensure_function(func)?;
+        self.function_object_from_info(body, block, context, this, info, arrow, true)
+    }
+
+    fn function_object_from_info(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        context: Value,
+        this: LowerValue,
+        info: FunctionInfo,
+        arrow: bool,
+        fresh: bool,
+    ) -> Result<LowerValue, ConvertError> {
+        let trie = self.new_trie(body, block)?;
+        let elements = body.add_op(
+            block,
+            Operator::RefNull {
+                ty: self.repr.arguments_ty(),
+            },
+            &[],
+            &[self.repr.arguments_ty()],
+        );
+        let properties = body.add_op(
+            block,
+            Operator::RefNull { ty: self.repr.value },
+            &[],
+            &[self.repr.value],
+        );
+        let code = body.add_op(
+            block,
+            Operator::RefFunc {
+                func_index: info.adapter,
+            },
+            &[],
+            &[ref_sig(self.repr.adapter)],
+        );
+        let arrow = body.add_op(
+            block,
+            Operator::I32Const {
+                value: u32::from(arrow),
+            },
+            &[],
+            &[Type::I32],
+        );
+        let captured_this = self.box_value(body, block, &this)?;
+        let trie = self.anyref(body, block, trie);
+        let tag = body.add_op(
+            block,
+            Operator::I32Const {
+                value: info.tag as u32,
+            },
+            &[],
+            &[Type::I32],
+        );
+        let value = body.add_op(
+            block,
+            Operator::StructNew {
+                sig: self.repr.function,
+            },
+            &[
+                trie,
+                elements,
+                properties,
+                code,
+                context,
+                captured_this,
+                arrow,
+                tag,
+            ],
+            &[self.repr.function_ty()],
+        );
+        Ok(LowerValue::FunctionRef { value, info, fresh })
+    }
+
+    fn object_literal(
+        &mut self,
+        body: &mut FunctionBody,
+        block: &mut Block,
+        context: Value,
+        this: LowerValue,
+        values: &BTreeMap<SValueId, LowerValue>,
+        members: &'a [(PropKey<SValueId>, PropVal<SValueId, SFunc>)],
+        span: &impl std::fmt::Debug,
+    ) -> Result<LowerValue, ConvertError> {
+        let shape = members
+            .iter()
+            .map(|(key, _)| match key {
+                PropKey::Lit(key) => Some(key.sym.to_string()),
+                PropKey::Computed(_) => None,
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|mut keys| {
+                keys.sort();
+                keys.dedup();
+                keys
+            })
+            .and_then(|keys| self.shape_index(&keys));
+        let object = match shape {
+            Some(shape) => {
+                let root = self.new_shape(body, *block, shape)?;
+                self.new_object_with_root(body, *block, root)?
+            }
+            None => self.new_object(body, *block)?,
+        };
+        // Source object members are already ordered by the front-end. Keep
+        // a local descriptor table so `get x` followed by `set x` shares one
+        // descriptor, while a later data definition replaces it entirely.
+        let mut accessors = BTreeMap::<String, Value>::new();
+        // Method literals keyed by property name, threaded onto the result.
+        let mut methods = BTreeMap::<String, FunctionInfo>::new();
+        for (key, property) in members {
+            let key = match key {
+                PropKey::Lit(key) => key.sym.to_string(),
+                PropKey::Computed(value) => self.key_of(
+                    values
+                        .get(value)
+                        .ok_or_else(|| ConvertError::invalid("undefined object property key"))?,
+                )?,
+                _ => return Err(ConvertError::unsupported("object property key", span)),
+            };
+            match property {
+                PropVal::Item(value) => {
+                    let value = values
+                        .get(value)
+                        .cloned()
+                        .ok_or_else(|| ConvertError::invalid("undefined object property value"))?;
+                    accessors.remove(&key);
+                    *block = self.set_static_property_value_raw(body, *block, &object, &key, &value)?;
+                }
+                PropVal::Method(func) => {
+                    let value = self.function_object(body, *block, context, this.clone(), func, false)?;
+                    accessors.remove(&key);
+                    *block = self.set_static_property_value_raw(body, *block, &object, &key, &value)?;
+                    // Record the method's identity so member calls on this
+                    // literal can verify the slot still holds it.
+                    if let LowerValue::FunctionRef { info, .. } = &value {
+                        methods.insert(key.clone(), *info);
+                    }
+                }
+                PropVal::Getter(func) | PropVal::Setter(func) => {
+                    let descriptor = if let Some(descriptor) = accessors.get(&key).copied() {
+                        descriptor
+                    } else {
+                        let descriptor = self.new_descriptor(body, *block);
+                        let descriptor_value = self.anyref(body, *block, descriptor);
+                        let descriptor_value = LowerValue::Wasm {
+                            value: descriptor_value,
+                            kind: ValueKind::Reference,
+                        };
+                        *block = self.set_static_property_value_raw(
+                            body,
+                            *block,
+                            &object,
+                            &key,
+                            &descriptor_value,
+                        )?;
+                        accessors.insert(key.clone(), descriptor);
+                        descriptor
+                    };
+                    let function = self.function_object(body, *block, context, this.clone(), func, false)?;
+                    let function = self.box_value(body, *block, &function)?;
+                    let index = match property {
+                        PropVal::Getter(_) => 0,
+                        PropVal::Setter(_) => 1,
+                        _ => unreachable!("accessor arm only matches getter/setter"),
+                    };
+                    body.add_op(
+                        *block,
+                        Operator::StructSet {
+                            sig: self.repr.descriptor,
+                            idx: index,
+                        },
+                        &[descriptor, function],
+                        &[],
+                    );
+                }
+                _ => return Err(ConvertError::unsupported("object property", span)),
+            }
+        }
+        let (object, _) = object.wasm()?;
+        Ok(LowerValue::ObjectLiteral {
+            value: object,
+            methods: std::rc::Rc::new(methods),
+        })
+    }
+
+    fn key_of(&self, value: &LowerValue) -> Result<String, ConvertError> {
+        match value {
+            LowerValue::ReferenceKey { key, .. } => Ok(key.clone()),
+            LowerValue::NumberLiteral { key, .. } => Ok(key.clone()),
+            LowerValue::String { key, .. } => Ok(key.clone()),
+            _ => Err(ConvertError::invalid(
+                "dynamic property keys are unsupported",
+            )),
+        }
+    }
+
+    fn static_array_index(key: &str) -> Option<u32> {
+        let bytes = key.as_bytes();
+        if bytes.is_empty()
+            || (bytes.len() > 1 && bytes.first().is_some_and(|byte| *byte == b'0'))
+            || bytes.iter().any(|byte| !byte.is_ascii_digit())
+        {
+            return None;
+        }
+        let value = key.parse::<u32>().ok()?;
+        // `2^32 - 1` is the `length` sentinel rather than an array index.
+        (value != u32::MAX).then_some(value)
+    }
+
+    fn object_and_root(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+    ) -> Result<(Block, Value), ConvertError> {
+        let (object, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            // JavaScript permits property stores on primitives (they are
+            // discarded). Give that path an unaliased generic root so the
+            // ordinary store lowering cannot mutate an object continuation.
+            let trie = self.new_trie(body, block)?;
+            return Ok((block, self.anyref(body, block, trie)));
+        }
+        let is_function = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.function_ty(),
+            },
+            &[object],
+            &[Type::I32],
+        );
+        let function = body.add_block();
+        let non_function = body.add_block();
+        let plain = body.add_block();
+        let primitive = body.add_block();
+        let join = body.add_block();
+        let root = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_function,
+                if_true: BlockTarget {
+                    block: function,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: non_function,
+                    args: vec![],
+                },
+            },
+        );
+        let function_value = body.add_op(
+            function,
+            Operator::RefCast {
+                ty: self.repr.function_ty(),
+            },
+            &[object],
+            &[self.repr.function_ty()],
+        );
+        let function_root = body.add_op(
+            function,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: 0,
+            },
+            &[function_value],
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            function,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![function_root],
+                },
+            },
+        );
+        let is_object = body.add_op(
+            non_function,
+            Operator::RefTest {
+                ty: self.repr.object_ty(),
+            },
+            &[object],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            non_function,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget {
+                    block: plain,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: primitive,
+                    args: vec![],
+                },
+            },
+        );
+        let object_value = body.add_op(
+            plain,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[object],
+            &[self.repr.object_ty()],
+        );
+        let object_root = body.add_op(
+            plain,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 0,
+            },
+            &[object_value],
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            plain,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![object_root],
+                },
+            },
+        );
+        let primitive_trie = self.new_trie(body, primitive)?;
+        let primitive_root = self.anyref(body, primitive, primitive_trie);
+        body.set_terminator(
+            primitive,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![primitive_root],
+                },
+            },
+        );
+        Ok((join, root))
+    }
+
+    /// Companion to [`Self::object_and_root`]: extract an object's dense
+    /// `elements` array. Per the `object` struct's field comment in
+    /// `repr.rs`, a non-null `elements` (field 1) is what distinguishes a
+    /// real Array from a plain object; functions and non-object primitives
+    /// never carry array elements in this engine, so both return a null
+    /// `arguments` reference.
+    fn object_elements(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+    ) -> Result<(Block, Value), ConvertError> {
+        let (object, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            let elements = body.add_op(
+                block,
+                Operator::RefNull {
+                    ty: self.repr.arguments_ty(),
+                },
+                &[],
+                &[self.repr.arguments_ty()],
+            );
+            return Ok((block, elements));
+        }
+        let is_object = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.object_ty(),
+            },
+            &[object],
+            &[Type::I32],
+        );
+        let plain = body.add_block();
+        let other = body.add_block();
+        let join = body.add_block();
+        let elements = body.add_blockparam(join, self.repr.arguments_ty());
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget {
+                    block: plain,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: other,
+                    args: vec![],
+                },
+            },
+        );
+        let object_value = body.add_op(
+            plain,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[object],
+            &[self.repr.object_ty()],
+        );
+        let object_elements = body.add_op(
+            plain,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 1,
+            },
+            &[object_value],
+            &[self.repr.arguments_ty()],
+        );
+        body.set_terminator(
+            plain,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![object_elements],
+                },
+            },
+        );
+        let other_elements = body.add_op(
+            other,
+            Operator::RefNull {
+                ty: self.repr.arguments_ty(),
+            },
+            &[],
+            &[self.repr.arguments_ty()],
+        );
+        body.set_terminator(
+            other,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![other_elements],
+                },
+            },
+        );
+        Ok((join, elements))
+    }
+
+    fn get_property_raw(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        context: Value,
+        key: &str,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        self.get_property_value_raw(
+            body,
+            block,
+            &LowerValue::Wasm {
+                value: context,
+                kind: ValueKind::Reference,
+            },
+            key,
+        )
+    }
+
+    /// Turn a raw property slot into the JavaScript result of a property
+    /// read. Values and absent slots keep one path; an internal descriptor
+    /// splits into no-getter and call-getter paths before callers merge their
+    /// common `anyref` result continuation.
+    fn resolve_property_read_paths(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        receiver: &LowerValue,
+        value: LowerValue,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let value = self.box_value(body, block, &value)?;
+        let is_descriptor = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.descriptor_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let ordinary = body.add_block();
+        let descriptor = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_descriptor,
+                if_true: BlockTarget {
+                    block: descriptor,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: ordinary,
+                    args: vec![],
+                },
+            },
+        );
+
+        let descriptor_value = body.add_op(
+            descriptor,
+            Operator::RefCast {
+                ty: self.repr.descriptor_ty(),
+            },
+            &[value],
+            &[self.repr.descriptor_ty()],
+        );
+        let getter = body.add_op(
+            descriptor,
+            Operator::StructGet {
+                sig: self.repr.descriptor,
+                idx: 0,
+            },
+            &[descriptor_value],
+            &[self.repr.value],
+        );
+        let missing = body.add_op(descriptor, Operator::RefIsNull, &[getter], &[Type::I32]);
+        let absent = body.add_block();
+        let invoke = body.add_block();
+        body.set_terminator(
+            descriptor,
+            Terminator::CondBr {
+                cond: missing,
+                if_true: BlockTarget {
+                    block: absent,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: invoke,
+                    args: vec![],
+                },
+            },
+        );
+        let undefined = self.undef(body, absent);
+        let getter = LowerValue::Wasm {
+            value: getter,
+            kind: ValueKind::Reference,
+        };
+        let (context, receiver, code, _) =
+            self.callable_parts(body, invoke, &getter, receiver.clone())?;
+        let arguments = body.add_op(
+            invoke,
+            Operator::ArrayNewFixed {
+                sig: self.repr.arguments,
+                num: 0,
+            },
+            &[],
+            &[self.repr.arguments_ty()],
+        );
+        let result = body.add_op(
+            invoke,
+            Operator::CallRef {
+                sig_index: self.repr.adapter,
+            },
+            &[context, receiver, arguments, code],
+            &[self.repr.value],
+        );
+        Ok(vec![
+            (
+                ordinary,
+                LowerValue::Wasm {
+                    value,
+                    kind: ValueKind::Reference,
+                },
+            ),
+            (absent, undefined),
+            (
+                invoke,
+                LowerValue::Wasm {
+                    value: result,
+                    kind: ValueKind::Reference,
+                },
+            ),
+        ])
+    }
+
+    /// Merge descriptor outcomes when all of them carry the same `anyref`
+    /// representation. The descriptor branch still gets its own Wasm
+    /// continuation for a getter invocation, but the subsequent source
+    /// statement can be emitted once without duplicating a whole SSA suffix.
+    fn resolve_property_read(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        receiver: &LowerValue,
+        value: LowerValue,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let (block, value) = self.resolve_property_read_join(body, block, receiver, value)?;
+        Ok(vec![(block, value)])
+    }
+
+    /// Use the same descriptor semantics when an internal operation only
+    /// needs one post-read block. This keeps object-rest copying linear in
+    /// the number of fields.
+    fn resolve_property_read_join(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        receiver: &LowerValue,
+        value: LowerValue,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        let continuations = self.resolve_property_read_paths(body, block, receiver, value)?;
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        for (block, value) in continuations {
+            let value = self.box_value(body, block, &value)?;
+            body.set_terminator(
+                block,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![value],
+                    },
+                },
+            );
+        }
+        Ok((
+            join,
+            LowerValue::Wasm {
+                value: result,
+                kind: ValueKind::Reference,
+            },
+        ))
+    }
+
+    /// Separate a descriptor write from the ordinary define/update path.
+    /// The returned first block is the one caller-owned direct-write
+    /// continuation; every returned vector block has already handled an
+    /// accessor setter (or intentionally ignored the write).
+    fn split_descriptor_write(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        receiver: &LowerValue,
+        existing: LowerValue,
+        assigned: &LowerValue,
+    ) -> Result<(Block, Vec<Block>), ConvertError> {
+        let existing = self.box_value(body, block, &existing)?;
+        let is_descriptor = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.descriptor_non_null_ty(),
+            },
+            &[existing],
+            &[Type::I32],
+        );
+        let ordinary = body.add_block();
+        let descriptor = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_descriptor,
+                if_true: BlockTarget {
+                    block: descriptor,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: ordinary,
+                    args: vec![],
+                },
+            },
+        );
+        let descriptor_value = body.add_op(
+            descriptor,
+            Operator::RefCast {
+                ty: self.repr.descriptor_ty(),
+            },
+            &[existing],
+            &[self.repr.descriptor_ty()],
+        );
+        let setter = body.add_op(
+            descriptor,
+            Operator::StructGet {
+                sig: self.repr.descriptor,
+                idx: 1,
+            },
+            &[descriptor_value],
+            &[self.repr.value],
+        );
+        let missing = body.add_op(descriptor, Operator::RefIsNull, &[setter], &[Type::I32]);
+        let absent = body.add_block();
+        let invoke = body.add_block();
+        body.set_terminator(
+            descriptor,
+            Terminator::CondBr {
+                cond: missing,
+                if_true: BlockTarget {
+                    block: absent,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: invoke,
+                    args: vec![],
+                },
+            },
+        );
+        let setter = LowerValue::Wasm {
+            value: setter,
+            kind: ValueKind::Reference,
+        };
+        let (context, receiver, code, _) =
+            self.callable_parts(body, invoke, &setter, receiver.clone())?;
+        let assigned = self.box_value(body, invoke, assigned)?;
+        let arguments = body.add_op(
+            invoke,
+            Operator::ArrayNewFixed {
+                sig: self.repr.arguments,
+                num: 1,
+            },
+            &[assigned],
+            &[self.repr.arguments_ty()],
+        );
+        body.add_op(
+            invoke,
+            Operator::CallRef {
+                sig_index: self.repr.adapter,
+            },
+            &[context, receiver, arguments, code],
+            &[self.repr.value],
+        );
+        Ok((ordinary, vec![absent, invoke]))
+    }
+
+    fn join_write_continuations(&self, body: &mut FunctionBody, blocks: Vec<Block>) -> Block {
+        let join = body.add_block();
+        for block in blocks {
+            body.set_terminator(
+                block,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![],
+                    },
+                },
+            );
+        }
+        join
+    }
+
+    fn get_property(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        context: Value,
+        key: &str,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let receiver = LowerValue::Wasm {
+            value: context,
+            kind: ValueKind::Reference,
+        };
+        let (block, value) = self.get_property_raw(body, block, context, key)?;
+        self.resolve_property_read(body, block, &receiver, value)
+    }
+
+    fn get_property_value(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &str,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let (block, value) = self.get_property_value_raw(body, block, object, key)?;
+        self.resolve_property_read(body, block, object, value)
+    }
+
+    fn get_numeric_member(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        index: Value,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let (block, value) = self.get_numeric_member_raw(body, block, object, index)?;
+        self.resolve_property_read(body, block, object, value)
+    }
+
+    fn get_string_member(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: Value,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let (block, value) = self.get_string_member_raw(body, block, object, key)?;
+        self.resolve_property_read(body, block, object, value)
+    }
+
+    fn get_property_value_raw(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &str,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        // Typed arrays share the object/property seam with ordinary arrays,
+        // but their elements live in unboxed native WasmGC arrays. Intercept
+        // the small typed surface before ordinary-array dispatch; the helper
+        // falls through to the existing path for every non-typed receiver.
+        if !matches!(object, LowerValue::String { .. })
+            && (matches!(key, "length" | "byteLength" | "set" | "subarray")
+                || Self::static_array_index(key).is_some())
+            && let Some(result) = self.get_typed_array_static_property(body, block, object, key)?
+        {
+            return Ok(result);
+        }
+        if key == "length"
+            && let LowerValue::String { value, .. } = object
+        {
+            return Ok((block, self.string_length(body, block, *value)?));
+        }
+        if let LowerValue::String { bytes, .. } = object
+            && let Some(index) = Self::static_array_index(key)
+        {
+            return Ok((
+                block,
+                self.literal_string_index(body, block, bytes, index)?,
+            ));
+        }
+        let string_index = Self::static_array_index(key);
+        if key != "length" && string_index.is_none() {
+            if Self::is_array_instance_method(key) {
+                return self.get_array_method_or_property(body, block, object, key);
+            }
+            return self.get_nonstring_property_value_raw(body, block, object, key);
+        }
+        let (value, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return self.get_nonstring_property_value_raw(body, block, object, key);
+        }
+        let is_string = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.string_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let string = body.add_block();
+        let non_string = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_string,
+                if_true: BlockTarget {
+                    block: string,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: non_string,
+                    args: vec![],
+                },
+            },
+        );
+        let string_value = body.add_op(
+            string,
+            Operator::RefCast {
+                ty: self.repr.string_ty(),
+            },
+            &[value],
+            &[self.repr.string_ty()],
+        );
+        let (string, string_value) = if key == "length" {
+            (string, self.string_length(body, string, string_value)?)
+        } else {
+            let index = body.add_op(
+                string,
+                Operator::I32Const {
+                    value: string_index.expect("numeric key was checked above"),
+                },
+                &[],
+                &[Type::I32],
+            );
+            self.get_string_index(body, string, string_value, index)?
+        };
+        let string_value = self.box_value(body, string, &string_value)?;
+        body.set_terminator(
+            string,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![string_value],
+                },
+            },
+        );
+        let (non_string, non_string_value) =
+            self.get_nonstring_property_value_raw(body, non_string, object, key)?;
+        let non_string_value = self.box_value(body, non_string, &non_string_value)?;
+        body.set_terminator(
+            non_string,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![non_string_value],
+                },
+            },
+        );
+        Ok((
+            join,
+            LowerValue::Wasm {
+                value: result,
+                kind: ValueKind::Reference,
+            },
+        ))
+    }
+
+    /// `push`/`pop`/`map`/`forEach` are implemented as intrinsic dispatch on
+    /// any receiver with a non-null `elements` field, not via a real
+    /// inheritable `Array.prototype` object — there is no prototype-chain
+    /// walking anywhere in this crate (see `primordials.rs`'s module
+    /// comment). A plain object that happens to own a property with one of
+    /// these names is unaffected: the array check only fires for receivers
+    /// that are actually arrays, and falls back to ordinary property lookup
+    /// otherwise.
+    fn is_array_instance_method(key: &str) -> bool {
+        matches!(key, "push" | "pop" | "map" | "forEach")
+    }
+
+    fn get_array_method_or_property(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &str,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        let (value, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return self.get_nonstring_property_value_raw(body, block, object, key);
+        }
+        let is_object = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.object_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let maybe_array = body.add_block();
+        let fallback = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget {
+                    block: maybe_array,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: fallback,
+                    args: vec![],
+                },
+            },
+        );
+
+        let plain = body.add_op(
+            maybe_array,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[value],
+            &[self.repr.object_ty()],
+        );
+        let elements = body.add_op(
+            maybe_array,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 1,
+            },
+            &[plain],
+            &[self.repr.arguments_ty()],
+        );
+        let no_elements = body.add_op(maybe_array, Operator::RefIsNull, &[elements], &[Type::I32]);
+        let is_array = body.add_block();
+        body.set_terminator(
+            maybe_array,
+            Terminator::CondBr {
+                cond: no_elements,
+                if_true: BlockTarget {
+                    block: fallback,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: is_array,
+                    args: vec![],
+                },
+            },
+        );
+        let method = self.ensure_array_instance_method(key)?;
+        let context = self.new_object(body, is_array)?;
+        let (context_value, _) = context.wasm()?;
+        let method_value = self.native_function_value(body, is_array, context_value, method)?;
+        let method_boxed = self.box_value(body, is_array, &method_value)?;
+        body.set_terminator(
+            is_array,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![method_boxed],
+                },
+            },
+        );
+
+        let (fallback_end, fallback_value) =
+            self.get_nonstring_property_value_raw(body, fallback, object, key)?;
+        let fallback_boxed = self.box_value(body, fallback_end, &fallback_value)?;
+        body.set_terminator(
+            fallback_end,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![fallback_boxed],
+                },
+            },
+        );
+
+        Ok((
+            join,
+            LowerValue::Wasm {
+                value: result,
+                kind: ValueKind::Reference,
+            },
+        ))
+    }
+
+    fn get_nonstring_property_value_raw(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &str,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        if let LowerValue::String { bytes, .. } = object
+            && let Some(index) = Self::static_array_index(key)
+        {
+            return Ok((
+                block,
+                self.literal_string_index(body, block, bytes, index)?,
+            ));
+        }
+        let (value, kind) = object.wasm()?;
+        if kind != ValueKind::Reference || !(key == "length" || Self::static_array_index(key).is_some()) {
+            return self.get_object_property_value(body, block, object, key);
+        }
+
+        // The call ABI still uses a raw Wasm array, but JavaScript array
+        // values are ordinary objects with an optional element component.
+        // Keep accepting the raw representation here for adapter internals.
+        let is_raw_array = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.arguments_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let raw_array = body.add_block();
+        let non_raw = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_raw_array,
+                if_true: BlockTarget { block: raw_array, args: vec![] },
+                if_false: BlockTarget { block: non_raw, args: vec![] },
+            },
+        );
+        let array = body.add_op(
+            raw_array,
+            Operator::RefCast { ty: self.repr.arguments_ty() },
+            &[value],
+            &[self.repr.arguments_ty()],
+        );
+        let (raw_array, raw_value) = self.get_array_property(body, raw_array, array, key)?;
+        body.set_terminator(
+            raw_array,
+            Terminator::Br {
+                target: BlockTarget { block: join, args: vec![raw_value] },
+            },
+        );
+
+        let is_object = body.add_op(
+            non_raw,
+            Operator::RefTest { ty: self.repr.object_ty() },
+            &[value],
+            &[Type::I32],
+        );
+        let object_array = body.add_block();
+        let fallback = body.add_block();
+        body.set_terminator(
+            non_raw,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget { block: object_array, args: vec![] },
+                if_false: BlockTarget { block: fallback, args: vec![] },
+            },
+        );
+        // A primitive fallback may still be a string: strings answer
+        // `length` (and numeric indexes) from their UTF-16 representation,
+        // never from a property lookup. Without this arm a lazily produced
+        // string (`'abc'[1]`) reports `length` as `undefined`.
+        let is_string = body.add_op(
+            fallback,
+            Operator::RefTest { ty: self.repr.string_ty() },
+            &[value],
+            &[Type::I32],
+        );
+        let string = body.add_block();
+        let non_string = body.add_block();
+        body.set_terminator(
+            fallback,
+            Terminator::CondBr {
+                cond: is_string,
+                if_true: BlockTarget { block: string, args: vec![] },
+                if_false: BlockTarget { block: non_string, args: vec![] },
+            },
+        );
+        let string_value = body.add_op(
+            string,
+            Operator::RefCast { ty: self.repr.string_ty() },
+            &[value],
+            &[self.repr.string_ty()],
+        );
+        let (string, string_length_value) = if key == "length" {
+            let len = self.string_length(body, string, string_value)?;
+            (string, len)
+        } else {
+            let index = body.add_op(
+                string,
+                Operator::I32Const {
+                    value: Self::static_array_index(key).unwrap_or(u32::MAX),
+                },
+                &[],
+                &[Type::I32],
+            );
+            self.get_string_index(body, string, string_value, index)?
+        };
+        let string_length_value = self.box_value(body, string, &string_length_value)?;
+        body.set_terminator(
+            string,
+            Terminator::Br {
+                target: BlockTarget { block: join, args: vec![string_length_value] },
+            },
+        );
+        let fallback = non_string;
+        let plain = body.add_op(
+            object_array,
+            Operator::RefCast { ty: self.repr.object_ty() },
+            &[value],
+            &[self.repr.object_ty()],
+        );
+        let elements = body.add_op(
+            object_array,
+            Operator::StructGet { sig: self.repr.object, idx: 1 },
+            &[plain],
+            &[self.repr.arguments_ty()],
+        );
+        let no_elements = body.add_op(object_array, Operator::RefIsNull, &[elements], &[Type::I32]);
+        let array_component = body.add_block();
+        let no_component = body.add_block();
+        body.set_terminator(
+            object_array,
+            Terminator::CondBr {
+                cond: no_elements,
+                if_true: BlockTarget { block: no_component, args: vec![] },
+                if_false: BlockTarget { block: array_component, args: vec![] },
+            },
+        );
+        let (array_component, component_value) =
+            self.get_array_property(body, array_component, elements, key)?;
+        body.set_terminator(
+            array_component,
+            Terminator::Br {
+                target: BlockTarget { block: join, args: vec![component_value] },
+            },
+        );
+        for fallback_block in [fallback, no_component] {
+            let (fallback_block, fallback_value) =
+                self.get_object_property_value(body, fallback_block, object, key)?;
+            let fallback_value = self.box_value(body, fallback_block, &fallback_value)?;
+            body.set_terminator(
+                fallback_block,
+                Terminator::Br {
+                    target: BlockTarget { block: join, args: vec![fallback_value] },
+                },
+            );
+        }
+        Ok((join, LowerValue::Wasm { value: result, kind: ValueKind::Reference }))
+    }
+
+    fn get_array_property(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        array: Value,
+        key: &str,
+    ) -> Result<(Block, Value), ConvertError> {
+        if key == "length" {
+            let length = body.add_op(block, Operator::ArrayLen, &[array], &[Type::I32]);
+            let length = body.add_op(block, Operator::F64ConvertI32S, &[length], &[Type::F64]);
+            let length = body.add_op(
+                block,
+                Operator::StructNew {
+                    sig: self.repr.number,
+                },
+                &[length],
+                &[self.repr.number_ty()],
+            );
+            return Ok((
+                block,
+                body.add_op(
+                    block,
+                    Operator::RefCast {
+                        ty: self.repr.value,
+                    },
+                    &[length],
+                    &[self.repr.value],
+                ),
+            ));
+        }
+
+        let Some(index) = Self::static_array_index(key) else {
+            return Ok((
+                block,
+                body.add_op(
+                    block,
+                    Operator::RefNull {
+                        ty: self.repr.value,
+                    },
+                    &[],
+                    &[self.repr.value],
+                ),
+            ));
+        };
+        let index = body.add_op(
+            block,
+            Operator::I32Const { value: index },
+            &[],
+            &[Type::I32],
+        );
+        self.get_array_index(body, block, array, index)
+    }
+
+    fn get_array_index(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        array: Value,
+        index: Value,
+    ) -> Result<(Block, Value), ConvertError> {
+        let length = body.add_op(block, Operator::ArrayLen, &[array], &[Type::I32]);
+        let present = body.add_op(block, Operator::I32LtU, &[index, length], &[Type::I32]);
+        let get = body.add_block();
+        let missing = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: present,
+                if_true: BlockTarget {
+                    block: get,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: missing,
+                    args: vec![],
+                },
+            },
+        );
+        let value = body.add_op(
+            get,
+            Operator::ArrayGet {
+                sig: self.repr.arguments,
+            },
+            &[array, index],
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            get,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![value],
+                },
+            },
+        );
+        let undef = body.add_op(
+            missing,
+            Operator::RefNull {
+                ty: self.repr.value,
+            },
+            &[],
+            &[self.repr.value],
+        );
+        body.set_terminator(
+            missing,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![undef],
+                },
+            },
+        );
+        Ok((join, result))
+    }
+
+    fn numeric_index(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        key: &LowerValue,
+    ) -> Result<Value, ConvertError> {
+        let (key, kind) = key.wasm()?;
+        Ok(match kind {
+            ValueKind::Number => body.add_op(
+                block,
+                Operator::I32TruncSatF64U,
+                &[key],
+                &[Type::I32],
+            ),
+            ValueKind::Integer | ValueKind::Boolean => key,
+            _ => return Err(ConvertError::invalid("dynamic member key is not numeric")),
+        })
+    }
+
+    fn get_numeric_member_raw(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        index: Value,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        let (value, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return Ok((block, self.undef(body, block)));
+        }
+        let is_string = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.string_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let string = body.add_block();
+        let non_string = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_string,
+                if_true: BlockTarget {
+                    block: string,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: non_string,
+                    args: vec![],
+                },
+            },
+        );
+        let string_value = body.add_op(
+            string,
+            Operator::RefCast {
+                ty: self.repr.string_ty(),
+            },
+            &[value],
+            &[self.repr.string_ty()],
+        );
+        let (string, string_value) = self.get_string_index(body, string, string_value, index)?;
+        let string_value = self.box_value(body, string, &string_value)?;
+        body.set_terminator(
+            string,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![string_value],
+                },
+            },
+        );
+        let (non_string, non_string_value) =
+            self.get_nonstring_numeric_member(body, non_string, object, index)?;
+        let non_string_value = self.box_value(body, non_string, &non_string_value)?;
+        body.set_terminator(
+            non_string,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![non_string_value],
+                },
+            },
+        );
+        Ok((
+            join,
+            LowerValue::Wasm {
+                value: result,
+                kind: ValueKind::Reference,
+            },
+        ))
+    }
+
+    fn get_nonstring_numeric_member_base(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        index: Value,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        let (value, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return Ok((block, self.undef(body, block)));
+        }
+        let is_raw = body.add_op(
+            block,
+            Operator::RefTest { ty: self.repr.arguments_ty() },
+            &[value],
+            &[Type::I32],
+        );
+        let raw = body.add_block();
+        let non_raw = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_raw,
+                if_true: BlockTarget { block: raw, args: vec![] },
+                if_false: BlockTarget { block: non_raw, args: vec![] },
+            },
+        );
+        let raw_array = body.add_op(
+            raw,
+            Operator::RefCast { ty: self.repr.arguments_ty() },
+            &[value],
+            &[self.repr.arguments_ty()],
+        );
+        let (raw, raw_value) = self.get_array_index(body, raw, raw_array, index)?;
+        body.set_terminator(
+            raw,
+            Terminator::Br {
+                target: BlockTarget { block: join, args: vec![raw_value] },
+            },
+        );
+        let is_object = body.add_op(
+            non_raw,
+            Operator::RefTest { ty: self.repr.object_ty() },
+            &[value],
+            &[Type::I32],
+        );
+        let array_object = body.add_block();
+        let missing = body.add_block();
+        body.set_terminator(
+            non_raw,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget { block: array_object, args: vec![] },
+                if_false: BlockTarget { block: missing, args: vec![] },
+            },
+        );
+        let plain = body.add_op(
+            array_object,
+            Operator::RefCast { ty: self.repr.object_ty() },
+            &[value],
+            &[self.repr.object_ty()],
+        );
+        let elements = body.add_op(
+            array_object,
+            Operator::StructGet { sig: self.repr.object, idx: 1 },
+            &[plain],
+            &[self.repr.arguments_ty()],
+        );
+        let null = body.add_op(array_object, Operator::RefIsNull, &[elements], &[Type::I32]);
+        let present = body.add_block();
+        body.set_terminator(
+            array_object,
+            Terminator::CondBr {
+                cond: null,
+                if_true: BlockTarget { block: missing, args: vec![] },
+                if_false: BlockTarget { block: present, args: vec![] },
+            },
+        );
+        let (present, present_value) = self.get_array_index(body, present, elements, index)?;
+        body.set_terminator(
+            present,
+            Terminator::Br {
+                target: BlockTarget { block: join, args: vec![present_value] },
+            },
+        );
+        let undef = self.undef(body, missing);
+        let undef = self.box_value(body, missing, &undef)?;
+        body.set_terminator(
+            missing,
+            Terminator::Br {
+                target: BlockTarget { block: join, args: vec![undef] },
+            },
+        );
+        Ok((join, LowerValue::Wasm { value: result, kind: ValueKind::Reference }))
+    }
+
+    fn dynamic_string_key(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        key: &LowerValue,
+    ) -> Result<Value, ConvertError> {
+        let (key, kind) = key.wasm()?;
+        if kind != ValueKind::Reference {
+            return Err(ConvertError::invalid("dynamic member key is not a string"));
+        }
+        Ok(body.add_op(
+            block,
+            Operator::RefCast { ty: self.repr.string_ty() },
+            &[key],
+            &[self.repr.string_ty()],
+        ))
+    }
+
+    fn get_string_member_raw_base(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: Value,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        const INVALID: u32 = u32::MAX;
+        let (value, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return self.get_dynamic_property(body, block, object, key);
+        }
+        let parser = self.ensure_string_index()?;
+        let equal = self.ensure_string_equal()?;
+        let object_value = value;
+        let is_object = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.object_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let array_object = body.add_block();
+        let property = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget {
+                    block: array_object,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: property,
+                    args: vec![],
+                },
+            },
+        );
+        let plain = body.add_op(
+            array_object,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[value],
+            &[self.repr.object_ty()],
+        );
+        let elements = body.add_op(
+            array_object,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 1,
+            },
+            &[plain],
+            &[self.repr.arguments_ty()],
+        );
+        let no_elements = body.add_op(
+            array_object,
+            Operator::RefIsNull,
+            &[elements],
+            &[Type::I32],
+        );
+        let array = body.add_block();
+        body.set_terminator(
+            array_object,
+            Terminator::CondBr {
+                cond: no_elements,
+                if_true: BlockTarget {
+                    block: property,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: array,
+                    args: vec![],
+                },
+            },
+        );
+        let length_name = self.new_string(body, array, b"length")?;
+        let is_length = body.add_op(
+            array,
+            Operator::Call {
+                function_index: equal,
+            },
+            &[key, length_name],
+            &[Type::I32],
+        );
+        let length = body.add_block();
+        let maybe_index = body.add_block();
+        body.set_terminator(
+            array,
+            Terminator::CondBr {
+                cond: is_length,
+                if_true: BlockTarget {
+                    block: length,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: maybe_index,
+                    args: vec![],
+                },
+            },
+        );
+        let (length, length_value) = self.get_array_property(body, length, elements, "length")?;
+        body.set_terminator(
+            length,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![length_value],
+                },
+            },
+        );
+        let index = body.add_op(
+            maybe_index,
+            Operator::Call {
+                function_index: parser,
+            },
+            &[key],
+            &[Type::I32],
+        );
+        let invalid = body.add_op(
+            maybe_index,
+            Operator::I32Const { value: INVALID },
+            &[],
+            &[Type::I32],
+        );
+        let is_invalid = body.add_op(
+            maybe_index,
+            Operator::I32Eq,
+            &[index, invalid],
+            &[Type::I32],
+        );
+        let array_index = body.add_block();
+        body.set_terminator(
+            maybe_index,
+            Terminator::CondBr {
+                cond: is_invalid,
+                if_true: BlockTarget {
+                    block: property,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: array_index,
+                    args: vec![],
+                },
+            },
+        );
+        let (array_index, array_value) =
+            self.get_array_index(body, array_index, elements, index)?;
+        body.set_terminator(
+            array_index,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![array_value],
+                },
+            },
+        );
+        // A primitive (non-object) receiver has no property storage, but a
+        // *string* still answers `length` — and a lazily cached string only
+        // exposes its length through the UTF-16 helper, never through a
+        // property lookup. Route the string shape to `string_length` before
+        // the generic miss so `'abc'[1].length` does not read `undefined`.
+        let is_string = body.add_op(
+            property,
+            Operator::RefTest {
+                ty: self.repr.string_ty(),
+            },
+            &[object_value],
+            &[Type::I32],
+        );
+        let string = body.add_block();
+        let other = body.add_block();
+        body.set_terminator(
+            property,
+            Terminator::CondBr {
+                cond: is_string,
+                if_true: BlockTarget {
+                    block: string,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: other,
+                    args: vec![],
+                },
+            },
+        );
+        let string_value = body.add_op(
+            string,
+            Operator::RefCast {
+                ty: self.repr.string_ty(),
+            },
+            &[object_value],
+            &[self.repr.string_ty()],
+        );
+        let string_length = self.string_length(body, string, string_value)?;
+        let string_length = self.box_value(body, string, &string_length)?;
+        body.set_terminator(
+            string,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![string_length],
+                },
+            },
+        );
+        let (other, property_value) = self.get_dynamic_property(body, other, object, key)?;
+        let property_value = self.box_value(body, other, &property_value)?;
+        body.set_terminator(
+            other,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![property_value],
+                },
+            },
+        );
+        Ok((
+            join,
+            LowerValue::Wasm {
+                value: result,
+                kind: ValueKind::Reference,
+            },
+        ))
+    }
+
+    fn get_dynamic_property(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: Value,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        let (block, root) = self.object_and_root(body, block, object)?;
+        let helpers = self.ensure_property_helpers()?;
+        let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let slot = body.add_op(
+            block,
+            Operator::Call {
+                function_index: helpers.lookup,
+            },
+            &[root, key, zero],
+            &[self.repr.slot_ty()],
+        );
+        let (block, value) = self.unwrap_slot(body, block, slot);
+        Ok((
+            block,
+            LowerValue::Wasm {
+                value,
+                kind: ValueKind::Reference,
+            },
+        ))
+    }
+
+    fn set_string_member_raw_base(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: Value,
+        value: &LowerValue,
+    ) -> Result<Block, ConvertError> {
+        const INVALID: u32 = u32::MAX;
+        let (object_value, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return self.set_dynamic_property_raw(body, block, object, key, value);
+        }
+        let parser = self.ensure_string_index()?;
+        let equal = self.ensure_string_equal()?;
+        let is_object = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.object_ty(),
+            },
+            &[object_value],
+            &[Type::I32],
+        );
+        let array_object = body.add_block();
+        let property = body.add_block();
+        let done = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget {
+                    block: array_object,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: property,
+                    args: vec![],
+                },
+            },
+        );
+        let plain = body.add_op(
+            array_object,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[object_value],
+            &[self.repr.object_ty()],
+        );
+        let elements = body.add_op(
+            array_object,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 1,
+            },
+            &[plain],
+            &[self.repr.arguments_ty()],
+        );
+        let no_elements = body.add_op(
+            array_object,
+            Operator::RefIsNull,
+            &[elements],
+            &[Type::I32],
+        );
+        let array = body.add_block();
+        body.set_terminator(
+            array_object,
+            Terminator::CondBr {
+                cond: no_elements,
+                if_true: BlockTarget {
+                    block: property,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: array,
+                    args: vec![],
+                },
+            },
+        );
+        let length_name = self.new_string(body, array, b"length")?;
+        let is_length = body.add_op(
+            array,
+            Operator::Call {
+                function_index: equal,
+            },
+            &[key, length_name],
+            &[Type::I32],
+        );
+        let length = body.add_block();
+        let maybe_index = body.add_block();
+        body.set_terminator(
+            array,
+            Terminator::CondBr {
+                cond: is_length,
+                if_true: BlockTarget {
+                    block: length,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: maybe_index,
+                    args: vec![],
+                },
+            },
+        );
+        let length = self.set_array_length(body, length, object, value)?;
+        body.set_terminator(
+            length,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
+            },
+        );
+        let index = body.add_op(
+            maybe_index,
+            Operator::Call {
+                function_index: parser,
+            },
+            &[key],
+            &[Type::I32],
+        );
+        let invalid = body.add_op(
+            maybe_index,
+            Operator::I32Const { value: INVALID },
+            &[],
+            &[Type::I32],
+        );
+        let is_invalid = body.add_op(
+            maybe_index,
+            Operator::I32Eq,
+            &[index, invalid],
+            &[Type::I32],
+        );
+        let array_index = body.add_block();
+        body.set_terminator(
+            maybe_index,
+            Terminator::CondBr {
+                cond: is_invalid,
+                if_true: BlockTarget {
+                    block: property,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: array_index,
+                    args: vec![],
+                },
+            },
+        );
+        let array_index = self.set_numeric_member_raw(body, array_index, object, index, value)?;
+        body.set_terminator(
+            array_index,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
+            },
+        );
+        let property = self.set_dynamic_property_raw(body, property, object, key, value)?;
+        body.set_terminator(
+            property,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
+            },
+        );
+        Ok(done)
+    }
+
+    fn set_dynamic_property_raw(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: Value,
+        value: &LowerValue,
+    ) -> Result<Block, ConvertError> {
+        let (block, root) = self.object_and_root(body, block, object)?;
+        let boxed_value = self.box_value(body, block, value)?;
+        let helpers = self.ensure_property_helpers()?;
+        let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let existing = body.add_op(
+            block,
+            Operator::Call {
+                function_index: helpers.lookup,
+            },
+            &[root, key, zero],
+            &[self.repr.slot_ty()],
+        );
+        let (block, flags) = self.slot_flags_or_default(body, block, existing);
+        let slot = self.new_slot(body, block, boxed_value, flags);
+        let block = self.write_slot_if_writable(body, block, root, key, slot, flags, zero)?;
+        Ok(block)
+    }
+
+    fn set_numeric_member_raw_base(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        index: Value,
+        value: &LowerValue,
+    ) -> Result<Block, ConvertError> {
+        let (object, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return Ok(block);
+        }
+        let boxed_value = self.box_value(body, block, value)?;
+        let is_object = body.add_op(
+            block,
+            Operator::RefTest { ty: self.repr.object_ty() },
+            &[object],
+            &[Type::I32],
+        );
+        let array_object = body.add_block();
+        let done = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget { block: array_object, args: vec![] },
+                if_false: BlockTarget { block: done, args: vec![] },
+            },
+        );
+        let plain = body.add_op(
+            array_object,
+            Operator::RefCast { ty: self.repr.object_ty() },
+            &[object],
+            &[self.repr.object_ty()],
+        );
+        let elements = body.add_op(
+            array_object,
+            Operator::StructGet { sig: self.repr.object, idx: 1 },
+            &[plain],
+            &[self.repr.arguments_ty()],
+        );
+        let no_elements = body.add_op(array_object, Operator::RefIsNull, &[elements], &[Type::I32]);
+        let write = body.add_block();
+        body.set_terminator(
+            array_object,
+            Terminator::CondBr {
+                cond: no_elements,
+                if_true: BlockTarget { block: done, args: vec![] },
+                if_false: BlockTarget { block: write, args: vec![] },
+            },
+        );
+        let length = body.add_op(write, Operator::ArrayLen, &[elements], &[Type::I32]);
+        let in_bounds = body.add_op(write, Operator::I32LtU, &[index, length], &[Type::I32]);
+        let set_existing = body.add_block();
+        let grow = body.add_block();
+        body.set_terminator(
+            write,
+            Terminator::CondBr {
+                cond: in_bounds,
+                if_true: BlockTarget { block: set_existing, args: vec![] },
+                if_false: BlockTarget { block: grow, args: vec![] },
+            },
+        );
+        body.add_op(
+            set_existing,
+            Operator::ArraySet { sig: self.repr.arguments },
+            &[elements, index, boxed_value],
+            &[],
+        );
+        body.set_terminator(
+            set_existing,
+            Terminator::Br {
+                target: BlockTarget { block: done, args: vec![] },
+            },
+        );
+        let one = body.add_op(grow, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        let grown_length = body.add_op(grow, Operator::I32Add, &[index, one], &[Type::I32]);
+        let grown = body.add_op(
+            grow,
+            Operator::ArrayNewDefault { sig: self.repr.arguments },
+            &[grown_length],
+            &[self.repr.arguments_ty()],
+        );
+        let zero = body.add_op(grow, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        body.add_op(
+            grow,
+            Operator::ArrayCopy { dest: self.repr.arguments, src: self.repr.arguments },
+            &[grown, zero, elements, zero, length],
+            &[],
+        );
+        body.add_op(
+            grow,
+            Operator::ArraySet { sig: self.repr.arguments },
+            &[grown, index, boxed_value],
+            &[],
+        );
+        body.add_op(
+            grow,
+            Operator::StructSet { sig: self.repr.object, idx: 1 },
+            &[plain, grown],
+            &[],
+        );
+        body.set_terminator(
+            grow,
+            Terminator::Br {
+                target: BlockTarget { block: done, args: vec![] },
+            },
+        );
+        Ok(done)
+    }
+
+    fn static_subarray(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        wrapped: &LowerValue,
+        begin: usize,
+        end: usize,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        let (wrapped, kind) = wrapped.wasm()?;
+        if kind != ValueKind::Reference {
+            return Err(ConvertError::unsupported(
+                "static array destructuring of a primitive",
+                (),
+            ));
+        }
+        let begin = u32::try_from(begin)
+            .map_err(|_| ConvertError::invalid("array slice start exceeds Wasm i32"))?;
+        let end = u32::try_from(end)
+            .map_err(|_| ConvertError::invalid("array slice end exceeds Wasm i32"))?;
+        let object = body.add_op(
+            block,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[wrapped],
+            &[self.repr.object_ty()],
+        );
+        let array = body.add_op(
+            block,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 1,
+            },
+            &[object],
+            &[self.repr.arguments_ty()],
+        );
+        let length = body.add_op(block, Operator::ArrayLen, &[array], &[Type::I32]);
+        let begin = body.add_op(
+            block,
+            Operator::I32Const { value: begin },
+            &[],
+            &[Type::I32],
+        );
+        let end = body.add_op(block, Operator::I32Const { value: end }, &[], &[Type::I32]);
+        // `start = min(begin, length)` and
+        // `count = max(length - start - end, 0)`.  The saturated arithmetic
+        // makes empty and too-short arrays match destructuring rest semantics
+        // without ever issuing an out-of-bounds array.copy.
+        let start_after_length =
+            body.add_op(block, Operator::I32LtU, &[length, begin], &[Type::I32]);
+        let start = body.add_op(
+            block,
+            Operator::TypedSelect { ty: Type::I32 },
+            &[length, begin, start_after_length],
+            &[Type::I32],
+        );
+        let remaining = body.add_op(block, Operator::I32Sub, &[length, start], &[Type::I32]);
+        let has_tail = body.add_op(block, Operator::I32LtU, &[end, remaining], &[Type::I32]);
+        let without_tail = body.add_op(block, Operator::I32Sub, &[remaining, end], &[Type::I32]);
+        let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let count = body.add_op(
+            block,
+            Operator::TypedSelect { ty: Type::I32 },
+            &[without_tail, zero, has_tail],
+            &[Type::I32],
+        );
+        let copy = body.add_op(
+            block,
+            Operator::ArrayNewDefault {
+                sig: self.repr.arguments,
+            },
+            &[count],
+            &[self.repr.arguments_ty()],
+        );
+        body.add_op(
+            block,
+            Operator::ArrayCopy {
+                dest: self.repr.arguments,
+                src: self.repr.arguments,
+            },
+            &[copy, zero, array, start, count],
+            &[],
+        );
+        let copy = self.new_array_object(body, block, copy)?;
+        Ok((
+            block,
+            LowerValue::Wasm {
+                value: copy,
+                kind: ValueKind::Reference,
+            },
+        ))
+    }
+
+    fn static_subobject(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        values: &BTreeMap<SValueId, LowerValue>,
+        wrapped: &LowerValue,
+        keys: &[PropKey<SValueId>],
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        // CopyDataProperties reads accessor properties from the source and
+        // writes their resulting values into the rest object. For shapes we
+        // know every direct field, so lower those reads as ordinary accessor
+        // continuations instead of copying the descriptor representation.
+        let excluded = keys
+            .iter()
+            .map(|key| match key {
+                PropKey::Lit(key) => Ok(key.sym.to_string()),
+                PropKey::Computed(value) => self.key_of(values.get(value).ok_or_else(|| {
+                    ConvertError::invalid("undefined static object-rest key")
+                })?),
+                _ => Err(ConvertError::unsupported("object-rest property key", ())),
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let (block, root) = self.object_and_root(body, block, wrapped)?;
+        let mut current = block;
+        let mut results = Vec::new();
+
+        for shape in self.shapes.clone() {
+            let matches = body.add_op(
+                current,
+                Operator::RefTest {
+                    ty: ref_sig(shape.sig),
+                },
+                &[root],
+                &[Type::I32],
+            );
+            let matched = body.add_block();
+            let next = body.add_block();
+            body.set_terminator(
+                current,
+                Terminator::CondBr {
+                    cond: matches,
+                    if_true: BlockTarget {
+                        block: matched,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: next,
+                        args: vec![],
+                    },
+                },
+            );
+            let instance = body.add_op(
+                matched,
+                Operator::RefCast {
+                    ty: ref_sig(shape.sig),
+                },
+                &[root],
+                &[ref_sig(shape.sig)],
+            );
+            let fallback = body.add_op(
+                matched,
+                Operator::StructGet {
+                    sig: shape.sig,
+                    idx: 0,
+                },
+                &[instance],
+                &[self.repr.trie_ty()],
+            );
+            let copied = self.clone_trie(body, matched, fallback)?;
+            let mut copied_block = matched;
+            for key in &excluded {
+                copied_block = self.clear_property(body, copied_block, copied, key)?;
+            }
+            let copied_root = self.anyref(body, copied_block, copied);
+            let object = self.new_object_with_root(body, copied_block, copied_root)?;
+            for (field, name) in shape.keys.iter().enumerate() {
+                if excluded.contains(name) {
+                    continue;
+                }
+                let source_slot = body.add_op(
+                    copied_block,
+                    Operator::StructGet {
+                        sig: shape.sig,
+                        idx: field + 1,
+                    },
+                    &[instance],
+                    &[self.repr.slot_ty()],
+                );
+                let (unwrapped_block, value) = self.unwrap_slot(body, copied_block, source_slot);
+                let (next, value) = self.resolve_property_read_join(
+                    body,
+                    unwrapped_block,
+                    wrapped,
+                    LowerValue::Wasm {
+                        value,
+                        kind: ValueKind::Reference,
+                    },
+                )?;
+                copied_block = self.set_static_property_value_raw(
+                    body,
+                    next,
+                    &object,
+                    name,
+                    &value,
+                )?;
+            }
+            results.push((copied_block, object));
+            current = next;
+        }
+
+        // Accessors originate in object literals with a known literal-key
+        // shape. The remaining generic path preserves dynamic data entries
+        // with the existing trie clone and exclusion handling.
+        let (next, trie) = self.clone_property_root(body, current, root)?;
+        current = next;
+        for key in &excluded {
+            current = self.clear_property(body, current, trie, key)?;
+        }
+        let trie = self.anyref(body, current, trie);
+        let object = self.new_object_with_root(body, current, trie)?;
+        results.push((current, object));
+        Ok(results)
+    }
+
+    fn clone_property_root(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        root: Value,
+    ) -> Result<(Block, Value), ConvertError> {
+        let helpers = self.ensure_property_helpers()?;
+        let done = body.add_block();
+        let result = body.add_blockparam(done, self.repr.trie_ty());
+        let mut current = block;
+        for shape in self.shapes.clone() {
+            let matches = body.add_op(
+                current,
+                Operator::RefTest {
+                    ty: ref_sig(shape.sig),
+                },
+                &[root],
+                &[Type::I32],
+            );
+            let matched = body.add_block();
+            let next = body.add_block();
+            body.set_terminator(
+                current,
+                Terminator::CondBr {
+                    cond: matches,
+                    if_true: BlockTarget { block: matched, args: vec![] },
+                    if_false: BlockTarget { block: next, args: vec![] },
+                },
+            );
+            let instance = body.add_op(
+                matched,
+                Operator::RefCast { ty: ref_sig(shape.sig) },
+                &[root],
+                &[ref_sig(shape.sig)],
+            );
+            let fallback = body.add_op(
+                matched,
+                Operator::StructGet { sig: shape.sig, idx: 0 },
+                &[instance],
+                &[self.repr.trie_ty()],
+            );
+            let mut copied_block = matched;
+            let copied = self.clone_trie(body, copied_block, fallback)?;
+            let copied_root = self.anyref(body, copied_block, copied);
+            for (field, name) in shape.keys.iter().enumerate() {
+                let source_slot = body.add_op(
+                    copied_block,
+                    Operator::StructGet {
+                        sig: shape.sig,
+                        idx: field + 1,
+                    },
+                    &[instance],
+                    &[self.repr.slot_ty()],
+                );
+                // `CopyDataProperties` (object-rest/spread) always creates
+                // fresh writable/enumerable/configurable own properties on
+                // the target, regardless of the source's attributes.
+                let (next_block, value) = self.unwrap_slot(body, copied_block, source_slot);
+                copied_block = next_block;
+                let slot = self.new_slot_literal(body, copied_block, value, crate::repr::SLOT_FLAGS_DEFAULT);
+                let key = self.new_string(body, copied_block, name.as_bytes())?;
+                let zero = body.add_op(
+                    copied_block,
+                    Operator::I32Const { value: 0 },
+                    &[],
+                    &[Type::I32],
+                );
+                body.add_op(
+                    copied_block,
+                    Operator::Call {
+                        function_index: helpers.set,
+                    },
+                    &[copied_root, key, slot, zero],
+                    &[],
+                );
+            }
+            body.set_terminator(
+                copied_block,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: done,
+                        args: vec![copied],
+                    },
+                },
+            );
+            current = next;
+        }
+        let trie = body.add_op(
+            current,
+            Operator::RefCast {
+                ty: self.repr.trie_ty(),
+            },
+            &[root],
+            &[self.repr.trie_ty()],
+        );
+        let copied = self.clone_trie(body, current, trie)?;
+        body.set_terminator(
+            current,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: done,
+                    args: vec![copied],
+                },
+            },
+        );
+        Ok((done, result))
+    }
+
+    fn clear_property(
+        &self,
+        body: &mut FunctionBody,
+        mut block: Block,
+        mut trie: Value,
+        key: &str,
+    ) -> Result<Block, ConvertError> {
+        let done = body.add_block();
+        for byte in key.as_bytes() {
+            let child = body.add_op(
+                block,
+                Operator::StructGet {
+                    sig: self.repr.trie,
+                    idx: usize::from(*byte) + 1,
+                },
+                &[trie],
+                &[self.repr.value],
+            );
+            let missing = body.add_op(block, Operator::RefIsNull, &[child], &[Type::I32]);
+            let present = body.add_block();
+            body.set_terminator(
+                block,
+                Terminator::CondBr {
+                    cond: missing,
+                    if_true: BlockTarget {
+                        block: done,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: present,
+                        args: vec![],
+                    },
+                },
+            );
+            trie = body.add_op(
+                present,
+                Operator::RefCast {
+                    ty: self.repr.trie_ty(),
+                },
+                &[child],
+                &[self.repr.trie_ty()],
+            );
+            block = present;
+        }
+        let undef = body.add_op(
+            block,
+            Operator::RefNull {
+                ty: self.repr.slot_ty(),
+            },
+            &[],
+            &[self.repr.slot_ty()],
+        );
+        body.add_op(
+            block,
+            Operator::StructSet {
+                sig: self.repr.trie,
+                idx: 0,
+            },
+            &[trie, undef],
+            &[],
+        );
+        body.set_terminator(
+            block,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
+            },
+        );
+        Ok(done)
+    }
+
+    fn get_object_property_value(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &str,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        let (block, root) = self.object_and_root(body, block, object)?;
+        let helpers = self.ensure_property_helpers()?;
+        let key = self.new_string(body, block, key.as_bytes())?;
+        let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let slot = body.add_op(
+            block,
+            Operator::Call {
+                function_index: helpers.lookup,
+            },
+            &[root, key, zero],
+            &[self.repr.slot_ty()],
+        );
+        let (block, value) = self.unwrap_slot(body, block, slot);
+        Ok((
+            block,
+            LowerValue::Wasm {
+                value,
+                kind: ValueKind::Reference,
+            },
+        ))
+    }
+
+    fn set_property(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        context: Value,
+        key: &str,
+        value: &LowerValue,
+    ) -> Result<Vec<Block>, ConvertError> {
+        self.set_property_value(
+            body,
+            block,
+            &LowerValue::Wasm {
+                value: context,
+                kind: ValueKind::Reference,
+            },
+            key,
+            value,
+        )
+    }
+
+    fn set_property_value(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &str,
+        value: &LowerValue,
+    ) -> Result<Vec<Block>, ConvertError> {
+        let (block, existing) = self.get_property_value_raw(body, block, object, key)?;
+        let (ordinary, mut done) =
+            self.split_descriptor_write(body, block, object, existing, value)?;
+        done.push(self.set_property_value_raw(body, ordinary, object, key, value)?);
+        Ok(vec![self.join_write_continuations(body, done)])
+    }
+
+    fn set_numeric_member(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        index: Value,
+        value: &LowerValue,
+    ) -> Result<Vec<Block>, ConvertError> {
+        let (block, existing) = self.get_numeric_member_raw(body, block, object, index)?;
+        let (ordinary, mut done) =
+            self.split_descriptor_write(body, block, object, existing, value)?;
+        done.push(self.set_numeric_member_raw(body, ordinary, object, index, value)?);
+        Ok(vec![self.join_write_continuations(body, done)])
+    }
+
+    fn set_string_member(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: Value,
+        value: &LowerValue,
+    ) -> Result<Vec<Block>, ConvertError> {
+        let (block, existing) = self.get_string_member_raw(body, block, object, key)?;
+        let (ordinary, mut done) =
+            self.split_descriptor_write(body, block, object, existing, value)?;
+        done.push(self.set_string_member_raw(body, ordinary, object, key, value)?);
+        Ok(vec![self.join_write_continuations(body, done)])
+    }
+
+    fn set_property_value_raw(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &str,
+        value: &LowerValue,
+    ) -> Result<Block, ConvertError> {
+        if let Some(index) = Self::static_array_index(key) {
+            return self.set_static_array_index_raw(body, block, object, key, index, value);
+        }
+        if key == "length" {
+            return self.set_static_length_property_raw(body, block, object, key, value);
+        }
+        self.set_static_property_value_raw(body, block, object, key, value)
+    }
+
+    fn set_static_property_value_raw(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &str,
+        value: &LowerValue,
+    ) -> Result<Block, ConvertError> {
+        let (block, root) = self.object_and_root(body, block, object)?;
+        let boxed_value = self.box_value(body, block, value)?;
+        let key = self.new_string(body, block, key.as_bytes())?;
+        let helpers = self.ensure_property_helpers()?;
+        let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let existing = body.add_op(
+            block,
+            Operator::Call {
+                function_index: helpers.lookup,
+            },
+            &[root, key, zero],
+            &[self.repr.slot_ty()],
+        );
+        let (block, flags) = self.slot_flags_or_default(body, block, existing);
+        let slot = self.new_slot(body, block, boxed_value, flags);
+        let block = self.write_slot_if_writable(body, block, root, key, slot, flags, zero)?;
+        Ok(block)
+    }
+
+    fn set_static_array_index_raw_base(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &str,
+        index: u32,
+        value: &LowerValue,
+    ) -> Result<Block, ConvertError> {
+        let (object_value, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return self.set_static_property_value_raw(body, block, object, key, value);
+        }
+        let is_object = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.object_ty(),
+            },
+            &[object_value],
+            &[Type::I32],
+        );
+        let array_object = body.add_block();
+        let fallback = body.add_block();
+        let done = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget {
+                    block: array_object,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: fallback,
+                    args: vec![],
+                },
+            },
+        );
+        let plain = body.add_op(
+            array_object,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[object_value],
+            &[self.repr.object_ty()],
+        );
+        let elements = body.add_op(
+            array_object,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 1,
+            },
+            &[plain],
+            &[self.repr.arguments_ty()],
+        );
+        let no_elements = body.add_op(
+            array_object,
+            Operator::RefIsNull,
+            &[elements],
+            &[Type::I32],
+        );
+        let array = body.add_block();
+        body.set_terminator(
+            array_object,
+            Terminator::CondBr {
+                cond: no_elements,
+                if_true: BlockTarget {
+                    block: fallback,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: array,
+                    args: vec![],
+                },
+            },
+        );
+        let index = body.add_op(
+            array,
+            Operator::I32Const { value: index },
+            &[],
+            &[Type::I32],
+        );
+        let array = self.set_numeric_member_raw(body, array, object, index, value)?;
+        body.set_terminator(
+            array,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
+            },
+        );
+        let fallback = self.set_static_property_value_raw(body, fallback, object, key, value)?;
+        body.set_terminator(
+            fallback,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
+            },
+        );
+        Ok(done)
+    }
+
+    fn set_static_length_property_raw_base(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &str,
+        value: &LowerValue,
+    ) -> Result<Block, ConvertError> {
+        let (object_value, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return self.set_static_property_value_raw(body, block, object, key, value);
+        }
+        let is_object = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.object_ty(),
+            },
+            &[object_value],
+            &[Type::I32],
+        );
+        let array_object = body.add_block();
+        let fallback = body.add_block();
+        let done = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget {
+                    block: array_object,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: fallback,
+                    args: vec![],
+                },
+            },
+        );
+        let plain = body.add_op(
+            array_object,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[object_value],
+            &[self.repr.object_ty()],
+        );
+        let elements = body.add_op(
+            array_object,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 1,
+            },
+            &[plain],
+            &[self.repr.arguments_ty()],
+        );
+        let no_elements = body.add_op(
+            array_object,
+            Operator::RefIsNull,
+            &[elements],
+            &[Type::I32],
+        );
+        let array = body.add_block();
+        body.set_terminator(
+            array_object,
+            Terminator::CondBr {
+                cond: no_elements,
+                if_true: BlockTarget {
+                    block: fallback,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: array,
+                    args: vec![],
+                },
+            },
+        );
+        let array = self.set_array_length(body, array, object, value)?;
+        body.set_terminator(
+            array,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
+            },
+        );
+        let fallback = self.set_static_property_value_raw(body, fallback, object, key, value)?;
+        body.set_terminator(
+            fallback,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
+            },
+        );
+        Ok(done)
+    }
+
+    fn set_array_length(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        value: &LowerValue,
+    ) -> Result<Block, ConvertError> {
+        let (object, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            return Ok(block);
+        }
+        let requested = self.as_f64(body, block, value)?;
+        let requested = body.add_op(
+            block,
+            Operator::I32TruncSatF64U,
+            &[requested],
+            &[Type::I32],
+        );
+        let is_object = body.add_op(
+            block,
+            Operator::RefTest { ty: self.repr.object_ty() },
+            &[object],
+            &[Type::I32],
+        );
+        let array_object = body.add_block();
+        let done = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_object,
+                if_true: BlockTarget { block: array_object, args: vec![] },
+                if_false: BlockTarget { block: done, args: vec![] },
+            },
+        );
+        let plain = body.add_op(
+            array_object,
+            Operator::RefCast { ty: self.repr.object_ty() },
+            &[object],
+            &[self.repr.object_ty()],
+        );
+        let elements = body.add_op(
+            array_object,
+            Operator::StructGet { sig: self.repr.object, idx: 1 },
+            &[plain],
+            &[self.repr.arguments_ty()],
+        );
+        let absent = body.add_op(array_object, Operator::RefIsNull, &[elements], &[Type::I32]);
+        let resize = body.add_block();
+        body.set_terminator(
+            array_object,
+            Terminator::CondBr {
+                cond: absent,
+                if_true: BlockTarget { block: done, args: vec![] },
+                if_false: BlockTarget { block: resize, args: vec![] },
+            },
+        );
+        let old_length = body.add_op(resize, Operator::ArrayLen, &[elements], &[Type::I32]);
+        let old_is_shorter =
+            body.add_op(resize, Operator::I32LtU, &[old_length, requested], &[Type::I32]);
+        let copy_length = body.add_op(
+            resize,
+            Operator::TypedSelect { ty: Type::I32 },
+            &[old_length, requested, old_is_shorter],
+            &[Type::I32],
+        );
+        let replacement = body.add_op(
+            resize,
+            Operator::ArrayNewDefault { sig: self.repr.arguments },
+            &[requested],
+            &[self.repr.arguments_ty()],
+        );
+        let zero = body.add_op(resize, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        body.add_op(
+            resize,
+            Operator::ArrayCopy { dest: self.repr.arguments, src: self.repr.arguments },
+            &[replacement, zero, elements, zero, copy_length],
+            &[],
+        );
+        body.add_op(
+            resize,
+            Operator::StructSet { sig: self.repr.object, idx: 1 },
+            &[plain, replacement],
+            &[],
+        );
+        body.set_terminator(
+            resize,
+            Terminator::Br {
+                target: BlockTarget { block: done, args: vec![] },
+            },
+        );
+        Ok(done)
+    }
+
+    fn make_arguments(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        values: &BTreeMap<SValueId, LowerValue>,
+        args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
+    ) -> Result<Value, ConvertError> {
+        let values = args
+            .iter()
+            .map(|arg| {
+                if arg.is_spread {
+                    return Err(ConvertError::unsupported("spread argument", ()));
+                }
+                values
+                    .get(&arg.value)
+                    .ok_or_else(|| ConvertError::invalid("undefined call argument"))
+                    .and_then(|value| self.box_value(body, block, value))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(body.add_op(
+            block,
+            Operator::ArrayNewFixed {
+                sig: self.repr.arguments,
+                num: values.len(),
+            },
+            &values,
+            &[self.repr.arguments_ty()],
+        ))
+    }
+
+    fn make_plain_arguments(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        values: &BTreeMap<SValueId, LowerValue>,
+        args: &[SValueId],
+    ) -> Result<Value, ConvertError> {
+        let values = args
+            .iter()
+            .map(|arg| {
+                values
+                    .get(arg)
+                    .ok_or_else(|| ConvertError::invalid("undefined constructor argument"))
+                    .and_then(|value| self.box_value(body, block, value))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(body.add_op(
+            block,
+            Operator::ArrayNewFixed {
+                sig: self.repr.arguments,
+                num: values.len(),
+            },
+            &values,
+            &[self.repr.arguments_ty()],
+        ))
+    }
+
+    /// Emit the direct dispatch to a function literal's native body: a
+    /// `(context, this, arguments, args...) -> value` call with the current
+    /// context and the given receiver, skipping `callable_parts` and the
+    /// generic adapter's formal re-reads. Arguments are boxed positionally
+    /// (the unnormalized array still backs the source-level `arguments`).
+    fn direct_native_call(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        context: Value,
+        info: FunctionInfo,
+        this: LowerValue,
+        values: &BTreeMap<SValueId, LowerValue>,
+        args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        if args.iter().any(|arg| arg.is_spread) {
+            return Err(ConvertError::unsupported("spread argument", ()));
+        }
+        let (this, _) = this.wasm()?;
+        let this = self.anyref(body, block, this);
+        let mut boxed_args = Vec::with_capacity(args.len());
+        for arg in args {
+            let value = values
+                .get(&arg.value)
+                .ok_or_else(|| ConvertError::invalid("undefined call argument"))?;
+            boxed_args.push(self.box_value(body, block, value)?);
+        }
+        let arguments = body.add_op(
+            block,
+            Operator::ArrayNewFixed {
+                sig: self.repr.arguments,
+                num: boxed_args.len(),
+            },
+            &boxed_args,
+            &[self.repr.arguments_ty()],
+        );
+        // The native ABI has one formal per source parameter. Missing call
+        // arguments pass `undefined` (matching the adapter's bounds-checked
+        // reads); extra arguments ride in the array only.
+        let mut formals = boxed_args.clone();
+        formals.truncate(info.arity);
+        while formals.len() < info.arity {
+            let undef = body.add_op(
+                block,
+                Operator::RefNull {
+                    ty: self.repr.value,
+                },
+                &[],
+                &[self.repr.value],
+            );
+            formals.push(undef);
+        }
+        let mut call_args = vec![context, this, arguments];
+        call_args.extend(formals);
+        let result = body.add_op(
+            block,
+            Operator::Call {
+                function_index: info.native,
+            },
+            &call_args,
+            &[info.returns.native_return_type(&self.repr)],
+        );
+        let kind = info.returns.single().unwrap_or(ValueKind::Reference);
+        Ok((block, LowerValue::Wasm { value: result, kind }))
+    }
+
+    /// Guarded dispatch through a function literal: one tag check proves
+    /// the callee is still the original literal; mismatch falls back to the
+    /// generic `CallRef` path via the provided closure. Returns raw fast and
+    /// boxed-slow continuations.
+    fn guarded_function_ref_call<F>(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        callee: LowerValue,
+        info: FunctionInfo,
+        context: Value,
+        this: LowerValue,
+        values: &BTreeMap<SValueId, LowerValue>,
+        args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
+        fallback: F,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError>
+    where
+        F: FnOnce(
+            &mut Self,
+            &mut FunctionBody,
+            Block,
+        ) -> Result<Vec<(Block, LowerValue)>, ConvertError>,
+    {
+        let (callee_value, kind) = callee.wasm()?;
+        if kind != ValueKind::Reference || args.iter().any(|arg| arg.is_spread) {
+            return fallback(self, body, block);
+        }
+        let is_function = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.function_non_null_ty(),
+            },
+            &[callee_value],
+            &[Type::I32],
+        );
+        let check = body.add_block();
+        let slow = body.add_block();
+        let fast = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_function,
+                if_true: BlockTarget {
+                    block: check,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: slow,
+                    args: vec![],
+                },
+            },
+        );
+        let function = body.add_op(
+            check,
+            Operator::RefCast {
+                ty: self.repr.function_ty(),
+            },
+            &[callee_value],
+            &[self.repr.function_ty()],
+        );
+        let tag = body.add_op(
+            check,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: FUNCTION_FIELD_TAG,
+            },
+            &[function],
+            &[Type::I32],
+        );
+        let expected = body.add_op(
+            check,
+            Operator::I32Const {
+                value: info.tag as u32,
+            },
+            &[],
+            &[Type::I32],
+        );
+        let matches = body.add_op(check, Operator::I32Eq, &[tag, expected], &[Type::I32]);
+        body.set_terminator(
+            check,
+            Terminator::CondBr {
+                cond: matches,
+                if_true: BlockTarget {
+                    block: fast,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: slow,
+                    args: vec![],
+                },
+            },
+        );
+        let mut continuations = Vec::with_capacity(2);
+        let (fast_block, fast_value) =
+            self.direct_native_call(body, fast, context, info, this, values, args)?;
+        continuations.push((fast_block, fast_value));
+        for (slow_block, slow_value) in fallback(self, body, slow)? {
+            let slow_value = self.box_value(body, slow_block, &slow_value)?;
+            continuations.push((
+                slow_block,
+                LowerValue::Wasm {
+                    value: slow_value,
+                    kind: ValueKind::Reference,
+                },
+            ));
+        }
+        Ok(continuations)
+    }
+
+    fn lower_call_parts(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        context: Value,
+        this: LowerValue,
+        values: &BTreeMap<SValueId, LowerValue>,
+        callee: &TCallee<SValueId>,
+        args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
+    ) -> Result<Vec<(Block, Value, Value, Value, Value)>, ConvertError> {
+        let callees = match callee {
+            TCallee::Val(value) => vec![(
+                block,
+                values
+                    .get(value)
+                    .cloned()
+                    .ok_or_else(|| ConvertError::invalid("undefined callee"))?,
+                self.undef(body, block),
+            )],
+            TCallee::Member { func, member } => {
+                let receiver = values
+                    .get(func)
+                    .ok_or_else(|| ConvertError::invalid("undefined member receiver"))?;
+                let key = values
+                    .get(member)
+                    .ok_or_else(|| ConvertError::invalid("undefined member key"))?;
+                let callees = match self.key_of(key) {
+                    Ok(key) => self.get_property_value(body, block, receiver, &key),
+                    Err(_) => match key.kind()? {
+                        ValueKind::Number | ValueKind::Integer | ValueKind::Boolean => {
+                            let index = self.numeric_index(body, block, key)?;
+                            self.get_numeric_member(body, block, receiver, index)
+                        }
+                        ValueKind::Reference => {
+                            let key = self.dynamic_string_key(body, block, key)?;
+                            self.get_string_member(body, block, receiver, key)
+                        }
+                    },
+                }?;
+                callees
+                    .into_iter()
+                    .map(|(block, callee)| (block, callee, receiver.clone()))
+                    .collect()
+            }
+            _ => return Err(ConvertError::unsupported(format!("callee {callee:?}"), ())),
+        };
+        let mut result = Vec::with_capacity(callees.len());
+        for (block, callee, receiver) in callees {
+            let (captured_context, effective_this, code, _) =
+                self.callable_parts(body, block, &callee, receiver)?;
+            let array = self.make_arguments(body, block, values, args)?;
+            result.push((block, captured_context, effective_this, array, code));
+        }
+        let _ = context;
+        let _ = this;
+        Ok(result)
+    }
+
+    fn callable_parts(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        callee: &LowerValue,
+        receiver: LowerValue,
+    ) -> Result<(Value, Value, Value, Value), ConvertError> {
+        let (callee, _) = callee.wasm()?;
+        let function = body.add_op(
+            block,
+            Operator::RefCast {
+                ty: self.repr.function_ty(),
+            },
+            &[callee],
+            &[self.repr.function_ty()],
+        );
+        let code = body.add_op(
+            block,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: 3,
+            },
+            &[function],
+            &[ref_sig(self.repr.adapter)],
+        );
+        let context = body.add_op(
+            block,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: 4,
+            },
+            &[function],
+            &[self.repr.object_ty()],
+        );
+        let captured_this = body.add_op(
+            block,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: 5,
+            },
+            &[function],
+            &[self.repr.value],
+        );
+        let arrow = body.add_op(
+            block,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: 6,
+            },
+            &[function],
+            &[Type::I32],
+        );
+        let receiver = self.box_value(body, block, &receiver)?;
+        let this = body.add_op(
+            block,
+            Operator::TypedSelect {
+                ty: self.repr.value,
+            },
+            &[captured_this, receiver, arrow],
+            &[self.repr.value],
+        );
+        Ok((context, this, code, arrow))
+    }
+}
+
+// Hand-written native (non-lowered-source) implementations of the
+// `Math`/`Array` primordials, installed into each exported function's fresh
+// lexical context. `include!`d as a module-level item (an `impl Converter`
+// block of its own) so these methods share full access to the existing
+// property/object helpers without a separate crate-visibility surface.
+include!("primordials.rs");
+
+// Native WasmGC backing storage and the corresponding JavaScript typed-array
+// surface. Kept beside the primordial implementation because constructors and
+// prototype-like methods are installed through that same context builder.
+include!("typed_arrays.rs");
+
+// Runtime property enumeration, backing Object.keys/values/entries/
+// getOwnPropertyNames/getOwnPropertyDescriptors/assign/freeze/isFrozen and
+// Reflect.ownKeys.
+include!("enumerate.rs");

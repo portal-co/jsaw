@@ -2,8 +2,10 @@ use portal_jsc_swc_cfg::module::CfgModule;
 use portal_jsc_swc_ssa::{SFunc, SValue, module::SModule};
 use portal_jsc_swc_tac::{Item, module::TModule};
 use portal_pc_waffle::{
-    ExportKind, FuncDecl, HeapType, Module, Operator, SignatureData, StorageType, Terminator, Type, ValueDef, WithMutablility,
+    ExportKind, FuncDecl, FunctionBody, HeapType, Module, Operator, SignatureData, StorageType,
+    Terminator, Type, ValueDef, WithMutablility,
 };
+use portal_pc_waffle::entity::EntityRef;
 use swc_common::{FileName, GLOBALS, Globals, SourceMap, sync::Lrc};
 use swc_ecma_ast::{EsVersion, Module as SwcModule, ModuleItem};
 use swc_ecma_parser::{EsSyntax, Syntax, parse_file_as_module, parse_file_as_script};
@@ -2524,17 +2526,39 @@ fn multi_call_site_splits_into_tag_continuations_per_payload_kind() {
     // The run export calls the pick adapter (generic path), whose result is
     // boxed; the *direct* call site in run's own body is not present since
     // pick is reached through the export machinery — so assert on the pick
-    // native's signature returning the union, plus run's tag read.
+    // native's signature returning its dedicated union layout. pick's
+    // kinds are {Number, Reference}: layout `rf` = (tag i32, r anyref,
+    // f f64), 3 fields, no i32 slot.
     let multi_ret_count = module.signatures.entries().filter(|(_, sig)| {
         matches!(sig, SignatureData::Func { returns, .. } if returns.len() == 1 && {
             matches!(&returns[0], Type::Heap(w) if {
                 matches!(&w.value, portal_pc_waffle::HeapType::Sig { sig_index } if {
-                    matches!(&module.signatures[*sig_index], SignatureData::Struct { fields, .. } if fields.len() == 4)
+                    matches!(&module.signatures[*sig_index], SignatureData::Struct { fields, .. } if {
+                        fields.len() == 3 && {
+                            let tys: Vec<Type> = fields
+                                .iter()
+                                .map(|f: &WithMutablility<StorageType>| match f.value {
+                                    StorageType::Val(t) => t,
+                                    _ => Type::I32,
+                                })
+                                .collect();
+                            tys[0] == Type::I32
+                                && tys[1]
+                                    == Type::Heap(portal_pc_waffle::WithNullable {
+                                        value: portal_pc_waffle::HeapType::Any,
+                                        nullable: true,
+                                    })
+                                && tys[2] == Type::F64
+                        }
+                    })
                 })
             })
         })
     }).count();
-    assert!(multi_ret_count >= 1, "at least one native must return the multi union");
+    assert!(
+        multi_ret_count >= 1,
+        "at least one native must return the dedicated rf union layout"
+    );
 }
 
 #[test]
@@ -2715,3 +2739,259 @@ fn cross_module_tail_chain_executes_on_both_parities() {
     assert_eq!(execute_in_wasmtime(&bytes, "run", &[101.0]), 2.0);
     assert_eq!(execute_in_wasmtime(&bytes, "run", &[100.0]), 1.0);
 }
+
+/// Find a native `js_body_*` body whose signature returns a struct with
+/// exactly `ty` field types (by value equality), returning its body id.
+fn body_returning_struct_with_fields<'m>(
+    module: &'m Module<'_>,
+    want: &[Type],
+) -> Option<(usize, &'m FunctionBody)> {
+    let mut found = None;
+    for (fid, decl) in module.funcs.entries() {
+        let FuncDecl::Body(sig, name, body) = decl else {
+            continue;
+        };
+        if !name.starts_with("js_body") {
+            continue;
+        }
+        if let SignatureData::Func { returns, .. } = &module.signatures[*sig] {
+            if returns.len() != 1 {
+                continue;
+            }
+            let is_match = matches!(&returns[0], Type::Heap(w) if {
+                matches!(&w.value, portal_pc_waffle::HeapType::Sig { sig_index } if {
+                    matches!(&module.signatures[*sig_index], SignatureData::Struct { fields, .. } if {
+                        fields.len() == want.len()
+                            && fields.iter().zip(want).all(|(f, t)| match f.value {
+                                StorageType::Val(ty) => &ty == t,
+                                _ => false,
+                            })
+                    })
+                })
+            });
+            if is_match {
+                found = Some((fid.index(), body));
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn boolean_float_core_returns_dedicated_layout() {
+    // A {Boolean, Number} core returns the dedicated `if` layout
+    // (tag i32, i i32, f f64) — no reference slot, no dead fields.
+    let module = compile_module(
+        "
+            export function run(n) {
+                let f = function(k) {
+                    if (k === 0) { return false; }
+                    return k * 1.5;
+                };
+                return f(n) === false ? -1 : f(n) + 1;
+            }
+        ",
+    );
+    validate(&module);
+    let (_, _) = body_returning_struct_with_fields(
+        &module,
+        &[Type::I32, Type::I32, Type::F64],
+    )
+    .expect("{Boolean, Number} core must return the dedicated if layout");
+    // No core in this module should return any layout carrying an anyref
+    // slot: the only multi set here is {Boolean, Number}.
+    let bytes = wasm_bytes(&module);
+    // f(0) = false -> -1
+    assert_eq!(execute_in_wasmtime(&bytes, "run", &[0.0]), -1.0);
+    // f(2) = 3.0 -> 4.0
+    assert_eq!(execute_in_wasmtime(&bytes, "run", &[2.0]), 4.0);
+}
+
+#[test]
+fn ref_float_core_returns_dedicated_layout() {
+    // The {Number, Reference} pick core returns (tag, r, f) with no i32
+    // slot — the dedicated `rf` layout rather than the fat 4-field one.
+    let module = compile_module(
+        "
+            export function run(x) {
+                let pick = function(v) { if (v > 0) { return v * 1.5; } return null; };
+                let v = pick(x);
+                return v === null ? -7 : v + 1;
+            }
+        ",
+    );
+    validate(&module);
+    body_returning_struct_with_fields(
+        &module,
+        &[Type::I32, repr_anyref(), Type::F64],
+    )
+    .expect("{Number, Reference} core must return the dedicated rf layout");
+    let bytes = wasm_bytes(&module);
+    assert_eq!(execute_in_wasmtime(&bytes, "run", &[2.0]), 4.0);
+    assert_eq!(execute_in_wasmtime(&bytes, "run", &[-1.0]), -7.0);
+}
+
+fn repr_anyref() -> Type {
+    Type::Heap(portal_pc_waffle::WithNullable {
+        value: portal_pc_waffle::HeapType::Any,
+        nullable: true,
+    })
+}
+
+#[test]
+fn forwarding_chain_has_no_interior_unpacks() {
+    // a -> b -> c -> export, all links `return next(x);` on the same
+    // {Number, Reference} set: every interior link must tail-forward the
+    // packed union untouched (ReturnCall, no tag chain), and only the
+    // export's adapter prologue unpacks. Depth-100000 execution pins O(1).
+    let module = compile_module(
+        "
+            export function run(n) {
+                let a = function(k) { if (k <= 0) { return null; } if (k === 1) { return 1.5; } return b(k - 2); };
+                let b = function(k) { return a(k); };
+                let c = function(k) { return b(k); };
+                return c(n);
+            }
+        ",
+    );
+    validate(&module);
+    // Every interior body returning the rf layout must contain a
+    // ReturnCall and no CondBr tag chains feeding StructGets. Count
+    // unpack chains by counting I32Eq comparisons against the tag values
+    // inside the rf-returning bodies.
+    let mut interior = 0;
+    let mut with_return_call = 0;
+    for (_, body) in body_returning_struct_with_fields_all(&module) {
+        interior += 1;
+        let has_rc = body.blocks.iter().any(|b| {
+            matches!(
+                body.blocks[b].terminator.terminator,
+                Terminator::ReturnCall { .. }
+            )
+        });
+        if has_rc {
+            with_return_call += 1;
+        }
+    }
+    assert!(interior >= 2, "chain should have at least two union cores");
+    assert_eq!(
+        with_return_call,
+        interior,
+        "every same-set link must tail-forward via ReturnCall"
+    );
+    let bytes = wasm_bytes(&module);
+    for (runtime, result) in [
+        ("Wasmtime", execute_in_wasmtime(&bytes, "run", &[100_000.0])),
+        ("Node.js", execute_in_node(&bytes, "run", &[100_000.0])),
+    ] {
+        assert_eq!(result, 0.0, "{runtime} forwarding chain at depth 100000");
+    }
+}
+
+fn body_returning_struct_with_fields_all<'m>(
+    module: &'m Module<'_>,
+) -> Vec<(usize, &'m FunctionBody)> {
+    let mut found = Vec::new();
+    for (fid, decl) in module.funcs.entries() {
+        let FuncDecl::Body(sig, name, body) = decl else {
+            continue;
+        };
+        if !name.starts_with("js_body") {
+            continue;
+        }
+        if let SignatureData::Func { returns, .. } = &module.signatures[*sig] {
+            if returns.len() == 1 {
+                let is_rf = matches!(&returns[0], Type::Heap(w) if {
+                    matches!(&w.value, portal_pc_waffle::HeapType::Sig { sig_index } if {
+                        matches!(&module.signatures[*sig_index], SignatureData::Struct { fields, .. } if {
+                            fields.len() == 3
+                        })
+                    })
+                });
+                if is_rf {
+                    found.push((fid.index(), body));
+                }
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn different_set_cores_repack_across_the_boundary() {
+    // A {Boolean, Number} core returns into a {Number, Reference} core:
+    // different dedicated types, so the tail downgrades to a framed call
+    // and the caller repacks into its own layout. Values stay exact on
+    // both arms.
+    let module = compile_module(
+        "
+            export function run(n) {
+                let bf = function(k) {
+                    if (k === 2) { return false; }
+                    return k * 1.5;
+                };
+                let rf = function(k) {
+                    if (k <= 0) { return null; }
+                    return bf(k);
+                };
+                let v = rf(n);
+                return v === null ? -3 : v === false ? -2 : v + 1;
+            }
+        ",
+    );
+    validate(&module);
+    let bytes = wasm_bytes(&module);
+    // rf(1) -> bf(1) = 1.5 -> 2.5
+    assert_eq!(execute_in_wasmtime(&bytes, "run", &[1.0]), 2.5);
+    // rf(2) -> bf(2) = false -> -2
+    assert_eq!(execute_in_wasmtime(&bytes, "run", &[2.0]), -2.0);
+    // rf(-1) -> null -> -3
+    assert_eq!(execute_in_wasmtime(&bytes, "run", &[-1.0]), -3.0);
+}
+
+#[test]
+fn dedicated_layouts_differ_between_kind_sets() {
+    // Inspection: within one module, a {Boolean, Number} core and a
+    // {Number, Reference} core return *different* struct types — the
+    // structural identity that keeps cross-set tail forwarding a
+    // validation error instead of a silent trap.
+    let module = compile_module(
+        "
+            export function run(n) {
+                let bf = function(k) {
+                    if (k === 0) { return false; }
+                    return k * 1.5;
+                };
+                let rf = function(k) {
+                    if (k <= 0) { return null; }
+                    return k * 1.5;
+                };
+                return bf(n) === false ? rf(n) + 1 : 9;
+            }
+        ",
+    );
+    validate(&module);
+    let if_layout = body_returning_struct_with_fields(
+        &module,
+        &[Type::I32, Type::I32, Type::F64],
+    )
+    .expect("bf core must return the if layout");
+    let rf_layout = body_returning_struct_with_fields(
+        &module,
+        &[Type::I32, repr_anyref(), Type::F64],
+    )
+    .expect("rf core must return the rf layout");
+    assert_ne!(
+        if_layout.0, rf_layout.0,
+        "different kind sets must produce different struct types"
+    );
+    let bytes = wasm_bytes(&module);
+    assert_eq!(execute_in_wasmtime(&bytes, "run", &[0.0]), 1.0);
+    assert_eq!(execute_in_wasmtime(&bytes, "run", &[2.0]), 9.0);
+}
+
+
+
+
+
+

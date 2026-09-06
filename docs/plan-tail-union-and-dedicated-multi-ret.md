@@ -443,3 +443,61 @@ Landed essentially per §4.1–§4.3 with these refinements:
   (Milestone 3) flipped: the downgrade is now direct union→union
   forwarding; comment updated, values unchanged.
 - Full suite: 76 passed (71 baseline + 5 new).
+
+---
+
+## Milestone 5 — as built (implementation notes)
+
+- **Four dedicated layouts replace the fat union** (`Repr::multi_rf`,
+  `multi_ri`, `multi_if`, `multi_rif`), all minted eagerly in `Repr::new`
+  with canonical field order `tag, r, i, f` and dead groups elided.
+  Tag *values* stay the global constants, so `pack_multi_return` /
+  `unpack_multi_return` keep one implementation each and only the field
+  indices vary.
+- **`ReturnKinds::multi_layout(&Repr)`** maps a kind set to its struct;
+  `native_return_type` returns that layout's type for multi sets.
+  A free `multi_slot(layout, repr, kind)` helper resolves each kind's
+  field index and payload type from the layout, replacing the fixed
+  `MULTI_FIELD_*` constants (the tag stays field 0 everywhere).
+- **Structural ABI identity now enforces forwarding legality**: equal
+  kind sets share one struct type, so the M4 tail-dispatch type check
+  alone rejects cross-set `ReturnCall`s at compile time (the explicit
+  kinds-subset check is kept as local documentation of intent).
+- **The M3-era `Reference` fixup was removed.** It force-inserted
+  `Reference` into every multi set on the fat-layout assumption that the
+  REF tag always existed — wrong for a dedicated `{Boolean, Number}`
+  layout, which has no reference slot. Off-set return sites are now
+  handled at packing time: `pack_multi_return` coerces a value whose
+  classified kind is outside the declared set (to Reference when the set
+  carries that group, else to Number), keeping every runtime tag a
+  member of the set the unpack-side branch chain covers.
+- **Pure forwarders inside tail cycles needed a second analysis pass.**
+  `analyze_return_kinds` now retries once when the first pass scans
+  empty (evicting the cached placeholder first): a function whose only
+  returns are tail edges back into a still-in-progress cycle collects
+  nothing on the first pass, but the cycle's members have kinds stored
+  by the second pass. Throw-only bodies re-scan empty and stay empty.
+  This is what lets the `a → b → c` forwarding chain keep the union ABI
+  through all three links.
+- **Tests** (per §5.6, with the noted fixture adjustments):
+  - `boolean_float_core_returns_dedicated_layout` — `{Boolean, Number}`
+    core returns the 3-field `(i32, i32, f64)` layout, no anyref slot.
+  - `ref_float_core_returns_dedicated_layout` — the `{Number, Reference}`
+    core returns `(i32, anyref, f64)`; the fat 4-field layout is gone
+    from this shape (the Milestone 3 inspection test was updated to the
+    dedicated 3-field layout, and
+    `multi_kind_singleton_regression_no_union_in_all_single_module` was
+    removed: its premise — exactly one possible multi layout — no
+    longer holds with four layouts).
+  - `forwarding_chain_has_no_interior_unpacks` — `a → b → c → export`,
+    all links on the same set; every interior body returns the dedicated
+    layout and ends in `ReturnCall` (depth-100000 execution in both
+    runtimes pins O(1)).
+  - `different_set_cores_repack_across_the_boundary` — `{Boolean, Number}`
+    core into a `{Number, Reference}` core: the tail downgrades (types
+    differ), the caller repacks into its own layout, values exact on all
+    three arms (boolean, number, null).
+  - `dedicated_layouts_differ_between_kind_sets` — the two layouts coexist
+    as distinct struct types in one module.
+  - Full suite: 81 passed (76 pre-M5 + 5 new − 1 removed − 1 retired
+    assert).

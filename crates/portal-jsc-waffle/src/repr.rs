@@ -46,15 +46,26 @@ pub(crate) struct Repr {
     pub(crate) typed_f32: Signature,
     pub(crate) typed_f64: Signature,
     pub(crate) adapter: Signature,
+    /// Dedicated tagged-union return layouts, one per payload-slot-group
+    /// combination a multi-return core can need. Each carries `tag: i32`
+    /// first, then only the live slots (canonical order: `r: anyref`,
+    /// `i: i32`, `f: f64`). Tag *values* are global constants shared by
+    /// every layout, so one unpack implementation serves all of them; only
+    /// the field indices differ. Equal kind sets share one struct type,
+    /// which makes a tail `ReturnCall`'s "same native return type" check
+    /// also prove the payload-slot subset property structurally.
+    ///
+    /// - `multi_rf`: sets `{Number, Reference}` — `{ tag, r, f }`
+    /// - `multi_ri`: sets with Reference + Boolean/Integer — `{ tag, r, i }`
+    /// - `multi_if`: sets with Number + Boolean/Integer — `{ tag, i, f }`
+    /// - `multi_rif`: all three groups — `{ tag, r, i, f }`
+    pub(crate) multi_rf: Signature,
+    pub(crate) multi_ri: Signature,
+    pub(crate) multi_if: Signature,
+    pub(crate) multi_rif: Signature,
     /// The adapter signature's return type (`anyref`), so call sites can
     /// type a `CallRef`/`ReturnCallRef` to the adapter explicitly.
     pub(crate) adapter_value: Type,
-    /// Tagged union a mixed-return core returns: `tag` selects which of
-    /// `r` (a boxed value), `i` (a raw i32 from a boolean or an integer
-    /// computation), and `f` (a raw f64) is live. Only functions whose
-    /// returns provably produce more than one representation get this ABI;
-    /// single-kind cores keep raw f64/i32 and everything else stays boxed.
-    pub(crate) multi: Signature,
 }
 
 /// The supported Number-backed typed-array constructors.  The discriminant
@@ -236,7 +247,19 @@ impl Repr {
             fields: vec![field(Type::I32)],
             shared: false,
         });
-        let multi = module.signatures.push(SignatureData::Struct {
+        let multi_rf = module.signatures.push(SignatureData::Struct {
+            fields: vec![field(Type::I32), field(value), field(Type::F64)],
+            shared: false,
+        });
+        let multi_ri = module.signatures.push(SignatureData::Struct {
+            fields: vec![field(Type::I32), field(value), field(Type::I32)],
+            shared: false,
+        });
+        let multi_if = module.signatures.push(SignatureData::Struct {
+            fields: vec![field(Type::I32), field(Type::I32), field(Type::F64)],
+            shared: false,
+        });
+        let multi_rif = module.signatures.push(SignatureData::Struct {
             fields: vec![
                 field(Type::I32),
                 field(value),
@@ -333,12 +356,11 @@ impl Repr {
             typed_f64,
             adapter,
             adapter_value,
-            multi,
+            multi_rf,
+            multi_ri,
+            multi_if,
+            multi_rif,
         }
-    }
-
-    pub(crate) fn multi_ty(self) -> Type {
-        ref_sig(self.multi)
     }
 
     pub(crate) fn object_ty(self) -> Type {

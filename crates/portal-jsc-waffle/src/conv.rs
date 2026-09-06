@@ -305,17 +305,35 @@ impl ReturnKinds {
     }
 
     /// The Wasm return type for the native body. Single-kind sets get a
-    /// raw type; a genuinely multi-representation set returns the tagged
-    /// union (payload slots per kind); everything else keeps the boxed
-    /// `anyref` ABI because the boxed value is the join of the branches.
+    /// raw type; a genuinely multi-representation set returns its
+    /// dedicated tagged union (payload slots per kind group); everything
+    /// else keeps the boxed `anyref` ABI because the boxed value is the
+    /// join of the branches.
     fn native_return_type(self, repr: &Repr) -> Type {
         if self.is_multi_union() {
-            return repr.multi_ty();
+            return ref_sig(self.multi_layout(repr));
         }
         match self.single() {
             Some(ValueKind::Number) => Type::F64,
             Some(ValueKind::Boolean | ValueKind::Integer) => Type::I32,
             _ => repr.value,
+        }
+    }
+
+    /// The dedicated union layout this kind set returns: exactly the
+    /// payload-slot groups the set can produce, so no dead slots ride
+    /// along. Equal sets share one struct type, which is what makes a
+    /// tail `ReturnCall`'s same-return-type check also prove the
+    /// payload subset property.
+    fn multi_layout(self, repr: &Repr) -> portal_pc_waffle::Signature {
+        let has_ref = self.contains(ValueKind::Reference);
+        let has_i32 = self.0 & (Self::BOOLEAN | Self::INTEGER) != 0;
+        let has_f64 = self.contains(ValueKind::Number);
+        match (has_ref, has_i32, has_f64) {
+            (true, false, true) => repr.multi_rf,
+            (true, true, false) => repr.multi_ri,
+            (false, true, true) => repr.multi_if,
+            _ => repr.multi_rif,
         }
     }
 
@@ -365,8 +383,8 @@ impl ReturnKinds {
     }
 }
 
-/// Tag constants for the [`Repr::multi`] union's `tag` field. Only the
-/// tagged payload slot is valid; the others carry unspecified defaults.
+/// Tag constants shared by every [`Repr`] multi layout's `tag` field. Only
+/// the tagged payload slot is valid; the others carry unspecified defaults.
 /// Boolean and Integer get distinct tags even though both ride the `i`
 /// slot: unboxing at an adapter boundary must know whether to rebuild a
 /// boolean box or a number box, and `=== true` observes the difference.
@@ -375,11 +393,35 @@ pub(crate) const MULTI_TAG_BOOL: i32 = 1;
 pub(crate) const MULTI_TAG_INT: i32 = 2;
 pub(crate) const MULTI_TAG_F64: i32 = 3;
 
-/// Field indices of the [`Repr::multi`] struct (layout: tag, r, i, f).
+/// Field index of the `tag` slot (first field of every multi layout).
 const MULTI_FIELD_TAG: usize = 0;
-const MULTI_FIELD_REF: usize = 1;
-const MULTI_FIELD_I32: usize = 2;
-const MULTI_FIELD_F64: usize = 3;
+
+/// One kind's payload slot in a dedicated multi layout: the field index and
+/// the slot's storage type. Canonical field order is `tag, r, i, f` with
+/// absent groups elided, so the index follows from which groups precede.
+fn multi_slot(
+    layout: portal_pc_waffle::Signature,
+    repr: &Repr,
+    kind: ValueKind,
+) -> (usize, Type) {
+    let has_ref = matches!(layout, l if l == repr.multi_rf || l == repr.multi_ri || l == repr.multi_rif);
+    let has_i32 = matches!(layout, l if l == repr.multi_ri || l == repr.multi_if || l == repr.multi_rif);
+    match kind {
+        ValueKind::Reference => {
+            debug_assert!(has_ref, "layout must carry the reference slot");
+            (1, repr.value)
+        }
+        ValueKind::Boolean | ValueKind::Integer => {
+            debug_assert!(has_i32, "layout must carry the i32 slot");
+            (if has_ref { 2 } else { 1 }, Type::I32)
+        }
+        ValueKind::Number => {
+            // The f64 slot always follows tag plus any live slots before it.
+            let before = 1 + usize::from(has_ref) + usize::from(has_i32);
+            (before, Type::F64)
+        }
+    }
+}
 
 /// Outcome of resolving a tail callee for return-kind analysis.
 enum TailCalleeKinds {
@@ -404,7 +446,7 @@ enum ReturnType {
     /// Boxed `anyref` (the conservative join; also every tail-carrying
     /// function and every function the analysis could not pin down).
     Boxed,
-    /// The [`Repr::multi`] tagged union: returns pack their classified
+    /// A dedicated multi tagged union: returns pack their classified
     /// kind's tag and payload; callers branch on the tag.
     Multi,
 }
@@ -842,6 +884,22 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     /// The result is memoized per source function so call sites can read a
     /// callee's kinds before (or without) that callee's body being lowered.
     fn analyze_return_kinds(&mut self, func: &'a SFunc) -> ReturnKinds {
+        let kinds = self.analyze_return_kinds_pass(func);
+        if !kinds.is_empty() {
+            return kinds;
+        }
+        // An empty result is ambiguous: throw-only bodies genuinely promise
+        // nothing, but a *pure forwarder* inside a tail cycle (every return
+        // is a tail edge back into the cycle) also scans empty when the
+        // cycle's members were still placeholders. The other members now
+        // have their kinds stored, so one re-pass lets the forwarder
+        // inherit them. A throw-only body re-scans empty and stays empty.
+        // Evict the empty placeholder so the retry actually rescans.
+        self.return_kinds.remove(&Self::key(func));
+        self.analyze_return_kinds_pass(func)
+    }
+
+    fn analyze_return_kinds_pass(&mut self, func: &'a SFunc) -> ReturnKinds {
         let key = Self::key(func);
         if let Some(kinds) = self.return_kinds.get(&key) {
             return *kinds;
@@ -856,11 +914,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         self.scan_return_kinds(func, func.entry, &mut kinds, &mut visited_blocks);
         self.analysis_in_progress.remove(&key);
         // A return site the classifier cannot pin down (an alias, a load,
-        // a parameter) packs the union's reference tag at runtime, so the
-        // reference kind is always possible in a multi-return core.
-        if kinds.is_multi_union() {
-            kinds.insert(ValueKind::Reference);
-        }
+        // a parameter) classifies as Reference; if that lands in a set
+        // that was not multi it means the function also produces exactly
+        // one other kind — which is genuinely multi, so nothing to fix
+        // up. Empty sets (throw-only) stay empty: the boxed join is
+        // assigned by the ABI decision, not here.
         self.return_kinds.insert(key, kinds);
         kinds
     }
@@ -917,7 +975,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 // A provable callee still being analyzed is this function
                 // itself mid-cycle (or its mutual partner). Its tail edge
                 // forwards exactly the values the cycle's own return
-                // sites pack, so the accumulator needs nothing new.
+                // sites pack, so the accumulator needs nothing new —
+                // unless this function is a pure forwarder whose only
+                // returns are tail edges; then the cycle's kinds stay
+                // under-approximated (empty) and the site downgrades.
                 TailCalleeKinds::InProgress => {}
                 TailCalleeKinds::Unknown => kinds.insert(ValueKind::Reference),
             },
@@ -963,7 +1024,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                                 .get(&current)
                                 .is_some_and(|name| name == id)
                         });
-                    if is_self_name {
+                    let resolved = if is_self_name {
                         self.lowering_function
                     } else if let Some(literal) = self.function_literal_locals.get(id).copied() {
                         Some(literal)
@@ -975,7 +1036,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         Some(target.function)
                     } else {
                         None
-                    }
+                    };
+                    resolved
                 }
                 _ => None,
             };
@@ -1379,8 +1441,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             ),
             _ => call_result,
         };
+        let multi_layout = self
+            .multi_kinds_of(native)
+            .multi_layout(&self.repr);
         let mut result_block = block;
-        let result = if native_return_type == self.repr.multi_ty() {
+        let result = if native_return_type == ref_sig(multi_layout) {
             // A multi-return native's union must become the boxed join
             // here: the adapter's pinned signature returns `anyref`, and
             // every generic `CallRef` site consumes that. Boolean and
@@ -3973,17 +4038,34 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         ))
     }
 
-    /// Pack a classified return value into the [`Repr::multi`] tagged
-    /// union: the kind's tag plus the value in its payload slot (boxed,
-    /// raw i32, or raw f64). Only used by native bodies whose declared
-    /// return ABI is the union.
+    /// Pack a classified return value into this kind set's dedicated
+    /// tagged union: the kind's tag plus the value in its payload slot
+    /// (boxed, raw i32, or raw f64). Absent slot groups are zero-filled
+    /// defaults; the layout itself carries no dead fields. Only used by
+    /// native bodies whose declared return ABI is the union.
     fn pack_multi_return(
-        &self,
+        &mut self,
         body: &mut FunctionBody,
         block: Block,
         value: &LowerValue,
         kind: ValueKind,
+        returns: ReturnKinds,
     ) -> Result<Value, ConvertError> {
+        let layout = returns.multi_layout(&self.repr);
+        // The declared set is the union ABI's contract. A value whose
+        // classified kind lies outside it (an off-set return site the
+        // analysis could not pin down) coerces into the set before
+        // packing: to Reference when the set carries that group, else to
+        // Number (a ToNumber of anything is well-defined at runtime).
+        // This keeps every runtime tag a member of `returns`, which the
+        // unpack-side branch chain relies on.
+        let kind = if returns.contains(kind) {
+            kind
+        } else if returns.contains(ValueKind::Reference) {
+            ValueKind::Reference
+        } else {
+            ValueKind::Number
+        };
         let (value, actual) = value.wasm()?;
         debug_assert_eq!(kind, actual, "multi-return packing expects the classified kind");
         let (tag, r, i, f) = match kind {
@@ -4003,10 +4085,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 &[ty],
             )
         };
-        let r = match r {
-            Some(v) => v,
-            None => undef(body, self.repr.value),
-        };
+        // Zero-fill the layout's dead slots; live slots carry the value.
+        let r = r.unwrap_or_else(|| undef(body, self.repr.value));
         let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
         let i = i.unwrap_or(zero);
         let zero_f = body.add_op(
@@ -4026,15 +4106,27 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[],
             &[Type::I32],
         );
+        // StructNew takes the layout's fields in canonical order:
+        // tag, then r / i / f as present in the layout.
+        let mut fields = vec![tag];
+        if returns.contains(ValueKind::Reference) {
+            fields.push(r);
+        }
+        if returns.0 & (ReturnKinds::BOOLEAN | ReturnKinds::INTEGER) != 0 {
+            fields.push(i);
+        }
+        if returns.contains(ValueKind::Number) {
+            fields.push(f);
+        }
         Ok(body.add_op(
             block,
-            Operator::StructNew { sig: self.repr.multi },
-            &[tag, r, i, f],
-            &[self.repr.multi_ty()],
+            Operator::StructNew { sig: layout },
+            &fields,
+            &[ref_sig(layout)],
         ))
     }
 
-    /// Split a [`Repr::multi`] union value into one continuation per kind
+    /// Split a multi-layout union value into one continuation per kind
     /// the producing function's analysis proved possible. Each continuation
     /// block extracts the tagged payload slot into a [`LowerValue`] with
     /// that exact kind, so the rest of the source statement lowers once per
@@ -4048,10 +4140,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         result: Value,
         kinds: ReturnKinds,
     ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let layout = kinds.multi_layout(&self.repr);
         let tag = body.add_op(
             block,
             Operator::StructGet {
-                sig: self.repr.multi,
+                sig: layout,
                 idx: MULTI_FIELD_TAG,
             },
             &[result],
@@ -4093,15 +4186,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     },
                 },
             );
-            let (idx, payload_ty) = match kind {
-                ValueKind::Reference => (MULTI_FIELD_REF, self.repr.value),
-                ValueKind::Boolean | ValueKind::Integer => (MULTI_FIELD_I32, Type::I32),
-                ValueKind::Number => (MULTI_FIELD_F64, Type::F64),
-            };
+            let (idx, payload_ty) = multi_slot(layout, &self.repr, kind);
             let payload = body.add_op(
                 arm,
                 Operator::StructGet {
-                    sig: self.repr.multi,
+                    sig: layout,
                     idx,
                 },
                 &[result],
@@ -10285,7 +10374,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             ReturnType::Boxed => self.box_value(body, block, value),
             ReturnType::Multi => {
                 let kind = value.kind()?;
-                self.pack_multi_return(body, block, value, kind)
+                self.pack_multi_return(body, block, value, kind, returns)
             }
         }
     }

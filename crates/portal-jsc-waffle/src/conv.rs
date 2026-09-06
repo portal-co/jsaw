@@ -4,7 +4,7 @@ use std::{
 };
 
 use portal_jsc_swc_ssa::{
-    SBlockId, SFunc, SValue, SValueId,
+    SBlockId, SFunc, SValue, SValueId, STarget,
     module::{ExportSpec, SModule},
 };
 use portal_jsc_swc_tac::{Item, LId, PropKey, PropVal, TCallee, TTerm};
@@ -47,6 +47,7 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
         shadowed_names: BTreeSet::new(),
         next_function_tag: USER_TAG_BASE,
         to_number_helper: None,
+        typeof_helper: None,
         add_helper: None,
         return_kinds: BTreeMap::new(),
         current_native_returns: None,
@@ -159,6 +160,7 @@ pub fn convert_module<'a, 'wasm>(
         shadowed_names: BTreeSet::new(),
         next_function_tag: USER_TAG_BASE,
         to_number_helper: None,
+        typeof_helper: None,
         add_helper: None,
         return_kinds: BTreeMap::new(),
         current_native_returns: None,
@@ -529,6 +531,7 @@ struct Converter<'a, 'module, 'wasm> {
     /// Generic `ToNumber` coercion over a boxed value at the `anyref`
     /// boundary. Generated lazily; see `ensure_to_number_helper`.
     to_number_helper: Option<Func>,
+    typeof_helper: Option<Func>,
     /// Runtime `+` over boxed values (string concat vs numeric add).
     /// Generated lazily; see `ensure_add_helper`.
     add_helper: Option<Func>,
@@ -1589,8 +1592,142 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         );
                     }
                 }
-                TTerm::Throw(_) | TTerm::Switch { .. } => {
-                    return Err(ConvertError::unsupported("throw or switch terminator", ()));
+                TTerm::Throw(value) => {
+                    // Throw lowering without an exception table: evaluate
+                    // the thrown value for its side effects, then trap. The
+                    // host runner distinguishes JS throws from internal
+                    // traps once catch handling exists (see
+                    // docs/plan-test262-compatibility.md Phase 1.4).
+                    for continuation in continuations {
+                        let thrown = continuation
+                            .values
+                            .get(value)
+                            .cloned()
+                            .ok_or_else(|| ConvertError::invalid("undefined throw value"))?;
+                        let _ = self.box_value(body, continuation.block, &thrown)?;
+                        body.set_terminator(
+                            continuation.block,
+                            Terminator::Unreachable,
+                        );
+                    }
+                }
+                TTerm::Switch {
+                    x,
+                    blocks: cases,
+                    default,
+                } => {
+                    for continuation in continuations {
+                        let subject = continuation
+                            .values
+                            .get(x)
+                            .cloned()
+                            .ok_or_else(|| ConvertError::invalid("undefined switch subject"))?;
+                        // Build the arm list up front; the default arm is a
+                        // marker handled last without a comparison.
+                        let mut arms: Vec<(SValueId, &STarget<SValueId, SBlockId>)> =
+                            Vec::with_capacity(cases.len() + 1);
+                        for (case_value, target) in cases {
+                            arms.push((*case_value, target));
+                        }
+                        let default_target: &STarget<SValueId, SBlockId> = default;
+                        // Sequential strict-equality chain. Each compare
+                        // after the first runs in the previous arm's
+                        // fallthrough block; a failed final compare routes
+                        // to the default target.
+                        let mut current_block = continuation.block;
+                        let mut current_values = continuation.values.clone();
+                        for (index, (case_value, target)) in arms.iter().enumerate() {
+                            let case = current_values
+                                .get(case_value)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    ConvertError::invalid("undefined switch case value")
+                                })?;
+                            let equal =
+                                self.strict_equality(body, current_block, &subject, &case, false)?;
+                            let (equal, _) = equal.wasm()?;
+                            let equal = self.as_condition(
+                                body,
+                                current_block,
+                                &LowerValue::Wasm {
+                                    value: equal,
+                                    kind: ValueKind::Boolean,
+                                },
+                            )?;
+                            let target_args = target
+                                .args
+                                .iter()
+                                .map(|value| {
+                                    current_values
+                                        .get(value)
+                                        .ok_or_else(|| {
+                                            ConvertError::invalid("undefined switch arm argument")
+                                        })
+                                        .cloned()
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let target_block = self.target_block(
+                                sfunc,
+                                body,
+                                &mut blocks,
+                                &mut pending,
+                                target.block,
+                                &target_args,
+                            )?;
+                            let target_args =
+                                self.lower_block_args(body, current_block, target_args)?;
+                            let is_last_case = index + 1 == arms.len();
+                            let fallthrough_block = body.add_block();
+                            body.set_terminator(
+                                current_block,
+                                Terminator::CondBr {
+                                    cond: equal,
+                                    if_true: BlockTarget {
+                                        block: target_block,
+                                        args: target_args,
+                                    },
+                                    if_false: BlockTarget {
+                                        block: fallthrough_block,
+                                        args: vec![],
+                                    },
+                                },
+                            );
+                            current_block = fallthrough_block;
+                            let _ = is_last_case;
+                        }
+                        // Route the exhausted chain to the default target.
+                        let default_args = default_target
+                            .args
+                            .iter()
+                            .map(|value| {
+                                current_values
+                                    .get(value)
+                                    .ok_or_else(|| {
+                                        ConvertError::invalid("undefined switch arm argument")
+                                    })
+                                    .cloned()
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let default_block = self.target_block(
+                            sfunc,
+                            body,
+                            &mut blocks,
+                            &mut pending,
+                            default_target.block,
+                            &default_args,
+                        )?;
+                        let default_args =
+                            self.lower_block_args(body, current_block, default_args)?;
+                        body.set_terminator(
+                            current_block,
+                            Terminator::Br {
+                                target: BlockTarget {
+                                    block: default_block,
+                                    args: default_args,
+                                },
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -2581,13 +2718,245 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 }
             }
             UnaryOp::Void => self.undef(body, block),
-            UnaryOp::TypeOf | UnaryOp::Delete => {
+            UnaryOp::TypeOf => self.type_of(body, block, arg)?,
+            UnaryOp::Delete => {
                 return Err(ConvertError::unsupported(
                     format!("unary operator {op:?}"),
                     span,
                 ));
             }
         })
+    }
+
+    /// JS `typeof value` — returns one of the eight typeof result strings.
+    /// The classification helper consults the static kind when the operand
+    /// already holds one; otherwise the runtime helper classifies the boxed
+    /// value.
+    fn type_of(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        arg: &LowerValue,
+    ) -> Result<LowerValue, ConvertError> {
+        // Statically-known primitives short-circuit without a helper call.
+        match arg {
+            LowerValue::String { .. } => {
+                return Ok(self.type_of_string_const(body, block, "string"));
+            }
+            LowerValue::Wasm { kind, .. } => {
+                let name: Option<&str> = match kind {
+                    ValueKind::Number => Some("number"),
+                    ValueKind::Boolean | ValueKind::Integer => Some("boolean"),
+                    ValueKind::Reference => None,
+                };
+                if let Some(name) = name {
+                    return Ok(self.type_of_string_const(body, block, name));
+                }
+            }
+            _ => {}
+        }
+        // ReferenceKey (a boxed primitive read from a context slot) and
+        // FunctionRef both still need the runtime classification for full
+        // fidelity; consult the helper with the boxed value.
+        let boxed = self.box_value(body, block, arg)?;
+        let helper = self.ensure_typeof_helper()?;
+        let name = body.add_op(
+            block,
+            Operator::Call {
+                function_index: helper,
+            },
+            &[boxed],
+            &[self.repr.string_ty()],
+        );
+        Ok(LowerValue::String {
+            value: name,
+            key: String::new(),
+            bytes: Vec::new(),
+        })
+    }
+
+    fn type_of_string_const(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        name: &str,
+    ) -> LowerValue {
+        let value = self
+            .new_string(body, block, name.as_bytes())
+            .expect("typeof result names are ASCII");
+        LowerValue::String {
+            value,
+            key: name.to_owned(),
+            bytes: name.as_bytes().to_vec(),
+        }
+    }
+
+    /// Runtime `typeof` on a boxed value: `undefined` → "undefined",
+    /// JS null → "object", number → "number", boolean → "boolean",
+    /// string → "string", function struct → "function", anything else →
+    /// "object". BigInt/symbol are not representable yet.
+    fn ensure_typeof_helper(&mut self) -> Result<Func, ConvertError> {
+        if let Some(func) = self.typeof_helper {
+            return Ok(func);
+        }
+        let sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.value],
+            returns: vec![self.repr.string_ty()],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, sig);
+        let entry = body.entry;
+        let value = body.blocks[entry].params[0].1;
+
+        let is_undefined = body.add_op(entry, Operator::RefIsNull, &[value], &[Type::I32]);
+        let is_js_null = self.is_js_null(&mut body, entry, value);
+        let is_number = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.number_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let is_boolean = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.boolean_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let is_string = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.string_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let is_function = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.function_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+
+        // Compose a priority code: typeof = min(matching arm) with the
+        // precedence undefined < null < boolean < number < string < function
+        // < object. The tests are mutually exclusive except function vs the
+        // generic object catch-all, handled by ordering.
+        let undefined_code = body.add_op(entry, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let null_code = body.add_op(
+            entry,
+            Operator::I32Const { value: 1 },
+            &[],
+            &[Type::I32],
+        );
+        let bool_code = body.add_op(
+            entry,
+            Operator::I32Const { value: 2 },
+            &[],
+            &[Type::I32],
+        );
+        let number_code = body.add_op(
+            entry,
+            Operator::I32Const { value: 3 },
+            &[],
+            &[Type::I32],
+        );
+        let string_code = body.add_op(
+            entry,
+            Operator::I32Const { value: 4 },
+            &[],
+            &[Type::I32],
+        );
+        let function_code = body.add_op(
+            entry,
+            Operator::I32Const { value: 5 },
+            &[],
+            &[Type::I32],
+        );
+        let object_code = body.add_op(
+            entry,
+            Operator::I32Const { value: 6 },
+            &[],
+            &[Type::I32],
+        );
+
+        // code = is_undefined ? 0 : is_js_null ? 1 : is_boolean ? 2 :
+        //        is_number ? 3 : is_string ? 4 : is_function ? 5 : 6
+        // The tests are mutually exclusive, so a select chain works.
+        let mut code = object_code;
+        for (test, matching) in [
+            (is_function, function_code),
+            (is_string, string_code),
+            (is_number, number_code),
+            (is_boolean, bool_code),
+            (is_js_null, null_code),
+            (is_undefined, undefined_code),
+        ] {
+            code = body.add_op(
+                entry,
+                Operator::Select,
+                &[matching, code, test],
+                &[Type::I32],
+            );
+        }
+
+        // Map the code to a string constant via a conditional-branch chain:
+        // each arm compares the code and returns on match, falling through
+        // to the next arm otherwise. The final "object" arm is the default.
+        let names = [
+            "undefined", "object", "boolean", "number", "string", "function",
+        ];
+        let mut current = entry;
+        for (index, name) in names.iter().enumerate() {
+            let index_const = body.add_op(
+                current,
+                Operator::I32Const {
+                    value: index as u32,
+                },
+                &[],
+                &[Type::I32],
+            );
+            let matches = body.add_op(current, Operator::I32Eq, &[code, index_const], &[Type::I32]);
+            let string = self.new_string(&mut body, current, name.as_bytes())?;
+            let hit = body.add_block();
+            let next = body.add_block();
+            body.set_terminator(
+                current,
+                Terminator::CondBr {
+                    cond: matches,
+                    if_true: BlockTarget {
+                        block: hit,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: next,
+                        args: vec![],
+                    },
+                },
+            );
+            body.set_terminator(hit, Terminator::Return { values: vec![string] });
+            current = next;
+        }
+        // Default arm: "object".
+        let object_string = self.new_string(&mut body, current, b"object")?;
+        body.set_terminator(
+            current,
+            Terminator::Return {
+                values: vec![object_string],
+            },
+        );
+        let function = self.module.funcs.push(FuncDecl::Body(
+            sig,
+            format!("js_typeof_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.typeof_helper = Some(function);
+        Ok(function)
     }
 
     fn equality(

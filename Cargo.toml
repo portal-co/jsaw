@@ -1,5 +1,5 @@
 [workspace]
-members=[ "crates/mobile/jacon",   "crates/mobile/portal-jsc-mob-backend-common", "crates/mobile/portal-jsc-swift-backend", "crates/portal-jsc-waffle",   "crates/swc-batch"]
+members=[ "crates/mobile/jacon",   "crates/mobile/portal-jsc-mob-backend-common", "crates/mobile/portal-jsc-swift-backend", "crates/portal-jsc-waffle",   "crates/swc-batch", "crates/test262-runner"]
 
 # "js-runtime-lib","swc-emit-rust","swc-waffle"
 
@@ -16,7 +16,7 @@ portal-jsc-swc-ssa =      {git="https://github.com/portal-co/jsaw-core.git",vers
 portal-jsc-swc-opt-ssa =  {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.11"}
 portal-jsc-swc-util =     {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.11"}
 
-portal-pc-waffle = {version="^0.6.0-alpha.1",git="https://github.com/portal-co/waffle-.git"}
+portal-pc-waffle = { version = "^0.6.0-alpha.1", git = "https://github.com/portal-co/waffle-.git", features = ["backend"] }
 
 id-arena = "^2.2.1"
 arena-traits = {version="^0.2.3",features=["id-arena"]}

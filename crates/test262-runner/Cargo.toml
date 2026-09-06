@@ -1,0 +1,23 @@
+[package]
+name = "test262-runner"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+portal-jsc-swc-cfg.workspace = true
+portal-jsc-swc-ssa.workspace = true
+portal-jsc-swc-tac.workspace = true
+portal-jsc-waffle = { path = "../portal-jsc-waffle" }
+swc_common.workspace = true
+swc_ecma_ast.workspace = true
+swc_ecma_parser.workspace = true
+portal-pc-waffle = { workspace = true }
+anyhow.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasmparser = { version = "0.240", features = ["validate"] }
+wasmtime = { version = "47", default-features = false, features = ["cranelift", "gc-null", "runtime"] }
+
+[[bin]]
+name = "test262-runner"
+path = "src/main.rs"

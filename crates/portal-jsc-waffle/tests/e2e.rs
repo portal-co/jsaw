@@ -853,7 +853,6 @@ fn rejects_unsupported_forms_with_convert_error() {
             "let value = 1 instanceof 2;",
             "binary operator \"instanceof\"",
         ),
-        ("let value = typeof 1;", "unary operator \"typeof\""),
         (
             "let object = {}; delete object.value;",
             "unary operator \"delete\"",
@@ -1972,4 +1971,20 @@ fn exports_run_entry_for_top_level_body() {
         0,
         "run entry reports completion status 0"
     );
+}
+
+#[test]
+fn executes_typeof_unary() {
+    // typeof of statically-typed primitives takes the compile-time path;
+    // typeof of a missing argument exercises the runtime helper's
+    // undefined classification through the generic call path.
+    let module = compile_module(
+        "
+            export function type_of_number() { return typeof 1 === 'number' ? 1 : 0; }
+            export function type_of_string() { return typeof 'x' === 'string' ? 1 : 0; }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "type_of_number", &[], 1.0);
+    assert_executes_in_all_runtimes(&module, "type_of_string", &[], 1.0);
 }

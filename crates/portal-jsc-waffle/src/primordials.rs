@@ -3152,7 +3152,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let Ok(member) = self.key_of(key) else {
             return Ok(None);
         };
-        let Some(tag) = static_primordial_tag(namespace, &member) else {
+        let Some(tag) = static_primordial_tag(&namespace.0, &member) else {
             return Ok(None);
         };
         // Spread arguments have no position-wise unboxing; leave them generic.
@@ -3298,7 +3298,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         if !self.primordial_is_provable(name) {
             return Ok(None);
         }
-        let Some(kind) = TypedArrayKind::from_name(name) else {
+        let Some(kind) = TypedArrayKind::from_name(&name.0) else {
             return Ok(None);
         };
         if !args.is_empty() && args.len() != 1 {

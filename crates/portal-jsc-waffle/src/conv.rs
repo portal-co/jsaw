@@ -49,6 +49,9 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
         return_kinds: BTreeMap::new(),
         current_native_returns: None,
         function_literal_locals: BTreeMap::new(),
+        function_self_names: BTreeMap::new(),
+        lowering_function: None,
+        lowering_function_key: None,
         // Bare-script conversion has no module set: the import tables stay
         // empty and every load resolves through the ordinary context path.
         import_tables: BTreeMap::new(),
@@ -202,10 +205,21 @@ pub fn convert_modules<'a, 'wasm>(
         return_kinds: BTreeMap::new(),
         current_native_returns: None,
         function_literal_locals: BTreeMap::new(),
+        function_self_names: BTreeMap::new(),
+        lowering_function: None,
+        lowering_function_key: None,
         import_tables,
         module_of_function: BTreeMap::new(),
         current_module: String::new(),
     };
+    // The entry module's top-level body performs the context stores that
+    // install hoisted function declarations (`function run(){}` lowers to a
+    // `StoreId` of the literal). Walk it first so its assignments participate
+    // in the shadowing analysis and feed the literal→name reverse map that
+    // proves self-recursive call sites fresh.
+    let entry_module = set.get(entry)?;
+    converter.collect_shapes(&entry_module.body)?;
+    converter.collect_shadowed_names(&entry_module.body, &mut BTreeSet::new());
     let mut exports = Vec::with_capacity(exported.len());
     for (name, function) in exported {
         converter.collect_shapes(function)?;
@@ -349,7 +363,7 @@ enum LowerValue {
     /// `LoadId`; retaining the identifier here disambiguates it at the use.
     ReferenceKey {
         value: Value,
-        key: String,
+        key: Ident,
     },
     /// A raw numeric literal, retained long enough to be used as an
     /// ECMAScript-formatted static property key as well as a number.
@@ -504,7 +518,7 @@ struct Converter<'a, 'module, 'wasm> {
     /// Variable names assigned somewhere in the function currently being
     /// collected (including its nested closures). Reset per top-level
     /// function before lowering. See `collect_shadowed_names`.
-    shadowed_names: BTreeSet<String>,
+    shadowed_names: BTreeSet<Ident>,
     /// Minting counter for user function literal tags (see
     /// [`FunctionInfo::tag`]). Primordials occupy the low tag range.
     next_function_tag: i32,
@@ -525,7 +539,15 @@ struct Converter<'a, 'module, 'wasm> {
     /// reassignment anywhere, including nested closures). A load of such a
     /// name produces a [`LowerValue::FunctionRef`] whose tag check proves
     /// the binding is unchanged at call time. Reset per top-level function.
-    function_literal_locals: BTreeMap<String, &'a SFunc>,
+    function_literal_locals: BTreeMap<Ident, &'a SFunc>,
+    /// Reverse map from a lowered function's key to the context name its
+    /// literal was stored under by the enclosing scope (`function name()`
+    /// declarations and single-assignment `let f = function(){}` in the
+    /// top-level scope chain). Used to prove self-recursion sites fresh.
+    function_self_names: BTreeMap<usize, Ident>,
+    /// The function currently being lowered (its source), and its key.
+    lowering_function: Option<&'a SFunc>,
+    lowering_function_key: Option<usize>,
     /// Per-module import tables for multi-module ingestion: resolved
     /// binding → linked target function. Keyed by module path; the single-
     /// module and bare-script paths use the same shape with an empty table
@@ -611,14 +633,28 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         for (_, value) in func.cfg.values.iter() {
             match &value.value {
                 SValue::StoreId { target, val } => {
-                    self.shadowed_names.insert(target.0.to_string());
+                    self.shadowed_names.insert(target.clone());
+                    // Record the literal -> bound-name reverse mapping so the
+                    // literal's own body can prove a self-recursive call is
+                    // still the original literal (fresh dispatch).
+                    if let SValue::Item {
+                        item: Item::Func { func: literal, .. },
+                        ..
+                    } = &func.cfg.values[*val].value
+                    {
+                        #[cfg(feature = "lower_trace")]
+                        eprintln!("[selfname] inserted");
+                        self.function_self_names
+                            .entry(Self::key(literal))
+                            .or_insert(target.clone());
+                    }
                     // Only the top-level function's own stores can vouch for
                     // a single-assignment literal; a nested closure's store
                     // makes the name ambiguous from the outside.
                     if !nested {
-                        self.note_function_literal_local(&target.0.to_string(), *val, func);
+                        self.note_function_literal_local(target.clone(), *val, func);
                     } else {
-                        self.function_literal_locals.remove(&target.0.to_string());
+                        self.function_literal_locals.remove(&target.clone());
                     }
                 }
                 SValue::Item { item, .. } => {
@@ -643,7 +679,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     /// ambiguous too — its `val` index resolves in the nested cfg, so treat
     /// any store whose value is not found in *this* function's arena as a
     /// disqualifier.
-    fn note_function_literal_local(&mut self, name: &str, val: SValueId, func: &'a SFunc) {
+    fn note_function_literal_local(&mut self, name: Ident, val: SValueId, func: &'a SFunc) {
         let literal: Option<&'a SFunc> = match &func.cfg.values[val].value {
             SValue::Item {
                 item: Item::Func { func: literal, .. },
@@ -662,13 +698,13 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             },
             _ => None,
         };
-        match (self.function_literal_locals.get(name).copied(), literal) {
+        match (self.function_literal_locals.get(&name).copied(), literal) {
             (None, Some(literal)) => {
-                self.function_literal_locals.insert(name.to_string(), literal);
+                self.function_literal_locals.insert(name, literal);
             }
             // A non-literal first store, or any second store, disqualifies.
             (None, None) | (Some(_), _) => {
-                self.function_literal_locals.remove(name);
+                self.function_literal_locals.remove(&name);
             }
         }
     }
@@ -677,8 +713,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     /// check? True when neither this function nor any nested closure assigns
     /// that name — the context property then stays exactly the primordial
     /// value `new_context_with_primordials` installed.
-    fn primordial_is_provable(&self, name: &str) -> bool {
-        static_primordial_tag_namespace(name).is_some() && !self.shadowed_names.contains(name)
+    fn primordial_is_provable(&self, name: &Ident) -> bool {
+        static_primordial_tag_namespace(&name.0).is_some() && !self.shadowed_names.contains(name)
     }
 
     /// Statically classify every representation a function's `return`
@@ -1247,6 +1283,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         sfunc: &'a SFunc,
         body: &mut FunctionBody,
     ) -> Result<(), ConvertError> {
+        self.lowering_function = Some(sfunc);
+        self.lowering_function_key = Some(Self::key(sfunc));
         let mut blocks = BTreeMap::new();
         let entry_state = BlkSet {
             source: sfunc.entry,
@@ -1477,6 +1515,29 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 }
                 TTerm::Tail { callee, args } => {
                     for continuation in continuations {
+                        // A statically-known callee (provenance-tracked
+                        // function literal) tail-calls its native body
+                        // directly — the only O(1) host-stack form, since
+                        // the generic adapter plain-calls the native after
+                        // the frame-replacing `ReturnCallRef` hop. Anything
+                        // else keeps the generic adapter tail call, which
+                        // is always semantically valid from a boxed-return
+                        // caller (the analysis classifies every
+                        // `Tail`-carrying function as `Reference`).
+                        if self
+                            .try_tail_dispatch(
+                                body,
+                                continuation.block,
+                                context,
+                                this.clone(),
+                                &continuation.values,
+                                callee,
+                                args,
+                            )?
+                            .is_some()
+                        {
+                            continue;
+                        }
                         for (block, context, receiver, array, code) in self.lower_call_parts(
                             body,
                             continuation.block,
@@ -1602,7 +1663,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 self.lower_item(body, block, context, this, arguments, values, item, span)
             }
             SValue::LoadId(id) => {
-                let key = id.0.to_string();
+                let key = id.clone();
                 // A cross-module import binding is statically the target
                 // function: function-declaration exports are immutable, so
                 // the load never touches the context and mints the target's
@@ -1632,9 +1693,29 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     )?;
                     return Ok(vec![(block, value)]);
                 }
-                let literal = self.function_literal_locals.get(&key).copied();
+                // A self-recursive function's own name resolves to the
+                // function literal itself: the enclosing scope stored the
+                // literal under this name exactly once, and the name cannot
+                // be rebound inside the body before the load executes
+                // (recursion re-enters after the binding exists). Mark the
+                // loaded function fresh so tail position can skip the tag
+                // check entirely.
+                #[cfg(feature = "lower_trace")]
+                eprintln!("[selfcheck] key={key:?} lower_key={:?} names={:?}", self.lowering_function_key, self.function_self_names);
+                let is_self_name = self
+                    .lowering_function_key
+                    .is_some_and(|current| {
+                        self.function_self_names
+                            .get(&current)
+                            .is_some_and(|name| name == id)
+                    });
+                let literal = if is_self_name {
+                    self.lowering_function
+                } else {
+                    self.function_literal_locals.get(&key).copied()
+                };
                 let mut results = Vec::new();
-                for (block, value) in self.get_property(body, block, context, &key)? {
+                for (block, value) in self.get_property(body, block, context, &key.0)? {
                     let (value, _) = value.wasm()?;
                     // A single-assignment function-literal local keeps its
                     // origin: the call site's tag check proves the context
@@ -1645,7 +1726,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         LowerValue::FunctionRef {
                             value,
                             info,
-                            fresh: false,
+                            // A self-recursive load (the function's own name
+                            // inside its own body) is provably the literal:
+                            // the enclosing scope's binding exists before the
+                            // first call and re-entry sees the same object.
+                            fresh: is_self_name,
                         }
                     } else {
                         LowerValue::ReferenceKey { value, key: key.clone() }
@@ -1659,7 +1744,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     .get(val)
                     .ok_or_else(|| ConvertError::invalid("undefined stored value"))?;
                 Ok(self
-                    .set_property(body, block, context, &target.0.to_string(), value)?
+                    .set_property(body, block, context, &target.0, value)?
                     .into_iter()
                     .map(|block| (block, value.clone()))
                     .collect())
@@ -1974,7 +2059,24 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             Item::Lit { lit } => self.literal(body, block, lit, span)?,
             Item::This => this,
             Item::Func { func, arrow } => {
-                self.function_object(body, block, context, this, func, *arrow)?
+                // A function literal is the one value whose origin is
+                // statically known *and* immutable: the object allocated
+                // here can never be rebound, so call sites (including tail
+                // position) may dispatch to the native body with no tag
+                // check at all.
+                let module = self.current_module.clone();
+                let info = self.ensure_function(func, &module)?;
+                match self.function_object(body, block, context, this, func, *arrow)? {
+                    LowerValue::FunctionRef {
+                        value,
+                        ..
+                    } => LowerValue::FunctionRef {
+                        value,
+                        info,
+                        fresh: true,
+                    },
+                    other => other,
+                }
             }
             Item::Obj { members } => self.object_literal(
                 body,
@@ -2364,8 +2466,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 // shared helper takes boxed operands and returns one
                 // boxed result; `binary` cannot branch, so all of the
                 // dispatch lives inside the helper.
-                let (left_wasm, left_kind) = left.wasm()?;
-                let (right_wasm, right_kind) = right.wasm()?;
+                let (_, left_kind) = left.wasm()?;
+                let (_, right_kind) = right.wasm()?;
                 if left_kind == ValueKind::Reference || right_kind == ValueKind::Reference {
                     let add = self.ensure_add_helper()?;
                     let left_value = self.box_value(body, block, left)?;
@@ -6866,7 +6968,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
 
     fn key_of(&self, value: &LowerValue) -> Result<String, ConvertError> {
         match value {
-            LowerValue::ReferenceKey { key, .. } => Ok(key.clone()),
+            LowerValue::ReferenceKey { key, .. } => Ok(key.0.to_string()),
             LowerValue::NumberLiteral { key, .. } => Ok(key.clone()),
             LowerValue::String { key, .. } => Ok(key.clone()),
             _ => Err(ConvertError::invalid(
@@ -9567,6 +9669,38 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         if args.iter().any(|arg| arg.is_spread) {
             return Err(ConvertError::unsupported("spread argument", ()));
         }
+        let (this_value, arguments, formals) =
+            self.build_native_call_args(body, block, info, this, values, args)?;
+        let mut call_args = vec![context, this_value, arguments];
+        call_args.extend(formals);
+        let result = body.add_op(
+            block,
+            Operator::Call {
+                function_index: info.native,
+            },
+            &call_args,
+            &[info.returns.native_return_type(&self.repr)],
+        );
+        let kind = info.returns.single().unwrap_or(ValueKind::Reference);
+        Ok((block, LowerValue::Wasm { value: result, kind }))
+    }
+
+    /// Build the arguments of a direct dispatch to a function literal's
+    /// native body: the receiver coerced to the ABI's `anyref`, the boxed
+    /// arguments array, and one boxed formal per source parameter (missing
+    /// call arguments pass `undefined`, matching the adapter's
+    /// bounds-checked reads; extra arguments ride in the array only).
+    /// Shared between ordinary direct calls and tail-position
+    /// `ReturnCall` emission.
+    fn build_native_call_args(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        info: FunctionInfo,
+        this: LowerValue,
+        values: &BTreeMap<SValueId, LowerValue>,
+        args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
+    ) -> Result<(Value, Value, Vec<Value>), ConvertError> {
         let (this, _) = this.wasm()?;
         let this = self.anyref(body, block, this);
         let mut boxed_args = Vec::with_capacity(args.len());
@@ -9585,10 +9719,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &boxed_args,
             &[self.repr.arguments_ty()],
         );
-        // The native ABI has one formal per source parameter. Missing call
-        // arguments pass `undefined` (matching the adapter's bounds-checked
-        // reads); extra arguments ride in the array only.
-        let mut formals = boxed_args.clone();
+        let mut formals = boxed_args;
         formals.truncate(info.arity);
         while formals.len() < info.arity {
             let undef = body.add_op(
@@ -9601,18 +9732,185 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             );
             formals.push(undef);
         }
-        let mut call_args = vec![context, this, arguments];
-        call_args.extend(formals);
-        let result = body.add_op(
+        Ok((this, arguments, formals))
+    }
+
+    /// Emit a tail-position call when the callee is statically known.
+    ///
+    /// `ReturnCallRef` through the generic adapter preserves the tail call
+    /// semantically but still accumulates one host frame per hop (the
+    /// adapter plain-calls the native body), so deep tail recursion only
+    /// becomes O(1) host-stack when the dispatch goes *straight* to a
+    /// native body with `ReturnCall`. That is legal only when the caller's
+    /// declared return type equals the callee's: the return-kind analysis
+    /// classifies every `Tail`-carrying function as boxed (`Reference`),
+    /// so this dispatch refuses raw-returning callees and lets the caller
+    /// fall back to a plain call + boxed return.
+    ///
+    /// Returns `Some(())` when the tail call was fully lowered into the
+    /// given blocks; `None` means the caller must lower the generic
+    /// `ReturnCallRef`-through-adapter form instead.
+    fn try_tail_dispatch(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        context: Value,
+        this: LowerValue,
+        values: &BTreeMap<SValueId, LowerValue>,
+        callee: &TCallee<SValueId>,
+        args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
+    ) -> Result<Option<()>, ConvertError> {
+        // Only simple (non-spread) calls to provenance-tracked function
+        // values can dispatch directly; everything else keeps the generic
+        // adapter tail call.
+        if args.iter().any(|arg| arg.is_spread) {
+            return Ok(None);
+        }
+        let TCallee::Val(value) = callee else {
+            return Ok(None);
+        };
+        let Some(callee_value) = values.get(value) else {
+            return Ok(None);
+        };
+        let LowerValue::FunctionRef { info, fresh, .. } = callee_value else {
+            return Ok(None);
+        };
+        let info = *info;
+        let raw_returns = info.returns.single() != Some(ValueKind::Reference);
+        if *fresh {
+            // A literal allocated by the current statement cannot have
+            // been rebound: dispatch straight to its native body.
+            if raw_returns {
+                return Ok(None);
+            }
+            let (this_value, arguments, formals) =
+                self.build_native_call_args(body, block, info, this, values, args)?;
+            let mut call_args = vec![context, this_value, arguments];
+            call_args.extend(formals);
+            body.set_terminator(
+                block,
+                Terminator::ReturnCall {
+                    func: info.native,
+                    args: call_args,
+                },
+            );
+            return Ok(Some(()));
+        }
+        // Retained origin: the binding could have been rebound. Verify the
+        // literal's tag at runtime; the fast arm dispatches to the native
+        // body while the slow arm keeps the generic adapter tail call. The
+        // check costs one branch, not a duplicated body.
+        let (callee_wasm, kind) = callee_value.wasm()?;
+        if kind != ValueKind::Reference {
+            return Ok(None);
+        }
+        let is_function = body.add_op(
             block,
-            Operator::Call {
-                function_index: info.native,
+            Operator::RefTest {
+                ty: self.repr.function_non_null_ty(),
             },
-            &call_args,
-            &[info.returns.native_return_type(&self.repr)],
+            &[callee_wasm],
+            &[Type::I32],
         );
-        let kind = info.returns.single().unwrap_or(ValueKind::Reference);
-        Ok((block, LowerValue::Wasm { value: result, kind }))
+        let check = body.add_block();
+        let slow = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_function,
+                if_true: BlockTarget {
+                    block: check,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: slow,
+                    args: vec![],
+                },
+            },
+        );
+        let function = body.add_op(
+            check,
+            Operator::RefCast {
+                ty: self.repr.function_ty(),
+            },
+            &[callee_wasm],
+            &[self.repr.function_ty()],
+        );
+        let tag = body.add_op(
+            check,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: FUNCTION_FIELD_TAG,
+            },
+            &[function],
+            &[Type::I32],
+        );
+        let expected = body.add_op(
+            check,
+            Operator::I32Const {
+                value: info.tag as u32,
+            },
+            &[],
+            &[Type::I32],
+        );
+        let matches = body.add_op(check, Operator::I32Eq, &[tag, expected], &[Type::I32]);
+        let fast = body.add_block();
+        body.set_terminator(
+            check,
+            Terminator::CondBr {
+                cond: matches,
+                if_true: BlockTarget {
+                    block: fast,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: slow,
+                    args: vec![],
+                },
+            },
+        );
+        if raw_returns {
+            // A raw-returning native cannot appear in this boxed caller's
+            // tail position (`ReturnCall` must match return types). Lower a
+            // plain call whose boxed result the caller returns; semantics
+            // are identical, only the frame is kept.
+            let (fast_block, result) =
+                self.direct_native_call(body, fast, context, info, this.clone(), values, args)?;
+            let boxed = self.box_value(body, fast_block, &result)?;
+            body.set_terminator(
+                fast_block,
+                Terminator::Return {
+                    values: vec![boxed],
+                },
+            );
+        } else {
+            let (this_value, arguments, formals) =
+                self.build_native_call_args(body, fast, info, this.clone(), values, args)?;
+            let mut call_args = vec![context, this_value, arguments];
+            call_args.extend(formals);
+            body.set_terminator(
+                fast,
+                Terminator::ReturnCall {
+                    func: info.native,
+                    args: call_args,
+                },
+            );
+        }
+        // The slow arm keeps the generic adapter tail call: the dispatch
+        // table entry, the captured context, the effective receiver, and a
+        // fresh arguments array. Emitted after the fast arm so each arm's
+        // ops land on its own block.
+        let (slow_context, slow_this, slow_code, _arrow) =
+            self.callable_parts(body, slow, callee_value, this)?;
+        let slow_array = self.make_arguments(body, slow, values, args)?;
+        body.set_terminator(
+            slow,
+            Terminator::ReturnCallRef {
+                sig: self.repr.adapter,
+                args: vec![slow_context, slow_this, slow_array, slow_code],
+            },
+        );
+        Ok(Some(()))
     }
 
     /// Guarded dispatch through a function literal: one tag check proves

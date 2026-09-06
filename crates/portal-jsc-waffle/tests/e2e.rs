@@ -71,19 +71,7 @@ fn lower_module(
         let cfg = CfgModule::try_from(source).expect("CFG lowering should succeed");
         let tac = TModule::try_from(cfg).expect("TAC lowering should succeed");
         let ssa = SModule::try_from(tac).expect("SSA lowering should succeed");
-        #[cfg(feature = "lower_trace")]
-        for (name, f) in ssa.funcs.iter() {
-            eprintln!("[trace] module func {name:?} vals:");
-            for (vid, v) in f.cfg.values.iter() {
-                let t = format!("{:?}", v.value);
-                if !t.contains("SFunc {") && t.starts_with("Item") {
-                    eprintln!("[trace]   v{} = {}", vid.index(), &t[..t.len().min(150)]);
-                }
-            }
-            for (bid, blk) in f.cfg.blocks.iter() {
-                eprintln!("[trace]   SSA BLOCK {bid:?} stmts {:?} term {:?}", blk.stmts.iter().map(|v| v.index()).collect::<Vec<_>>(), blk.postcedent.term);
-            }
-        }
+
         let mut wasm = Module::empty();
         portal_jsc_waffle::convert_module(&ssa, &mut wasm, options)?;
         Ok(wasm)
@@ -2183,3 +2171,165 @@ fn rejects_circular_reexport_chains() {
         "{error}"
     );
 }
+
+// ── Tail calls ────────────────────────────────────────────────────────────
+
+/// Count static `return_call` terminators (direct tail calls) in a module.
+fn count_return_call(module: &Module<'_>) -> usize {
+    let mut count = 0;
+    for (_, decl) in module.funcs.entries() {
+        if let FuncDecl::Body(_, _, body) = decl {
+            for block in body.blocks.iter() {
+                if let Terminator::ReturnCall { .. } = body.blocks[block].terminator.terminator {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
+#[test]
+fn executes_deep_tail_recursion_end_to_end() {
+    // `return f(...)` is a `TTerm::Tail` in jsaw-core SSA: the frame-
+    // replacing tail call must keep 100k-deep self-recursion through a
+    // provenance-tracked local literal within the host stack, where an
+    // accumulating form would overflow.
+    let module = compile_module(
+        "
+            export function run(n) {
+                let f = function(k, acc) {
+                    if (k <= 0) { return acc; }
+                    return f(k - 1, acc + k);
+                };
+                return f(n, 0);
+            }
+        ",
+    );
+    validate(&module);
+    let bytes = wasm_bytes(&module);
+    for (runtime, result) in [
+        ("Wasmtime", execute_in_wasmtime(&bytes, "run", &[100_000.0])),
+        ("Node.js", execute_in_node(&bytes, "run", &[100_000.0])),
+    ] {
+        assert!(
+            (result - 5_000_050_000.0).abs() < f64::EPSILON,
+            "{runtime} deep tail recursion returned {result}; expected 100000",
+        );
+    }
+}
+
+#[test]
+fn executes_mutual_tail_recursion_end_to_end() {
+    // Even/odd as two mutually-referencing locals: `odd` closes over
+    // `even` before `even` holds a literal, so `odd`'s tail call cannot be
+    // proven fresh and keeps the guarded/generic adapter path — one host
+    // frame per hop. Depth is bounded (1000) to document that the fallback
+    // is a *correct* tail call but not O(1); the O(1) claim is covered by
+    // `executes_deep_tail_recursion_end_to_end` (a single fresh literal).
+    let module = compile_module(
+        "
+            export function run(n) {
+                let even = null;
+                let odd = function(k) { if (k === 0) { return 0; } return even(k - 1); };
+                even = function(k) { if (k === 0) { return 1; } return odd(k - 1); };
+                return even(n);
+            }
+        ",
+    );
+    validate(&module);
+    let bytes = wasm_bytes(&module);
+    for (runtime, result) in [
+        ("Wasmtime", execute_in_wasmtime(&bytes, "run", &[1000.0])),
+        ("Node.js", execute_in_node(&bytes, "run", &[1000.0])),
+    ] {
+        assert!(
+            (result - 1.0).abs() < f64::EPSILON,
+            "{runtime} mutual tail recursion returned {result}; expected 1",
+        );
+    }
+}
+
+#[test]
+fn direct_tail_dispatch_to_proven_literal_uses_return_call() {
+    // A provable self-recursive tail call dispatches straight to the
+    // native body: `return f(k - 1, acc + k)` keeps the literal origin,
+    // so at least one static `return_call` must exist in the module.
+    let module = compile_module(
+        "
+            export function run(n) {
+                let f = function(k, acc) {
+                    if (k <= 0) { return acc; }
+                    return f(k - 1, acc + k);
+                };
+                return f(n, 0);
+            }
+        ",
+    );
+    assert!(
+        count_return_call(&module) > 0,
+        "a proven tail callee must emit a static return_call"
+    );
+}
+
+#[test]
+fn tail_call_result_still_correct_through_guarded_dispatch() {
+    // A retained (non-fresh) literal keeps the runtime tag check: the fast
+    // arm tail-calls the native body, the slow arm keeps the generic
+    // adapter tail call. Both arms must return the callee's result.
+    let module = compile_module(
+        "
+            export function run(n) {
+                let f = function(x) { return x + 1; };
+                let saved = f;
+                return f(n);
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[41.0], 42.0);
+}
+
+#[test]
+fn tail_call_fallback_arm_matches_generic_dispatch_result() {
+    // Rebinding between the literal and the tail call must route through
+    // the fallback and still produce the rebound callee's result.
+    let module = compile_module(
+        "
+            export function run(n) {
+                let f = function(x) { return x + 1; };
+                let probe = f;
+                f = function(x) { return x + 2; };
+                if (n === 1000) { return f(n); }
+                return f(n);
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[41.0], 43.0);
+}
+
+#[test]
+fn dump_ssa_values_for_recursion() {
+    let ssa = script_ssa(
+        "
+            function run(n) {
+                if (n <= 0) { return 0; }
+                return run(n - 1);
+            }
+            run(3);
+        ",
+    );
+    for (id, value) in ssa.cfg.values.iter() {
+        println!("VALUE {id:?} = {:?}", value.value);
+    }
+}
+
+
+
+
+
+
+
+
+

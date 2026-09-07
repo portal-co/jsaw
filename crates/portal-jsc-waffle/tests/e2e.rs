@@ -92,6 +92,16 @@ fn validate(module: &Module<'_>) {
                 .expect("generated Waffle function should validate");
         }
     }
+    // The mobile emitters' feature closure is a living contract: every
+    // module this compiler produces must stay inside it.
+    portal_jsc_mob_emit::audit::audit_module(module)
+        .expect("emitted module should stay inside the mobile feature closure");
+    for (_, declaration) in module.funcs.entries() {
+        if let FuncDecl::Body(_, _, body) = declaration {
+            portal_jsc_mob_emit::lower::lower_body(body)
+                .expect("SIR lowering should succeed for every body");
+        }
+    }
     let bytes = portal_pc_waffle::to_wasm_bytes(module).expect("Wasm emission should succeed");
     let mut features = wasmparser::WasmFeatures::default();
     features.set(wasmparser::WasmFeatures::GC, true);

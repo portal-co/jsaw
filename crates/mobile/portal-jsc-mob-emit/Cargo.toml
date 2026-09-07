@@ -1,0 +1,10 @@
+[package]
+name = "portal-jsc-mob-emit"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+description = "Shared core for emitting WasmGC (portal-pc-waffle IR) to Java and Swift"
+
+[dependencies]
+portal-pc-waffle = { workspace = true, features = ["backend"] }
+anyhow = { workspace = true }

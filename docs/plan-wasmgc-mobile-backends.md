@@ -261,3 +261,48 @@ Android/Xcode project).
   rather than substituting another host (per global QEMU/tooling rules —
   Linux Swift coverage, if ever needed, goes through QEMU software
   emulation, not host substitution).
+
+---
+
+## Milestone 7 — as built (implementation notes)
+
+- Crates: `crates/mobile/portal-jsc-mob-emit` (shared core),
+  `portal-jsc-jvm-emit`, `portal-jsc-swift-emit`.
+- **No waffle patch was needed**: `waffle-backend` exposes `Reducifier`,
+  `Trees::compute`, `StackifyContext::compute`, and `Localifier::compute`
+  publicly, so `lower::lower_body` consumes exactly the post-Localify
+  artifacts the opcode encoder consumes (`portal_pc_waffle::backend::
+  backend::{reducify,treeify,stackify,localify}`).
+- `lower::lower_body` mirrors `WasmFuncBackend` step for step (validate →
+  Reducifier → CFGInfo → Trees → Stackify → Localify → walk), producing
+  the target-neutral SIR (`sir.rs`): labeled `Block`/`Loop`/`If`,
+  `Break`/`Continue`, `Assign`/`Effect`, `Return`, `TailCall`,
+  `TailCallRef`, `Unreachable`, and expression trees with owned/remat
+  values inlined exactly like the encoder places them on the Wasm stack.
+  Block-param transfers are parallel assignments through fresh temps;
+  `If` occupies one label depth (branching to it is a break to its end);
+  the trailing-`Unreachable` rule is mirrored.
+- `audit::audit_module` is wired into the e2e harness's `validate()`
+  (plus `lower_body` for every body), so the feature closure and the
+  walker are exercised by all 81 fixtures on every run — the living
+  contract.
+- `tail::tail_callable_set` = static `ReturnCall` targets ∪ `RefFunc`
+  targets ∪ declared table elements (conservative superset of dynamic
+  `return_call_ref` targets).
+- Java skeleton: `final class S{sig}` with public fields + all-args
+  constructor (only ≤255 fields — Java's method param limit; the
+  257-field global-context struct uses the no-arg constructor and
+  field-by-field population), `I{sig}` funcref interfaces, `Mod` with
+  static method stubs + export delegates, `W` runtime (WasmTrap, JsNull
+  sentinel, IFun marker, non-constant `T` to defeat `javac` reachability
+  errors on Wasm-shaped loops).
+- Swift skeleton: `final class S{sig}`, `A{sig}` array wrappers
+  (reference semantics — Swift arrays are value types), `Fn{sig}`
+  funcref closure boxes, `Mod` enum namespace with stubs + export
+  delegates, `Runtime.swift` (WasmTrap error, JsNull singleton, IFun
+  protocol).
+- Gates: `javac` compiles and `swiftc -typecheck` passes the skeleton
+  emission of the smallest module fixture (`export function run(a) {
+  return a + 1; }`); tool discovery via JAVAC/JAVA_HOME/PATH/Homebrew and
+  SWIFTC/PATH, missing toolchains reported as prerequisites (skip), never
+  substituted. All 81 e2e fixtures pass the audit + SIR lowering.

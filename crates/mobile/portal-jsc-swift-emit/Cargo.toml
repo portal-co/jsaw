@@ -1,0 +1,20 @@
+[package]
+name = "portal-jsc-swift-emit"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+description = "Emit WasmGC (portal-pc-waffle IR) as Swift source"
+
+[dependencies]
+portal-pc-waffle = { workspace = true, features = ["backend"] }
+portal-jsc-mob-emit = { path = "../portal-jsc-mob-emit" }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+portal-jsc-waffle = { path = "../../portal-jsc-waffle" }
+portal-jsc-swc-cfg.workspace = true
+portal-jsc-swc-ssa.workspace = true
+portal-jsc-swc-tac.workspace = true
+swc_common.workspace = true
+swc_ecma_ast.workspace = true
+swc_ecma_parser.workspace = true

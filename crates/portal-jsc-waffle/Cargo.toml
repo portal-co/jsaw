@@ -17,6 +17,7 @@ ryu-js = "1"
 swc_ecma_ast.workspace = true
 
 [dev-dependencies]
+portal-jsc-mob-emit = { path = "../mobile/portal-jsc-mob-emit" }
 swc_common.workspace = true
 swc_ecma_parser.workspace = true
 wasmparser = { version = "0.240", features = ["validate"] }

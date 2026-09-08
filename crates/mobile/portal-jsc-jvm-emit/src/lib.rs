@@ -9,7 +9,7 @@
 //! Milestone 7 skeleton: classes, interfaces, method signatures, and the
 //! runtime are emitted; method bodies are stubs filled in by Milestone 8.
 
-mod render;
+pub mod render;
 
 use std::collections::BTreeMap;
 
@@ -121,6 +121,22 @@ impl<'m> Emitter<'m> {
                  \x20   }}\n\n\
                  \x20   /** Marker super-interface for all typed funcref interfaces. */\n\
                  \x20   public interface IFun {{}}\n\n\
+                 \x20   /** One trampoline step: either a final value or a tail-call thunk. */\n\
+                 \x20   public abstract static class Step {{\n\
+                 \x20       private Step() {{}}\n\
+                 \x20       public static Step value(Object v) {{ return new Value(v); }}\n\
+                 \x20       public static Step tail(java.util.function.Supplier<Step> thunk) {{ return new Tail(thunk); }}\n\
+                 \x20   }}\n\
+                 \x20   public static final class Value extends Step {{\n\
+                 \x20       public final Object value;\n\
+                 \x20       private Value(Object v) {{ value = v; }}\n\
+                 \x20   }}\n\
+\
+                 \x20   public static final class Tail extends Step {{\n\
+                 \x20       private final java.util.function.Supplier<Step> thunk;\n\
+                 \x20       private Tail(java.util.function.Supplier<Step> thunk) {{ this.thunk = thunk; }}\n\
+                 \x20       public Step invoke() {{ return thunk.get(); }}\n\
+                 \x20   }}\n\n\
                  \x20   /** Non-constant `true`: keeps `javac` reachability analysis from\n\
                  \x20       rejecting Wasm-shaped infinite loops. */\n\
                  \x20   public static boolean T = true;\n\n\
@@ -284,16 +300,32 @@ impl<'m> Emitter<'m> {
                 Some(&ty) => java_ty(self.module, ty),
                 None => "void".to_string(),
             };
+            let params_args = (0..params.len())
+                .map(|i| format!("a{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
             let params = params
                 .iter()
                 .enumerate()
                 .map(|(i, &ty)| format!("{} a{i}", java_ty(self.module, ty)))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let step_body = if ret == "void" {
+                format!("apply({params_args}); return W.Step.value(null);")
+            } else {
+                format!("return W.Step.value(apply({params_args}));")
+            };
             let out = format!(
                 "package {PACKAGE};\n\n\
                  public interface {name} extends IFun {{\n\
                  \x20   {ret} apply({params});\n\
+                 \x20   /** One trampoline step: the default completes the call\n\
+                 \x20       immediately and wraps its result (correct for plain\n\
+                 \x20       targets; protocol members still chain O(1) via their\n\
+                 \x20       own nested trampoline). */\n\
+                 \x20   default W.Step apply$step({params}) {{\n\
+                 \x20       {step_body}\n\
+                 \x20   }}\n\
                  }}\n"
             );
             self.file(&name, out);
@@ -302,6 +334,8 @@ impl<'m> Emitter<'m> {
 
     fn emit_mod(&mut self) -> anyhow::Result<()> {
         let mut out = format!("package {PACKAGE};\n\npublic final class Mod {{\n    private Mod() {{}}\n");
+        let tail_set = portal_jsc_mob_emit::tail::tail_callable_set(self.module);
+        let mut renderer = render::Renderer::new(self.module, &tail_set);
         for (func, decl) in self.module.funcs.entries() {
             let (sig, name) = match decl {
                 FuncDecl::Body(sig, name, _) => (*sig, name.as_str()),
@@ -314,10 +348,15 @@ impl<'m> Emitter<'m> {
                 Some(&ty) => java_ty(self.module, ty),
                 None => "void".to_string(),
             };
+            let n_params = params.len();
             let params = params
                 .iter()
                 .enumerate()
                 .map(|(i, &ty)| format!("{} l{i}", java_ty(self.module, ty)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let args = (0..n_params)
+                .map(|i| format!("l{i}"))
                 .collect::<Vec<_>>()
                 .join(", ");
             let fname = names::func_name(func.index());
@@ -325,12 +364,66 @@ impl<'m> Emitter<'m> {
                 unreachable!()
             };
             let sfunc = lower::lower_body(body)?;
-            let body_src = render::Renderer::new(self.module).render_func(&sfunc)?;
-            out.push_str(&format!(
-                "\n    /** {name} */\n\
-                 \x20   public static {ret} {fname}({params}) {{\n{body_src}\
-                 \x20   }}\n"
-            ));
+            let rendered = renderer.render_func(func, &sfunc)?;
+            let body = &rendered.body_src;
+            // Self tail calls compile to a `continue selfTail` inside a
+            // wrapping loop (locals re-initialize each iteration, matching
+            // frame replacement); everything else is the plain body.
+            let wrap_self = |inner: &str| {
+                if rendered.has_self_tail {
+                    format!("    selfTail: while (W.T) {{\n{inner}    }}\n")
+                } else {
+                    inner.to_string()
+                }
+            };
+            if rendered.needs_step {
+                // The protocol body returns `W.Step`; the public wrapper
+                // runs the trampoline loop.
+                let step = names::step_name(func.index());
+                let fell_through = if rendered.has_self_tail {
+                    format!("    throw new W.WasmTrap(\"{step} fell through\");\n")
+                } else {
+                    String::new()
+                };
+                out.push_str(&format!(
+                    "\n    /** {name} (trampoline body) */\n\
+                     \x20   public static W.Step {step}({params}) {{\n{}\
+                     {fell_through}\
+                     \x20   }}\n",
+                    wrap_self(body)
+                ));
+                let finish = match ret.as_str() {
+                    "void" => "return;".to_string(),
+                    "int" => "return (Integer) ((W.Value) s).value;".to_string(),
+                    "long" => "return (Long) ((W.Value) s).value;".to_string(),
+                    "float" => "return (Float) ((W.Value) s).value;".to_string(),
+                    "double" => "return (Double) ((W.Value) s).value;".to_string(),
+                    other => format!("return ({other}) ((W.Value) s).value;"),
+                };
+                out.push_str(&format!(
+                    "\n    /** {name} */\n\
+                     \x20   public static {ret} {fname}({params}) {{\n\
+                     \x20       W.Step s = {step}({args});\n\
+                     \x20       while (s instanceof W.Tail t) {{\n\
+                     \x20           s = t.invoke();\n\
+                     \x20       }}\n\
+                     \x20       {finish}\n\
+                     \x20   }}\n"
+                ));
+            } else {
+                let fell_through = if rendered.has_self_tail && ret != "void" {
+                    format!("    throw new W.WasmTrap(\"{fname} fell through\");\n")
+                } else {
+                    String::new()
+                };
+                out.push_str(&format!(
+                    "\n    /** {name} */\n\
+                     \x20   public static {ret} {fname}({params}) {{\n{}\
+                     {fell_through}\
+                     \x20   }}\n",
+                    wrap_self(body)
+                ));
+            }
         }
         for export in &self.module.exports {
             let ExportKind::Func(func) = export.kind else {

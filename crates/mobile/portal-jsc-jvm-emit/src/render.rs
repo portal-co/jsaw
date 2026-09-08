@@ -15,7 +15,7 @@ use std::fmt::Write as _;
 use anyhow::bail;
 use portal_jsc_mob_emit::names;
 use portal_jsc_mob_emit::sir::{SExpr, SFunc, SLabel, SStmt};
-use portal_pc_waffle::{EntityRef, HeapType, Module, Operator, SignatureData, StorageType, Type};
+use portal_pc_waffle::{EntityRef, Func, HeapType, Module, Operator, SignatureData, StorageType, Type};
 
 use crate::{array_ty, iface_name, java_ty};
 
@@ -36,26 +36,59 @@ enum JTy {
 
 pub struct Renderer<'m> {
     pub module: &'m Module<'m>,
+    /// Functions targeted by (or containing) cross-function tail calls:
+    /// members of the trampoline protocol.
+    pub tail_set: &'m BTreeSet<Func>,
     broken_to: BTreeSet<SLabel>,
     /// Wasm types of the current function's locals (set by `render_func`).
     locals: Vec<Type>,
+    /// The function being rendered (for self-tail detection).
+    current: Func,
+    /// The current function participates in the Step protocol.
+    needs_step: bool,
+    /// The current function tail-calls itself (rendered as a loop).
+    has_self_tail: bool,
+    /// The current function's return types.
+    rets: Vec<Type>,
+    /// Per-site temp counter for self-tail argument assignment.
+    temp_counter: u32,
 }
 
 impl<'m> Renderer<'m> {
-    pub fn new(module: &'m Module<'m>) -> Self {
+    pub fn new(module: &'m Module<'m>, tail_set: &'m BTreeSet<Func>) -> Self {
         Self {
             module,
+            tail_set,
             broken_to: BTreeSet::new(),
             locals: Vec::new(),
+            current: Func::invalid(),
+            needs_step: false,
+            has_self_tail: false,
+            rets: Vec::new(),
+            temp_counter: 0,
         }
     }
 
     /// Render one function body to a Java method body (without the method
     /// signature line and outer braces).
-    pub fn render_func(&mut self, sfunc: &SFunc) -> anyhow::Result<String> {
+    ///
+    /// The returned [`RenderedBody`] reports whether the function
+    /// participates in the trampoline protocol (`needs_step`: the body
+    /// returns `W.Step` and belongs in `fN$step`) and whether it tail-calls
+    /// itself (`has_self_tail`: the body must be wrapped in a `selfTail`
+    /// loop).
+    pub fn render_func(&mut self, func: Func, sfunc: &SFunc) -> anyhow::Result<RenderedBody> {
         self.broken_to = BTreeSet::new();
         collect_breaks(&sfunc.body, &mut self.broken_to);
         self.locals = sfunc.locals.clone();
+        self.current = func;
+        self.rets = sfunc.rets.clone();
+        self.temp_counter = 0;
+        let mut cross_tail = false;
+        let mut self_tail = false;
+        scan_tails(&sfunc.body, func, &mut cross_tail, &mut self_tail);
+        self.needs_step = self.tail_set.contains(&func) || cross_tail;
+        self.has_self_tail = self_tail;
         let mut out = String::new();
         // Non-param locals, default-initialized so `javac`'s definite
         // assignment analysis is satisfied along Wasm CFG paths.
@@ -68,14 +101,75 @@ impl<'m> Renderer<'m> {
             let _ = writeln!(out, "    {jty} {} = {default};", names::local_name(i as u32));
         }
         self.render_seq(&sfunc.body, &mut out, 1)?;
-        Ok(out)
+        Ok(RenderedBody {
+            needs_step: self.needs_step,
+            has_self_tail: self.has_self_tail,
+            body_src: out,
+        })
+    }
+
+    /// Render one statement at `indent` levels. The structured arms
+    /// (Block/Loop/If) recurse with deliberately thin stack frames — Wasm
+    /// CFGs nest arbitrarily deeply — while all leaf work happens in
+    /// [`Self::render_leaf`], kept out of the recursive frames.
+    fn render_stmt_indented(
+        &mut self,
+        stmt: &SStmt,
+        out: &mut String,
+        indent: usize,
+    ) -> anyhow::Result<()> {
+        let pad = "    ".repeat(indent);
+        match stmt {
+            SStmt::Block { label, body } => {
+                let _ = writeln!(out, "{pad}{}: {{", names::label_name(*label));
+                self.render_seq(body, out, indent + 1)?;
+                let _ = writeln!(out, "{pad}}}");
+            }
+            SStmt::Loop { label, body } => {
+                let _ = writeln!(out, "{pad}{}: while (W.T) {{", names::label_name(*label));
+                self.render_seq(body, out, indent + 1)?;
+                // Wasm loops run one trip unless re-entered by a branch to
+                // their label; the trailing break provides the one-trip
+                // exit. Elided when the body cannot fall through.
+                if !self.seq_terminates(body) {
+                    let _ = writeln!(out, "{pad}    break;");
+                }
+                let _ = writeln!(out, "{pad}}}");
+            }
+            SStmt::If {
+                label,
+                cond,
+                if_true,
+                if_false,
+            } => {
+                let cond = self.cond_expr(cond)?;
+                let _ = writeln!(out, "{pad}{}: if ({cond}) {{", names::label_name(*label));
+                self.render_seq(if_true, out, indent + 1)?;
+                if if_false.is_empty() {
+                    let _ = writeln!(out, "{pad}}}");
+                } else {
+                    let _ = writeln!(out, "{pad}}} else {{");
+                    self.render_seq(if_false, out, indent + 1)?;
+                    let _ = writeln!(out, "{pad}}}");
+                }
+            }
+            _ => {
+                let mut inner = String::new();
+                self.render_leaf(stmt, &mut inner)?;
+                for line in inner.split_inclusive('\n') {
+                    out.push_str(&pad);
+                    out.push_str(line);
+                }
+            }
+        }
+        Ok(())
     }
 
     // ---- statements ----
 
     fn render_seq(&mut self, stmts: &[SStmt], out: &mut String, indent: usize) -> anyhow::Result<()> {
         for stmt in stmts {
-            self.render_stmt(stmt, out, indent)?;
+            self.render_stmt_indented(stmt, out, indent)?;
             if self.stmt_terminates(stmt) {
                 // Elide the rest of the sequence: it is unreachable per
                 // Wasm semantics, and `javac` would reject it as an
@@ -121,8 +215,11 @@ impl<'m> Renderer<'m> {
         stmts.iter().any(|s| self.stmt_terminates(s))
     }
 
-    fn render_stmt(&mut self, stmt: &SStmt, out: &mut String, indent: usize) -> anyhow::Result<()> {
-        let pad = "    ".repeat(indent);
+    /// Render a leaf (non-structured) statement. `#[inline(never)]` keeps
+    /// its working set out of the recursive structured frames.
+    #[inline(never)]
+    fn render_leaf(&mut self, stmt: &SStmt, out: &mut String) -> anyhow::Result<()> {
+        let pad = "";
         match stmt {
             SStmt::Assign { local, expr } => {
                 let ty = self.locals[*local as usize];
@@ -160,21 +257,8 @@ impl<'m> Renderer<'m> {
                     }
                 }
             }
-            SStmt::Block { label, body } => {
-                let _ = writeln!(out, "{pad}{}: {{", names::label_name(*label));
-                self.render_seq(body, out, indent + 1)?;
-                let _ = writeln!(out, "{pad}}}");
-            }
-            SStmt::Loop { label, body } => {
-                let _ = writeln!(out, "{pad}{}: while (W.T) {{", names::label_name(*label));
-                self.render_seq(body, out, indent + 1)?;
-                // Wasm loops run one trip unless re-entered by a branch to
-                // their label; the trailing break provides the one-trip
-                // exit. Elided when the body cannot fall through.
-                if !self.seq_terminates(body) {
-                    let _ = writeln!(out, "{pad}    break;");
-                }
-                let _ = writeln!(out, "{pad}}}");
+            SStmt::Block { .. } | SStmt::Loop { .. } | SStmt::If { .. } => {
+                unreachable!("structured statements are rendered by render_stmt_indented")
             }
             SStmt::Break { label } => {
                 let _ = writeln!(out, "{pad}break {};", names::label_name(*label));
@@ -182,63 +266,97 @@ impl<'m> Renderer<'m> {
             SStmt::Continue { label } => {
                 let _ = writeln!(out, "{pad}continue {};", names::label_name(*label));
             }
-            SStmt::If {
-                label,
-                cond,
-                if_true,
-                if_false,
-            } => {
-                let cond = self.cond_expr(cond)?;
-                let _ = writeln!(out, "{pad}{}: if ({cond}) {{", names::label_name(*label));
-                self.render_seq(if_true, out, indent + 1)?;
-                if if_false.is_empty() {
-                    let _ = writeln!(out, "{pad}}}");
-                } else {
-                    let _ = writeln!(out, "{pad}}} else {{");
-                    self.render_seq(if_false, out, indent + 1)?;
-                    let _ = writeln!(out, "{pad}}}");
-                }
-            }
-            SStmt::Return { value } => match value {
-                Some(v) => {
-                    let e = self.expr(v)?;
+            SStmt::Return { value } => match (value, self.needs_step) {
+                (Some(v), false) => {
+                    let e = self.coerce(v, self.rets[0])?;
                     let _ = writeln!(out, "{pad}return {e};");
                 }
-                None => {
+                (None, false) => {
                     let _ = writeln!(out, "{pad}return;");
                 }
+                (Some(v), true) => {
+                    let e = self.coerce(v, self.rets[0])?;
+                    let _ = writeln!(out, "{pad}return W.Step.value({e});");
+                }
+                (None, true) => {
+                    let _ = writeln!(out, "{pad}return W.Step.value(null);");
+                }
             },
-            // Milestone 8: tail calls are plain calls (framed). Milestone 9
-            // replaces this with the trampoline protocol.
             SStmt::TailCall { func, args } => {
-                let args = self.arg_exprs(args)?;
-                // Wasm validity makes the callee's results the caller's;
-                // Java forbids `return expr;` when both are void.
-                let (_, rets) = self.sig_parts(self.sig_of_func(*func)?)?;
-                if rets.is_empty() {
-                    let _ = writeln!(out, "{pad}{}({args});", names::func_name(func.index()));
-                    let _ = writeln!(out, "{pad}return;");
+                if *func == self.current {
+                    // Self tail call: assign arguments to the parameter
+                    // locals (through temps, since the sources may read
+                    // them) and loop.
+                    let site = self.temp_counter;
+                    self.temp_counter += 1;
+                    let params = self.sig_params_of_func(*func)?;
+                    let mut exprs = Vec::with_capacity(params.len());
+                    for (i, &ty) in params.iter().enumerate() {
+                        exprs.push((ty, self.coerce(&args[i], ty)?));
+                    }
+                    for (i, (ty, e)) in exprs.iter().enumerate() {
+                        let jty = java_ty(self.module, *ty);
+                        let _ = writeln!(out, "{pad}{jty} s{site}_{i} = {e};");
+                    }
+                    for i in 0..exprs.len() {
+                        let _ = writeln!(out, "{pad}{} = s{site}_{i};", names::local_name(i as u32));
+                    }
+                    let _ = writeln!(out, "{pad}continue selfTail;");
+                } else if self.needs_step {
+                    // Cross-function tail call: hand a thunk to the
+                    // trampoline loop in this function's public wrapper.
+                    // Lambdas capture only effectively-final locals, so
+                    // evaluate the arguments into fresh final temps first.
+                    let site = self.temp_counter;
+                    self.temp_counter += 1;
+                    let params = self.sig_params_of_func(*func)?;
+                    let mut names_out = Vec::with_capacity(params.len());
+                    for (i, &ty) in params.iter().enumerate() {
+                        let e = self.coerce(&args[i], ty)?;
+                        let jty = java_ty(self.module, ty);
+                        let _ = writeln!(out, "{pad}final {jty} t{site}_{i} = {e};");
+                        names_out.push(format!("t{site}_{i}"));
+                    }
+                    let args = names_out.join(", ");
+                    let _ = writeln!(
+                        out,
+                        "{pad}return W.Step.tail(() -> {}({args}));",
+                        names::step_name(func.index())
+                    );
                 } else {
-                    let _ = writeln!(out, "{pad}return {}({args});", names::func_name(func.index()));
+                    bail!(
+                        "cross-function tail call in a non-protocol function \
+                         (tail-callable set computation is incomplete)"
+                    );
                 }
             }
             SStmt::TailCallRef { sig, args } => {
                 let (params, _) = self.sig_parts(*sig)?;
-                let rendered = params
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &ty)| self.coerce(&args[i], ty))
-                    .collect::<anyhow::Result<Vec<_>>>()?
-                    .join(", ");
                 let funcref = self.expr(args.last().unwrap())?;
                 let iface = iface_name(sig.index());
-                let (_, rets) = self.sig_parts(*sig)?;
-                if rets.is_empty() {
-                    let _ = writeln!(out, "{pad}(({iface})({funcref})).apply({rendered});");
-                    let _ = writeln!(out, "{pad}return;");
-                } else {
-                    let _ = writeln!(out, "{pad}return (({iface})({funcref})).apply({rendered});");
+                if !self.needs_step {
+                    bail!(
+                        "tail-call-ref in a non-protocol function \
+                         (tail-callable set computation is incomplete)"
+                    );
                 }
+                // Lambdas capture only effectively-final locals, so
+                // evaluate the arguments into fresh final temps first.
+                let site = self.temp_counter;
+                self.temp_counter += 1;
+                let mut names_out = Vec::with_capacity(params.len());
+                for (i, &ty) in params.iter().enumerate() {
+                    let e = self.coerce(&args[i], ty)?;
+                    let jty = java_ty(self.module, ty);
+                    let _ = writeln!(out, "{pad}final {jty} t{site}_{i} = {e};");
+                    names_out.push(format!("t{site}_{i}"));
+                }
+                let _ = writeln!(out, "{pad}final Object t{site}_fn = {funcref};");
+                let rendered = names_out.join(", ");
+                let _ = writeln!(
+                    out,
+                    "{pad}return (({iface})(t{site}_fn)).apply$step({rendered});"
+                );
             }
             SStmt::Unreachable => {
                 let _ = writeln!(out, "{pad}throw new W.WasmTrap(\"unreachable\");");
@@ -632,9 +750,44 @@ impl<'m> Renderer<'m> {
             RefNull { .. } => ("null".to_string(), JTy::Ref),
             RefIsNull => (format!("({} == null)", any(0)?), JTy::Boolean),
             RefFunc { func_index } => {
+                // Every RefFunc target is in the tail-callable set (by
+                // construction), hence a protocol member: the funcref
+                // overrides `apply$step` to enter the target's trampoline
+                // body directly, so `return_call_ref` chains flow through
+                // Steps consumed by the outermost loop — O(1) stack rather
+                // than trampolines nested per hop.
+                let (params, rets) = self.sig_parts(self.sig_of_func(*func_index)?)?;
                 let sig = self.sig_of_func(*func_index)?;
+                let iface = iface_name(sig.index());
+                let fname = names::func_name(func_index.index());
+                let step = names::step_name(func_index.index());
+                let decls = params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &ty)| format!("{} a{i}", java_ty(self.module, ty)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let pass = (0..params.len())
+                    .map(|i| format!("a{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let apply_ret = match rets.first() {
+                    Some(&ty) => java_ty(self.module, ty),
+                    None => "void".to_string(),
+                };
+                let apply_body = if apply_ret == "void" {
+                    format!("Mod.{fname}({pass});")
+                } else {
+                    format!("return Mod.{fname}({pass});")
+                };
                 (
-                    format!("(({}) Mod::{})", iface_name(sig.index()), names::func_name(func_index.index())),
+                    format!(
+                        "(({}) new {iface}() {{ \
+                        public {apply_ret} apply({decls}) {{ {apply_body} }} \
+                        public W.Step apply$step({decls}) {{ return Mod.{step}({pass}); }} \
+                        }})",
+                        iface
+                    ),
                     JTy::Ref,
                 )
             }
@@ -753,6 +906,39 @@ impl<'m> Renderer<'m> {
             HeapType::None | HeapType::NoFunc => "W.trapExpr(\"cast to bottom type\")".to_string(),
             other => bail!("ref.cast heap type {other:?} is outside the mobile closure"),
         })
+    }
+}
+
+/// The rendered body of one function plus its trampoline-protocol flags.
+pub struct RenderedBody {
+    pub needs_step: bool,
+    pub has_self_tail: bool,
+    pub body_src: String,
+}
+
+/// Scan for self/cross tail calls (determines the protocol membership).
+fn scan_tails(stmts: &[SStmt], current: Func, cross: &mut bool, self_tail: &mut bool) {
+    for stmt in stmts {
+        match stmt {
+            SStmt::TailCall { func, .. } => {
+                if *func == current {
+                    *self_tail = true;
+                } else {
+                    *cross = true;
+                }
+            }
+            SStmt::TailCallRef { .. } => *cross = true,
+            SStmt::Block { body, .. } | SStmt::Loop { body, .. } => {
+                scan_tails(body, current, cross, self_tail)
+            }
+            SStmt::If {
+                if_true, if_false, ..
+            } => {
+                scan_tails(if_true, current, cross, self_tail);
+                scan_tails(if_false, current, cross, self_tail);
+            }
+            _ => {}
+        }
     }
 }
 

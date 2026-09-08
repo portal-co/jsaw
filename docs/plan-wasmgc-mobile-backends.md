@@ -354,3 +354,42 @@ Android/Xcode project).
   execution fixture on all three runtimes).
 - Gate note: JDK discovery via JAVA_HOME/PATH/Homebrew; a missing JDK
   fails loudly (execution) or reports-and-skips (skeleton gate).
+
+---
+
+## Milestone 9 — as built (implementation notes)
+
+- **Protocol.** `W.Step` = `Value(Object) | Tail(Supplier<Step>)`.
+  Functions in the tail-callable set (or containing cross-function tail
+  calls) get a `fN$step` body returning `W.Step` plus a public `fN`
+  trampoline wrapper (`while (s instanceof W.Tail t) s = t.invoke();`).
+  Plain functions keep plain bodies.
+- **Self `ReturnCall`** renders as final-temp argument assignment +
+  `continue selfTail` inside a `selfTail: while (W.T)` wrap of the whole
+  body (locals re-declare per iteration, matching frame replacement);
+  zero allocation per hop.
+- **Cross `ReturnCall`** renders as `return W.Step.tail(() ->
+  g$step(args))` (args through `final` temps — Java lambdas capture
+  only effectively-final locals).
+- **`ReturnCallRef`** renders as `return fn.apply$step(args)`; funcref
+  interfaces declare `apply` abstract plus a default value-wrapping
+  `apply$step`. `RefFunc` sites create an anonymous class overriding
+  both (`apply` → public `fN`, `apply$step` → `fN$step`), because every
+  `RefFunc` target is in the tail-callable set by construction — this
+  keeps funcref chains O(1): hops are `Step`s consumed by the outermost
+  loop instead of trampolines nested per hop (the default `apply$step`
+  alone would nest one trampoline per funcref boundary).
+- **O(1) evidence**: depth-100000 self and mutual tail fixtures (plus
+  raw/union/cross-module/forwarding chains) pass on the JVM at
+  `-Xss2m`; the e2e runner now uses `-Xss8m` headroom (a framed
+  lowering would need ~256 MB at that depth).
+- **Latent M8 bug fixed**: `Return` now coerces the value to the
+  declared return type (`? 1 : 0` materialization for Wasm-i32
+  booleans) — previously a raw comparison return would not have
+  compiled (no fixture happened to hit it).
+- **Renderer robustness**: the structured statement walker recurses
+  with deliberately thin frames (Block/Loop/If inline) and does all
+  leaf work in an `#[inline(never)]` renderer — real CFGs nest
+  arbitrarily deeply (`js_property_trie_set_9` nests 257 levels) and
+  the fat match frame overflowed the 2 MB test-thread stack before the
+  split. Indentation is applied per line at emission time.

@@ -270,7 +270,7 @@ fn execute_in_jvm(module: &Module<'_>, name: &str, args: &[f64]) -> f64 {
     // A large thread stack keeps framed (non-trampolined) tail calls
     // working until the Milestone 9 trampoline lands.
     let run = std::process::Command::new(&java)
-        .arg("-Xss256m")
+        .arg("-Xss8m")
         .arg("-cp")
         .arg(&dir)
         .arg("pc.portal.mob.Main")

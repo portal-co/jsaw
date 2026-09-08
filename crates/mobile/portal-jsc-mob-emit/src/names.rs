@@ -67,6 +67,12 @@ pub fn func_name(index: usize) -> String {
     format!("f{index}")
 }
 
+/// The canonical generated name for a function's trampoline-protocol body
+/// method: `f{index}$step` (Java-legal; the Swift backend uses its own).
+pub fn step_name(index: usize) -> String {
+    format!("f{index}$step")
+}
+
 /// The canonical generated class name for a struct signature: `S{index}`.
 pub fn struct_name(index: usize) -> String {
     format!("S{index}")

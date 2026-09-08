@@ -122,3 +122,4 @@ fn skeleton_emission_shape() {
     // Milestone 8: bodies are real SIR renderings, not stubs.
     assert!(!mod_src.contains("not yet emitted"), "{mod_src}");
 }
+

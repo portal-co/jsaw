@@ -188,6 +188,7 @@ fn assert_executes_in_all_runtimes(module: &Module<'_>, name: &str, args: &[f64]
         ("Wasmtime", execute_in_wasmtime(&bytes, name, args)),
         ("Node.js", execute_in_node(&bytes, name, args)),
         ("JVM", execute_in_jvm(module, name, args)),
+        ("Swift", execute_in_swift(module, name, args)),
     ] {
         assert!(
             (result - expected).abs() < f64::EPSILON,
@@ -3101,3 +3102,127 @@ fn dedicated_layouts_differ_between_kind_sets() {
 
 
 
+
+fn swiftc_bin() -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(explicit) = std::env::var("SWIFTC") {
+        candidates.push(std::path::PathBuf::from(explicit));
+    }
+    candidates.push(std::path::PathBuf::from("swiftc"));
+    candidates.push(std::path::PathBuf::from("/usr/bin/swiftc"));
+    candidates.into_iter().find(|candidate| {
+        std::process::Command::new(candidate)
+            .arg("-version")
+            .output()
+            .is_ok_and(|out| out.status.success())
+    })
+}
+
+/// Compile the emitted Swift once per unique module (swiftc is slow and
+/// many tests assert repeatedly against one module).
+fn swift_exe(module: &Module<'_>) -> std::path::PathBuf {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<u64, std::path::PathBuf>>> = OnceLock::new();
+    let Some(swiftc) = swiftc_bin() else {
+        panic!("Swift execution requested but no swiftc found (set SWIFTC)");
+    };
+    let sources = portal_jsc_swift_emit::emit_swift(module).expect("Swift emission should succeed");
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for (path, content) in &sources.files {
+        for byte in path.as_bytes().iter().chain(content.as_bytes()) {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+        }
+    }
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(exe) = cache.lock().unwrap().get(&hash) {
+        return exe.clone();
+    }
+    let dir = std::env::temp_dir().join(format!("swift_e2e_{hash:x}"));
+    std::fs::create_dir_all(&dir).expect("temp dir should be creatable");
+    // The content-addressed dylib persists across runs: reuse it.
+    let existing = dir.join("libfixture.dylib");
+    if existing.exists() {
+        cache.lock().unwrap().insert(hash, existing.clone());
+        return existing;
+    }
+    let mut files = Vec::new();
+    for (path, content) in &sources.files {
+        let full = dir.join(path);
+        std::fs::write(&full, content).expect("source file should be writable");
+        files.push(full);
+    }
+    let exe = dir.join("libfixture.dylib");
+    let compile = std::process::Command::new(&swiftc)
+        .arg("-suppress-warnings")
+        .arg("-emit-library")
+        .arg("-module-name")
+        .arg("fixturelib")
+        .arg("-emit-module-path")
+        .arg(dir.join("fixturelib.swiftmodule"))
+        .arg("-o")
+        .arg(&exe)
+        .args(&files)
+        .output()
+        .expect("swiftc should run");
+    assert!(
+        compile.status.success(),
+        "swiftc should compile the emitted module:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    cache.lock().unwrap().insert(hash, exe.clone());
+    exe
+}
+
+fn execute_in_swift(module: &Module<'_>, name: &str, args: &[f64]) -> f64 {
+    use std::sync::{Mutex, OnceLock};
+    // Serialize runs against the cached executable and per-name mains.
+    static RUN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = RUN_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let exe = swift_exe(module);
+    let dir = exe.parent().unwrap().to_path_buf();
+    let ename = portal_jsc_mob_emit::names::swift(name);
+    let arglist = (0..args.len())
+        .map(|i| format!("Double(a[{}])!", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let main = format!(
+        "import fixturelib\n\
+         let a = CommandLine.arguments\n\
+         print(Mod.{ename}({arglist}).bitPattern)\n"
+    );
+    let main_path = dir.join("main.swift");
+    std::fs::write(&main_path, &main).expect("main.swift should be writable");
+    // Link the per-call main against the cached dylib.
+    let run_exe = dir.join(format!("fixture_main_{name}"));
+    let status = std::process::Command::new(swiftc_bin().unwrap())
+        .arg("-suppress-warnings")
+        .arg("-I")
+        .arg(&dir)
+        .arg("-o")
+        .arg(&run_exe)
+        .arg(&main_path)
+        .arg(&exe)
+        .output()
+        .expect("swiftc should link");
+    assert!(
+        status.status.success(),
+        "swiftc should link the harness:\n{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let run = std::process::Command::new(&run_exe)
+        .args(args.iter().map(|a| a.to_string()))
+        .output()
+        .expect("emitted Swift module should run");
+    assert!(
+        run.status.success(),
+        "emitted Swift module should execute:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    stdout
+        .trim()
+        .parse::<u64>()
+        .map(f64::from_bits)
+        .unwrap_or_else(|_| panic!("Swift printed {stdout:?}, expected raw f64 bits"))
+}

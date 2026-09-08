@@ -393,3 +393,45 @@ Android/Xcode project).
   arbitrarily deeply (`js_property_trie_set_9` nests 257 levels) and
   the fat match frame overflowed the 2 MB test-thread stack before the
   split. Indentation is applied per line at emission time.
+
+---
+
+## Milestone 10 — as built (implementation notes)
+
+- `portal-jsc-swift-emit` renders full bodies from the shared SIR,
+  mirroring the Java renderer: labeled `do`/`while true`/`if` for
+  structured control flow (Swift labels attach to `do`, loops, and
+  `if`; no unreachable-statement errors exist, so no elision pass —
+  instead every non-Void body ends with a defensive `fatalError`).
+- **The state-machine fallback exists and lives in Swift**: swiftc
+  rejects structure nesting beyond 256 levels, and real CFGs (the
+  property-trie walkers) nest 257+. Bodies deeper than 220 emit as a
+  flat `switch`-in-`while` state machine (one state per statement
+  sequence, branches as `pc` assignments, label entry/exit states
+  computed by a reverse linearization pass) — the plan's promised
+  fallback, scoped to where the structured form cannot compile.
+- Swift semantics details:
+  - wrapping `&+`/`&-`/`&*`; Swift `/`, `%`, `Int32(Double)` trap
+    exactly where Wasm traps; masking shifts `&<<`/`&>>` match Wasm;
+    `W` helpers for rotl/rotr, NaN/signed-zero-correct min/max, and
+    saturating conversions (Swift has none).
+  - all casts/tests route through `Any` (`(x as Any) is S19`,
+    `(x as Any) as! S19`) since Swift rejects statically-impossible
+    casts; array member access uses `as!`-typed unwrap (non-optional
+    inline constructions and optional locals both work).
+  - arrays are one generic `AArr<E>` reference-semantics wrapper with
+    per-signature typealiases (Swift arrays are value types);
+    `array.copy` uses `replaceSubrange`.
+  - the trampoline mirrors the JVM: `W.Step` = `W.Value`/`W.Tail`
+    classes, `fN_step` bodies, `fN` wrappers, and funcref boxes carry
+    both `body` and `step` closures (`$` is not a Swift identifier,
+    hence `_step`).
+- The e2e harness gained a Swift leg: emit →
+  `swiftc -emit-library -emit-module-path` into a content-addressed
+  cache dir (dylibs are reused across runs; the math fixture's ~20
+  asserts share one compile) → per-call `main.swift` linked against
+  the dylib → raw `bitPattern` comparison. Full suite: **81 passed**
+  on Wasmtime, Node.js, JVM, and Swift (depth-100000 fixtures
+  included).
+- Known cost: swiftc dominates suite time (~45 unique module compiles
+  at ~40-80s each; repeated runs reuse the on-disk cache).

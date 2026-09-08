@@ -117,5 +117,6 @@ fn skeleton_emission_shape() {
         mod_src.contains("public static func run(_ a0: Double) -> Double"),
         "{mod_src}"
     );
-    assert!(mod_src.contains("not yet emitted"), "{mod_src}");
+    // Milestone 10: bodies are real SIR renderings, not stubs.
+    assert!(!mod_src.contains("not yet emitted"), "{mod_src}");
 }

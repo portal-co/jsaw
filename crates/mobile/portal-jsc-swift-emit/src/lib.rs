@@ -34,6 +34,15 @@ impl SwiftSources {
         }
         out
     }
+
+    /// Write the sources into a directory.
+    pub fn write_to(&self, dir: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir.as_ref())?;
+        for (path, content) in &self.files {
+            std::fs::write(dir.as_ref().join(path), content)?;
+        }
+        Ok(())
+    }
 }
 
 /// Emit a module as Swift sources.

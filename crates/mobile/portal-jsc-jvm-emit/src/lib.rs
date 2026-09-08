@@ -34,6 +34,18 @@ impl JavaSources {
         }
         out
     }
+
+    /// Write the sources into a directory (creating package directories).
+    pub fn write_to(&self, dir: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        for (path, content) in &self.files {
+            let full = dir.as_ref().join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&full, content)?;
+        }
+        Ok(())
+    }
 }
 
 /// The Java package all generated files live in.

@@ -435,3 +435,21 @@ Android/Xcode project).
   included).
 - Known cost: swiftc dominates suite time (~45 unique module compiles
   at ~40-80s each; repeated runs reuse the on-disk cache).
+
+---
+
+## Milestone 11 — as built (implementation notes)
+
+- `JavaSources::write_to(dir)` / `SwiftSources::write_to(dir)` added as
+  the consumer-facing API (with `concatenated()` for debugging).
+- **JVM 64 KiB method-limit measured**: the largest emitted method in
+  the corpus is ~30 KB of bytecode (`javap` on `Mod.class`), ~2×
+  headroom; method splitting is documented as the remediation, not
+  implemented. The Java-per-struct/interface file split already keeps
+  class files small; `Mod.java` size is a readability concern only.
+- `README.md` documents the three backends; `TESTING.md` documents the
+  four-runtime e2e matrix, tool discovery (JAVA_HOME/PATH/Homebrew,
+  SWIFTC/PATH), and the on-disk Swift dylib cache.
+- `docs/mobile-consumers.md` is the embedding guide: produced sources,
+  runtime shapes, Android/Xcode integration, semantics notes (traps,
+  O(1) tail trampolines, identity, numeric behavior), and the limits.

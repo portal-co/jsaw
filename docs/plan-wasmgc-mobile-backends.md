@@ -306,3 +306,51 @@ Android/Xcode project).
   return a + 1; }`); tool discovery via JAVAC/JAVA_HOME/PATH/Homebrew and
   SWIFTC/PATH, missing toolchains reported as prerequisites (skip), never
   substituted. All 81 e2e fixtures pass the audit + SIR lowering.
+
+---
+
+## Milestone 8 — as built (implementation notes)
+
+- `portal-jsc-jvm-emit` now renders full method bodies from the SIR
+  (`render.rs`): all closure operators, structured control flow
+  (`Block` → labeled block, `Loop` → one-trip `while (W.T)` with a
+  trailing break, `If` occupying one label depth), and expression trees.
+- **Tail calls are framed plain calls** (documented stack caveat); the
+  e2e JVM runner passes `-Xss256m`, so even the depth-100000 tail
+  fixtures pass on the JVM. Milestone 9 replaces this with the
+  trampoline.
+- **No state-machine fallback was needed**: Stackify's output for
+  closure-valid bodies is always label-reducible; `Select`/
+  `ReturnCallIndirect` are audit-rejected, so the walker errors (never
+  silently falls back) — the plan's "must exist, fires never" fallback
+  is the audit itself.
+- Java semantic details pinned down:
+  - Wasm comparisons/`ref.test`/`ref.eq` produce Java `boolean`, and the
+    renderer tracks expression Java-ness (`JTy`) to materialize
+    `? 1 : 0` wherever Wasm wants an `i32`.
+  - `javac` rejects `instanceof`/casts between unrelated *final* classes
+    (e.g. a `ref.test $S19` on an `$S11` value, valid and false in
+    Wasm). All tests/casts/field accesses route through an `(Object)`
+    detour: `((Object)x) instanceof S19`, `(S19)((Object)x)` — compile-
+    time acceptance, runtime ClassCastException as the trap.
+  - `javac` reachability: statements after an unconditional terminator
+    within a sequence are elided; loops use the non-constant `W.T`
+    condition so `javac` always considers their fall-through reachable
+    (and the mirrored trailing `Unreachable` keeps semantics).
+  - Trapping arithmetic/conversions are `W` helpers (`divS`, `remS`,
+    `truncF64I32`, …); saturating unsigned conversions and unsigned
+    i64→float use exact helper implementations; `f64.min/max` map to
+    `Math.min/max` (NaN and ±0 semantics match Wasm).
+  - Struct classes implement the marker `IStruct` so abstract
+    `ref.test struct` is one `instanceof`; >255-field structs
+    (the global context) use `W.build` + field-wise population.
+  - `F32Const`/`F64Const` emit via `intBitsToFloat`/`longBitsToDouble`
+    for bit-exact NaN payloads; `i32::MIN`/`i64::MIN` avoid the literal
+    pitfall.
+- The e2e harness gained a JVM leg in `assert_executes_in_all_runtimes`:
+  emit → `javac -proc:none -nowarn -g:none` → `java -Xss256m` with a
+  generated `Main` printing `Double.doubleToRawLongBits`, compared
+  bit-exactly against Wasmtime/Node. Full suite: **81 passed** (every
+  execution fixture on all three runtimes).
+- Gate note: JDK discovery via JAVA_HOME/PATH/Homebrew; a missing JDK
+  fails loudly (execution) or reports-and-skips (skeleton gate).

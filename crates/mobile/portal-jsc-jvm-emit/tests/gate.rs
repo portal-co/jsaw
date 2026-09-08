@@ -119,5 +119,6 @@ fn skeleton_emission_shape() {
     );
     let mod_src = &sources.files["pc/portal/mob/Mod.java"];
     assert!(mod_src.contains("public static double run(double a0)"), "{mod_src}");
-    assert!(mod_src.contains("not yet emitted"), "{mod_src}");
+    // Milestone 8: bodies are real SIR renderings, not stubs.
+    assert!(!mod_src.contains("not yet emitted"), "{mod_src}");
 }

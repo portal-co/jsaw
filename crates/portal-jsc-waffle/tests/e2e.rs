@@ -187,12 +187,108 @@ fn assert_executes_in_all_runtimes(module: &Module<'_>, name: &str, args: &[f64]
     for (runtime, result) in [
         ("Wasmtime", execute_in_wasmtime(&bytes, name, args)),
         ("Node.js", execute_in_node(&bytes, name, args)),
+        ("JVM", execute_in_jvm(module, name, args)),
     ] {
         assert!(
             (result - expected).abs() < f64::EPSILON,
             "{runtime} returned {result} from {name:?}; expected {expected}",
         );
     }
+}
+
+fn java_bin() -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(home) = std::env::var("JAVA_HOME") {
+        candidates.push(std::path::PathBuf::from(home).join("bin/java"));
+    }
+    candidates.push(std::path::PathBuf::from("java"));
+    candidates.push(std::path::PathBuf::from("/opt/homebrew/opt/openjdk/bin/java"));
+    candidates.into_iter().find(|candidate| {
+        std::process::Command::new(candidate)
+            .arg("-version")
+            .output()
+            .is_ok_and(|out| out.status.success())
+    })
+}
+
+fn execute_in_jvm(module: &Module<'_>, name: &str, args: &[f64]) -> f64 {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let Some(java) = java_bin() else {
+        panic!(
+            "JVM execution requested but no working JDK found \
+             (set JAVA_HOME, or install openjdk)"
+        );
+    };
+    let javac = java.with_file_name("javac");
+    let sources = portal_jsc_jvm_emit::emit_java(module).expect("Java emission should succeed");
+    let dir = std::env::temp_dir().join(format!(
+        "jvm_e2e_{}_{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir should be creatable");
+    let mut files = Vec::new();
+    for (path, content) in &sources.files {
+        let full = dir.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).expect("package dirs should be creatable");
+        std::fs::write(&full, content).expect("source file should be writable");
+        files.push(full);
+    }
+    let ename = portal_jsc_mob_emit::names::java(name);
+    let arglist = (0..args.len())
+        .map(|i| format!("Double.parseDouble(a[{i}])"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let main = format!(
+        "package pc.portal.mob;\n\
+         public class Main {{\n\
+         \x20   public static void main(String[] a) {{\n\
+         \x20       double r = Mod.{ename}({arglist});\n\
+         \x20       System.out.println(Double.doubleToRawLongBits(r));\n\
+         \x20   }}\n\
+         }}\n"
+    );
+    let main_path = dir.join("pc/portal/mob/Main.java");
+    std::fs::write(&main_path, &main).expect("Main.java should be writable");
+    files.push(main_path);
+    let compile = std::process::Command::new(&javac)
+        .arg("-proc:none")
+        .arg("-nowarn")
+        .arg("-g:none")
+        .arg("-d")
+        .arg(&dir)
+        .args(&files)
+        .output()
+        .expect("javac should run");
+    assert!(
+        compile.status.success(),
+        "javac should compile the emitted module:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    // A large thread stack keeps framed (non-trampolined) tail calls
+    // working until the Milestone 9 trampoline lands.
+    let run = std::process::Command::new(&java)
+        .arg("-Xss256m")
+        .arg("-cp")
+        .arg(&dir)
+        .arg("pc.portal.mob.Main")
+        .args(args.iter().map(|a| a.to_string()))
+        .output()
+        .expect("java should run");
+    assert!(
+        run.status.success(),
+        "emitted JVM module should execute:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let bits: i64 = stdout
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("JVM printed {stdout:?}, expected raw f64 bits"));
+    let _ = std::fs::remove_dir_all(&dir);
+    f64::from_bits(bits as u64)
 }
 
 #[test]

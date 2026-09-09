@@ -272,3 +272,37 @@ dependency assertion that Chicory is gone.
 - **WASI surface creep (§3.4).** The compiler binary may use more WASI
   than fd_read/write (preopens, clocks, random). Milestone 15 inventories
   the exact import list so 18 is scoped.
+
+## 8. As-built
+
+### Milestone 15 — characterization done, blitz-js opt mode fixed (prerequisite)
+
+`crates/jsaw-wasi-bin/tests/dogfood_m15.rs` characterizes the real
+`jsaw-wasi-bin.wasm` through blitz-js and executes the result. Findings:
+
+- **16 WASI imports** scope the Milestone 18 glue (args/environ get+sizes,
+  fd_close/fd_fdstat_get/fd_filestat_get/fd_prestat_dir_name/fd_prestat_get/
+  fd_read/fd_write, path_create_directory/path_filestat_get/path_open,
+  proc_exit, random_get). Exports: `_start`, `__main_void`.
+- **~6042 `call_indirect` sites, zero `return_call`, zero `memory.grow`** —
+  so Milestone 17 needs no tail-call or growth handling from this corpus.
+- blitz-js models **every** wasm value as BigInt (i32 included — `mask32`
+  masking everywhere), so Milestone 16 BigInt support is load-bearing for all
+  arithmetic, not just i64.
+
+**Deviation discovered here:** blitz-js's non-optimized output was 452 MB
+(dominated by the stack weave), so opt mode was required — but opt mode
+*crashed with a stack underflow* on the real compiler wasm. The plan said
+"blitz-js needs no changes," but opt mode was genuinely broken (not a
+scope choice), so it was fixed in the blitz repo (`wasm-blitz-spectests`
+commit `9c52005`): per-frame base tracking in `OptState`, and codegen fixes
+for `Drop` (physical pop never emitted), `Select` (popped 5 instead of 3),
+and conditional branches (`br_if`/`br_table` committed depth mutations the
+fallthrough path didn't take). With the fix, opt mode compiles the compiler
+wasm cleanly and emits **167 MB** (2.7× smaller), and five opt-mode modules
+in `crates/blitz-js/tests/opt_repro.rs` execute correctly in Node.
+
+`trivial_core_wasm_round_trips_to_js` now executes **both** non-opt and opt
+compiled output in Node (add(40,2)=42), proving the pipe shape end-to-end on
+a trivial input. The full `compiler.js`→jsaw→WasmGC→Java round-trip remains
+Milestones 16–19 (it needs the BigInt and mechanical-JS frontend support).

@@ -19,6 +19,11 @@ tempfile = { workspace = true }
 wasmtime = { version = "47", default-features = false, features = ["cranelift", "runtime"] }
 wasmtime-wasi = { version = "47", default-features = false, features = ["p1"] }
 wasmparser = { version = "0.240", features = ["validate"] }
+# Milestone 15 (dogfood): characterize the wasm-blitz JS the compiler wasm
+# translates to. Path deps to the sibling wasm-blitz checkout.
+portal-solutions-blitz-js = { path = "../../../wasm-blitz-spectests/crates/blitz-js" }
+portal-solutions-blitz-common = { path = "../../../wasm-blitz-spectests/crates/blitz-common" }
+portal-solutions-blitz-opt = { path = "../../../wasm-blitz-spectests/crates/blitz-opt" }
 
 [[bin]]
 name = "jsaw-wasi-bin"

@@ -305,3 +305,18 @@ relative import + a deep tail-recursive function) compiles to a
 isolation test for wasip1-only divergence); and a bad entry yields a
 structured `{"status":"error"}` with exit code 1. Full e2e stays green
 (81 passed).
+
+## Milestone 13 — as built
+
+`emit_java` and `emit_swift` were already reachable in the M12 driver, so
+this milestone's substance is the determinism guarantee. The new golden
+test `java_and_swift_outputs_match_native_emission_byte_for_byte` runs
+the wasip1 binary on the fixture with `emit.java` and `emit.swift` set,
+collects every written file into a path→bytes map, and asserts it equals
+`compile_to_outputs` run natively on the same module — **byte-for-byte
+equal on the first attempt**, confirming the wasm build is fully
+deterministic (matching the `BTreeMap`-keyed `ModuleSet` and the
+deterministic emitters) and that both emitters behave identically inside
+the WASI sandbox. This is the property the Gradle build cache relies on:
+the cache key `hash(compiler.wasm) + source hashes + options` is sound
+because compilation is a pure function of those inputs.

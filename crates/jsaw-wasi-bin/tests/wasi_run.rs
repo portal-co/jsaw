@@ -24,17 +24,28 @@ const FIXTURE: &[(&str, &str)] = &[
 ];
 
 fn manifest() -> jsaw_wasi_bin::manifest::Manifest {
+    manifest_with_emit(jsaw_wasi_bin::manifest::Emit {
+        wasm: Some("module.wasm".to_string()),
+        java: None,
+        swift: None,
+    })
+}
+
+fn manifest_with_emit(emit: jsaw_wasi_bin::manifest::Emit) -> jsaw_wasi_bin::manifest::Manifest {
     jsaw_wasi_bin::manifest::Manifest {
         version: jsaw_wasi_bin::manifest::MANIFEST_VERSION,
         entry: "index.js".to_string(),
         modules: FIXTURE.iter().map(|(p, _)| p.to_string()).collect(),
         options: Default::default(),
-        emit: jsaw_wasi_bin::manifest::Emit {
-            wasm: Some("module.wasm".to_string()),
-            java: None,
-            swift: None,
-        },
+        emit,
     }
+}
+
+fn fixture_sources() -> std::collections::BTreeMap<String, String> {
+    FIXTURE
+        .iter()
+        .map(|(p, s)| (p.to_string(), s.to_string()))
+        .collect()
 }
 
 /// Build the wasip1 binary (cargo makes this a no-op when it is fresh)
@@ -115,12 +126,8 @@ fn native_driver_sees_exports() {
     // The same driver that runs under wasip1 must, natively, see the
     // module's exports — this isolates a wasip1-only lowering divergence
     // from a driver bug.
-    let mut sources = std::collections::BTreeMap::new();
-    for (path, source) in FIXTURE {
-        sources.insert(path.to_string(), source.to_string());
-    }
     let (exports, outputs) =
-        jsaw_wasi_bin::compile_to_outputs(&manifest(), &sources).expect("native compile");
+        jsaw_wasi_bin::compile_to_outputs(&manifest(), &fixture_sources()).expect("native compile");
     assert!(
         exports.contains(&"run".to_string()),
         "native exports should contain run: {exports:?}"
@@ -176,4 +183,72 @@ fn reports_a_manifest_error_cleanly() {
         result["error"].as_str().unwrap().contains("not in the module set"),
         "error should mention the entry: {line}"
     );
+}
+
+/// Milestone 13: the Java and Swift the wasip1 binary emits must be
+/// byte-identical to the same emitters run natively on the same module.
+/// This pins the wasm build's determinism and proves the emitters work
+/// identically inside the sandbox.
+#[test]
+fn java_and_swift_outputs_match_native_emission_byte_for_byte() {
+    let emit = jsaw_wasi_bin::manifest::Emit {
+        wasm: None,
+        java: Some("java".to_string()),
+        swift: Some("swift".to_string()),
+    };
+    let manifest = manifest_with_emit(emit);
+
+    // Native emission.
+    let (native_exports, native_outputs) =
+        jsaw_wasi_bin::compile_to_outputs(&manifest, &fixture_sources()).expect("native compile");
+    assert!(
+        native_outputs.keys().any(|p| p.starts_with("java/")),
+        "native emission should produce java outputs"
+    );
+    assert!(
+        native_outputs.keys().any(|p| p.starts_with("swift/")),
+        "native emission should produce swift outputs"
+    );
+
+    // wasip1 emission.
+    let (src, out) = fixture_dirs();
+    let (stdout, stderr, success) =
+        run_compiler(src.path(), out.path(), &serde_json::to_string(&manifest).unwrap());
+    assert!(success, "compiler should exit 0; stderr: {stderr}");
+    let line = stdout.lines().next().expect("a result line");
+    let result: serde_json::Value = serde_json::from_str(line).unwrap();
+    assert_eq!(result["status"], "ok", "compile should succeed: {line}");
+
+    // Collect the written files into the same path->bytes shape.
+    let mut wasip1_outputs: std::collections::BTreeMap<String, Vec<u8>> =
+        std::collections::BTreeMap::new();
+    for top in ["java", "swift"] {
+        let dir = out.path().join(top);
+        let mut stack = vec![dir.clone()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let rel = path.strip_prefix(out.path()).unwrap().to_string_lossy().replace('\\', "/");
+                    wasip1_outputs.insert(rel, std::fs::read(&path).unwrap());
+                }
+            }
+        }
+    }
+
+    // Byte-for-byte equality on every emitted file, and the same export list.
+    assert_eq!(
+        native_outputs, wasip1_outputs,
+        "wasip1 and native emission must be byte-identical"
+    );
+    let wasip1_exports: Vec<String> = result["exports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(native_exports, wasip1_exports, "export lists must match");
 }

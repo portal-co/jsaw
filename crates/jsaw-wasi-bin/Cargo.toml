@@ -1,0 +1,25 @@
+[package]
+name = "jsaw-wasi-bin"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+description = "jsaw compiler as a wasm32-wasip1 binary: JS module set -> WasmGC / Java / Swift"
+
+[dependencies]
+portal-jsc-waffle = { path = "../portal-jsc-waffle" }
+portal-jsc-jvm-emit = { path = "../mobile/portal-jsc-jvm-emit" }
+portal-jsc-swift-emit = { path = "../mobile/portal-jsc-swift-emit" }
+portal-pc-waffle = { workspace = true, features = ["backend"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+wasmtime = { version = "47", default-features = false, features = ["cranelift", "runtime"] }
+wasmtime-wasi = { version = "47", default-features = false, features = ["p1"] }
+wasmparser = { version = "0.240", features = ["validate"] }
+
+[[bin]]
+name = "jsaw-wasi-bin"
+path = "src/main.rs"

@@ -2028,33 +2028,14 @@ fn lower_modules(
     entry: &str,
     options: &portal_jsc_waffle::ConvertOptions,
 ) -> Result<Module<'static>, portal_jsc_waffle::ConvertError> {
-    GLOBALS.set(&Globals::default(), || {
-        let cm: Lrc<SourceMap> = Lrc::new(SourceMap::default());
-        let mut set = portal_jsc_waffle::ModuleSet::new();
-        for (path, source) in fixtures {
-            let file = cm.new_source_file(
-                Lrc::new(FileName::Custom((*path).into())),
-                (*source).to_owned(),
-            );
-            let mut errors = vec![];
-            let module = parse_file_as_module(
-                &file,
-                Syntax::Es(EsSyntax::default()),
-                EsVersion::Es2022,
-                None,
-                &mut errors,
-            )
-            .expect("module fixture should parse");
-            assert!(errors.is_empty(), "parser diagnostics: {errors:?}");
-            let cfg = CfgModule::try_from(module).expect("CFG lowering should succeed");
-            let tac = TModule::try_from(cfg).expect("TAC lowering should succeed");
-            let ssa = SModule::try_from(tac).expect("SSA lowering should succeed");
-            set.insert(*path, Box::leak(Box::new(ssa)))?;
-        }
-        let mut wasm = Module::empty();
-        portal_jsc_waffle::convert_modules(entry, &set, &mut wasm, options)?;
-        Ok(wasm)
-    })
+    // The shared ingestion pipeline (parse -> CFG -> TAC -> SSA ->
+    // ModuleSet) lives in the crate so the wasip1 CLI uses it too. The
+    // lowering error type differs only in that ingestion failures are
+    // already ConvertErrors.
+    let set = portal_jsc_waffle::module_set_from_sources(fixtures.iter().copied())?;
+    let mut wasm = Module::empty();
+    portal_jsc_waffle::convert_modules(entry, &set, &mut wasm, options)?;
+    Ok(wasm)
 }
 
 fn compile_modules(fixtures: Fixture<'_>, entry: &str) -> Module<'static> {

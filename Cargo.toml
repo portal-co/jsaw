@@ -1,5 +1,5 @@
 [workspace]
-members=["crates/mobile/portal-jsc-jvm-emit", "crates/mobile/portal-jsc-mob-emit", "crates/mobile/portal-jsc-swift-emit", "crates/portal-jsc-waffle",   "crates/swc-batch"]
+members=["crates/jsaw-wasi-bin", "crates/mobile/portal-jsc-jvm-emit", "crates/mobile/portal-jsc-mob-emit", "crates/mobile/portal-jsc-swift-emit", "crates/portal-jsc-waffle",   "crates/swc-batch"]
 
 # "js-runtime-lib","swc-emit-rust","swc-waffle"
 
@@ -51,6 +51,9 @@ portal-solutions-swibb = {version="^0.6.0-alpha.1",git="https://github.com/porta
 
 
 anyhow = "^1.0.87"
+serde = { version = "^1.0", features = ["derive"] }
+serde_json = "^1.0"
+tempfile = "^3.10"
 bimap = "^0.6.3"
 
 

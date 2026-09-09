@@ -267,3 +267,41 @@ compile and run correctly on wasip1) first, before any Gradle code exists.
   cache key is the whole set).
 - Any change to the compiler's semantics, resolution rules, or emitted
   code — this plan only packages what exists.
+
+## Milestone 12 — as built
+
+`crates/jsaw-wasi-bin` compiles the whole swc+jsaw stack to
+`wasm32-wasip1 --release` with **zero source changes** (5.3 MB wasm,
+~25 s build) — the plan's highest-risk item cleared on the first attempt.
+The crate is a lib + thin bin:
+
+- `src/manifest.rs` — the versioned schema (`Manifest`/`Options`/`Emit`,
+  `Result` as a `#[serde(tag = "status")]` enum). One as-built deviation:
+  `Options` implements `Default` by hand (not derived) so
+  `numeric_exports` defaults to `true` in both the serde path and the
+  direct-construction path — a derived `Default` had set it `false` and
+  silently dropped every numeric export.
+- `src/lib.rs` — `compile_to_outputs(&Manifest, &sources)` is the
+  target-independent core (manifest check → `module_set_from_sources` →
+  `convert_modules` → per-target emission into an in-memory
+  path→bytes map), plus `read_sources`/`write_outputs` (with
+  path-escape rejection) for the binary.
+- `src/main.rs` — parses `--src`/`--out`, reads the manifest from stdin,
+  prints one result JSON line to stdout, sets a panic hook to stderr, and
+  exits 0/1 by status.
+- The multi-module ingestion pipeline (parse → CFG → TAC → SSA →
+  `ModuleSet`, owning the swc `GLOBALS` scope) moved out of
+  `tests/e2e.rs` into `portal-jsc-waffle::ingest` (new public module);
+  the e2e `lower_modules` now calls it, so the harness and the CLI share
+  exactly one front half.
+
+Tests (`tests/wasi_run.rs`, 3 passing) build the wasip1 wasm (cargo
+unconditionally, so it is never stale), run it under `wasmtime` with
+`wasmtime-wasi` p1 (`--src`/`--out` as preopened dirs, manifest on a
+memory-pipe stdin), and assert: a multi-module fixture (entry with a
+relative import + a deep tail-recursive function) compiles to a
+`module.wasm` that validates with the GC feature and reports `run` /
+`count` in `exports`; the same driver natively sees the exports (an
+isolation test for wasip1-only divergence); and a bad entry yields a
+structured `{"status":"error"}` with exit code 1. Full e2e stays green
+(81 passed).

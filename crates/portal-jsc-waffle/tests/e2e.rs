@@ -3207,3 +3207,211 @@ fn execute_in_swift(module: &Module<'_>, name: &str, args: &[f64]) -> f64 {
         .map(f64::from_bits)
         .unwrap_or_else(|_| panic!("Swift printed {stdout:?}, expected raw f64 bits"))
 }
+
+// === Milestone 16: BigInt (fixed-width, i64-backed) ===
+//
+// jsaw's BigInt is fixed-width: blitz-js only ever uses the
+// `asUintN`/`asIntN` fixed-width forms, so a raw i64 payload is exact.
+// These fixtures exercise the operator family, the fixed-width intrinsics,
+// and comparisons, with results surfaced as Numbers at the f64 export
+// boundary (BigInt itself never crosses that boundary).
+
+#[test]
+fn bigint_literal_and_arithmetic() {
+    let module = compile_module(
+        "
+            export function run() {
+                let a = 40n + 2n;
+                return a === 42n ? 1 : 0;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 1.0);
+}
+
+#[test]
+fn bigint_sub_mul_and_bitwise() {
+    let module = compile_module(
+        "
+            export function run() {
+                let a = 100n - 58n;   // 42
+                let b = 6n * 7n;      // 42
+                let c = 0xffn & 0x2an; // 0x2a = 42
+                return a === 42n && b === 42n && c === 42n ? 1 : 0;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 1.0);
+}
+
+#[test]
+fn bigint_shifts() {
+    let module = compile_module(
+        "
+            export function run() {
+                let hi = 1n << 40n;      // 1099511627776
+                let back = hi >> 40n;    // 1
+                return back === 1n && hi > 0n ? 1 : 0;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 1.0);
+}
+
+#[test]
+fn bigint_division_and_remainder_truncate_toward_zero() {
+    let module = compile_module(
+        "
+            export function run() {
+                let q = 17n / 5n;   // 3 (truncated)
+                let r = 17n % 5n;   // 2
+                let nq = -17n / 5n; // -3 (toward zero, matching Wasm i64.div_s)
+                return q === 3n && r === 2n && nq === -3n ? 1 : 0;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 1.0);
+}
+
+#[test]
+fn bigint_comparisons() {
+    let module = compile_module(
+        "
+            export function run() {
+                let a = 5n;
+                let b = 9n;
+                return a < b && b > a && a <= 5n && b >= 9n && a !== b && a === 5n ? 1 : 0;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 1.0);
+}
+
+#[test]
+fn bigint_unary_minus_and_not() {
+    let module = compile_module(
+        "
+            export function run() {
+                let neg = -42n;
+                let not = ~0n;      // -1n
+                return neg === -42n && not === -1n ? 1 : 0;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 1.0);
+}
+
+#[test]
+fn bigint_asuintn_masks_unsigned() {
+    let module = compile_module(
+        "
+            export function run() {
+                // -1 asUintN(32) => 0xffffffff = 4294967295
+                let x = BigInt.asUintN(32, -1n);
+                return x === 4294967295n ? 1 : 0;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 1.0);
+}
+
+#[test]
+fn bigint_asintn_sign_extends() {
+    let module = compile_module(
+        "
+            export function run() {
+                // asIntN(32, 0xffffffff) => -1 (bit 31 set)
+                let x = BigInt.asIntN(32, 4294967295n);
+                // asIntN(64, x) is the identity for a value already fitting i64.
+                let y = BigInt.asIntN(64, 42n);
+                return x === -1n && y === 42n ? 1 : 0;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 1.0);
+}
+
+#[test]
+fn bigint_mask32_idiom_from_blitz_js() {
+    // The exact idiom blitz-js emits: a `mask32` constant, a per-function
+    // `toUint` arrow alias of `BigInt.asUintN`, and `& mask32` masking of i32
+    // arithmetic. `mask32` is function-local here: module top-level binding
+    // evaluation is a separate pre-existing jsaw-core gap (out of scope for
+    // Milestone 16), and the corpus's per-function aliases are local anyway.
+    let module = compile_module(
+        "
+            export function run() {
+                const mask32 = 0xffff_ffffn;
+                const toUint = (a, b) => BigInt.asUintN(b, a);
+                let sum = (41n + 1n) & mask32;
+                let masked = toUint(sum & mask32, 32);
+                return masked === 42n ? 1 : 0;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 1.0);
+}
+
+#[test]
+fn bigint_truthiness() {
+    let module = compile_module(
+        "
+            export function run() {
+                let zero = 0n;
+                let nonzero = 5n;
+                let a = nonzero ? 1 : 0;   // 1
+                let b = zero ? 1 : 0;      // 0
+                return a === 1 && b === 0 ? 1 : 0;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 1.0);
+}
+
+#[test]
+fn bigint_comparison_result_drives_branch() {
+    let module = compile_module(
+        "
+            export function run() {
+                let big = 9007199254740993n; // 2^53 + 1, beyond f64 integer precision
+                return big > 9007199254740992n ? 42 : -1;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
+}
+
+#[test]
+fn bigint_i64_range_arithmetic() {
+    let module = compile_module(
+        "
+            export function run() {
+                // Exercises the raw i64 payload well beyond the f64 exact range.
+                let a = 4611686018427387904n; // 2^62
+                let b = a / 2n;               // 2^61
+                let c = b * 2n;               // 2^62 again
+                return c === 4611686018427387904n && b === 2305843009213693952n ? 1 : 0;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 1.0);
+}
+
+
+
+
+
+
+

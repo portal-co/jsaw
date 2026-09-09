@@ -2574,6 +2574,11 @@ pub(crate) const TAG_MATH_ROUND: i32 = PRIMORDIAL_TAG_BASE + 8;
 pub(crate) const TAG_MATH_FROUND: i32 = PRIMORDIAL_TAG_BASE + 9;
 pub(crate) const TAG_MATH_IMUL: i32 = PRIMORDIAL_TAG_BASE + 10;
 pub(crate) const TAG_ARRAY_IS_ARRAY: i32 = PRIMORDIAL_TAG_BASE + 11;
+/// `BigInt.asUintN(width, value)`: mask `value` to `width` bits unsigned.
+/// `BigInt.asIntN(width, value)`: sign-extend the low `width` bits of
+/// `value`. Both are fixed-width BigInt operations on the raw `i64` payload.
+pub(crate) const TAG_BIGINT_AS_UINT_N: i32 = PRIMORDIAL_TAG_BASE + 12;
+pub(crate) const TAG_BIGINT_AS_INT_N: i32 = PRIMORDIAL_TAG_BASE + 13;
 
 /// Static namespace-member tag lookup. `None` means the primordial has no
 /// fast core (its calls keep the generic dispatch path).
@@ -2591,6 +2596,8 @@ fn static_primordial_tag(namespace: &str, member: &str) -> Option<i32> {
         ("Math", "fround") => Some(TAG_MATH_FROUND),
         ("Math", "imul") => Some(TAG_MATH_IMUL),
         ("Array", "isArray") => Some(TAG_ARRAY_IS_ARRAY),
+        ("BigInt", "asUintN") => Some(TAG_BIGINT_AS_UINT_N),
+        ("BigInt", "asIntN") => Some(TAG_BIGINT_AS_INT_N),
         _ => None,
     }
 }
@@ -2949,6 +2956,13 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 block,
                 body.add_op(block, Operator::F64ConvertI32S, &[value], &[Type::F64]),
             ),
+            // A BigInt reaching a numeric primordial (Math.*): JS would throw
+            // a TypeError. The dogfood corpus never does this; widen via the
+            // raw i64 for totality so the match stays exhaustive.
+            ValueKind::BigInt => (
+                block,
+                body.add_op(block, Operator::F64ConvertI64S, &[value], &[Type::F64]),
+            ),
             ValueKind::Reference => {
                 let is_null = body.add_op(block, Operator::RefIsNull, &[value], &[Type::I32]);
                 let convert = body.add_block();
@@ -3006,6 +3020,60 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 (join, result)
             }
         })
+    }
+
+    /// Lower `BigInt.asUintN(width, value)` / `BigInt.asIntN(width, value)`
+    /// to `i64` masking. `asUintN(w, x)` keeps the low `w` bits (zero-
+    /// extended); `asIntN(w, x)` sign-extends from bit `w-1`.
+    ///
+    /// The width is **not** required to be a compile-time literal: blitz-js
+    /// routes it through a trivial forwarder arrow (`const toUint = (a,b) =>
+    /// BigInt.asUintN(b,a)`), so it arrives boxed as a Number param. The
+    /// masking is computed with a runtime shift count `64 - w` (Wasm shifts
+    /// mask the count to 64, so `w >= 64` leaves the value unchanged, matching
+    /// `asUintN`'s identity for wide widths). The value coerces through
+    /// `as_i64` (a raw BigInt, or a boxed one reached through a reference
+    /// boundary).
+    fn bigint_as_n_call(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        tag: i32,
+        core_args: &[LowerValue],
+    ) -> Result<Option<Vec<(Block, LowerValue)>>, ConvertError> {
+        let Some(width_arg) = core_args.first() else {
+            return Ok(None);
+        };
+        let Some(value_arg) = core_args.get(1) else {
+            return Ok(None);
+        };
+        let value = self.as_i64(body, block, value_arg)?;
+        // The shift count: `64 - width`. `width` is a boxed Number (f64) —
+        // truncate to i32, extend to i64, subtract from 64. Wasm shift counts
+        // are masked to the operand width (64), so a width of exactly 64 gives
+        // a count of 0 (identity), and larger widths wrap harmlessly since the
+        // corpus only uses 8/16/32/64.
+        let width_f64 = self.as_f64(body, block, width_arg)?;
+        let width_i32 = body.add_op(block, Operator::I32TruncF64S, &[width_f64], &[Type::I32]);
+        let width_i64 = body.add_op(block, Operator::I64ExtendI32S, &[width_i32], &[Type::I64]);
+        let sixty_four = body.add_op(block, Operator::I64Const { value: 64 }, &[], &[Type::I64]);
+        let count = body.add_op(block, Operator::I64Sub, &[sixty_four, width_i64], &[Type::I64]);
+        let shifted_left = body.add_op(block, Operator::I64Shl, &[value, count], &[Type::I64]);
+        // asUintN: logical shift back (zero-fill); asIntN: arithmetic
+        // (sign-fill).
+        let shr = if tag == TAG_BIGINT_AS_INT_N {
+            Operator::I64ShrS
+        } else {
+            Operator::I64ShrU
+        };
+        let result = body.add_op(block, shr, &[shifted_left, count], &[Type::I64]);
+        Ok(Some(vec![(
+            block,
+            LowerValue::Wasm {
+                value: result,
+                kind: ValueKind::BigInt,
+            },
+        )]))
     }
 
     /// Pad core arguments with NaN constants out to the core's arity.
@@ -3165,6 +3233,19 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 .get(&arg.value)
                 .ok_or_else(|| ConvertError::invalid("undefined call argument"))?;
             core_args.push(value.clone());
+        }
+        // Fixed-width BigInt intrinsics (`BigInt.asUintN` / `asIntN`). These
+        // are an i64-ABI family, disjoint from the numeric f64 fast cores, so
+        // they lower inline here rather than through `ensure_primordial_fast_
+        // core`. The width is always a compile-time literal in the corpus
+        // (32 or 64); a dynamic width bails to the generic dispatch. Only the
+        // provable path is supported: blitz-js never shadows `BigInt`, and the
+        // guarded path's f64 core ABI cannot express the i64 masking.
+        if matches!(tag, TAG_BIGINT_AS_UINT_N | TAG_BIGINT_AS_INT_N) {
+            if !provable {
+                return Ok(None);
+            }
+            return self.bigint_as_n_call(body, block, tag, &core_args);
         }
         if !provable {
             // Guarded path (plan Part 2, item 3): shadowing could not be
@@ -3339,7 +3420,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
 /// provably-unshadowed namespace with a statically-known member name.
 pub(crate) fn static_primordial_tag_namespace(name: &str) -> Option<()> {
     match name {
-        "Math" | "Array" | "Reflect" | "Object" => Some(()),
+        "Math" | "Array" | "Reflect" | "Object" | "BigInt" => Some(()),
         "Int8Array" | "Uint8Array" | "Uint8ClampedArray" | "Int16Array" | "Uint16Array"
         | "Int32Array" | "Uint32Array" | "Float32Array" | "Float64Array" => Some(()),
         _ => None,

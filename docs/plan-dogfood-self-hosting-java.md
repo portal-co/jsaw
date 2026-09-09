@@ -304,5 +304,60 @@ in `crates/blitz-js/tests/opt_repro.rs` execute correctly in Node.
 
 `trivial_core_wasm_round_trips_to_js` now executes **both** non-opt and opt
 compiled output in Node (add(40,2)=42), proving the pipe shape end-to-end on
-a trivial input. The full `compiler.js`→jsaw→WasmGC→Java round-trip remains
-Milestones 16–19 (it needs the BigInt and mechanical-JS frontend support).
+a trivial input.
+
+### Milestone 16 — BigInt in jsaw (as-built)
+
+BigInt landed as a **fixed-width, `i64`-backed** value representation —
+exactly the form blitz-js uses (it only ever applies `asUintN`/`asIntN`,
+never arbitrary-precision), so a raw `i64` payload is exact and never
+allocates in straight-line code.
+
+- **`repr.rs`**: a single-field `bigint` struct (`{ i64 }`) minted in
+  `Repr::new`, plus `bigint_ty`/`bigint_non_null_ty` accessors. A BigInt
+  boxes into this struct only when it escapes to a reference boundary
+  (the adapter, a context store, a property slot).
+- **`ValueKind::BigInt`** (raw `i64`) added; every kind-driven match updated.
+  `as_i64` (identity for BigInt, `ref.cast`+`struct.get` unbox for a boxed
+  BigInt reached through a reference boundary, compile error for a number),
+  `box_value` (StructNew bigint), `as_condition` (`!= 0n`), `wasm_type`
+  (`I64`).
+- **Return ABI**: a pure-BigInt core returns a raw `i64`
+  (`native_return_type`/`ReturnType::I64`); any kind mix containing BigInt
+  keeps the boxed `anyref` ABI. **The M5 union layouts are untouched** —
+  BigInt never rides a union (it joins no `r`/`i`/`f` group), so the
+  tail-call/union machinery needed no change. The adapter gained an `I64`
+  return arm that StructNews the bigint box.
+- **Literals**: `parse_bigint_i64` reads the swc `raw` source text (decimal,
+  `0x`/`0o`/`0b`, with `_` separators) into raw `i64` bits — no `num-bigint`
+  dependency. Out-of-range literals are rejected. (swc parses `-1n` as
+  `UnaryOp::Minus(1n)`, so the literal is always unsigned.)
+- **Operators**: `binary`/`unary` route BigInt operands to the raw `i64`
+  family (`+ - * / % & | ^ << >>`, comparisons `=== !== < <= > >=`, unary
+  `- ~ !`). JS BigInt `/`/`%` truncate toward zero, matching Wasm
+  `i64.div_s`/`rem_s` exactly; `>>` is arithmetic; `>>>` on a BigInt errors
+  (JS throws). Mixing a BigInt with a plain number is a compile error (JS
+  throws TypeError; the corpus never does it).
+- **`BigInt.asUintN(width, x)` / `asIntN(width, x)`** are provable primordial
+  intrinsics (new `BigInt` namespace + tags). The width is **not** required
+  to be a literal: blitz-js routes it through trivial forwarder arrows
+  (`const toUint = (a,b) => BigInt.asUintN(b,a)`), so the masking computes a
+  runtime shift count `64 - width` from the boxed Number arg. `asUintN` uses
+  a logical right shift, `asIntN` arithmetic.
+- **Tail-position primordial calls** (`return BigInt.asUintN(…)`, the exact
+  form of the forwarder arrows) now route through the provable primordial
+  lowering in `try_tail_dispatch`, converting the result to the caller's ABI
+  — without this, the `BigInt` member callee (which has no context object)
+  fell through to the generic adapter path and trapped on a null receiver.
+
+Tests: 12 e2e fixtures (`bigint_*`) covering literals, arithmetic, bitwise,
+shifts, division/remainder truncation, comparisons, unary ops, both
+intrinsics, truthiness, i64-range arithmetic beyond f64 precision, and the
+exact `mask32`/`toUint` blitz-js idiom — all green on **all four runtimes**
+(Wasmtime, Node.js, JVM, Swift), full suite 93 passed / 0 failed.
+
+**Known boundary (out of scope for 16):** module top-level binding evaluation
+(`let mask32 = …` at module scope) is the pre-existing jsaw-core shim gap —
+top-level non-function stores don't run before a function body reads them.
+The corpus's per-function aliases are local, so this doesn't block BigInt;
+it belongs to Milestone 17/18 (module top-level evaluation).

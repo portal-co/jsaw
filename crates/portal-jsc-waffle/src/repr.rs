@@ -19,6 +19,10 @@ pub(crate) struct Repr {
     pub(crate) object: Signature,
     pub(crate) number: Signature,
     pub(crate) boolean: Signature,
+    /// A JavaScript `bigint` value, boxed as a struct wrapping a raw `i64`.
+    /// BigInt here is fixed-width (blitz-js only ever uses the
+    /// `asUintN`/`asIntN` fixed-width forms), so an `i64` payload is exact.
+    pub(crate) bigint: Signature,
     pub(crate) function: Signature,
     /// Internal accessor descriptor. Ordinary property values remain direct
     /// `anyref`s; only accessor properties use this tagged representation.
@@ -247,6 +251,10 @@ impl Repr {
             fields: vec![field(Type::I32)],
             shared: false,
         });
+        let bigint = module.signatures.push(SignatureData::Struct {
+            fields: vec![field(Type::I64)],
+            shared: false,
+        });
         let multi_rf = module.signatures.push(SignatureData::Struct {
             fields: vec![field(Type::I32), field(value), field(Type::F64)],
             shared: false,
@@ -341,6 +349,7 @@ impl Repr {
             object,
             number,
             boolean,
+            bigint,
             function,
             descriptor,
             slot,
@@ -401,6 +410,19 @@ impl Repr {
         Type::Heap(WithNullable {
             value: portal_pc_waffle::HeapType::Sig {
                 sig_index: self.boolean,
+            },
+            nullable: false,
+        })
+    }
+
+    pub(crate) fn bigint_ty(self) -> Type {
+        ref_sig(self.bigint)
+    }
+
+    pub(crate) fn bigint_non_null_ty(self) -> Type {
+        Type::Heap(WithNullable {
+            value: portal_pc_waffle::HeapType::Sig {
+                sig_index: self.bigint,
             },
             nullable: false,
         })

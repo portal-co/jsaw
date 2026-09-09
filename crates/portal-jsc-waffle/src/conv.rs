@@ -283,6 +283,7 @@ impl ReturnKinds {
     const NUMBER: u8 = 1 << 1;
     const BOOLEAN: u8 = 1 << 2;
     const INTEGER: u8 = 1 << 3;
+    const BIGINT: u8 = 1 << 4;
 
     fn insert(&mut self, kind: ValueKind) {
         self.0 |= match kind {
@@ -290,6 +291,7 @@ impl ReturnKinds {
             ValueKind::Number => Self::NUMBER,
             ValueKind::Boolean => Self::BOOLEAN,
             ValueKind::Integer => Self::INTEGER,
+            ValueKind::BigInt => Self::BIGINT,
         };
     }
 
@@ -300,6 +302,7 @@ impl ReturnKinds {
             Self::NUMBER => Some(ValueKind::Number),
             Self::BOOLEAN => Some(ValueKind::Boolean),
             Self::INTEGER => Some(ValueKind::Integer),
+            Self::BIGINT => Some(ValueKind::BigInt),
             _ => None,
         }
     }
@@ -310,6 +313,18 @@ impl ReturnKinds {
     /// else keeps the boxed `anyref` ABI because the boxed value is the
     /// join of the branches.
     fn native_return_type(self, repr: &Repr) -> Type {
+        // BigInt joins no union layout: a pure BigInt body returns a raw
+        // `i64`, and any mix containing BigInt keeps the boxed `anyref` ABI
+        // (the union layouts carry only ref/i32/f64 slots). This keeps the
+        // M5 union system untouched; BigInt crossing a function boundary is
+        // always boxed.
+        if self.contains(ValueKind::BigInt) {
+            return if self.0 == Self::BIGINT {
+                Type::I64
+            } else {
+                repr.value
+            };
+        }
         if self.is_multi_union() {
             return ref_sig(self.multi_layout(repr));
         }
@@ -326,6 +341,10 @@ impl ReturnKinds {
     /// tail `ReturnCall`'s same-return-type check also prove the
     /// payload subset property.
     fn multi_layout(self, repr: &Repr) -> portal_pc_waffle::Signature {
+        debug_assert!(
+            !self.contains(ValueKind::BigInt),
+            "BigInt never rides a union layout (see native_return_type)"
+        );
         let has_ref = self.contains(ValueKind::Reference);
         let has_i32 = self.0 & (Self::BOOLEAN | Self::INTEGER) != 0;
         let has_f64 = self.contains(ValueKind::Number);
@@ -358,6 +377,7 @@ impl ReturnKinds {
             ValueKind::Number => Self::NUMBER,
             ValueKind::Boolean => Self::BOOLEAN,
             ValueKind::Integer => Self::INTEGER,
+            ValueKind::BigInt => Self::BIGINT,
         };
         self.0 & bit != 0
     }
@@ -396,6 +416,46 @@ pub(crate) const MULTI_TAG_F64: i32 = 3;
 /// Field index of the `tag` slot (first field of every multi layout).
 const MULTI_FIELD_TAG: usize = 0;
 
+/// Parse a BigInt literal's source text (`123`, `0xffff_ffff`, possibly with
+/// a trailing `n` already stripped by swc) into the raw `i64` bits the
+/// fixed-width model carries. Decimal and hexadecimal literals are accepted;
+/// anything that does not fit a `u64`/`i64` is rejected, since blitz-js only
+/// ever produces fixed-width values.
+fn parse_bigint_i64(raw: Option<&str>, span: &impl std::fmt::Debug) -> Result<i64, ConvertError> {
+    let text = raw
+        .ok_or_else(|| ConvertError::unsupported("BigInt literal without source text", span))?
+        .trim_end_matches('n');
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let parsed: u64 = if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        u64::from_str_radix(&hex.replace('_', ""), 16)
+    } else if let Some(oct) = digits
+        .strip_prefix("0o")
+        .or_else(|| digits.strip_prefix("0O"))
+    {
+        u64::from_str_radix(&oct.replace('_', ""), 8)
+    } else if let Some(bin) = digits
+        .strip_prefix("0b")
+        .or_else(|| digits.strip_prefix("0B"))
+    {
+        u64::from_str_radix(&bin.replace('_', ""), 2)
+    } else {
+        digits.replace('_', "").parse::<u64>()
+    }
+    .map_err(|_| ConvertError::unsupported(format!("BigInt literal {text} out of i64 range"), span))?;
+    let value = if negative {
+        (parsed as i64).wrapping_neg()
+    } else {
+        parsed as i64
+    };
+    Ok(value)
+}
+
 /// One kind's payload slot in a dedicated multi layout: the field index and
 /// the slot's storage type. Canonical field order is `tag, r, i, f` with
 /// absent groups elided, so the index follows from which groups precede.
@@ -420,6 +480,11 @@ fn multi_slot(
             let before = 1 + usize::from(has_ref) + usize::from(has_i32);
             (before, Type::F64)
         }
+        ValueKind::BigInt => {
+            // BigInt never rides a union layout (native_return_type keeps it
+            // boxed), so this is unreachable for a well-typed layout.
+            unreachable!("BigInt has no multi-union payload slot")
+        }
     }
 }
 
@@ -443,6 +508,8 @@ enum ReturnType {
     F64,
     /// Raw i32 (a provably boolean/integer-only core).
     I32,
+    /// Raw i64 (a provably `BigInt`-only core).
+    I64,
     /// Boxed `anyref` (the conservative join; also every tail-carrying
     /// function and every function the analysis could not pin down).
     Boxed,
@@ -453,6 +520,15 @@ enum ReturnType {
 
 impl ReturnType {
     fn from_kinds(kinds: ReturnKinds) -> Self {
+        // BigInt joins no union: a pure-BigInt core returns a raw i64; any
+        // mix keeps the boxed join (matching `native_return_type`).
+        if kinds.contains(ValueKind::BigInt) {
+            return if kinds.single() == Some(ValueKind::BigInt) {
+                Self::I64
+            } else {
+                Self::Boxed
+            };
+        }
         if kinds.is_multi_union() {
             return Self::Multi;
         }
@@ -491,6 +567,12 @@ enum ValueKind {
     Boolean,
     /// A raw Wasm i32 resulting from an integer/bitwise computation.
     Integer,
+    /// A raw Wasm i64 JavaScript `bigint`. BigInt here is fixed-width
+    /// (blitz-js only ever uses the `asUintN`/`asIntN` forms), so an `i64`
+    /// payload is exact; the value rides `i64` end-to-end in straight-line
+    /// code and is boxed (into the union / a `bigint` struct) only when it
+    /// escapes to a reference boundary.
+    BigInt,
     /// A nullable WasmGC reference at a JavaScript value boundary.
     Reference,
 }
@@ -1115,6 +1197,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             Item::Lit { lit } => match lit {
                 Lit::Num(_) => Some(ValueKind::Number),
                 Lit::Bool(_) => Some(ValueKind::Boolean),
+                Lit::BigInt(_) => Some(ValueKind::BigInt),
                 _ => Some(ValueKind::Reference),
             },
             Item::Undef | Item::This | Item::Arguments => Some(ValueKind::Reference),
@@ -1139,7 +1222,13 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     .filter(|kind| matches!(kind, ValueKind::Number | ValueKind::Boolean | ValueKind::Integer))
                     .or(Some(ValueKind::Number)),
                 UnaryOp::Bang => Some(ValueKind::Boolean),
-                UnaryOp::Tilde => Some(ValueKind::Integer),
+                UnaryOp::Tilde => {
+                    // `~x` on a BigInt stays BigInt; on a number it is an i32.
+                    match self.classify_return_value(root, *arg) {
+                        Some(ValueKind::BigInt) => Some(ValueKind::BigInt),
+                        _ => Some(ValueKind::Integer),
+                    }
+                }
                 UnaryOp::Void | UnaryOp::TypeOf | UnaryOp::Delete => Some(ValueKind::Reference),
             },
             Item::Bin { left, right, op } => self.classify_return_bin(root, *left, *right, *op),
@@ -1175,6 +1264,13 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 // string; both operands unknown keeps it conservative.
                 let left_kind = self.classify_return_value(root, left);
                 let right_kind = self.classify_return_value(root, right);
+                // BigInt arithmetic (either operand BigInt — JS requires both)
+                // yields a BigInt.
+                if matches!(left_kind, Some(ValueKind::BigInt))
+                    || matches!(right_kind, Some(ValueKind::BigInt))
+                {
+                    return Some(ValueKind::BigInt);
+                }
                 if op == Add
                     && matches!(
                         (left_kind, right_kind),
@@ -1187,7 +1283,17 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             }
             Lt | LtEq | Gt | GtEq | EqEq | EqEqEq | NotEq | NotEqEq
             | InstanceOf | In => Some(ValueKind::Boolean),
-            BitAnd | BitOr | BitXor | LShift | RShift | ZeroFillRShift => Some(ValueKind::Integer),
+            BitAnd | BitOr | BitXor | LShift | RShift | ZeroFillRShift => {
+                // BigInt bitwise ops yield a BigInt; number bitwise ops an i32.
+                let left_kind = self.classify_return_value(root, left);
+                let right_kind = self.classify_return_value(root, right);
+                if matches!(left_kind, Some(ValueKind::BigInt))
+                    || matches!(right_kind, Some(ValueKind::BigInt))
+                {
+                    return Some(ValueKind::BigInt);
+                }
+                Some(ValueKind::Integer)
+            }
             // `**` is ordinary floating-point exponentiation.
             Exp => Some(ValueKind::Number),
             LogicalAnd | LogicalOr | NullishCoalescing => {
@@ -1439,19 +1545,34 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 &[call_result],
                 &[self.repr.boolean_ty()],
             ),
+            // A pure-BigInt native returns a raw `i64`; box it into the
+            // `bigint` struct so the adapter's `anyref` boundary carries it.
+            Type::I64 => body.add_op(
+                block,
+                Operator::StructNew {
+                    sig: self.repr.bigint,
+                },
+                &[call_result],
+                &[self.repr.bigint_ty()],
+            ),
             _ => call_result,
         };
-        let multi_layout = self
-            .multi_kinds_of(native)
-            .multi_layout(&self.repr);
+        // Compute the union layout only for natives whose kind set is a
+        // genuine multi-union; a BigInt (or any single/boxed) native's set
+        // would trip `multi_layout`'s no-BigInt assertion for a result it
+        // never uses.
+        let kind_sets_for_layout = self.multi_kinds_of(native);
+        let is_multi_native = kind_sets_for_layout.is_multi_union();
         let mut result_block = block;
-        let result = if native_return_type == ref_sig(multi_layout) {
+        let result = if is_multi_native
+            && native_return_type == ref_sig(kind_sets_for_layout.multi_layout(&self.repr))
+        {
             // A multi-return native's union must become the boxed join
             // here: the adapter's pinned signature returns `anyref`, and
             // every generic `CallRef` site consumes that. Boolean and
             // Integer rebuild *different* boxes (the `=== true` observer),
             // so the tags carry the distinction.
-            let kind_sets = self.multi_kinds_of(native);
+            let kind_sets = kind_sets_for_layout;
             let parts = self.unpack_multi_return(&mut body, block, call_result, kind_sets)?;
             let join = body.add_block();
             let boxed = body.add_blockparam(join, self.repr.value);
@@ -2030,6 +2151,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         match kind {
             ValueKind::Number => Type::F64,
             ValueKind::Boolean | ValueKind::Integer => Type::I32,
+            ValueKind::BigInt => Type::I64,
             ValueKind::Reference => self.repr.value,
         }
     }
@@ -2046,6 +2168,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 ValueKind::Number => self.as_f64(body, block, &value),
                 ValueKind::Boolean => self.as_condition(body, block, &value),
                 ValueKind::Integer => self.as_i32(body, block, &value),
+                ValueKind::BigInt => self.as_i64(body, block, &value),
             })
             .collect()
     }
@@ -2171,7 +2294,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                                     let index = self.numeric_index(body, block, key)?;
                                     self.set_numeric_member(body, block, object, index, value)?
                                 }
-                                ValueKind::Reference => {
+                                ValueKind::BigInt | ValueKind::Reference => {
                                     let key = self.dynamic_string_key(body, block, key)?;
                                     self.set_string_member(body, block, object, key, value)?
                                 }
@@ -2263,7 +2386,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         let index = self.numeric_index(body, block, key)?;
                         self.get_numeric_member(body, block, object, index)
                     }
-                    ValueKind::Reference => {
+                    ValueKind::BigInt | ValueKind::Reference => {
                         let key = self.dynamic_string_key(body, block, key)?;
                         self.get_string_member(body, block, object, key)
                     }
@@ -2798,6 +2921,17 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 key: string.value.to_string_lossy().into_owned(),
                 bytes: string.value.as_wtf8().as_bytes().to_vec(),
             },
+            Lit::BigInt(bigint) => {
+                // Fixed-width BigInt: the dogfood corpus (blitz-js) only uses
+                // values that fit an i64 after the asUintN/asIntN masking. Parse
+                // the source text (decimal or 0x…) and reject anything wider,
+                // rather than dragging num-bigint in as a direct dependency.
+                let bits = parse_bigint_i64(bigint.raw.as_ref().map(|a| a.as_str()), span)?;
+                LowerValue::Wasm {
+                    value: body.add_op(block, Operator::I64Const { value: bits as u64 }, &[], &[Type::I64]),
+                    kind: ValueKind::BigInt,
+                }
+            }
             _ => return Err(ConvertError::unsupported(format!("literal {lit:?}"), span)),
         })
     }
@@ -2840,6 +2974,17 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         span: &impl std::fmt::Debug,
     ) -> Result<LowerValue, ConvertError> {
         use BinaryOp::*;
+        // BigInt fast path: JS requires both operands be BigInt (mixing with
+        // a plain number throws a TypeError). blitz-js's corpus is homogeneous,
+        // so when either operand is statically BigInt both are — coerce both
+        // through `as_i64` and run the fixed-width i64 operator family.
+        {
+            let left_kind = left.kind()?;
+            let right_kind = right.kind()?;
+            if left_kind == ValueKind::BigInt || right_kind == ValueKind::BigInt {
+                return self.bigint_binary(body, block, left, right, op, span);
+            }
+        }
         match op {
             Add => {
                 // Static string concat: both operands are known literals.
@@ -2976,6 +3121,77 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         }
     }
 
+    /// The fixed-width BigInt operator family, lowered to raw `i64` Wasm ops.
+    /// JS BigInt division and `%` truncate toward zero; Wasm's `I64DivS`/
+    /// `I64RemS` already truncate toward zero, so they match exactly (and a
+    /// zero divisor traps, matching JS's RangeError). Shifts mask the count
+    /// to 64 bits, exactly Wasm's `i64.shl`/`shr` semantics.
+    fn bigint_binary(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        left: &LowerValue,
+        right: &LowerValue,
+        op: BinaryOp,
+        span: &impl std::fmt::Debug,
+    ) -> Result<LowerValue, ConvertError> {
+        use BinaryOp::*;
+        let left = self.as_i64(body, block, left)?;
+        let right = self.as_i64(body, block, right)?;
+        // Comparisons return a JS boolean (i32); arithmetic returns a BigInt
+        // (i64). Signed comparisons: blitz-js applies `asIntN` whenever it
+        // needs signedness, so the operands reaching `</<=/>/>=` are already
+        // sign-adjusted and a signed i64 compare is correct.
+        macro_rules! i64_arith {
+            ($operator:expr) => {
+                LowerValue::Wasm {
+                    value: body.add_op(block, $operator, &[left, right], &[Type::I64]),
+                    kind: ValueKind::BigInt,
+                }
+            };
+        }
+        macro_rules! i32_compare {
+            ($operator:expr) => {
+                LowerValue::Wasm {
+                    value: body.add_op(block, $operator, &[left, right], &[Type::I32]),
+                    kind: ValueKind::Boolean,
+                }
+            };
+        }
+        Ok(match op {
+            Add => i64_arith!(Operator::I64Add),
+            Sub => i64_arith!(Operator::I64Sub),
+            Mul => i64_arith!(Operator::I64Mul),
+            Div => i64_arith!(Operator::I64DivS),
+            Mod => i64_arith!(Operator::I64RemS),
+            BitAnd => i64_arith!(Operator::I64And),
+            BitOr => i64_arith!(Operator::I64Or),
+            BitXor => i64_arith!(Operator::I64Xor),
+            LShift => i64_arith!(Operator::I64Shl),
+            // JS bigint `>>` is arithmetic (sign-preserving). There is no
+            // `>>>` on bigint in JS (it throws), so ZeroFillRShift errors.
+            RShift => i64_arith!(Operator::I64ShrS),
+            Lt => i32_compare!(Operator::I64LtS),
+            LtEq => i32_compare!(Operator::I64LeS),
+            Gt => i32_compare!(Operator::I64GtS),
+            GtEq => i32_compare!(Operator::I64GeS),
+            EqEq | EqEqEq => i32_compare!(Operator::I64Eq),
+            NotEq | NotEqEq => i32_compare!(Operator::I64Ne),
+            ZeroFillRShift => {
+                return Err(ConvertError::unsupported(
+                    "unsigned right shift on a BigInt (JS throws TypeError)",
+                    span,
+                ));
+            }
+            _ => {
+                return Err(ConvertError::unsupported(
+                    format!("BigInt binary operator {op:?}"),
+                    span,
+                ));
+            }
+        })
+    }
+
     fn f64_binary(
         &mut self,
         body: &mut FunctionBody,
@@ -3016,6 +3232,48 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         op: UnaryOp,
         span: &impl std::fmt::Debug,
     ) -> Result<LowerValue, ConvertError> {
+        // BigInt unary operators: `-x` (negate) and `~x` (bitwise not) keep
+        // the i64; `!x` and `+x` follow their JS bigint semantics (`+x` on a
+        // bigint throws TypeError, but unary plus never reaches here from the
+        // corpus — it would be a number coercion). `-`/`~` stay fixed-width.
+        if arg.kind()? == ValueKind::BigInt {
+            return Ok(match op {
+                UnaryOp::Minus => {
+                    let arg = self.as_i64(body, block, arg)?;
+                    let zero = body.add_op(block, Operator::I64Const { value: 0 }, &[], &[Type::I64]);
+                    LowerValue::Wasm {
+                        value: body.add_op(block, Operator::I64Sub, &[zero, arg], &[Type::I64]),
+                        kind: ValueKind::BigInt,
+                    }
+                }
+                UnaryOp::Tilde => {
+                    let arg = self.as_i64(body, block, arg)?;
+                    let all = body.add_op(
+                        block,
+                        Operator::I64Const { value: u64::MAX },
+                        &[],
+                        &[Type::I64],
+                    );
+                    LowerValue::Wasm {
+                        value: body.add_op(block, Operator::I64Xor, &[arg, all], &[Type::I64]),
+                        kind: ValueKind::BigInt,
+                    }
+                }
+                UnaryOp::Bang => {
+                    let arg = self.as_condition(body, block, arg)?;
+                    LowerValue::Wasm {
+                        value: body.add_op(block, Operator::I32Eqz, &[arg], &[Type::I32]),
+                        kind: ValueKind::Boolean,
+                    }
+                }
+                _ => {
+                    return Err(ConvertError::unsupported(
+                        format!("BigInt unary operator {op:?}"),
+                        span,
+                    ));
+                }
+            });
+        }
         Ok(match op {
             UnaryOp::Plus => LowerValue::Wasm {
                 value: self.as_f64(body, block, arg)?,
@@ -3575,6 +3833,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             ValueKind::Boolean | ValueKind::Integer => {
                 body.add_op(block, Operator::F64ConvertI32S, &[value], &[Type::F64])
             }
+            ValueKind::BigInt => {
+                // JS `Number(bigint)` is defined, but the dogfood corpus never
+                // mixes them; widen via the raw i64 for correctness anyway.
+                body.add_op(block, Operator::F64ConvertI64S, &[value], &[Type::F64])
+            }
             ValueKind::Reference => {
                 let to_number = self.ensure_to_number_helper()?;
                 body.add_op(
@@ -3797,10 +4060,58 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         Ok(match kind {
             ValueKind::Boolean | ValueKind::Integer => value,
             ValueKind::Number => body.add_op(block, Operator::I32TruncF64S, &[value], &[Type::I32]),
+            // Truncate the i64 to i32 (JS `Number(bigint)` then ToInt32 is a
+            // truncation; the corpus never relies on this, kept for totality).
+            ValueKind::BigInt => body.add_op(block, Operator::I32WrapI64, &[value], &[Type::I32]),
             ValueKind::Reference => {
                 let boxed = LowerValue::Wasm { value, kind };
                 let number = self.as_f64(body, block, &boxed)?;
                 body.add_op(block, Operator::I32TruncF64S, &[number], &[Type::I32])
+            }
+        })
+    }
+
+    /// Coerce a value to the raw `i64` a fixed-width BigInt carries. Only a
+    /// statically BigInt value is exact; anything else is a compile-time
+    /// type error (blitz-js never mixes BigInt and plain numbers, so a
+    /// non-BigInt here means the frontend mis-analyzed).
+    fn as_i64(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        value: &LowerValue,
+    ) -> Result<Value, ConvertError> {
+        let (value, kind) = value.wasm()?;
+        Ok(match kind {
+            ValueKind::BigInt => value,
+            // A boxed BigInt reached a numeric site through a reference
+            // boundary (call return, property load): unbox the payload. The
+            // `ref.cast` traps if it was not actually a bigint, standing in
+            // for the JS TypeError.
+            ValueKind::Reference => {
+                let boxed = body.add_op(
+                    block,
+                    Operator::RefCast {
+                        ty: self.repr.bigint_non_null_ty(),
+                    },
+                    &[value],
+                    &[self.repr.bigint_non_null_ty()],
+                );
+                body.add_op(
+                    block,
+                    Operator::StructGet {
+                        sig: self.repr.bigint,
+                        idx: 0,
+                    },
+                    &[boxed],
+                    &[Type::I64],
+                )
+            }
+            ValueKind::Number | ValueKind::Boolean | ValueKind::Integer => {
+                return Err(ConvertError::unsupported(
+                    format!("coercing {kind:?} to BigInt (mixing BigInt and number)"),
+                    "BigInt operand",
+                ));
             }
         })
     }
@@ -3814,6 +4125,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let (value, kind) = value.wasm()?;
         Ok(match kind {
             ValueKind::Boolean | ValueKind::Integer => value,
+            // ToBoolean on a bigint: false iff 0n.
+            ValueKind::BigInt => {
+                let zero = body.add_op(block, Operator::I64Const { value: 0 }, &[], &[Type::I64]);
+                body.add_op(block, Operator::I64Ne, &[value, zero], &[Type::I32])
+            }
             ValueKind::Number => {
                 let zero = body.add_op(
                     block,
@@ -4013,6 +4329,16 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 &[value],
                 &[self.repr.boolean_ty()],
             ),
+            // A BigInt escaping to a reference boundary boxes into the
+            // single-field `bigint` struct, keeping the raw i64 payload exact.
+            ValueKind::BigInt => body.add_op(
+                block,
+                Operator::StructNew {
+                    sig: self.repr.bigint,
+                },
+                &[value],
+                &[self.repr.bigint_ty()],
+            ),
             ValueKind::Integer => {
                 let number = body.add_op(block, Operator::F64ConvertI32S, &[value], &[Type::F64]);
                 body.add_op(
@@ -4076,6 +4402,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             ValueKind::Boolean => (MULTI_TAG_BOOL, None, Some(value), None),
             ValueKind::Integer => (MULTI_TAG_INT, None, Some(value), None),
             ValueKind::Number => (MULTI_TAG_F64, None, None, Some(value)),
+            // BigInt never rides a union layout (native_return_type keeps it
+            // boxed), so packing it into a union is a frontend bug.
+            ValueKind::BigInt => {
+                unreachable!("BigInt has no multi-union payload slot")
+            }
         };
         let undef = |body: &mut FunctionBody, ty: Type| {
             body.add_op(
@@ -10371,6 +10702,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         match ReturnType::from_kinds(returns) {
             ReturnType::F64 => self.as_f64(body, block, value),
             ReturnType::I32 => self.as_i32(body, block, value),
+            ReturnType::I64 => self.as_i64(body, block, value),
             ReturnType::Boxed => self.box_value(body, block, value),
             ReturnType::Multi => {
                 let kind = value.kind()?;
@@ -10412,6 +10744,31 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         // the boxed result before returning).
         if args.iter().any(|arg| arg.is_spread) {
             return Ok(None);
+        }
+        // A tail-position primordial member call (`return BigInt.asUintN(…)`):
+        // route it through the same provable primordial lowering as a plain
+        // call, then convert the result to this caller's ABI and `Return`.
+        // Without this the member callee (e.g. `BigInt`, which has no context
+        // object) falls through to the generic adapter path and traps on a
+        // null receiver.
+        if let TCallee::Member { func, member } = callee {
+            if let Some(receiver) = values.get(func)
+                && let Some(key) = values.get(member)
+                && let Some(results) =
+                    self.try_provable_primordial_call(body, block, receiver, key, values, args)?
+            {
+                for (block, value) in results {
+                    let converted =
+                        self.convert_returned_value(body, block, &value, self.current_return_kinds)?;
+                    body.set_terminator(
+                        block,
+                        Terminator::Return {
+                            values: vec![converted],
+                        },
+                    );
+                }
+                return Ok(Some(()));
+            }
         }
         let TCallee::Val(value) = callee else {
             return Ok(None);
@@ -10731,7 +11088,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                             let index = self.numeric_index(body, block, key)?;
                             self.get_numeric_member(body, block, receiver, index)
                         }
-                        ValueKind::Reference => {
+                        ValueKind::BigInt | ValueKind::Reference => {
                             let key = self.dynamic_string_key(body, block, key)?;
                             self.get_string_member(body, block, receiver, key)
                         }

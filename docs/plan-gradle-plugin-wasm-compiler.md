@@ -320,3 +320,56 @@ deterministic emitters) and that both emitters behave identically inside
 the WASI sandbox. This is the property the Gradle build cache relies on:
 the cache key `hash(compiler.wasm) + source hashes + options` is sound
 because compilation is a pure function of those inputs.
+
+## Milestone 14 — as built
+
+`gradle/jsaw-gradle-plugin/` is a Kotlin `java-gradle-plugin` +
+`maven-publish` project publishing `dev.portal.jsaw`. It compiles and its
+`check` (unit + TestKit functional) is green against Gradle 8.10.2 on JDK
+21.
+
+Structure:
+- `JsawExtension` / `JsawModuleSet` — the `jsaw { modules { register("main") { ... } } }`
+  DSL (entry, sourceDir, emitWasm/Java/Swift, numericExports,
+  gcExportSuffix), plus `compilerWasm` / `compilerProject` for the three
+  compiler-resolution modes.
+- `Manifest` — hand-rolled JSON build/parse, in lockstep with
+  `crates/jsaw-wasi-bin/src/manifest.rs`.
+- `JsawRunner` — the Chicory invocation: `WasiOptions` with
+  stdin/stdout/stderr pipes, `/src` (read-only) and `/out` (read-write)
+  preopens, `WasiPreview1` host functions into an `Instance` with
+  `withStart(false)` and an explicit `_start` call, catching
+  `WasiExitException` for the exit code.
+- `JsawCompileTask` — `@Cacheable`, inputs = compiler wasm + source dir +
+  scalar options, outputs = the enabled target dirs; enumerates the
+  module set, builds the manifest, runs the compiler into a staging dir,
+  moves outputs to `build/generated/jsaw/<name>/{wasm,java,swift}`, and
+  fails with the compiler's structured error. When `emitJava` is on, the
+  output dir is wired into the `main` source set and `compileJava`
+  depends on the task.
+- `JsawPlugin` — registers the `jsawCompiler` configuration (default
+  dependency `dev.portal.jsaw:jsaw-compiler-wasm:<version>@wasm`) and one
+  `compileJsaw<Name>` task per module set.
+
+As-built deviations / notes:
+- **Chicory API (1.7.5)**: WASI imports come from
+  `WasiPreview1.toHostFunctions()` into `ImportValues`, and `_start` is a
+  plain export invoked via `instance.export("_start").apply()` with
+  `withStart(false)` (a wasip1 command module has no start *section*);
+  `proc_exit(code)` throws `WasiExitException`, whose `exitCode()` is the
+  status. This differs from the `wasmtime-wasi` p1 shape used in the M12
+  Rust test but is the same WASI contract.
+- **Gradle 8.10.2 requires a JDK it recognizes** — it runs on JDK 21 but
+  rejects JDK 26 (`26.0.1` as an opaque error). Build the plugin with
+  `JAVA_HOME` pointing at a supported JDK (21 here).
+- A task bug found by the functional test: the staging dir was itself
+  under the output root and the manifest paths were `out/...`-prefixed,
+  double-nesting outputs; fixed by staging into `<root>/staging` with
+  root-relative emit paths (`wasm/module.wasm`, `java`, `swift`).
+
+Tests: `JsawRunnerTest` drives Chicory directly (asserts the wasm and
+`Mod.java` are written and the result is `ok`); four TestKit functional
+tests assert valid-WasmGC + Java generation, generated-Java compilation
+via the source-set wiring, `UP-TO-DATE` on a second run, and a structured
+compiler error failing the build. `docs/gradle-plugin.md` is the consumer
+guide; the README gained a Layout section.

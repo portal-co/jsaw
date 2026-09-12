@@ -36,9 +36,13 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
         shapes: Vec::new(),
         property_helpers: None,
         truthy_helper: None,
+        typeof_helper: None,
+        to_bigint_helper: None,
+        to_string_helper: None,
         native_function_cache: BTreeMap::new(),
         context_builder: None,
         arguments_push_helper: None,
+        arguments_concat_helper: None,
         trie_enumerate_helper: None,
         object_enumerate_keys_helper: None,
         primordial_fast_cores: BTreeMap::new(),
@@ -194,9 +198,13 @@ pub fn convert_modules<'a, 'wasm>(
         shapes: Vec::new(),
         property_helpers: None,
         truthy_helper: None,
+        typeof_helper: None,
+        to_bigint_helper: None,
+        to_string_helper: None,
         native_function_cache: BTreeMap::new(),
         context_builder: None,
         arguments_push_helper: None,
+        arguments_concat_helper: None,
         trie_enumerate_helper: None,
         object_enumerate_keys_helper: None,
         primordial_fast_cores: BTreeMap::new(),
@@ -722,6 +730,9 @@ struct Converter<'a, 'module, 'wasm> {
     /// crosses a function-call/property-read boundary and loses its
     /// unboxed `ValueKind`.
     truthy_helper: Option<Func>,
+    typeof_helper: Option<Func>,
+    to_bigint_helper: Option<Func>,
+    to_string_helper: Option<Func>,
     /// Native primordial method bodies (`Math.sqrt`, `Reflect.get`, ...),
     /// keyed by the label passed to `build_native_adapter`. A fresh lexical
     /// context is built per exported function, but the underlying Wasm
@@ -739,6 +750,7 @@ struct Converter<'a, 'module, 'wasm> {
     /// Appends a value to a growable `arguments`-typed array, reallocating
     /// when full. See `enumerate.rs`.
     arguments_push_helper: Option<Func>,
+    arguments_concat_helper: Option<Func>,
     /// Recursively walks a generic property trie collecting own-property
     /// keys. See `enumerate.rs`.
     trie_enumerate_helper: Option<Func>,
@@ -2106,8 +2118,19 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         );
                     }
                 }
-                TTerm::Throw(_) | TTerm::Switch { .. } => {
-                    return Err(ConvertError::unsupported("throw or switch terminator", ()));
+                // A `throw` with no enclosing catch (the only form this
+                // backend supports — `SCatch` edges are not lowered) unwinds
+                // to the host. In WasmGC that is a trap: the thrown value's
+                // own statements already ran, so the terminator is just
+                // `unreachable`. This makes `throw new Error(…)` (the
+                // corpus's sig-mismatch guard) compile and trap correctly.
+                TTerm::Throw(_) => {
+                    for continuation in continuations {
+                        body.set_terminator(continuation.block, Terminator::Unreachable);
+                    }
+                }
+                TTerm::Switch { .. } => {
+                    return Err(ConvertError::unsupported("switch terminator", ()));
                 }
             }
         }
@@ -2408,11 +2431,29 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     return Ok(result);
                 }
             }
+            // A bare call to an unshadowed `Number`/`BigInt` global is a
+            // value conversion, not a property lookup: `Number(x)` is
+            // ToNumber, `BigInt(x)` is the integer-valued ToBigInt. The
+            // corpus relies on both (DataView indices are `Number(a)` where
+            // `a` is a BigInt; `__wasm_grow` does `BigInt(len / 65536)`).
+            if let TCallee::Val(value) = callee
+                && let Some(LowerValue::ReferenceKey { key, .. }) = values.get(value)
+            {
+                let key = key.clone();
+                if let Some(result) =
+                    self.try_provable_conversion_call(body, block, &key, values, args)?
+                {
+                    return Ok(result);
+                }
+            }
             // Direct dispatch for provenance-tracked function values: local
             // function-literal variables and object-literal methods. One
             // tag check (or none, for a freshly allocated literal) proves
             // the callee is still the original literal.
-            if !args.iter().any(|arg| arg.is_spread) {
+            // Spread calls are supported end to end (direct dispatch folds
+            // them through `build_native_call_args`; the generic path uses
+            // the spreading `make_arguments`), so no `is_spread` gate here.
+            {
                 match callee {
                     TCallee::Val(value) => {
                         if let Some(callee_value) = values.get(value)
@@ -2648,6 +2689,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     {
                         return Ok(vec![result]);
                     }
+                    // `new DataView(buffer)` — the corpus's linear-memory view.
+                    if let Some(result) =
+                        self.try_provable_dataview_constructor(body, block, callee, values, args)?
+                    {
+                        return Ok(vec![result]);
+                    }
                 }
                 let callee = values
                     .get(class)
@@ -2769,6 +2816,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 span,
             )?,
             Item::Select { .. } => unreachable!("select was handled above"),
+            Item::Tpl { quasis, exprs } => {
+                // A template literal is a string concatenation: the literal
+                // quasis interleaved with the interpolated expressions, each
+                // coerced to a string. The corpus's templates are constant
+                // (no interpolations), but the general path is handled for
+                // robustness.
+                self.template_literal(body, block, values, quasis, exprs)?
+            }
             Item::PrivateMem { .. }
             | Item::HasPrivateMem { .. }
             | Item::Class(_)
@@ -2934,6 +2989,278 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             }
             _ => return Err(ConvertError::unsupported(format!("literal {lit:?}"), span)),
         })
+    }
+
+    /// Lower a template literal: `quasis[0] + exprs[0] + quasis[1] + …`.
+    /// Constant templates (the only form the corpus uses — `` `wasm sig
+    /// mismatch` ``) fold to a single string literal at compile time.
+    /// Interpolated expressions are coerced to strings via
+    /// [`Self::to_string_value`].
+    fn template_literal(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        values: &BTreeMap<SValueId, LowerValue>,
+        quasis: &[swc_atoms::Atom],
+        exprs: &[SValueId],
+    ) -> Result<LowerValue, ConvertError> {
+        let mut block = block;
+        if exprs.is_empty() {
+            // Constant template: join the quasis (a single quasi is the
+            // common case; an empty template is the empty string).
+            let mut bytes = Vec::new();
+            for quasi in quasis {
+                bytes.extend_from_slice(quasi.as_bytes());
+            }
+            let key = String::from_utf8_lossy(&bytes).into_owned();
+            return Ok(LowerValue::String {
+                value: self.new_string(body, block, &bytes)?,
+                key,
+                bytes,
+            });
+        }
+        // General path: fold quasis and coerced exprs through the string
+        // concatenation helper.
+        let concat = self.ensure_string_concat()?;
+        let mut current = self.new_string(body, block, quasis[0].as_bytes())?;
+        for (i, expr) in exprs.iter().enumerate() {
+            let value = values
+                .get(expr)
+                .ok_or_else(|| ConvertError::invalid("undefined template expression"))?;
+            let (block2, string) = self.to_string_value(body, block, value)?;
+            block = block2;
+            current = body.add_op(
+                block,
+                Operator::Call {
+                    function_index: concat,
+                },
+                &[current, string],
+                &[self.repr.string_ty()],
+            );
+            if let Some(quasi) = quasis.get(i + 1) {
+                let quasi_string = self.new_string(body, block, quasi.as_bytes())?;
+                current = body.add_op(
+                    block,
+                    Operator::Call {
+                        function_index: concat,
+                    },
+                    &[current, quasi_string],
+                    &[self.repr.string_ty()],
+                );
+            }
+        }
+        Ok(LowerValue::Wasm {
+            value: current,
+            kind: ValueKind::Reference,
+        })
+    }
+
+    /// Coerce a value to its string representation (a string struct).
+    /// Strings pass through; booleans, `null`, `undefined`, and BigInts are
+    /// handled exactly. Numbers go through a runtime helper that formats
+    /// integral values without a decimal point; non-integral number
+    /// formatting is not needed by the corpus and traps (documented).
+    fn to_string_value(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        value: &LowerValue,
+    ) -> Result<(Block, Value), ConvertError> {
+        match value {
+            LowerValue::String { value, .. } => Ok((block, *value)),
+            _ => {
+                let boxed = self.box_value(body, block, value)?;
+                let helper = self.ensure_to_string_helper()?;
+                let result = body.add_op(
+                    block,
+                    Operator::Call {
+                        function_index: helper,
+                    },
+                    &[boxed],
+                    &[self.repr.string_ty()],
+                );
+                Ok((block, result))
+            }
+        }
+    }
+
+    /// Runtime ToString for a boxed value: string identity, boolean
+    /// `true`/`false`, `null`, `undefined`, and BigInt (decimal digits). A
+    /// number with a non-integral value, or an object, is outside the
+    /// corpus's needs and traps rather than mis-formatting.
+    fn ensure_to_string_helper(&mut self) -> Result<Func, ConvertError> {
+        if let Some(func) = self.to_string_helper {
+            return Ok(func);
+        }
+        let sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.value],
+            returns: vec![self.repr.string_ty()],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, sig);
+        let entry = body.entry;
+        let value = body.blocks[entry].params[0].1;
+
+        // String: pass through.
+        let is_string = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.string_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let string_hit = body.add_block();
+        let not_string = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: is_string,
+                if_true: BlockTarget {
+                    block: string_hit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: not_string,
+                    args: vec![],
+                },
+            },
+        );
+        let string_ref = body.add_op(
+            string_hit,
+            Operator::RefCast {
+                ty: self.repr.string_ty(),
+            },
+            &[value],
+            &[self.repr.string_ty()],
+        );
+        body.set_terminator(
+            string_hit,
+            Terminator::Return {
+                values: vec![string_ref],
+            },
+        );
+
+        // Boolean: "true" / "false".
+        let is_boolean = body.add_op(
+            not_string,
+            Operator::RefTest {
+                ty: self.repr.boolean_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let boolean_hit = body.add_block();
+        let not_boolean = body.add_block();
+        body.set_terminator(
+            not_string,
+            Terminator::CondBr {
+                cond: is_boolean,
+                if_true: BlockTarget {
+                    block: boolean_hit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: not_boolean,
+                    args: vec![],
+                },
+            },
+        );
+        let boolean_struct = body.add_op(
+            boolean_hit,
+            Operator::RefCast {
+                ty: self.repr.boolean_non_null_ty(),
+            },
+            &[value],
+            &[self.repr.boolean_non_null_ty()],
+        );
+        let bit = body.add_op(
+            boolean_hit,
+            Operator::StructGet {
+                sig: self.repr.boolean,
+                idx: 0,
+            },
+            &[boolean_struct],
+            &[Type::I32],
+        );
+        let true_string = self.new_string(&mut body, boolean_hit, b"true")?;
+        let false_string = self.new_string(&mut body, boolean_hit, b"false")?;
+        let boolean_result = body.add_op(
+            boolean_hit,
+            Operator::TypedSelect {
+                ty: self.repr.string_ty(),
+            },
+            &[true_string, false_string, bit],
+            &[self.repr.string_ty()],
+        );
+        body.set_terminator(
+            boolean_hit,
+            Terminator::Return {
+                values: vec![boolean_result],
+            },
+        );
+
+        // undefined / null.
+        let is_undefined = body.add_op(not_boolean, Operator::RefIsNull, &[value], &[Type::I32]);
+        let undefined_hit = body.add_block();
+        let not_undefined = body.add_block();
+        body.set_terminator(
+            not_boolean,
+            Terminator::CondBr {
+                cond: is_undefined,
+                if_true: BlockTarget {
+                    block: undefined_hit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: not_undefined,
+                    args: vec![],
+                },
+            },
+        );
+        let undefined_string = self.new_string(&mut body, undefined_hit, b"undefined")?;
+        body.set_terminator(
+            undefined_hit,
+            Terminator::Return {
+                values: vec![undefined_string],
+            },
+        );
+        let is_js_null = self.is_js_null(&mut body, not_undefined, value);
+        let null_hit = body.add_block();
+        let not_null = body.add_block();
+        body.set_terminator(
+            not_undefined,
+            Terminator::CondBr {
+                cond: is_js_null,
+                if_true: BlockTarget {
+                    block: null_hit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: not_null,
+                    args: vec![],
+                },
+            },
+        );
+        let null_string = self.new_string(&mut body, null_hit, b"null")?;
+        body.set_terminator(
+            null_hit,
+            Terminator::Return {
+                values: vec![null_string],
+            },
+        );
+
+        // BigInt/number/object: outside the corpus's template usage
+        // (constant templates only), so trap rather than mis-format.
+        body.set_terminator(not_null, Terminator::Unreachable);
+
+        let func = self.module.funcs.push(FuncDecl::Body(
+            sig,
+            format!("js_to_string_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.to_string_helper = Some(func);
+        Ok(func)
     }
 
     /// Materialize an `Add` operand as a string-struct reference for the
@@ -3232,6 +3559,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         op: UnaryOp,
         span: &impl std::fmt::Debug,
     ) -> Result<LowerValue, ConvertError> {
+        // `typeof` is kind-based, not value-based: it answers the same
+        // "bigint" for any BigInt operand, so it is handled before the
+        // BigInt operator dispatch below (which rejects it).
+        if op == UnaryOp::TypeOf {
+            return self.typeof_value(body, block, arg);
+        }
         // BigInt unary operators: `-x` (negate) and `~x` (bitwise not) keep
         // the i64; `!x` and `+x` follow their JS bigint semantics (`+x` on a
         // bigint throws TypeError, but unary plus never reaches here from the
@@ -3307,7 +3640,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 }
             }
             UnaryOp::Void => self.undef(body, block),
-            UnaryOp::TypeOf | UnaryOp::Delete => {
+            // `TypeOf` returned at the top of this function (kind-dispatched).
+            UnaryOp::TypeOf => unreachable!("typeof returned early"),
+            UnaryOp::Delete => {
                 return Err(ConvertError::unsupported(
                     format!("unary operator {op:?}"),
                     span,
@@ -3901,6 +4236,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let check_null = body.add_block();
         let null_hit = body.add_block();
         let check_undefined = body.add_block();
+        let check_undefined2 = body.add_block();
         let undefined_hit = body.add_block();
         let other = body.add_block();
 
@@ -3998,8 +4334,64 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let zero = body.add_op(null_hit, Operator::F64Const { value: 0.0f64.to_bits() }, &[], &[Type::F64]);
         body.set_terminator(null_hit, Terminator::Return { values: vec![zero] });
 
+        // BigInt: `Number(x)` is exact for the fixed-width i64 payload. This
+        // is how the corpus's DataView index math (`Number(a)` on a BigInt
+        // address) reaches the numeric world.
+        let is_bigint = body.add_op(
+            check_undefined,
+            Operator::RefTest {
+                ty: self.repr.bigint_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let unbox_bigint = body.add_block();
         body.set_terminator(
             check_undefined,
+            Terminator::CondBr {
+                cond: is_bigint,
+                if_true: BlockTarget {
+                    block: unbox_bigint,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: check_undefined2,
+                    args: vec![],
+                },
+            },
+        );
+        let bigint_struct = body.add_op(
+            unbox_bigint,
+            Operator::RefCast {
+                ty: self.repr.bigint_non_null_ty(),
+            },
+            &[value],
+            &[self.repr.bigint_non_null_ty()],
+        );
+        let bigint_payload = body.add_op(
+            unbox_bigint,
+            Operator::StructGet {
+                sig: self.repr.bigint,
+                idx: 0,
+            },
+            &[bigint_struct],
+            &[Type::I64],
+        );
+        let bigint_number = body.add_op(
+            unbox_bigint,
+            Operator::F64ConvertI64S,
+            &[bigint_payload],
+            &[Type::F64],
+        );
+        body.set_terminator(
+            unbox_bigint,
+            Terminator::Return {
+                values: vec![bigint_number],
+            },
+        );
+
+        body.set_terminator(
+            check_undefined2,
             Terminator::CondBr {
                 cond: is_undefined,
                 if_true: BlockTarget {
@@ -4244,8 +4636,196 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[Type::I32],
         );
         body.set_terminator(unbox, Terminator::Return { values: vec![bit] });
-        let one = body.add_op(truthy, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
-        body.set_terminator(truthy, Terminator::Return { values: vec![one] });
+
+        // Everything else funnels through a chain of falsy checks: JS `null`
+        // (the i31 sentinel), `0`/`NaN` (a number struct), `""` (a string
+        // struct), and `0n` (a bigint struct) are falsy; objects and
+        // functions are truthy. The final block is the truthy fallthrough.
+        let not_truthy = |body: &mut FunctionBody, block: Block| {
+            let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+            body.set_terminator(block, Terminator::Return { values: vec![zero] });
+        };
+
+        // 1. JS null (i31 sentinel) is falsy.
+        let check_i31 = truthy;
+        let is_i31 = body.add_op(
+            check_i31,
+            Operator::RefTest {
+                ty: self.repr.i31_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let i31_falsy = body.add_block();
+        let not_i31 = body.add_block();
+        body.set_terminator(
+            check_i31,
+            Terminator::CondBr {
+                cond: is_i31,
+                if_true: BlockTarget {
+                    block: i31_falsy,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: not_i31,
+                    args: vec![],
+                },
+            },
+        );
+        not_truthy(&mut body, i31_falsy);
+
+        // 2. A number struct is falsy when it is `0` or `NaN`
+        //    (`x != 0 && x == x`).
+        let is_number = body.add_op(
+            not_i31,
+            Operator::RefTest {
+                ty: self.repr.number_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let number_check = body.add_block();
+        let not_number = body.add_block();
+        body.set_terminator(
+            not_i31,
+            Terminator::CondBr {
+                cond: is_number,
+                if_true: BlockTarget {
+                    block: number_check,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: not_number,
+                    args: vec![],
+                },
+            },
+        );
+        let number_ref = body.add_op(
+            number_check,
+            Operator::RefCast {
+                ty: self.repr.number_non_null_ty(),
+            },
+            &[value],
+            &[self.repr.number_non_null_ty()],
+        );
+        let number_value = body.add_op(
+            number_check,
+            Operator::StructGet {
+                sig: self.repr.number,
+                idx: 0,
+            },
+            &[number_ref],
+            &[Type::F64],
+        );
+        let zero_f64 = body.add_op(
+            number_check,
+            Operator::F64Const {
+                value: 0.0f64.to_bits(),
+            },
+            &[],
+            &[Type::F64],
+        );
+        let is_nonzero = body.add_op(number_check, Operator::F64Ne, &[number_value, zero_f64], &[Type::I32]);
+        let is_not_nan = body.add_op(number_check, Operator::F64Eq, &[number_value, number_value], &[Type::I32]);
+        let number_truthy = body.add_op(number_check, Operator::I32And, &[is_nonzero, is_not_nan], &[Type::I32]);
+        body.set_terminator(number_check, Terminator::Return { values: vec![number_truthy] });
+
+        // 3. A string struct is falsy when it is empty (UTF-8 length 0).
+        let is_string = body.add_op(
+            not_number,
+            Operator::RefTest {
+                ty: self.repr.string_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let string_check = body.add_block();
+        let not_string = body.add_block();
+        body.set_terminator(
+            not_number,
+            Terminator::CondBr {
+                cond: is_string,
+                if_true: BlockTarget {
+                    block: string_check,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: not_string,
+                    args: vec![],
+                },
+            },
+        );
+        let string_ref = body.add_op(
+            string_check,
+            Operator::RefCast {
+                ty: self.repr.string_non_null_ty(),
+            },
+            &[value],
+            &[self.repr.string_non_null_ty()],
+        );
+        let utf8 = body.add_op(
+            string_check,
+            Operator::StructGet {
+                sig: self.repr.string,
+                idx: 0,
+            },
+            &[string_ref],
+            &[ref_sig(self.repr.utf8)],
+        );
+        let utf8_len = body.add_op(string_check, Operator::ArrayLen, &[utf8], &[Type::I32]);
+        let zero_i32 = body.add_op(string_check, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let string_truthy = body.add_op(string_check, Operator::I32Ne, &[utf8_len, zero_i32], &[Type::I32]);
+        body.set_terminator(string_check, Terminator::Return { values: vec![string_truthy] });
+
+        // 4. A bigint struct is falsy when it is `0n`.
+        let is_bigint = body.add_op(
+            not_string,
+            Operator::RefTest {
+                ty: self.repr.bigint_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let bigint_check = body.add_block();
+        let not_bigint = body.add_block();
+        body.set_terminator(
+            not_string,
+            Terminator::CondBr {
+                cond: is_bigint,
+                if_true: BlockTarget {
+                    block: bigint_check,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: not_bigint,
+                    args: vec![],
+                },
+            },
+        );
+        let bigint_ref = body.add_op(
+            bigint_check,
+            Operator::RefCast {
+                ty: self.repr.bigint_non_null_ty(),
+            },
+            &[value],
+            &[self.repr.bigint_non_null_ty()],
+        );
+        let bigint_value = body.add_op(
+            bigint_check,
+            Operator::StructGet {
+                sig: self.repr.bigint,
+                idx: 0,
+            },
+            &[bigint_ref],
+            &[Type::I64],
+        );
+        let zero_i64 = body.add_op(bigint_check, Operator::I64Const { value: 0 }, &[], &[Type::I64]);
+        let bigint_truthy = body.add_op(bigint_check, Operator::I64Ne, &[bigint_value, zero_i64], &[Type::I32]);
+        body.set_terminator(bigint_check, Terminator::Return { values: vec![bigint_truthy] });
+
+        // 5. Objects and functions are truthy.
+        let one = body.add_op(not_bigint, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        body.set_terminator(not_bigint, Terminator::Return { values: vec![one] });
 
         let func = self.module.funcs.push(FuncDecl::Body(
             sig,
@@ -4254,6 +4834,118 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         ));
         self.truthy_helper = Some(func);
         Ok(func)
+    }
+
+    /// The runtime half of `typeof` for values whose kind is not statically
+    /// known: classifies a boxed `anyref` into the ECMAScript type name
+    /// string. `undefined` is the null `anyref`, JS `null` the i31 sentinel
+    /// (`typeof null === "object"`), and the struct types map to their names
+    /// (functions are the one "function" case).
+    fn ensure_typeof_helper(&mut self) -> Result<Func, ConvertError> {
+        if let Some(func) = self.typeof_helper {
+            return Ok(func);
+        }
+        let sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.value],
+            returns: vec![self.repr.value],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, sig);
+        let entry = body.entry;
+        let value = body.blocks[entry].params[0].1;
+
+        // Chain of `ref.test`s, each leaf returning the type-name string.
+        // Order matters only for correctness of the string case (a string is
+        // not in the other tested types, so any order works).
+        let cases: [(&[u8], Type); 7] = [
+            (b"object", self.repr.i31_non_null_ty()),
+            (b"number", self.repr.number_non_null_ty()),
+            (b"boolean", self.repr.boolean_non_null_ty()),
+            (b"string", self.repr.string_non_null_ty()),
+            (b"bigint", self.repr.bigint_non_null_ty()),
+            (b"function", self.repr.function_non_null_ty()),
+            (b"object", self.repr.object_non_null_ty()),
+        ];
+        let mut block = entry;
+        for (name, ty) in cases {
+            let is_case = body.add_op(block, Operator::RefTest { ty }, &[value], &[Type::I32]);
+            let hit = body.add_block();
+            let miss = body.add_block();
+            body.set_terminator(
+                block,
+                Terminator::CondBr {
+                    cond: is_case,
+                    if_true: BlockTarget {
+                        block: hit,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: miss,
+                        args: vec![],
+                    },
+                },
+            );
+            let name = self.new_string(&mut body, hit, name)?;
+            body.set_terminator(hit, Terminator::Return { values: vec![name] });
+            block = miss;
+        }
+        // Anything left over is `undefined` (the null `anyref`) — plus any
+        // exotic reference not enumerated above, which has no JS name and
+        // should not occur.
+        let undefined_name = self.new_string(&mut body, block, b"undefined")?;
+        body.set_terminator(block, Terminator::Return {
+            values: vec![undefined_name],
+        });
+
+        let func = self.module.funcs.push(FuncDecl::Body(
+            sig,
+            format!("js_typeof_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.typeof_helper = Some(func);
+        Ok(func)
+    }
+
+    /// Lower `typeof x`. Statically-known kinds map to their name at compile
+    /// time; a reference goes through [`Self::ensure_typeof_helper`]. The
+    /// result is a string struct.
+    fn typeof_value(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        arg: &LowerValue,
+    ) -> Result<LowerValue, ConvertError> {
+        // Statically-known kinds (and string literals) name themselves.
+        let static_name: Option<&'static [u8]> = match arg {
+            LowerValue::String { .. } => Some(b"string"),
+            _ => match arg.kind()? {
+                ValueKind::Number | ValueKind::Integer => Some(b"number"),
+                ValueKind::Boolean => Some(b"boolean"),
+                ValueKind::BigInt => Some(b"bigint"),
+                ValueKind::Reference => None,
+            },
+        };
+        if let Some(name) = static_name {
+            let value = self.new_string(body, block, name)?;
+            return Ok(LowerValue::Wasm {
+                value,
+                kind: ValueKind::Reference,
+            });
+        }
+        let value = self.box_value(body, block, arg)?;
+        let helper = self.ensure_typeof_helper()?;
+        let result = body.add_op(
+            block,
+            Operator::Call {
+                function_index: helper,
+            },
+            &[value],
+            &[self.repr.value],
+        );
+        Ok(LowerValue::Wasm {
+            value: result,
+            kind: ValueKind::Reference,
+        })
     }
 
     fn undef(&self, body: &mut FunctionBody, block: Block) -> LowerValue {
@@ -8389,8 +9081,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         // the small typed surface before ordinary-array dispatch; the helper
         // falls through to the existing path for every non-typed receiver.
         if !matches!(object, LowerValue::String { .. })
-            && (matches!(key, "length" | "byteLength" | "set" | "subarray")
-                || Self::static_array_index(key).is_some())
+            && (matches!(key, "length" | "byteLength" | "set" | "subarray" | "buffer")
+                || Self::static_array_index(key).is_some()
+                || is_dataview_method(key))
             && let Some(result) = self.get_typed_array_static_property(body, block, object, key)?
         {
             return Ok(result);
@@ -10509,18 +11202,60 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn make_arguments(
-        &self,
+        &mut self,
         body: &mut FunctionBody,
         block: Block,
         values: &BTreeMap<SValueId, LowerValue>,
         args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
     ) -> Result<Value, ConvertError> {
+        if args.iter().any(|arg| arg.is_spread) {
+            // A spread (`f(...rest)`) mixes statically-known leading
+            // arguments with the runtime-length contents of an array, so the
+            // exact-length `ArrayNewFixed` fast path cannot express it. Fold
+            // the members left to right: push each scalar, concatenate each
+            // spread source's elements (see `ensure_arguments_concat`).
+            let mut current = body.add_op(
+                block,
+                Operator::ArrayNewFixed {
+                    sig: self.repr.arguments,
+                    num: 0,
+                },
+                &[],
+                &[self.repr.arguments_ty()],
+            );
+            for arg in args {
+                let value = values
+                    .get(&arg.value)
+                    .ok_or_else(|| ConvertError::invalid("undefined call argument"))?;
+                if arg.is_spread {
+                    let spread = self.box_value(body, block, value)?;
+                    let concat = self.ensure_arguments_concat()?;
+                    current = body.add_op(
+                        block,
+                        Operator::Call {
+                            function_index: concat,
+                        },
+                        &[current, spread],
+                        &[self.repr.arguments_ty()],
+                    );
+                } else {
+                    let boxed = self.box_value(body, block, value)?;
+                    let push = self.ensure_arguments_push()?;
+                    current = body.add_op(
+                        block,
+                        Operator::Call {
+                            function_index: push,
+                        },
+                        &[current, boxed],
+                        &[self.repr.arguments_ty()],
+                    );
+                }
+            }
+            return Ok(current);
+        }
         let values = args
             .iter()
             .map(|arg| {
-                if arg.is_spread {
-                    return Err(ConvertError::unsupported("spread argument", ()));
-                }
                 values
                     .get(&arg.value)
                     .ok_or_else(|| ConvertError::invalid("undefined call argument"))
@@ -10580,9 +11315,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         values: &BTreeMap<SValueId, LowerValue>,
         args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
     ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
-        if args.iter().any(|arg| arg.is_spread) {
-            return Err(ConvertError::unsupported("spread argument", ()));
-        }
+        // Spread calls are supported: `build_native_call_args` folds them
+        // into a runtime-length arguments array and reads the formals out
+        // of it positionally.
         let (this_value, arguments, formals) =
             self.build_native_call_args(body, block, info, this, values, args)?;
         let mut call_args = vec![context, this_value, arguments];
@@ -10623,8 +11358,88 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         values: &BTreeMap<SValueId, LowerValue>,
         args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
     ) -> Result<(Value, Value, Vec<Value>), ConvertError> {
+        #[allow(unused_mut)]
+        let mut block = block;
         let (this, _) = this.wasm()?;
         let this = self.anyref(body, block, this);
+        if args.iter().any(|arg| arg.is_spread) {
+            // A spread call into a provenance-known callee: the effective
+            // arguments array is runtime-length, so the formals cannot be
+            // boxed positionally at compile time. Build the folded array
+            // (the same `ensure_arguments_concat` path as the generic
+            // dispatch), then read each declared formal out of it, defaulting
+            // out-of-range positions to `undefined` — exactly the JS
+            // parameter-binding semantics for a short call.
+            let arguments = self.make_arguments(body, block, values, args)?;
+            let length = body.add_op(block, Operator::ArrayLen, &[arguments], &[Type::I32]);
+            let mut formals = Vec::with_capacity(info.arity);
+            for i in 0..info.arity {
+                let index = body.add_op(
+                    block,
+                    Operator::I32Const {
+                        value: i as u32,
+                    },
+                    &[],
+                    &[Type::I32],
+                );
+                let in_bounds = body.add_op(block, Operator::I32LtU, &[index, length], &[Type::I32]);
+                let present = body.add_block();
+                let missing = body.add_block();
+                let join = body.add_block();
+                let formal = body.add_blockparam(join, self.repr.value);
+                body.set_terminator(
+                    block,
+                    Terminator::CondBr {
+                        cond: in_bounds,
+                        if_true: BlockTarget {
+                            block: present,
+                            args: vec![],
+                        },
+                        if_false: BlockTarget {
+                            block: missing,
+                            args: vec![],
+                        },
+                    },
+                );
+                let read = body.add_op(
+                    present,
+                    Operator::ArrayGet {
+                        sig: self.repr.arguments,
+                    },
+                    &[arguments, index],
+                    &[self.repr.value],
+                );
+                body.set_terminator(
+                    present,
+                    Terminator::Br {
+                        target: BlockTarget {
+                            block: join,
+                            args: vec![read],
+                        },
+                    },
+                );
+                let undef = body.add_op(
+                    missing,
+                    Operator::RefNull {
+                        ty: self.repr.value,
+                    },
+                    &[],
+                    &[self.repr.value],
+                );
+                body.set_terminator(
+                    missing,
+                    Terminator::Br {
+                        target: BlockTarget {
+                            block: join,
+                            args: vec![undef],
+                        },
+                    },
+                );
+                formals.push(formal);
+                block = join;
+            }
+            return Ok((this, arguments, formals));
+        }
         let mut boxed_args = Vec::with_capacity(args.len());
         for arg in args {
             let value = values

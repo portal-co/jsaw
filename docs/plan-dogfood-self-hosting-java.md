@@ -361,3 +361,63 @@ exact `mask32`/`toUint` blitz-js idiom — all green on **all four runtimes**
 top-level non-function stores don't run before a function body reads them.
 The corpus's per-function aliases are local, so this doesn't block BigInt;
 it belongs to Milestone 17/18 (module top-level evaluation).
+
+### Milestone 17 — the mechanical-JS surface (as-built)
+
+Implements every syntactic and intrinsic form the blitz-js opt-mode
+`compiler.js` emits, validated against fixtures mirroring the exact emission
+idioms (a stack-machine function plus a `Uint8Array` linear memory). Two
+jsaw-core bugs blocked this milestone and were fixed first (jsaw-core
+`81ccb25`): labeled `break`/`continue` (the `labelled` map keyed on
+`Ident` including its span, so declaration and use never hashed equal) and
+array-rest binding (an off-by-one that silently dropped the first rest
+element, plus a bind that was never emitted).
+
+Surface implemented (all new tests are `m17_*`, run on all four runtimes):
+
+- **Labeled control flow** (`lN: for(;;)` / `break lN` / `continue lN`) —
+  the corpus's 85,844 labeled loops.
+- **Rest parameters and array destructuring rest** (`function(...locals)`,
+  `let [...rest] = arr`), including the spread-call path (`$N(...args)`)
+  through both the generic adapter and direct native dispatch.
+- **Array spread literals** (`[...rest, x]`), folded member-by-member.
+- **Dynamic arrays** as the operand stack: `stack.length++`/`--`,
+  `stack[i]` reads/writes, `push`-free slot management.
+- **The comma operator** (used ~204k times by blitz-js for sequencing).
+- **Function-object properties** (`f.__sig = {...}` read back), plus
+  `Object.defineProperty`/`Object.freeze` as no-op-ish metadata carriers.
+- **The `typeof` operator** over all kinds (compile-time constant for
+  statically-known kinds; a runtime ref-test chain for boxed values).
+- **`Number(x)` / `BigInt(x)`** global conversion intrinsics.
+- **Template literals** (constant-concatenated; the corpus's only template
+  is the constant `` `wasm sig mismatch` `` sig-guard message).
+- **`throw` / `new Error(msg)`** — `throw` lowers to value evaluation plus a
+  wasm `unreachable` (the corpus never catches); `new Error` is a provable
+  constructor producing a plain object.
+- **Truthy/`||` correctness** for all falsy values (null/0/NaN/''/0n), used
+  by the corpus's `cur || default` guards.
+- **`Uint8Array` `.set`/`.length`/`.byteLength`** and **`.buffer`** (returns
+  an `ArrayBuffer` object sharing the backing bytes).
+- **`DataView`** (constructor over `.buffer`, and the full accessor surface
+  `getUint8/Int8/Uint16/Int16/Uint32/Int32/Float64/BigUint64` plus the
+  `set` family) over a **shared** i8 backing array so DataView writes alias
+  Uint8Array reads — the exact `__wasm_dv`/`__wasm_mb` linear-memory
+  intrinsic. Accessors assemble/split bytes little-endian from the shared
+  array; `getBigUint64`/`setBigUint64` round-trip the raw i64 as a BigInt.
+
+Tests: 38 e2e fixtures (`m17_*`), each asserting a known result on all four
+runtimes (Wasmtime, Node.js, JVM, Swift).
+
+**Deviations / boundaries:**
+- The DataView adapter methods are minted per access *site* (~14 KB of wasm
+  per distinct-argument site in the current design, since `build_native_adapter`
+  specializes on nothing but is invoked per site). Module size grows linearly
+  with site count — fine for fixtures, a scaling concern for the 250k-access
+  corpus (addressed in Milestone 18/19 by sharing or caching method bodies).
+- `setUint32` with the full u32 range (`4294967295`) hits the f64→i32
+  saturating-truncate boundary; offsets beyond `2^32` are out of range. The
+  corpus's offsets and values stay within f64/i32-exact range.
+- Module top-level binding evaluation remains the pre-existing jsaw-core
+  shim gap (a top-level non-function store doesn't run before a function
+  body reads it); fixtures bind such values inside the exported function.
+  Addressed in Milestone 18.

@@ -5,6 +5,76 @@
 // property seam as ordinary arrays; only this module knows how the tagged
 // `typed_data` reference maps to packed WasmGC storage.
 
+
+/// One DataView accessor operation. Determines the byte width, the result
+/// kind (unsigned/signed int, float, or BigInt), and whether it reads or
+/// writes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DataViewOp {
+    GetUint8,
+    GetInt8,
+    GetUint16,
+    GetInt16,
+    GetUint32,
+    GetInt32,
+    GetFloat64,
+    GetBigUint64,
+    SetUint8,
+    SetUint16,
+    SetUint32,
+    SetFloat64,
+    SetBigUint64,
+}
+
+/// Is `key` a DataView accessor method name? Used to widen the member-read
+/// dispatch so these reach the DataView path.
+pub(crate) fn is_dataview_method(key: &str) -> bool {
+    matches!(
+        key,
+        "getUint8"
+            | "getInt8"
+            | "getUint16"
+            | "getInt16"
+            | "getUint32"
+            | "getInt32"
+            | "getFloat64"
+            | "getBigUint64"
+            | "setUint8"
+            | "setInt8"
+            | "setUint16"
+            | "setInt16"
+            | "setUint32"
+            | "setInt32"
+            | "setFloat64"
+            | "setBigUint64"
+    )
+}
+
+impl DataViewOp {
+    fn bytes(self) -> u32 {
+        match self {
+            DataViewOp::GetUint8 | DataViewOp::GetInt8 | DataViewOp::SetUint8 => 1,
+            DataViewOp::GetUint16 | DataViewOp::GetInt16 | DataViewOp::SetUint16 => 2,
+            DataViewOp::GetUint32 | DataViewOp::GetInt32 | DataViewOp::SetUint32 => 4,
+            DataViewOp::GetFloat64
+            | DataViewOp::GetBigUint64
+            | DataViewOp::SetFloat64
+            | DataViewOp::SetBigUint64 => 8,
+        }
+    }
+
+    fn is_write(self) -> bool {
+        matches!(
+            self,
+            DataViewOp::SetUint8
+                | DataViewOp::SetUint16
+                | DataViewOp::SetUint32
+                | DataViewOp::SetFloat64
+                | DataViewOp::SetBigUint64
+        )
+    }
+}
+
 impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     fn typed_array_sig(&self, kind: TypedArrayKind) -> portal_pc_waffle::Signature {
         match kind {
@@ -1524,6 +1594,608 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         }
     }
 
+    /// The DataView accessor method names this backend implements (the exact
+    /// set blitz-js emits for the linear-memory intrinsics).
+    const DATAVIEW_METHODS: [&'static str; 16] = [
+        "getUint8",
+        "getInt8",
+        "getUint16",
+        "getInt16",
+        "getUint32",
+        "getInt32",
+        "getFloat64",
+        "getBigUint64",
+        "setUint8",
+        "setInt8",
+        "setUint16",
+        "setInt16",
+        "setUint32",
+        "setInt32",
+        "setFloat64",
+        "setBigUint64",
+    ];
+
+    /// The `kind` tag (object field 4) marking a DataView. Real typed arrays
+    /// use `TypedArrayKind::code` (0..=8); DataView and ArrayBuffer share the
+    /// object layout (backing bytes at field 3, byte offset at 5, byte length
+    /// at 6) but need their own dispatch so a DataView's `.length` is never
+    /// misread as an element count.
+    ///
+    /// The corpus's linear memory is exactly this: `$mem = new
+    /// Uint8Array(0)`, `$mem_dv = new DataView($mem.buffer)`, and every load
+    /// and store goes through `$mem_dv.getUintN/setUintN(offset, …, true)`.
+    const DATAVIEW_KIND: i32 = 9;
+    const BUFFER_KIND: i32 = 10;
+
+    /// The backing bytes of a typed array / ArrayBuffer / DataView (object
+    /// field 3), as a concrete `i8` array. All three share the same backing
+    /// store, so a DataView write is visible through the Uint8Array's reads —
+    /// the linear-memory aliasing the corpus relies on.
+    fn backing_bytes(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: Value,
+    ) -> (Value, Value, Value) {
+        let plain = body.add_op(
+            block,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[object],
+            &[self.repr.object_ty()],
+        );
+        let data = body.add_op(
+            block,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 3,
+            },
+            &[plain],
+            &[self.repr.value],
+        );
+        let offset = body.add_op(
+            block,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 5,
+            },
+            &[plain],
+            &[Type::I32],
+        );
+        let length = body.add_op(
+            block,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 6,
+            },
+            &[plain],
+            &[Type::I32],
+        );
+        let bytes = body.add_op(
+            block,
+            Operator::RefCast {
+                ty: self.typed_array_ty(TypedArrayKind::Int8),
+            },
+            &[data],
+            &[self.typed_array_ty(TypedArrayKind::Int8)],
+        );
+        (bytes, offset, length)
+    }
+
+    /// Build an ArrayBuffer-flavoured object sharing `data` (a typed array's
+    /// backing bytes): `kind = BUFFER_KIND`, full range.
+    fn new_buffer_object(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        data: Value,
+        byte_length: Value,
+    ) -> Result<LowerValue, ConvertError> {
+        let trie = self.new_trie(body, block)?;
+        let root = self.anyref(body, block, trie);
+        let elements = body.add_op(
+            block,
+            Operator::RefNull {
+                ty: self.repr.arguments_ty(),
+            },
+            &[],
+            &[self.repr.arguments_ty()],
+        );
+        let properties = body.add_op(
+            block,
+            Operator::RefNull {
+                ty: self.repr.value,
+            },
+            &[],
+            &[self.repr.value],
+        );
+        let data = self.anyref(body, block, data);
+        let kind = body.add_op(
+            block,
+            Operator::I32Const {
+                value: Self::BUFFER_KIND as u32,
+            },
+            &[],
+            &[Type::I32],
+        );
+        let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let object = body.add_op(
+            block,
+            Operator::StructNew {
+                sig: self.repr.object,
+            },
+            &[root, elements, properties, data, kind, zero, byte_length],
+            &[self.repr.object_ty()],
+        );
+        Ok(LowerValue::Wasm {
+            value: object,
+            kind: ValueKind::Reference,
+        })
+    }
+
+    /// `new DataView(buffer)`: wrap the buffer's backing bytes with `kind =
+    /// DATAVIEW_KIND` and the buffer's full byte range. The corpus always
+    /// constructs a full-range view (`new DataView($mem.buffer)`), so no
+    /// offset/length arguments are handled.
+    fn try_provable_dataview_constructor(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        callee: &LowerValue,
+        values: &BTreeMap<SValueId, LowerValue>,
+        args: &[SValueId],
+    ) -> Result<Option<(Block, LowerValue)>, ConvertError> {
+        let LowerValue::ReferenceKey { key: name, .. } = callee else {
+            return Ok(None);
+        };
+        if name.0.as_ref() != "DataView" || !self.primordial_is_provable(name) {
+            return Ok(None);
+        }
+        let Some(buffer_arg) = args.first() else {
+            return Ok(None);
+        };
+        let buffer = values
+            .get(buffer_arg)
+            .cloned()
+            .ok_or_else(|| ConvertError::invalid("undefined DataView buffer"))?;
+        let (buffer_value, _) = buffer.wasm()?;
+        let buffer_value = self.anyref(body, block, buffer_value);
+        let (bytes, _offset, length) = self.backing_bytes(body, block, buffer_value);
+        let trie = self.new_trie(body, block)?;
+        let root = self.anyref(body, block, trie);
+        let elements = body.add_op(
+            block,
+            Operator::RefNull {
+                ty: self.repr.arguments_ty(),
+            },
+            &[],
+            &[self.repr.arguments_ty()],
+        );
+        let properties = body.add_op(
+            block,
+            Operator::RefNull {
+                ty: self.repr.value,
+            },
+            &[],
+            &[self.repr.value],
+        );
+        let data = self.anyref(body, block, bytes);
+        let kind = body.add_op(
+            block,
+            Operator::I32Const {
+                value: Self::DATAVIEW_KIND as u32,
+            },
+            &[],
+            &[Type::I32],
+        );
+        let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let object = body.add_op(
+            block,
+            Operator::StructNew {
+                sig: self.repr.object,
+            },
+            &[root, elements, properties, data, kind, zero, length],
+            &[self.repr.object_ty()],
+        );
+        Ok(Some((
+            block,
+            LowerValue::Wasm {
+                value: object,
+                kind: ValueKind::Reference,
+            },
+        )))
+    }
+
+    /// Map a DataView accessor name to its native adapter function.
+    fn dataview_instance_method(&mut self, key: &str) -> Result<Func, ConvertError> {
+        match key {
+            "getUint8" => self.dataview_method(DataViewOp::GetUint8),
+            "getInt8" => self.dataview_method(DataViewOp::GetInt8),
+            "getUint16" => self.dataview_method(DataViewOp::GetUint16),
+            "getInt16" => self.dataview_method(DataViewOp::GetInt16),
+            "getUint32" => self.dataview_method(DataViewOp::GetUint32),
+            "getInt32" => self.dataview_method(DataViewOp::GetInt32),
+            "getFloat64" => self.dataview_method(DataViewOp::GetFloat64),
+            "getBigUint64" => self.dataview_method(DataViewOp::GetBigUint64),
+            "setUint8" | "setInt8" => self.dataview_method(DataViewOp::SetUint8),
+            "setUint16" | "setInt16" => self.dataview_method(DataViewOp::SetUint16),
+            "setUint32" | "setInt32" => self.dataview_method(DataViewOp::SetUint32),
+            "setFloat64" => self.dataview_method(DataViewOp::SetFloat64),
+            "setBigUint64" => self.dataview_method(DataViewOp::SetBigUint64),
+            _ => Err(ConvertError::invalid(format!("unknown DataView method {key:?}"))),
+        }
+    }
+
+    /// Build the native adapter for one DataView accessor. All accessors
+    /// share one shape: read the byte offset argument, the backing bytes,
+    /// and (for multi-byte accesses) the little-endian flag, then assemble or
+    /// split the value byte by byte. Bounds violations trap (a stand-in for
+    /// the spec's RangeError, which the corpus never triggers).
+    fn dataview_method(&mut self, op: DataViewOp) -> Result<Func, ConvertError> {
+        let label = format!("dataview_{op:?}");
+        self.build_native_adapter(&label, move |this, body, entry, _context, this_val, args| {
+            let bytes = op.bytes();
+            let (block, offset_number) = this.read_arg_number(body, entry, args, 0)?;
+            let offset = body.add_op(
+                block,
+                Operator::I32TruncSatF64U,
+                &[offset_number],
+                &[Type::I32],
+            );
+            // Read the DataView's backing bytes, byte offset, and byte length.
+            let (backing, base, _length) = this.backing_bytes(body, block, this_val);
+            // Effective byte address: view base + accessor offset.
+            let address = body.add_op(block, Operator::I32Add, &[base, offset], &[Type::I32]);
+            // Bounds check: address + (bytes - 1) < length. The corpus stays
+            // in bounds; a violation traps.
+            let last = body.add_op(
+                block,
+                Operator::I32Const {
+                    value: (bytes - 1) as u32,
+                },
+                &[],
+                &[Type::I32],
+            );
+            let end = body.add_op(block, Operator::I32Add, &[address, last], &[Type::I32]);
+            let in_bounds = body.add_op(block, Operator::I32LtU, &[end, _length], &[Type::I32]);
+            let valid = body.add_block();
+            let invalid = body.add_block();
+            body.set_terminator(
+                block,
+                Terminator::CondBr {
+                    cond: in_bounds,
+                    if_true: BlockTarget {
+                        block: valid,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: invalid,
+                        args: vec![],
+                    },
+                },
+            );
+            body.set_terminator(invalid, Terminator::Unreachable);
+
+            // Multi-byte accesses take a little-endian flag (single-byte
+            // accessors have none). The flag is the last argument: index 1
+            // for reads, 2 for writes. The corpus always passes `true`.
+            let (block, little_endian) = if bytes > 1 {
+                let flag_index = if op.is_write() { 2 } else { 1 };
+                let (block, flag_raw) = this.read_arg_raw(body, valid, args, flag_index);
+                let truthy = this.ensure_truthy_helper()?;
+                let flag = body.add_op(
+                    block,
+                    Operator::Call {
+                        function_index: truthy,
+                    },
+                    &[flag_raw],
+                    &[Type::I32],
+                );
+                (block, flag)
+            } else {
+                let one = body.add_op(valid, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+                (valid, one)
+            };
+
+            match op {
+                DataViewOp::GetUint8
+                | DataViewOp::GetInt8
+                | DataViewOp::GetUint16
+                | DataViewOp::GetInt16
+                | DataViewOp::GetUint32
+                | DataViewOp::GetInt32
+                | DataViewOp::GetFloat64
+                | DataViewOp::GetBigUint64 => {
+                    let value =
+                        this.dataview_read(body, block, backing, address, bytes, little_endian, op);
+                    let boxed = this.box_dataview_read(body, block, value, op)?;
+                    body.set_terminator(
+                        block,
+                        Terminator::Return {
+                            values: vec![boxed],
+                        },
+                    );
+                }
+                DataViewOp::SetUint8
+                | DataViewOp::SetUint16
+                | DataViewOp::SetUint32
+                | DataViewOp::SetFloat64
+                | DataViewOp::SetBigUint64 => {
+                    let (block, value) = this.read_dataview_write_value(body, block, args, op)?;
+                    this.dataview_write(body, block, backing, address, bytes, little_endian, value);
+                    let undef = body.add_op(
+                        block,
+                        Operator::RefNull {
+                            ty: this.repr.value,
+                        },
+                        &[],
+                        &[this.repr.value],
+                    );
+                    body.set_terminator(
+                        block,
+                        Terminator::Return {
+                            values: vec![undef],
+                        },
+                    );
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Assemble a `bytes`-wide little-/big-endian value from `backing` at
+    /// `address`, as raw bits (i32 for 8/16/32, i64 for 64, f64 reinterpreted
+    /// for float64).
+    fn dataview_read(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        backing: Value,
+        address: Value,
+        bytes: u32,
+        little_endian: Value,
+        op: DataViewOp,
+    ) -> Value {
+        // Read each byte (unsigned) into a vector of i32 values.
+        let mut byte_vals = Vec::with_capacity(bytes as usize);
+        for i in 0..bytes {
+            let index = body.add_op(block, Operator::I32Const { value: i }, &[], &[Type::I32]);
+            let at = body.add_op(block, Operator::I32Add, &[address, index], &[Type::I32]);
+            let b = body.add_op(
+                block,
+                Operator::ArrayGetU {
+                    sig: self.repr.typed_i8,
+                },
+                &[backing, at],
+                &[Type::I32],
+            );
+            byte_vals.push(b);
+        }
+        // Assemble little- and big-endian forms, then select.
+        let assemble = |body: &mut FunctionBody, block: Block, order: &[usize]| -> Value {
+            match op {
+                DataViewOp::GetFloat64 | DataViewOp::GetBigUint64 => {
+                    let mut acc = {
+                        let b = body.add_op(block, Operator::I64ExtendI32U, &[byte_vals[order[0]]], &[Type::I64]);
+                        b
+                    };
+                    for (pos, &idx) in order.iter().enumerate().skip(1) {
+                        let shift = body.add_op(
+                            block,
+                            Operator::I64Const {
+                                value: (8 * pos) as u64,
+                            },
+                            &[],
+                            &[Type::I64],
+                        );
+                        let wide = body.add_op(block, Operator::I64ExtendI32U, &[byte_vals[idx]], &[Type::I64]);
+                        let shifted = body.add_op(block, Operator::I64Shl, &[wide, shift], &[Type::I64]);
+                        acc = body.add_op(block, Operator::I64Or, &[acc, shifted], &[Type::I64]);
+                    }
+                    acc
+                }
+                _ => {
+                    let mut acc = byte_vals[order[0]];
+                    for (pos, &idx) in order.iter().enumerate().skip(1) {
+                        let shift = body.add_op(
+                            block,
+                            Operator::I32Const {
+                                value: (8 * pos) as u32,
+                            },
+                            &[],
+                            &[Type::I32],
+                        );
+                        let shifted = body.add_op(block, Operator::I32Shl, &[byte_vals[idx], shift], &[Type::I32]);
+                        acc = body.add_op(block, Operator::I32Or, &[acc, shifted], &[Type::I32]);
+                    }
+                    acc
+                }
+            }
+        };
+        let le_order: Vec<usize> = (0..bytes as usize).collect();
+        let be_order: Vec<usize> = (0..bytes as usize).rev().collect();
+        let le = assemble(body, block, &le_order);
+        let be = assemble(body, block, &be_order);
+        let ty = match op {
+            DataViewOp::GetFloat64 | DataViewOp::GetBigUint64 => Type::I64,
+            _ => Type::I32,
+        };
+        body.add_op(
+            block,
+            Operator::TypedSelect { ty },
+            &[le, be, little_endian],
+            &[ty],
+        )
+    }
+
+    /// Box a freshly-assembled DataView read into its JS result value.
+    fn box_dataview_read(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        value: Value,
+        op: DataViewOp,
+    ) -> Result<Value, ConvertError> {
+        match op {
+            DataViewOp::GetUint8 | DataViewOp::GetUint16 | DataViewOp::GetUint32 => {
+                // Unsigned widening to f64. 32-bit needs the unsigned convert.
+                let f = if op == DataViewOp::GetUint32 {
+                    body.add_op(block, Operator::F64ConvertI32U, &[value], &[Type::F64])
+                } else {
+                    body.add_op(block, Operator::F64ConvertI32S, &[value], &[Type::F64])
+                };
+                self.box_value(body, block, &LowerValue::Wasm {
+                    value: f,
+                    kind: ValueKind::Number,
+                })
+            }
+            DataViewOp::GetInt8 => {
+                // Sign-extend the low byte.
+                let shift = body.add_op(block, Operator::I32Const { value: 24 }, &[], &[Type::I32]);
+                let shl = body.add_op(block, Operator::I32Shl, &[value, shift], &[Type::I32]);
+                let sar = body.add_op(block, Operator::I32ShrS, &[shl, shift], &[Type::I32]);
+                let f = body.add_op(block, Operator::F64ConvertI32S, &[sar], &[Type::F64]);
+                self.box_value(body, block, &LowerValue::Wasm {
+                    value: f,
+                    kind: ValueKind::Number,
+                })
+            }
+            DataViewOp::GetInt16 => {
+                let shift = body.add_op(block, Operator::I32Const { value: 16 }, &[], &[Type::I32]);
+                let shl = body.add_op(block, Operator::I32Shl, &[value, shift], &[Type::I32]);
+                let sar = body.add_op(block, Operator::I32ShrS, &[shl, shift], &[Type::I32]);
+                let f = body.add_op(block, Operator::F64ConvertI32S, &[sar], &[Type::F64]);
+                self.box_value(body, block, &LowerValue::Wasm {
+                    value: f,
+                    kind: ValueKind::Number,
+                })
+            }
+            DataViewOp::GetInt32 => {
+                let f = body.add_op(block, Operator::F64ConvertI32S, &[value], &[Type::F64]);
+                self.box_value(body, block, &LowerValue::Wasm {
+                    value: f,
+                    kind: ValueKind::Number,
+                })
+            }
+            DataViewOp::GetFloat64 => {
+                let f = body.add_op(block, Operator::F64ReinterpretI64, &[value], &[Type::F64]);
+                self.box_value(body, block, &LowerValue::Wasm {
+                    value: f,
+                    kind: ValueKind::Number,
+                })
+            }
+            DataViewOp::GetBigUint64 => {
+                // The raw i64 is the BigInt payload.
+                self.box_value(body, block, &LowerValue::Wasm {
+                    value,
+                    kind: ValueKind::BigInt,
+                })
+            }
+            _ => unreachable!("not a read op"),
+        }
+    }
+
+    /// Read the value argument of a DataView write, as raw bits (i32 or i64).
+    fn read_dataview_write_value(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        args: Value,
+        op: DataViewOp,
+    ) -> Result<(Block, Value), ConvertError> {
+        match op {
+            DataViewOp::SetBigUint64 => {
+                // The BigInt value: unbox to i64.
+                let (block, raw) = self.read_arg_raw(body, block, args, 1);
+                let i = self.as_i64(body, block, &LowerValue::Wasm {
+                    value: raw,
+                    kind: ValueKind::Reference,
+                })?;
+                Ok((block, i))
+            }
+            DataViewOp::SetFloat64 => {
+                let (block, f) = self.read_arg_number(body, block, args, 1)?;
+                let bits = body.add_op(block, Operator::I64ReinterpretF64, &[f], &[Type::I64]);
+                Ok((block, bits))
+            }
+            _ => {
+                let (block, f) = self.read_arg_number(body, block, args, 1)?;
+                let i = body.add_op(block, Operator::I32TruncF64S, &[f], &[Type::I32]);
+                Ok((block, i))
+            }
+        }
+    }
+
+    /// Split a raw value into `bytes` little-/big-endian bytes and store them
+    /// into `backing` at `address`.
+    fn dataview_write(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        backing: Value,
+        address: Value,
+        bytes: u32,
+        little_endian: Value,
+        value: Value,
+    ) {
+        let wide = bytes == 8;
+        // Compute the byte at logical position `pos` (0 = least significant).
+        let byte_at = |body: &mut FunctionBody, block: Block, pos: u32| -> Value {
+            let shift_amt = 8 * pos;
+            if wide {
+                let shift = body.add_op(
+                    block,
+                    Operator::I64Const {
+                        value: shift_amt as u64,
+                    },
+                    &[],
+                    &[Type::I64],
+                );
+                let shifted = body.add_op(block, Operator::I64ShrU, &[value, shift], &[Type::I64]);
+                body.add_op(block, Operator::I32WrapI64, &[shifted], &[Type::I32])
+            } else {
+                if shift_amt == 0 {
+                    value
+                } else {
+                    let shift = body.add_op(
+                        block,
+                        Operator::I32Const {
+                            value: shift_amt,
+                        },
+                        &[],
+                        &[Type::I32],
+                    );
+                    body.add_op(block, Operator::I32ShrU, &[value, shift], &[Type::I32])
+                }
+            }
+        };
+        for i in 0..bytes {
+            // Little-endian stores logical byte i at address+i; big-endian
+            // stores logical byte (bytes-1-i) there.
+            let le_pos = i;
+            let be_pos = bytes - 1 - i;
+            let le_byte = byte_at(body, block, le_pos);
+            let be_byte = byte_at(body, block, be_pos);
+            let byte = body.add_op(
+                block,
+                Operator::TypedSelect { ty: Type::I32 },
+                &[le_byte, be_byte, little_endian],
+                &[Type::I32],
+            );
+            let index = body.add_op(block, Operator::I32Const { value: i }, &[], &[Type::I32]);
+            let at = body.add_op(block, Operator::I32Add, &[address, index], &[Type::I32]);
+            body.add_op(
+                block,
+                Operator::ArraySet {
+                    sig: self.repr.typed_i8,
+                },
+                &[backing, at, byte],
+                &[],
+            );
+        }
+    }
+
     fn typed_array_subarray_index(
         &self,
         body: &mut FunctionBody,
@@ -2242,6 +2914,24 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             }
             "set" | "subarray" => {
                 let func = self.typed_array_instance_method(key)?;
+                let context = self.new_object(body, is_typed)?;
+                let (context, _) = context.wasm()?;
+                let method = self.native_function_value(body, is_typed, context, func)?;
+                self.box_value(body, is_typed, &method)?
+            }
+            // `someTypedArray.buffer`: an ArrayBuffer-flavoured object sharing
+            // the same backing bytes (so a DataView over it aliases the typed
+            // array — the corpus's `$mem_dv = new DataView($mem.buffer)`).
+            "buffer" => {
+                let (bytes, _offset, length) = self.backing_bytes(body, is_typed, value);
+                let buffer = self.new_buffer_object(body, is_typed, bytes, length)?;
+                self.box_value(body, is_typed, &buffer)?
+            }
+            // DataView accessors (`getUint32`, `setBigUint64`, …). These only
+            // ever apply to a DataView (a typed array has no such methods), so
+            // returning the native method unconditionally here is sound.
+            key if Self::DATAVIEW_METHODS.contains(&key) => {
+                let func = self.dataview_instance_method(key)?;
                 let context = self.new_object(body, is_typed)?;
                 let (context, _) = context.wasm()?;
                 let method = self.native_function_value(body, is_typed, context, func)?;

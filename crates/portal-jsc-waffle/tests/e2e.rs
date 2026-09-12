@@ -3415,3 +3415,672 @@ fn bigint_i64_range_arithmetic() {
 
 
 
+// M17 idiom probes: each fixture mirrors a blitz-js opt-mode idiom.
+
+// 1. plain array dynamic index + length mutation (the stack idiom)
+#[test]
+fn m17_array_stack_idiom() {
+    let module = compile_module(
+        "
+            export function run() {
+                let stack = [], tmp;
+                stack.length++;
+                stack[1] = 40;
+                stack.length++;
+                stack[2] = 2;
+                tmp = stack[2];
+                stack.length--;
+                return stack[1] + tmp;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
+}
+
+// 2. comma operator in expression position
+#[test]
+fn m17_comma_operator() {
+    let module = compile_module(
+        "
+            export function run() {
+                let tmp;
+                return (tmp = 41, tmp + 1);
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
+}
+
+// 3. object destructuring declaration
+#[test]
+fn m17_object_destructuring() {
+    let module = compile_module(
+        "
+            export function run() {
+                const o = { params: 40, rets: 2 };
+                let { params, rets } = o;
+                return params + rets;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
+}
+
+// 4. function-object property assignment + read
+// 5. rest args + spread call
+
+#[test]
+fn m17_rest_and_spread_call() {
+    // A rest-param function reached through a spread call, all internal
+    // (the corpus's `function $N(...locals)` + `$N(...args)` idiom).
+    let module = compile_module(
+        "
+            export function run() {
+                let f = function(...locals) {
+                    let t = function(...inner) { return inner.length; };
+                    return locals.length * 100 + t(...locals);
+                };
+                return f(40, 2);
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 202.0);
+}
+
+// 6. array spread in literal
+#[test]
+fn m17_array_spread_literal() {
+    let module = compile_module(
+        "
+            export function run() {
+                let a = [1, 2];
+                let b = [...a, 40];
+                return b[0] + b[1] + b[2];
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 43.0);
+}
+
+// 7. typeof check
+#[test]
+fn m17_typeof_all_kinds() {
+    let module = compile_module(
+        "
+            export function run() {
+                let f = function() {};
+                let parts = [typeof f, typeof 1, typeof 'x', typeof true, typeof undefined, typeof 1n];
+                return (parts[0] === 'function' ? 1 : 0)
+                    + (parts[1] === 'number' ? 2 : 0)
+                    + (parts[2] === 'string' ? 4 : 0)
+                    + (parts[3] === 'boolean' ? 8 : 0)
+                    + (parts[4] === 'undefined' ? 16 : 0)
+                    + (parts[5] === 'bigint' ? 32 : 0);
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 63.0);
+}
+
+// 8. IIFE with comma-operator body
+#[test]
+fn m17_iife_comma() {
+    let module = compile_module(
+        "
+            export function run() {
+                let v;
+                return ((a = 40) => (v = a + 2, v))();
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
+}
+
+#[test]
+fn m17_function_object_property() {
+    let module = compile_module(
+        "
+            export function run() {
+                let f = function(x) { return x + 1; };
+                f.__sig = { params: 1, rets: 1 };
+                return f.__sig.params + f(40);
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
+}
+
+#[test]
+fn m17_object_define_property_freeze() {
+    let module = compile_module(
+        "
+            export function run() {
+                let f = function(x) { return x; };
+                Object.defineProperty(f, '__sig', { value: Object.freeze({ params: 1, rets: 1 }) });
+                return f.__sig.params + f.__sig.rets;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 2.0);
+}
+
+#[test]
+fn m17_number_of_bigint() {
+    let module = compile_module(
+        "
+            export function run() {
+                return Number(40n) + Number(2n);
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
+}
+
+#[test]
+fn m17_bigint_of_number() {
+    let module = compile_module(
+        "
+            export function run() {
+                return BigInt(40) + BigInt(2) === 42n ? 1 : 0;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 1.0);
+}
+
+#[test]
+fn m17_uint8array_set() {
+    let module = compile_module(
+        "
+            export function run() {
+                let mem = new Uint8Array(16);
+                mem.set([1, 2, 3], 4);
+                return mem[4] + mem[5] + mem[6] + mem.length;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 22.0);
+}
+
+#[test]
+fn m17_dataview_roundtrip() {
+    let module = compile_module(
+        "
+            export function run() {
+                let mem = new Uint8Array(16);
+                let dv = new DataView(mem.buffer);
+                dv.setUint32(4, 40, true);
+                dv.setUint8(8, 2);
+                return dv.getUint32(4, true) + dv.getUint8(8);
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
+}
+
+#[test]
+fn m17_spread_call_generic() {
+    let module = compile_module(
+        "
+            export function run() {
+                let add = function(a, b) { return a + b; };
+                let args = [40, 2];
+                return add(...args);
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
+}
+
+#[test]
+fn m17_bytelength() {
+    let module = compile_module(
+        "
+            export function run() {
+                let mem = new Uint8Array(32);
+                return mem.byteLength;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 32.0);
+}
+
+#[test]
+fn m17_rest_param_direct_call() {
+    let module = compile_module(
+        "
+            export function run() {
+                let f = function(...locals) { return locals.length + (locals.length > 0 ? locals[0] : 0); };
+                return f(40, 2) + f();
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
+}
+
+#[test]
+fn m17_array_rest_destructure() {
+    let module = compile_module(
+        "
+            export function run() {
+                let [a, ...rest] = [10, 20, 12];
+                return a + rest.length * 100 + rest[0] + rest[1];
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 242.0);
+}
+
+#[test]
+fn m17_try_catch_never_throws() {
+    let module = compile_module(
+        "
+            export function run() {
+                let out = 0;
+                try {
+                    out = 42;
+                } catch (e) {
+                    out = -1;
+                }
+                return out;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
+}
+
+#[test]
+fn m17_template_literal() {
+    let module = compile_module(
+        "
+            export function run() {
+                let x = `wasm sig mismatch`;
+                return x === 'wasm sig mismatch' ? 42 : 0;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
+}
+
+#[test]
+fn m17_null_logical_or() {
+    let module = compile_module(
+        "
+            export function run() {
+                var cur = null;
+                var n = cur || 42;
+                return n;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
+}
+
+#[test]
+fn m17_throw_new_error() {
+    let module = compile_module(
+        "
+            export function run(n) {
+                if (n > 0) throw new Error('boom');
+                return 42;
+            }
+        ",
+    );
+    validate(&module);
+    // The non-throwing path must run; the throwing path traps (jsaw has no catch).
+    assert_executes_in_all_runtimes(&module, "run", &[0.0], 42.0);
+}
+
+#[test]
+fn m17_labeled_infinite_for_loop() {
+    let module = compile_module(
+        "
+            export function run() {
+                let n = 0;
+                l0: for (;;) {
+                    l1: for (;;) {
+                        n++;
+                        if (n < 3) continue l1;
+                        break l0;
+                    }
+                }
+                return n;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 3.0);
+}
+
+#[test]
+fn m17_labeled_simple() {
+    let module = compile_module(
+        "
+            export function run() {
+                l0: for (;;) {
+                    break l0;
+                }
+                return 42;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
+}
+
+#[test]
+fn m17_labeled_continue() {
+    let module = compile_module(
+        "
+            export function run() {
+                let n = 0;
+                l0: for (;;) {
+                    n++;
+                    if (n < 3) continue l0;
+                    break;
+                }
+                return n;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 3.0);
+}
+
+#[test]
+fn m17_labeled_while() {
+    let module = compile_module(
+        "
+            export function run() {
+                l0: while (true) {
+                    break l0;
+                }
+                return 42;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
+}
+
+#[test]
+fn m17_labeled_block() {
+    let module = compile_module(
+        "
+            export function run() {
+                l0: {
+                    if (true) break l0;
+                    return 0;
+                }
+                return 42;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
+}
+
+#[test]
+fn m17_unlabeled_infinite_for() {
+    let module = compile_module(
+        "
+            export function run() {
+                let n = 0;
+                for (;;) {
+                    n++;
+                    if (n >= 3) break;
+                }
+                return n;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 3.0);
+}
+
+
+#[test]
+fn m17_array_destructure_no_rest() {
+    let module = compile_module(
+        "
+            export function run() {
+                let [a, b] = [10, 32];
+                return a + b;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
+}
+
+#[test]
+fn m17_array_destructure_rest_only() {
+    let module = compile_module(
+        "
+            export function run() {
+                let arr = [10, 20, 12];
+                let [...rest] = arr;
+                return rest.length * 100 + rest[0] + rest[1] + rest[2];
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 342.0);
+}
+
+
+
+
+
+
+#[test]
+fn m17_truthy_falsy_values() {
+    // Boxed (reference-kind) falsy values must be falsy through the truthy
+    // helper: 0.0/NaN (number), "" (string), 0n (bigint). (The null case is
+    // covered by probe_null_logical_or.) Values are boxed by round-tripping
+    // through an array so the helper's runtime dispatch is exercised.
+    let module = compile_module(
+        "
+            export function run() {
+                let boxit = function(x) { return [x][0]; };
+                let falsy = [boxit(0.0), boxit(''), boxit(0n), boxit(0.0 / 0.0)];
+                let out = 0;
+                for (let i = 0; i < falsy.length; i++) {
+                    if (falsy[i]) out += 1;
+                }
+                return out;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 0.0);
+}
+
+#[test]
+fn m17_buffer_returns_object() {
+    let module = compile_module(
+        "
+            export function run() {
+                let mem = new Uint8Array(16);
+                let buf = mem.buffer;
+                return typeof buf === 'object' && buf !== null ? 42 : 0;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
+}
+
+
+#[test]
+fn m17_dataview_all_widths_le() {
+    // The full corpus DataView surface: unsigned/signed int reads and writes
+    // at 8/16/32, float64, all little-endian, over a shared Uint8Array.
+    let module = compile_module(
+        "
+            export function run() {
+                let mem = new Uint8Array(64);
+                let dv = new DataView(mem.buffer);
+                dv.setUint16(0, 0x1234, true);
+                dv.setUint32(4, 305419896, true);
+                dv.setFloat64(12, 1.5, true);
+                dv.setInt8(20, -5);
+                dv.setInt16(22, -1000, true);
+                return (dv.getUint16(0, true) === 0x1234 ? 1 : 0)
+                    + (dv.getUint32(4, true) === 305419896 ? 2 : 0)
+                    + (dv.getFloat64(12, true) === 1.5 ? 16 : 0)
+                    + (dv.getInt8(20) === -5 ? 4 : 0)
+                    + (dv.getInt16(22, true) === -1000 ? 8 : 0);
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 31.0);
+}
+
+#[test]
+fn m17_dataview_biguint64_bigint() {
+    let module = compile_module(
+        "
+            export function run() {
+                let mem = new Uint8Array(16);
+                let dv = new DataView(mem.buffer);
+                dv.setBigUint64(0, 0x123456789abcdef0n, true);
+                return dv.getBigUint64(0, true) === 0x123456789abcdef0n ? 1 : 0;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 1.0);
+}
+
+#[test]
+fn m17_dataview_aliasing() {
+    // Writes through the DataView must be visible through the Uint8Array.
+    let module = compile_module(
+        "
+            export function run() {
+                let mem = new Uint8Array(16);
+                let dv = new DataView(mem.buffer);
+                dv.setUint8(3, 42, true);
+                mem[4] = 100;
+                return dv.getUint8(3, true) + dv.getUint8(4, true) + mem[3] + mem[4];
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 284.0);
+}
+
+#[test]
+fn m17_dataview_float64_roundtrip() {
+    let module = compile_module(
+        "
+            export function run() {
+                let mem = new Uint8Array(64);
+                let dv = new DataView(mem.buffer);
+                dv.setFloat64(12, 1.5, true);
+                return dv.getFloat64(12, true) === 1.5 ? 1 : 0;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 1.0);
+}
+
+#[test]
+fn m17_dataview_module_size() {
+    // A handful of distinct-argument DataView accesses of several widths —
+    // check the emitted module stays small (method bodies should be shared,
+    // not minted per site).
+    let module = compile_module(
+        "
+            export function run() {
+                let mem = new Uint8Array(64);
+                let dv = new DataView(mem.buffer);
+                dv.setUint32(0, 1, true); dv.setUint32(4, 2, true); dv.setUint32(8, 3, true);
+                dv.setUint32(12, 4, true); dv.setUint32(16, 5, true); dv.setUint32(20, 6, true);
+                dv.setUint16(24, 7, true); dv.setUint16(26, 8, true); dv.setUint16(28, 9, true);
+                dv.setUint8(30, 10); dv.setUint8(31, 11); dv.setUint8(32, 12);
+                return dv.getUint32(0, true) + dv.getUint32(4, true) + dv.getUint32(8, true)
+                    + dv.getUint32(12, true) + dv.getUint32(16, true) + dv.getUint32(20, true)
+                    + dv.getUint16(24, true) + dv.getUint16(26, true) + dv.getUint16(28, true)
+                    + dv.getUint8(30) + dv.getUint8(31) + dv.getUint8(32);
+            }
+        ",
+    );
+    validate(&module);
+    let bytes = portal_pc_waffle::to_wasm_bytes(&module).expect("to wasm bytes");
+    println!("DataView module size: {} bytes", bytes.len());
+    assert_executes_in_all_runtimes(&module, "run", &[], 78.0);
+}
+
+#[test]
+fn m17_dataview_regression_all() {
+    // Exercise every DataView accessor across all four runtimes.
+    let module = compile_module(
+        "
+            export function run() {
+                let mem = new Uint8Array(64);
+                let dv = new DataView(mem.buffer);
+                dv.setUint8(0, 255); dv.setInt8(1, -1);
+                dv.setUint16(2, 65535, true); dv.setInt16(4, -1, true);
+                dv.setUint32(6, 305419896, true); dv.setInt32(10, -1, true);
+                dv.setFloat64(14, 3.5, true);
+                dv.setBigUint64(22, 0x1fffffffffffffn, true);
+                return (dv.getUint8(0) === 255 ? 1 : 0)
+                    + (dv.getInt8(1) === -1 ? 2 : 0)
+                    + (dv.getUint16(2, true) === 65535 ? 4 : 0)
+                    + (dv.getInt16(4, true) === -1 ? 8 : 0)
+                    + (dv.getUint32(6, true) === 305419896 ? 16 : 0)
+                    + (dv.getInt32(10, true) === -1 ? 32 : 0)
+                    + (dv.getFloat64(14, true) === 3.5 ? 64 : 0)
+                    + (dv.getBigUint64(22, true) === 0x1fffffffffffffn ? 128 : 0)
+                    + (mem[0] === 255 ? 256 : 0)
+                    + (mem[1] === 255 ? 512 : 0);
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 1023.0);
+}
+
+#[test]
+fn m17_dataview_large_offset() {
+    // The corpus accesses memory at offsets well beyond a few hundred — a
+    // 6 MB wasm memory uses offsets up to ~6 * 65536. Model a big-enough
+    // buffer and access a large offset.
+    let module = compile_module(
+        "
+            export function run() {
+                let mem = new Uint8Array(4194304); // 4 MB
+                let dv = new DataView(mem.buffer);
+                dv.setUint32(4000000, 305419896, true);
+                dv.setUint8(4000004, 99);
+                return dv.getUint32(4000000, true) === 305419896 && dv.getUint8(4000004) === 99 ? 42 : 0;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
+}

@@ -178,6 +178,202 @@ fn ensure_arguments_push(&mut self) -> Result<Func, ConvertError> {
     Ok(func)
 }
 
+/// Concatenate the elements of a spread source onto `dst`, returning a new
+/// exact-length `arguments` array. The source is either a raw `arguments`
+/// array (spread of a function's `arguments`-shaped value) or an ordinary
+/// array object (whose `elements` field holds the array); anything else is
+/// not spreadable here and yields the unchanged `dst` (the corpus only ever
+/// spreads real arrays).
+fn ensure_arguments_concat(&mut self) -> Result<Func, ConvertError> {
+    if let Some(func) = self.arguments_concat_helper {
+        return Ok(func);
+    }
+    let sig = self.module.signatures.push(SignatureData::Func {
+        params: vec![self.repr.arguments_ty(), self.repr.value],
+        returns: vec![self.repr.arguments_ty()],
+        shared: false,
+    });
+    let mut body = FunctionBody::new(self.module, sig);
+    let entry = body.entry;
+    let dst = body.blocks[entry].params[0].1;
+    let src = body.blocks[entry].params[1].1;
+
+    // Resolve the source to a raw `arguments` array: either it already is
+    // one, or it is an object whose `elements` field holds it. A non-array
+    // source (or an object with no elements) contributes nothing.
+    let is_raw = body.add_op(
+        entry,
+        Operator::RefTest {
+            ty: self.repr.arguments_ty(),
+        },
+        &[src],
+        &[Type::I32],
+    );
+    let raw = body.add_block();
+    let not_raw = body.add_block();
+    let src_join = body.add_block();
+    let src_array = body.add_blockparam(src_join, self.repr.arguments_ty());
+    body.set_terminator(
+        entry,
+        Terminator::CondBr {
+            cond: is_raw,
+            if_true: BlockTarget {
+                block: raw,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: not_raw,
+                args: vec![],
+            },
+        },
+    );
+    let raw_cast = body.add_op(
+        raw,
+        Operator::RefCast {
+            ty: self.repr.arguments_ty(),
+        },
+        &[src],
+        &[self.repr.arguments_ty()],
+    );
+    body.set_terminator(
+        raw,
+        Terminator::Br {
+            target: BlockTarget {
+                block: src_join,
+                args: vec![raw_cast],
+            },
+        },
+    );
+    // not_raw: object with elements?
+    let is_object = body.add_op(
+        not_raw,
+        Operator::RefTest {
+            ty: self.repr.object_non_null_ty(),
+        },
+        &[src],
+        &[Type::I32],
+    );
+    let object_block = body.add_block();
+    let skip = body.add_block();
+    body.set_terminator(
+        not_raw,
+        Terminator::CondBr {
+            cond: is_object,
+            if_true: BlockTarget {
+                block: object_block,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: skip,
+                args: vec![],
+            },
+        },
+    );
+    let object = body.add_op(
+        object_block,
+        Operator::RefCast {
+            ty: self.repr.object_ty(),
+        },
+        &[src],
+        &[self.repr.object_ty()],
+    );
+    let elements = body.add_op(
+        object_block,
+        Operator::StructGet {
+            sig: self.repr.object,
+            idx: 1,
+        },
+        &[object],
+        &[self.repr.arguments_ty()],
+    );
+    let no_elements = body.add_op(object_block, Operator::RefIsNull, &[elements], &[Type::I32]);
+    let have_elements = body.add_block();
+    body.set_terminator(
+        object_block,
+        Terminator::CondBr {
+            cond: no_elements,
+            if_true: BlockTarget {
+                block: skip,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: have_elements,
+                args: vec![],
+            },
+        },
+    );
+    let elements_nn = body.add_op(
+        have_elements,
+        Operator::RefCast {
+            ty: self.repr.arguments_ty(),
+        },
+        &[elements],
+        &[self.repr.arguments_ty()],
+    );
+    body.set_terminator(
+        have_elements,
+        Terminator::Br {
+            target: BlockTarget {
+                block: src_join,
+                args: vec![elements_nn],
+            },
+        },
+    );
+    // skip: nothing to append — return dst unchanged.
+    body.set_terminator(
+        skip,
+        Terminator::Return {
+            values: vec![dst],
+        },
+    );
+
+    // Concatenate dst ++ src_array into a fresh exact-length array.
+    let dst_len = body.add_op(src_join, Operator::ArrayLen, &[dst], &[Type::I32]);
+    let src_len = body.add_op(src_join, Operator::ArrayLen, &[src_array], &[Type::I32]);
+    let new_len = body.add_op(src_join, Operator::I32Add, &[dst_len, src_len], &[Type::I32]);
+    let grown = body.add_op(
+        src_join,
+        Operator::ArrayNewDefault {
+            sig: self.repr.arguments,
+        },
+        &[new_len],
+        &[self.repr.arguments_ty()],
+    );
+    let zero = body.add_op(src_join, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+    body.add_op(
+        src_join,
+        Operator::ArrayCopy {
+            dest: self.repr.arguments,
+            src: self.repr.arguments,
+        },
+        &[grown, zero, dst, zero, dst_len],
+        &[],
+    );
+    body.add_op(
+        src_join,
+        Operator::ArrayCopy {
+            dest: self.repr.arguments,
+            src: self.repr.arguments,
+        },
+        &[grown, dst_len, src_array, zero, src_len],
+        &[],
+    );
+    body.set_terminator(
+        src_join,
+        Terminator::Return {
+            values: vec![grown],
+        },
+    );
+
+    let func = self.module.funcs.push(FuncDecl::Body(
+        sig,
+        format!("js_arguments_concat_{}", self.module.funcs.len()),
+        body,
+    ));
+    self.arguments_concat_helper = Some(func);
+    Ok(func)
+}
+
 /// Build a JS string value from `prefix[0..prefix_len]`, box it, and append
 /// it to `keys` if `only_enumerable == 0` or the slot's enumerable bit is
 /// set. Returns the (possibly extended) array either way.

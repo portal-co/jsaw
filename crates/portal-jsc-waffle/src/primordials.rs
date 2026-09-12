@@ -3034,6 +3034,233 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     /// `asUintN`'s identity for wide widths). The value coerces through
     /// `as_i64` (a raw BigInt, or a boxed one reached through a reference
     /// boundary).
+    /// A bare call to an unshadowed `Number`/`BigInt` global is a value
+    /// conversion, not a property lookup. `Number(x)` is ToNumber (extended
+    /// for the fixed-width BigInt payload); `BigInt(x)` is the integer-valued
+    /// ToBigInt — the corpus only converts integral numbers (`BigInt(len /
+    /// 65536)`), so a non-integral input truncates (a deliberate divergence
+    /// from the spec's RangeError, matching how the corpus uses it).
+    ///
+    /// Returns `None` (leaving the generic call path in charge) when the
+    /// identifier is not `Number`/`BigInt`, is shadowed, or the arity is not
+    /// exactly one argument.
+    fn try_provable_conversion_call(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        key: &Ident,
+        values: &BTreeMap<SValueId, LowerValue>,
+        args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
+    ) -> Result<Option<Vec<(Block, LowerValue)>>, ConvertError> {
+        // Only `Number`/`BigInt` are conversion intrinsics, and only when the
+        // global is provably unshadowed.
+        let is_number = key.0.as_ref() == "Number";
+        let is_bigint = key.0.as_ref() == "BigInt";
+        if !is_number && !is_bigint {
+            return Ok(None);
+        }
+        if self.shadowed_names.contains(key) {
+            return Ok(None);
+        }
+        if args.len() != 1 || args.iter().any(|a| a.is_spread) {
+            return Ok(None);
+        }
+        let arg = values
+            .get(&args[0].value)
+            .ok_or_else(|| ConvertError::invalid("undefined conversion argument"))?;
+        let result = if is_number {
+            // ToNumber. Fast paths for statically-known kinds; a reference
+            // goes through the runtime helper (which now includes BigInt).
+            match arg.kind()? {
+                ValueKind::Number => self.as_f64(body, block, arg)?,
+                ValueKind::Integer | ValueKind::Boolean => {
+                    let i = self.as_i32(body, block, arg)?;
+                    body.add_op(block, Operator::F64ConvertI32S, &[i], &[Type::F64])
+                }
+                ValueKind::BigInt => {
+                    let v = self.as_i64(body, block, arg)?;
+                    body.add_op(block, Operator::F64ConvertI64S, &[v], &[Type::F64])
+                }
+                ValueKind::Reference => {
+                    let boxed = self.box_value(body, block, arg)?;
+                    let to_number = self.ensure_to_number_helper()?;
+                    body.add_op(
+                        block,
+                        Operator::Call {
+                            function_index: to_number,
+                        },
+                        &[boxed],
+                        &[Type::F64],
+                    )
+                }
+            }
+        } else {
+            // ToBigInt: a number truncates to its integer part (corpus values
+            // are always integral); a BigInt passes through unchanged.
+            match arg.kind()? {
+                ValueKind::BigInt => self.as_i64(body, block, arg)?,
+                ValueKind::Number => {
+                    let f = self.as_f64(body, block, arg)?;
+                    body.add_op(block, Operator::I64TruncF64S, &[f], &[Type::I64])
+                }
+                ValueKind::Integer | ValueKind::Boolean => {
+                    let i = self.as_i32(body, block, arg)?;
+                    body.add_op(block, Operator::I64ExtendI32S, &[i], &[Type::I64])
+                }
+                ValueKind::Reference => {
+                    // A boxed number or boxed BigInt.
+                    let boxed = self.box_value(body, block, arg)?;
+                    let to_bigint = self.ensure_to_bigint_helper()?;
+                    body.add_op(
+                        block,
+                        Operator::Call {
+                            function_index: to_bigint,
+                        },
+                        &[boxed],
+                        &[Type::I64],
+                    )
+                }
+            }
+        };
+        let kind = if is_number {
+            ValueKind::Number
+        } else {
+            ValueKind::BigInt
+        };
+        Ok(Some(vec![(
+            block,
+            LowerValue::Wasm {
+                value: result,
+                kind,
+            },
+        )]))
+    }
+
+    /// Runtime `ToBigInt` for a boxed value: a number struct truncates to its
+    /// integer part, a bigint struct unboxes, anything else is a TypeError
+    /// (lowered as a trap — the corpus never triggers it).
+    fn ensure_to_bigint_helper(&mut self) -> Result<Func, ConvertError> {
+        if let Some(func) = self.to_bigint_helper {
+            return Ok(func);
+        }
+        let sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.value],
+            returns: vec![Type::I64],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, sig);
+        let entry = body.entry;
+        let value = body.blocks[entry].params[0].1;
+
+        let is_bigint = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.bigint_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let bigint_hit = body.add_block();
+        let not_bigint = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: is_bigint,
+                if_true: BlockTarget {
+                    block: bigint_hit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: not_bigint,
+                    args: vec![],
+                },
+            },
+        );
+        let bigint_struct = body.add_op(
+            bigint_hit,
+            Operator::RefCast {
+                ty: self.repr.bigint_non_null_ty(),
+            },
+            &[value],
+            &[self.repr.bigint_non_null_ty()],
+        );
+        let payload = body.add_op(
+            bigint_hit,
+            Operator::StructGet {
+                sig: self.repr.bigint,
+                idx: 0,
+            },
+            &[bigint_struct],
+            &[Type::I64],
+        );
+        body.set_terminator(
+            bigint_hit,
+            Terminator::Return {
+                values: vec![payload],
+            },
+        );
+
+        // Number: truncate to the integer part.
+        let is_number = body.add_op(
+            not_bigint,
+            Operator::RefTest {
+                ty: self.repr.number_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let number_hit = body.add_block();
+        let other = body.add_block();
+        body.set_terminator(
+            not_bigint,
+            Terminator::CondBr {
+                cond: is_number,
+                if_true: BlockTarget {
+                    block: number_hit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: other,
+                    args: vec![],
+                },
+            },
+        );
+        let number_struct = body.add_op(
+            number_hit,
+            Operator::RefCast {
+                ty: self.repr.number_non_null_ty(),
+            },
+            &[value],
+            &[self.repr.number_non_null_ty()],
+        );
+        let number = body.add_op(
+            number_hit,
+            Operator::StructGet {
+                sig: self.repr.number,
+                idx: 0,
+            },
+            &[number_struct],
+            &[Type::F64],
+        );
+        let truncated = body.add_op(number_hit, Operator::I64TruncF64S, &[number], &[Type::I64]);
+        body.set_terminator(
+            number_hit,
+            Terminator::Return {
+                values: vec![truncated],
+            },
+        );
+        // Any other type is a TypeError; the corpus never reaches it.
+        body.set_terminator(other, Terminator::Unreachable);
+
+        let func = self.module.funcs.push(FuncDecl::Body(
+            sig,
+            format!("js_to_bigint_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.to_bigint_helper = Some(func);
+        Ok(func)
+    }
+
     fn bigint_as_n_call(
         &mut self,
         body: &mut FunctionBody,
@@ -3379,6 +3606,33 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         if !self.primordial_is_provable(name) {
             return Ok(None);
         }
+        // `new Error(message)` — the corpus throws these in its sig-mismatch
+        // guards. There is no Error prototype to model, so produce a plain
+        // object carrying the message; the throw path traps regardless, so
+        // the exact shape does not matter beyond being a valid object.
+        if name.0.as_ref() == "Error" {
+            let object = self.new_object(body, block)?;
+            let mut result_blocks = vec![block];
+            if let Some(message_arg) = args.first() {
+                let message = values
+                    .get(message_arg)
+                    .cloned()
+                    .ok_or_else(|| ConvertError::invalid("undefined Error message"))?;
+                for object_block in result_blocks.clone() {
+                    let done = self.set_property_value(
+                        body,
+                        object_block,
+                        &object,
+                        "message",
+                        &message,
+                    )?;
+                    result_blocks = done;
+                }
+            }
+            // All set-property continuations produce the same object.
+            let result_block = result_blocks[0];
+            return Ok(Some((result_block, object)));
+        }
         let Some(kind) = TypedArrayKind::from_name(&name.0) else {
             return Ok(None);
         };
@@ -3420,7 +3674,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
 /// provably-unshadowed namespace with a statically-known member name.
 pub(crate) fn static_primordial_tag_namespace(name: &str) -> Option<()> {
     match name {
-        "Math" | "Array" | "Reflect" | "Object" | "BigInt" => Some(()),
+        "Math" | "Array" | "Reflect" | "Object" | "BigInt" | "DataView" => Some(()),
         "Int8Array" | "Uint8Array" | "Uint8ClampedArray" | "Int16Array" | "Uint16Array"
         | "Int32Array" | "Uint32Array" | "Float32Array" | "Float64Array" => Some(()),
         _ => None,

@@ -4084,3 +4084,98 @@ fn m17_dataview_large_offset() {
     validate(&module);
     assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
 }
+
+
+// ── Module top-level evaluation (Milestone 18 foundation) ────────────────
+
+#[test]
+fn toplevel_let_state_persists() {
+    // A module top-level `let` binding initializes and persists.
+    let module = compile_module(
+        "
+            let counter = 10;
+            export function run() {
+                counter = counter + 1;
+                return counter;
+            }
+        ",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 11.0);
+}
+
+#[test]
+fn toplevel_sibling_function_call() {
+    // A top-level function declaration called from an exported function.
+    let module = compile_module(
+        "export function run() { return helper() * 10; } function helper() { return 5; }",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 50.0);
+}
+
+#[test]
+fn toplevel_sibling_let_function_call() {
+    let module = compile_module(
+        "export function run() { return helper() * 10; } let helper = function() { return 5; };",
+    );
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 50.0);
+}
+
+#[test]
+fn toplevel_cross_module_state() {
+    // A non-entry module's top-level `let` state persists across calls
+    // within one entry activation (the shared threaded context).
+    let fixtures: Fixture<'_> = &[
+        (
+            "lib.js",
+            "let state = 0; export function inc() { state = state + 1; return state; }",
+        ),
+        (
+            "main.mjs",
+            "import { inc } from './lib.js'; export function run() { inc(); inc(); return inc(); }",
+        ),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 3.0);
+}
+
+#[test]
+fn toplevel_glue_internal_helper_call() {
+    // A non-entry module's exported function calling a same-module internal
+    // helper resolves (the glue's top-level declarations are installed).
+    let fixtures: Fixture<'_> = &[
+        (
+            "lib.js",
+            "function helper() { return 5; } export function useHelper() { return helper() * 10; }",
+        ),
+        (
+            "main.mjs",
+            "import { useHelper } from './lib.js'; export function run() { return useHelper(); }",
+        ),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 50.0);
+}
+
+#[test]
+fn toplevel_cross_module_shared_object_state() {
+    // Two exported functions of a non-entry module share one top-level
+    // object across calls within the entry activation.
+    let fixtures: Fixture<'_> = &[
+        (
+            "lib.js",
+            "let box = { n: 0 }; export function bump() { box.n = box.n + 1; } export function read() { return box.n; }",
+        ),
+        (
+            "main.mjs",
+            "import { bump, read } from './lib.js'; export function run() { bump(); bump(); bump(); return read(); }",
+        ),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[], 3.0);
+}

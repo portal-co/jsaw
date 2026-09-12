@@ -142,6 +142,87 @@ fn ensure_context_builder(&mut self) -> Result<Func, ConvertError> {
     Ok(func)
 }
 
+/// Build the shared lexical context for one module-set activation: the
+/// primordial context plus, run with it, every module's top-level body.
+///
+/// Each module's top-level body (its hoisted function declarations, its
+/// `let`/`var` initializers, and its top-level executable statements such
+/// as the `Object.defineProperty($N, '__sig', …)` the blitz-js corpus
+/// emits) is lowered as an ordinary function; running it with the shared
+/// context installs those bindings as context properties, so a top-level
+/// sibling call (`function helper(){}` referenced from an exported
+/// function) or a module-level `let state` resolves instead of reading a
+/// never-written slot. All module bodies share the one context, so state a
+/// non-entry module (the WASI glue) installs is visible to its exported
+/// functions no matter which call site threads the context.
+///
+/// The init runs once per export activation (the context is built fresh
+/// per export call), which matches the WASI single-`_start` model: module
+/// state is freshly initialized for the one activation that uses it.
+fn ensure_module_init(&mut self) -> Result<Func, ConvertError> {
+    if let Some(func) = self.module_init {
+        return Ok(func);
+    }
+    let sig = self.module.signatures.push(SignatureData::Func {
+        params: vec![],
+        returns: vec![self.repr.object_ty()],
+        shared: false,
+    });
+    let mut body = FunctionBody::new(self.module, sig);
+    let block = body.entry;
+    let context_builder = self.ensure_context_builder()?;
+    let context = body.add_op(
+        block,
+        Operator::Call {
+            function_index: context_builder,
+        },
+        &[],
+        &[self.repr.object_ty()],
+    );
+    let this = body.add_op(
+        block,
+        Operator::RefNull {
+            ty: self.repr.value,
+        },
+        &[],
+        &[self.repr.value],
+    );
+    let empty_args = body.add_op(
+        block,
+        Operator::ArrayNewFixed {
+            sig: self.repr.arguments,
+            num: 0,
+        },
+        &[],
+        &[self.repr.arguments_ty()],
+    );
+    for adapter in self.module_init_bodies.clone() {
+        // Run the module body for its side effects (context stores); the
+        // undefined return is discarded.
+        body.add_op(
+            block,
+            Operator::Call {
+                function_index: adapter,
+            },
+            &[context, this, empty_args],
+            &[self.repr.value],
+        );
+    }
+    body.set_terminator(
+        block,
+        Terminator::Return {
+            values: vec![context],
+        },
+    );
+    let func = self.module.funcs.push(FuncDecl::Body(
+        sig,
+        "js_module_init".to_string(),
+        body,
+    ));
+    self.module_init = Some(func);
+    Ok(func)
+}
+
 /// Declare and fully build a Wasm function with the adapter ABI
 /// `(context, this, args) -> value`. `build` receives the entry block and
 /// the three ABI parameters and is responsible for terminating every block

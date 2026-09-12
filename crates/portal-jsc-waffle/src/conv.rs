@@ -41,6 +41,8 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
         to_string_helper: None,
         native_function_cache: BTreeMap::new(),
         context_builder: None,
+        module_init: None,
+        module_init_bodies: Vec::new(),
         arguments_push_helper: None,
         arguments_concat_helper: None,
         trie_enumerate_helper: None,
@@ -203,6 +205,8 @@ pub fn convert_modules<'a, 'wasm>(
         to_string_helper: None,
         native_function_cache: BTreeMap::new(),
         context_builder: None,
+        module_init: None,
+        module_init_bodies: Vec::new(),
         arguments_push_helper: None,
         arguments_concat_helper: None,
         trie_enumerate_helper: None,
@@ -232,6 +236,25 @@ pub fn convert_modules<'a, 'wasm>(
     let entry_module = set.get(entry)?;
     converter.collect_shapes(&entry_module.body)?;
     converter.collect_shadowed_names(&entry_module.body, &mut BTreeSet::new());
+    // Lower every module's top-level body so `ensure_module_init` can run
+    // them with the shared context, installing hoisted declarations and
+    // top-level `let`/`var` bindings. Imported (non-entry) modules first,
+    // then the entry, mirroring ES dependency-before-importer evaluation.
+    let mut init_order: Vec<String> = set
+        .keys()
+        .filter(|path| path.as_str() != entry)
+        .cloned()
+        .collect();
+    init_order.push(entry.to_owned());
+    for path in &init_order {
+        let module = set.get(path)?;
+        // The entry body's shapes were already collected above.
+        if path.as_str() != entry {
+            converter.collect_shapes(&module.body)?;
+        }
+        let info = converter.ensure_function(&module.body, path)?;
+        converter.module_init_bodies.push(info.adapter);
+    }
     let mut exports = Vec::with_capacity(exported.len());
     for (name, function) in exported {
         converter.collect_shapes(function)?;
@@ -747,6 +770,17 @@ struct Converter<'a, 'module, 'wasm> {
     /// allocates a fresh context at runtime — this only shares the
     /// generated *code*, not the runtime value).
     context_builder: Option<Func>,
+    /// `js_module_init`'s body, hoisted into its own function so every
+    /// export emits one `call`. It builds the primordial context and then
+    /// runs every module's top-level body with it, installing the hoisted
+    /// function declarations and top-level `let`/`var` bindings so sibling
+    /// calls and module-level state resolve. See `ensure_module_init`.
+    module_init: Option<Func>,
+    /// The adapter [`Func`] of every module's top-level body, in evaluation
+    /// order (imported modules before the entry). Populated by
+    /// `convert_modules` before `lower_all`; `ensure_module_init` emits a
+    /// call to each.
+    module_init_bodies: Vec<Func>,
     /// Appends a value to a growable `arguments`-typed array, reallocating
     /// when full. See `enumerate.rs`.
     arguments_push_helper: Option<Func>,
@@ -1658,11 +1692,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         // lexical context, pre-populated with the primordial globals
         // (`Math`, `Array`, ...). Top-level values and re-exports are not
         // part of this function-only export surface yet.
-        let context_builder = self.ensure_context_builder()?;
+        // The shared context is the module-initialized one: primordials
+        // plus every module's top-level bindings, so the export (and the
+        // functions it reaches) resolve sibling and module-level names.
+        let module_init = self.ensure_module_init()?;
         let context = body.add_op(
             block,
             Operator::Call {
-                function_index: context_builder,
+                function_index: module_init,
             },
             &[],
             &[self.repr.object_ty()],

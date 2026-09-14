@@ -241,12 +241,13 @@ The source is compiled as a closed JS module set by
 linked, and lowered through jsaw after the shared module-top-level context
 work. The JVM emitter now has a conservative method-splitting path for large,
 straight-line function prefixes: a generated mutable frame carries every
-Wasm local across small private helper methods. It is deliberately limited to
-functions whose remaining top-level body has an explicit value return; general
-CFG exits (`break`-terminated bodies and tail-call protocol bodies) still need
+Wasm local across small private helper methods. A terminal structured suffix
+(including conditionals whose arms both return) is also emitted in a helper:
+source returns store the result in the frame and signal the public wrapper to
+return it. `break`-terminated bodies and tail-call protocol bodies still need
 a continuation-aware splitter before the entire glue module compiles on the
 JVM. The full 64 KiB blocker therefore remains open, but the splitting seam
-and a JVM execution regression are now in place.
+now covers terminal conditional CFG exits and has JVM execution regressions.
 
 The observed WasmGC cast failure was rooted in computed keys that crossed a
 function/property boundary: a numeric key became a boxed `Number` `anyref`,

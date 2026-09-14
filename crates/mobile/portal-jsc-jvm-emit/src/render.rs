@@ -55,6 +55,8 @@ pub struct Renderer<'m> {
     /// Optional mutable frame variable used when a large Java method is split
     /// into helpers. Every Wasm local then resolves through this object.
     frame: Option<String>,
+    /// A split helper records (rather than directly executes) a source return.
+    split_return: bool,
 }
 
 impl<'m> Renderer<'m> {
@@ -70,6 +72,7 @@ impl<'m> Renderer<'m> {
             rets: Vec::new(),
             temp_counter: 0,
             frame: None,
+            split_return: false,
         }
     }
 
@@ -91,9 +94,11 @@ impl<'m> Renderer<'m> {
         self.needs_step = false;
         self.has_self_tail = false;
         self.frame = Some(frame.to_owned());
+        self.split_return = true;
         let mut out = String::new();
         self.render_seq(stmts, &mut out, 1)?;
         self.frame = None;
+        self.split_return = false;
         Ok(out)
     }
 
@@ -300,6 +305,20 @@ impl<'m> Renderer<'m> {
             }
             SStmt::Continue { label } => {
                 let _ = writeln!(out, "{pad}continue {};", names::label_name(*label));
+            }
+            SStmt::Return { value } if self.split_return => {
+                let frame = self.frame.as_deref().expect("split return has a frame");
+                match value {
+                    Some(value) => {
+                        let value = self.coerce(value, self.rets[0])?;
+                        let _ = writeln!(out, "{pad}{frame}.result = {value};");
+                    }
+                    None => {
+                        let _ = writeln!(out, "{pad}{frame}.result = null;");
+                    }
+                }
+                let _ = writeln!(out, "{pad}{frame}.control = 1;");
+                let _ = writeln!(out, "{pad}return;");
             }
             SStmt::Return { value } => match (value, self.needs_step) {
                 (Some(v), false) => {

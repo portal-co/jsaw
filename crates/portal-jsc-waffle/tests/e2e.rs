@@ -4197,6 +4197,19 @@ fn m18_wasi_glue_module_lowers() {
 
 
 #[test]
+fn jvm_emitter_splits_terminal_conditional_cfg() {
+    let mut source = String::from("export function run(flag){");
+    for i in 0..100 {
+        source.push_str(&format!("let x{i}={i};"));
+    }
+    source.push_str("if(flag){return x42;}else{return x7;}}");
+    let module = compile_module(&source);
+    validate(&module);
+    assert_eq!(execute_in_jvm(&module, "run", &[1.0]), 42.0);
+    assert_eq!(execute_in_jvm(&module, "run", &[0.0]), 7.0);
+}
+
+#[test]
 fn m18_debug_imported_glue_stdin_element_is_numeric() {
     let fixture = "import { __wasi_set_stdin, __wasi_debug_stdin_first } from './wasi.js'; export function run() { __wasi_set_stdin([42]); return __wasi_debug_stdin_first(); }";
     let fixtures: Fixture<'_> = &[("wasi.js", WASI_JS), ("main.mjs", fixture)];

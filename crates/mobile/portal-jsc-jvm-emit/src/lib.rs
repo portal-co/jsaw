@@ -344,15 +344,26 @@ impl<'m> Emitter<'m> {
         }
     }
 
-    /// Splitting across a structured branch would change branch targets. The
-    /// current splitter deliberately handles only a long top-level run of
-    /// local assignments/effects, which is the shape emitted for the large
-    /// DataView accessor bodies used by the WASI glue.
+    /// A helper may take a long top-level run of local assignments/effects.
+    /// The final helper owns the remaining structured CFG, keeping its labels
+    /// local while a shared frame transports source-level returns back to the
+    /// public method.
     fn split_prefix_len(stmts: &[SStmt]) -> usize {
         stmts
             .iter()
             .take_while(|stmt| matches!(stmt, SStmt::Assign { .. } | SStmt::Effect { .. }))
             .count()
+    }
+
+    fn frame_return(ret: &str) -> String {
+        match ret {
+            "void" => "return;".to_owned(),
+            "int" => "return (Integer) frame.result;".to_owned(),
+            "long" => "return (Long) frame.result;".to_owned(),
+            "float" => "return (Float) frame.result;".to_owned(),
+            "double" => "return (Double) frame.result;".to_owned(),
+            other => format!("return ({other}) frame.result;"),
+        }
     }
 
     fn emit_split_body(
@@ -361,6 +372,7 @@ impl<'m> Emitter<'m> {
         renderer: &mut render::Renderer<'_>,
         func: portal_pc_waffle::Func,
         sfunc: &portal_jsc_mob_emit::sir::SFunc,
+        ret: &str,
     ) -> anyhow::Result<String> {
         const CHUNK: usize = 48;
         let prefix = Self::split_prefix_len(&sfunc.body);
@@ -369,7 +381,7 @@ impl<'m> Emitter<'m> {
         for (i, &ty) in sfunc.locals.iter().enumerate() {
             out.push_str(&format!("        {} l{i};\n", java_ty(self.module, ty)));
         }
-        out.push_str("    }\n");
+        out.push_str("        Object result;\n        int control;\n    }\n");
 
         let mut result = format!("    {frame} frame = new {frame}();\n");
         for i in 0..sfunc.n_params {
@@ -393,14 +405,23 @@ impl<'m> Emitter<'m> {
             start = end;
             chunk += 1;
         }
-        // The suffix stays in the public method: it may contain a return or
-        // structured branch whose target must remain in this Java method.
-        result.push_str(&renderer.render_fragment_in_frame(
+        // The final helper owns the remaining structured CFG. Labels stay
+        // local to that helper; source returns are lowered to
+        // `frame.result`/`frame.control`, while unexpected fallthrough traps
+        // at the public-method boundary.
+        let helper = format!("f{}$split{chunk}", func.index());
+        let rendered = renderer.render_fragment_in_frame(
             func,
             sfunc,
             &sfunc.body[start..],
             "frame",
-        )?);
+        )?;
+        out.push_str(&format!(
+            "\n    private static void {helper}({frame} frame) {{\n{rendered}    }}\n"
+        ));
+        result.push_str(&format!("    {helper}(frame);\n"));
+        result.push_str(&format!("    if (frame.control != 0) {}\n", Self::frame_return(ret)));
+        result.push_str("    throw new W.WasmTrap(\"split function fell through\");\n");
         Ok(result)
     }
 
@@ -437,16 +458,13 @@ impl<'m> Emitter<'m> {
             };
             let sfunc = lower::lower_body(body)?;
             let rendered = renderer.render_func(func, &sfunc)?;
-            // A frame helper returns to its caller normally, so only split
-            // functions whose final top-level terminator remains an explicit
-            // return in the public method. (Some internal CFG bodies finish
-            // by breaking from a block instead.)
+            // The final helper owns all remaining structured control flow;
+            // its frame turns source returns into a public-method return.
             let split = !rendered.needs_step
                 && !rendered.has_self_tail
-                && matches!(sfunc.body.last(), Some(SStmt::Return { value: Some(_) }))
                 && Self::split_prefix_len(&sfunc.body) >= 48;
             let body = if split {
-                self.emit_split_body(&mut out, &mut renderer, func, &sfunc)?
+                self.emit_split_body(&mut out, &mut renderer, func, &sfunc, &ret)?
             } else {
                 rendered.body_src.clone()
             };

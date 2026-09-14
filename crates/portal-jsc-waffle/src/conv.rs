@@ -2276,6 +2276,31 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 } else {
                     self.function_literal_locals.get(&key).copied()
                 };
+                // Imports are lexical bindings, not context properties. In
+                // particular no module body stores the importing local name
+                // into the shared context. Looking it up first therefore
+                // manufactures `undefined` (and could run the generic
+                // accessor path) before throwing the value away to mint the
+                // statically resolved target below. Resolve it directly.
+                if let Some(target) = self
+                    .import_tables
+                    .get(&self.current_module)
+                    .and_then(|table| table.get(id))
+                    .cloned()
+                {
+                    let info = self.ensure_function(target.function, &target.module)?;
+                    let value = self.function_object_from_info(
+                        body,
+                        block,
+                        context,
+                        this.clone(),
+                        info,
+                        false, // a hoisted declaration is never an arrow
+                        true,  // an import binding cannot be rebound
+                    )?;
+                    return Ok(vec![(block, value)]);
+                }
+
                 let mut results = Vec::new();
                 for (block, value) in self.get_property(body, block, context, &key.0)? {
                     let (value, _) = value.wasm()?;
@@ -2294,30 +2319,6 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                             // first call and re-entry sees the same object.
                             fresh: is_self_name,
                         }
-                    } else if self
-                        .import_tables
-                        .get(&self.current_module)
-                        .is_some_and(|table| table.contains_key(id))
-                    {
-                        // An import binding resolves once, at link time, and
-                        // can never be rebound: its origin is statically
-                        // proven, so call sites (including tail position)
-                        // may dispatch with no tag check. Minting per load
-                        // diverges from ESM object identity across separate
-                        // loads within one activation; acceptable while
-                        // module top-level state (a shared per-module
-                        // context) does not exist yet.
-                        let target = self.import_tables[&self.current_module][id].clone();
-                        let info = self.ensure_function(target.function, &target.module)?;
-                        self.function_object_from_info(
-                            body,
-                            block,
-                            context,
-                            this.clone(),
-                            info,
-                            false, // a hoisted declaration is never an arrow
-                            true,  // proven origin: the binding cannot be rebound
-                        )?
                     } else {
                         LowerValue::ReferenceKey { value, key: key.clone() }
                     };
@@ -11612,6 +11613,36 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 for (block, value) in results {
                     let converted =
                         self.convert_returned_value(body, block, &value, self.current_return_kinds)?;
+                    body.set_terminator(
+                        block,
+                        Terminator::Return {
+                            values: vec![converted],
+                        },
+                    );
+                }
+                return Ok(Some(()));
+            }
+        }
+        // Bare `Number(x)` / `BigInt(x)` conversion calls are also valid in
+        // tail position.  The ordinary item lowering recognizes these before
+        // generic callable dispatch, but this tail path previously skipped
+        // that hook and tried to call the unmaterialized global as a function
+        // (a null-reference trap).  This showed up first through imported
+        // functions because the small reproducer returned `Number(x[0])`.
+        if let TCallee::Val(value) = callee
+            && let Some(LowerValue::ReferenceKey { key, .. }) = values.get(value)
+        {
+            let key = key.clone();
+            if let Some(results) =
+                self.try_provable_conversion_call(body, block, &key, values, args)?
+            {
+                for (block, value) in results {
+                    let converted = self.convert_returned_value(
+                        body,
+                        block,
+                        &value,
+                        self.current_return_kinds,
+                    )?;
                     body.set_terminator(
                         block,
                         Terminator::Return {

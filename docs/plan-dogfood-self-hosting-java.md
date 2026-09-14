@@ -226,6 +226,30 @@ stdin/stdout contract matching `JsawRunner`'s manifest protocol. Tests: a
 JS fixture that does `fd_write`/`fd_read` against the glue and round-trips
 bytes, compiled through Stages C→D and run on the JVM.
 
+### Milestone 18 — as-built foundation
+
+`wasi.js` now provides the hand-written `wasi_snapshot_preview1` module with
+all 16 imports inventoried in Milestone 15 plus host hooks for binding the
+owner's `Uint8Array` memory, feeding stdin/argv, reading stdout/stderr, and
+observing `proc_exit`. It uses `DataView` for preview1 ABI structures and
+returns the blitz-js-compatible one-element BigInt errno array (or `[]` for
+`proc_exit`). The module intentionally keeps mutable state in top-level
+arrays and primitive bindings, matching jsaw's cross-function state model.
+
+The source is compiled as a closed JS module set by
+`m18_wasi_glue_module_lowers`. This verifies its full surface can be parsed,
+linked, and lowered through jsaw after the shared module-top-level context
+work. A direct byte-roundtrip execution test is deferred: lowering the whole
+WASI module currently creates JVM methods larger than the 64 KiB bytecode
+limit, and an observed WasmGC cast failure remains when an imported glue
+function receives a `Uint8Array` passed through its host hook. These are
+M19-scale runtime/code-size blockers, not silently treated as working glue.
+
+Current filesystem calls expose the correct preview1 import ABI and errno
+behavior but return `ENOENT` until the M19 manifest-backed `/src` and `/out`
+file table is attached. This keeps the artifact honest: it is suitable for
+link/lowering integration today but not yet the compiler-execution proof.
+
 ### Milestone 19 — end-to-end dogfood (Stage 1 → Stage 2)
 Drive the real `compiler.wasm` through Stages B→C→D to Java, compile it
 with `javac`, and run it on the JVM against the standard fixtures. **Stage

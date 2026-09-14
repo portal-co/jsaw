@@ -4179,3 +4179,220 @@ fn toplevel_cross_module_shared_object_state() {
     validate(&module);
     assert_executes_in_all_runtimes(&module, "run", &[], 3.0);
 }
+
+// ── Milestone 18: hand-written WASI glue ───────────────────────────────────
+const WASI_JS: &str = include_str!("../../../wasi.js");
+
+#[test]
+fn m18_wasi_glue_module_lowers() {
+    let fixtures: Fixture<'_> = &[("wasi.js", WASI_JS)];
+    let module = compile_modules(fixtures, "wasi.js");
+    // All glue functions are lowered as ordinary JS functions, so this also
+    // exercises top-level shared-state installation and cross-module closure
+    // capture without the JVM's known 64-KiB giant-method limitation.
+    assert!(module.funcs.len() > 20);
+}
+
+
+#[test]
+fn m18_debug_imported_glue_stdin_element_is_numeric() {
+    let fixture = "import { __wasi_set_stdin, __wasi_debug_stdin_first } from './wasi.js'; export function run() { __wasi_set_stdin([42]); return __wasi_debug_stdin_first(); }";
+    let fixtures: Fixture<'_> = &[("wasi.js", WASI_JS), ("main.mjs", fixture)];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
+}
+
+#[test]
+fn m18_debug_imported_glue_dataview_literal_write() {
+    let fixture = "import { __wasi_bind_memory, __wasi_debug_write_literal } from './wasi.js'; export function run() { let mem = new Uint8Array(128); __wasi_bind_memory(mem); __wasi_debug_write_literal(); return mem[32]; }";
+    let fixtures: Fixture<'_> = &[("wasi.js", WASI_JS), ("main.mjs", fixture)];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
+}
+
+
+#[test]
+fn m18_debug_cross_module_array_parameter_state() {
+    let fixtures: Fixture<'_> = &[
+        ("lib.js", "let state=[[]]; export function set(x){state[0]=x;} export function get(){return Number(state[0][0]);}"),
+        ("main.mjs", "import {set,get} from './lib.js'; export function run(){set([42]);return get();}"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
+}
+
+#[test]
+fn m18_debug_same_module_array_parameter_state() {
+    let module = compile_module("let state=[[]]; function set(x){state[0]=x;} function get(){return Number(state[0][0]);} export function run(){set([42]);return get();}");
+    validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
+}
+
+
+#[test]
+fn m18_debug_cross_module_imported_literal_return() {
+    let fixtures: Fixture<'_> = &[
+        ("lib.js", "export function answer(){return 42;}"),
+        ("main.mjs", "import {answer} from './lib.js'; export function run(){return answer();}"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
+}
+
+#[test]
+fn m18_debug_cross_module_imported_number_param() {
+    let fixtures: Fixture<'_> = &[
+        ("lib.js", "export function add1(x){return x+1;}"),
+        ("main.mjs", "import {add1} from './lib.js'; export function run(){return add1(41);}"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
+}
+
+#[test]
+fn m18_debug_cross_module_array_param_unused() {
+    let fixtures: Fixture<'_> = &[
+        ("lib.js", "export function ignore(x){return 42;}"),
+        ("main.mjs", "import {ignore} from './lib.js'; export function run(){return ignore([99]);}"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
+}
+
+#[test]
+fn m18_debug_cross_module_array_param_round_trips() {
+    let fixtures: Fixture<'_> = &[
+        ("lib.js", "export function echo(x){return x;}"),
+        ("main.mjs", "import {echo} from './lib.js'; export function run(){return Number(echo([42])[0]);}"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
+}
+
+#[test]
+fn m18_debug_cross_module_callee_local_array() {
+    let fixtures: Fixture<'_> = &[
+        ("lib.js", "export function head(){let x=[42];return Number(x[0]);}"),
+        ("main.mjs", "import {head} from './lib.js'; export function run(){return head();}"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    let bytes = wasm_bytes(&module);
+    std::fs::write("/tmp/m18-cross-module-local-array.wasm", &bytes).unwrap();
+    assert_eq!(execute_in_wasmtime(&bytes, "run", &[]), 42.0);
+}
+
+#[test]
+fn m18_debug_cross_module_primitive_toplevel_state() {
+    let fixtures: Fixture<'_> = &[
+        ("lib.js", "let state=42; export function get(){return state;}"),
+        ("main.mjs", "import {get} from './lib.js'; export function run(){return get();}"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
+}
+
+#[test]
+fn m18_debug_cross_module_number_global() {
+    let fixtures: Fixture<'_> = &[
+        ("lib.js", "export function f(){return Number(42);}"),
+        ("main.mjs", "import {f} from './lib.js'; export function run(){return f();}"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
+}
+
+#[test]
+fn m18_debug_cross_module_number_of_element() {
+    let fixtures: Fixture<'_> = &[
+        ("lib.js", "export function f(){let x=[42];return Number(x[0]);}"),
+        ("main.mjs", "import {f} from './lib.js'; export function run(){return f();}"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
+}
+
+#[test]
+fn m18_debug_cross_module_callee_local_array_read_unused() {
+    let fixtures: Fixture<'_> = &[
+        ("lib.js", "export function f(){let x=[42];x[0];return 42;}"),
+        ("main.mjs", "import {f} from './lib.js'; export function run(){return f();}"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
+}
+
+#[test]
+fn m18_debug_cross_module_callee_local_array_raw_element() {
+    let fixtures: Fixture<'_> = &[
+        ("lib.js", "export function f(){let x=[42];return x[0];}"),
+        ("main.mjs", "import {f} from './lib.js'; export function run(){return f();}"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
+}
+
+#[test]
+fn m18_debug_cross_module_callee_returns_array_unused() {
+    let fixtures: Fixture<'_> = &[
+        ("lib.js", "export function make(){return [42];}"),
+        ("main.mjs", "import {make} from './lib.js'; export function run(){make();return 42;}"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
+}
+
+#[test]
+fn m18_debug_cross_module_callee_returns_array_consumed() {
+    let fixtures: Fixture<'_> = &[
+        ("lib.js", "export function make(){return [42];}"),
+        ("main.mjs", "import {make} from './lib.js'; export function run(){return Number(make()[0]);}"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
+}
+
+#[test]
+fn m18_debug_cross_module_array_param_return_constant() {
+    let fixtures: Fixture<'_> = &[
+        ("lib.js", "export function f(x){x[0];return 42;}"),
+        ("main.mjs", "import {f} from './lib.js'; export function run(){return f([42]);}"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
+}
+
+#[test]
+fn m18_debug_cross_module_imported_array_param() {
+    let fixtures: Fixture<'_> = &[
+        ("lib.js", "export function head(x){return Number(x[0]);}"),
+        ("main.mjs", "import {head} from './lib.js'; export function run(){return head([42]);}"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs"); validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]),42.0);
+}
+
+#[test]
+fn m18_debug_cross_module_state_no_param() {
+    let fixtures: Fixture<'_> = &[
+        ("lib.js", "let state=[[42]]; export function get(){return Number(state[0][0]);}"),
+        ("main.mjs", "import {get} from './lib.js'; export function run(){return get();}"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs"); validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]),42.0);
+}

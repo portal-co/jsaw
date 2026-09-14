@@ -39,14 +39,20 @@ for item in parsed_module_items {
 let module: SModule = builder.finish()?;
 ```
 
-Its interface has only `new`, `append`, and `finish`:
+Its interface has only `new`, `append`, `take_functions`, and `finish`:
 
 - `append` accepts one parsed `ModuleItem`, lets the CFG builder classify its
   imports/exports/top-level statements, recognizes both exported and ordinary
   module-scope `function` declarations as hoisted functions, drains them, and
   immediately lowers each through TAC to SSA.
+- `take_functions` is the destructive streaming option: after each `append`,
+  a dependent can take complete `SFunc`s and compile or serialize them before
+  parsing the next item. A consumer which takes functions owns its linking and
+  module-init representation; it cannot subsequently expect `finish` to
+  recreate an equivalent whole `SModule`.
 - `finish` lowers the remaining top-level body and reconstructs the ordinary
-  module-init stores which install hoisted functions in the shared context.
+  module-init stores which install hoisted functions in the shared context
+  when functions have not been taken.
 - The resulting `SModule` has the existing imports, exports, functions, and
   body representation. `ModuleSet`, linker, and WasmGC lowering callers do not
   need a second linking interface.
@@ -91,7 +97,11 @@ until they do.
 ### Phase 1 — incremental hoisted-function lowering (implemented)
 
 - Add `CfgModuleBuilder::take_functions`.
-- Add `SModuleBuilder`, which lowers drained functions immediately.
+- Add `SModuleBuilder`, which lowers drained functions immediately, plus its
+  destructive `take_functions` option for dependents that compile each SSA
+  function immediately. jsaw deliberately does not opt in yet: its
+  cross-module linker still needs a complete `SModule`; a streaming dependent
+  with its own linker gets the larger memory reduction.
 - Add `parse_module_source_lazy` and `module_set_from_sources_lazy` in
   `portal-jsc-waffle`.
 - Keep `parse_module_source` and `module_set_from_sources` unchanged.

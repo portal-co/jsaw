@@ -239,11 +239,22 @@ arrays and primitive bindings, matching jsaw's cross-function state model.
 The source is compiled as a closed JS module set by
 `m18_wasi_glue_module_lowers`. This verifies its full surface can be parsed,
 linked, and lowered through jsaw after the shared module-top-level context
-work. A direct byte-roundtrip execution test is deferred: lowering the whole
-WASI module currently creates JVM methods larger than the 64 KiB bytecode
-limit, and an observed WasmGC cast failure remains when an imported glue
-function receives a `Uint8Array` passed through its host hook. These are
-M19-scale runtime/code-size blockers, not silently treated as working glue.
+work. The JVM emitter now has a conservative method-splitting path for large,
+straight-line function prefixes: a generated mutable frame carries every
+Wasm local across small private helper methods. It is deliberately limited to
+functions whose remaining top-level body has an explicit value return; general
+CFG exits (`break`-terminated bodies and tail-call protocol bodies) still need
+a continuation-aware splitter before the entire glue module compiles on the
+JVM. The full 64 KiB blocker therefore remains open, but the splitting seam
+and a JVM execution regression are now in place.
+
+The observed WasmGC cast failure was rooted in computed keys that crossed a
+function/property boundary: a numeric key became a boxed `Number` `anyref`,
+yet member lowering treated every reference key as a string and attempted a
+string cast. Reference-valued keys now refine a boxed Number back to a numeric
+array index; raw growable arrays also take their own checked read path before
+the string/object fallback. The imported `fd_read` memory round-trip now
+executes under Wasmtime.
 
 Current filesystem calls expose the correct preview1 import ABI and errno
 behavior but return `ENOENT` until the M19 manifest-backed `/src` and `/out`

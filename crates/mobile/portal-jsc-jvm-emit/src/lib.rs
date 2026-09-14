@@ -14,7 +14,7 @@ pub mod render;
 use std::collections::BTreeMap;
 
 use anyhow::bail;
-use portal_jsc_mob_emit::{audit, lower, names};
+use portal_jsc_mob_emit::{audit, lower, names, sir::SStmt};
 use portal_pc_waffle::{
     EntityRef, ExportKind, FuncDecl, HeapType, Module, SignatureData, StorageType, Type,
 };
@@ -344,6 +344,66 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// Splitting across a structured branch would change branch targets. The
+    /// current splitter deliberately handles only a long top-level run of
+    /// local assignments/effects, which is the shape emitted for the large
+    /// DataView accessor bodies used by the WASI glue.
+    fn split_prefix_len(stmts: &[SStmt]) -> usize {
+        stmts
+            .iter()
+            .take_while(|stmt| matches!(stmt, SStmt::Assign { .. } | SStmt::Effect { .. }))
+            .count()
+    }
+
+    fn emit_split_body(
+        &self,
+        out: &mut String,
+        renderer: &mut render::Renderer<'_>,
+        func: portal_pc_waffle::Func,
+        sfunc: &portal_jsc_mob_emit::sir::SFunc,
+    ) -> anyhow::Result<String> {
+        const CHUNK: usize = 48;
+        let prefix = Self::split_prefix_len(&sfunc.body);
+        let frame = format!("F{}Frame", func.index());
+        out.push_str(&format!("\n    private static final class {frame} {{\n"));
+        for (i, &ty) in sfunc.locals.iter().enumerate() {
+            out.push_str(&format!("        {} l{i};\n", java_ty(self.module, ty)));
+        }
+        out.push_str("    }\n");
+
+        let mut result = format!("    {frame} frame = new {frame}();\n");
+        for i in 0..sfunc.n_params {
+            result.push_str(&format!("    frame.l{i} = l{i};\n"));
+        }
+        let mut start = 0;
+        let mut chunk = 0;
+        while prefix - start > CHUNK {
+            let end = start + CHUNK;
+            let helper = format!("f{}$split{chunk}", func.index());
+            let rendered = renderer.render_fragment_in_frame(
+                func,
+                sfunc,
+                &sfunc.body[start..end],
+                "frame",
+            )?;
+            out.push_str(&format!(
+                "\n    private static void {helper}({frame} frame) {{\n{rendered}    }}\n"
+            ));
+            result.push_str(&format!("    {helper}(frame);\n"));
+            start = end;
+            chunk += 1;
+        }
+        // The suffix stays in the public method: it may contain a return or
+        // structured branch whose target must remain in this Java method.
+        result.push_str(&renderer.render_fragment_in_frame(
+            func,
+            sfunc,
+            &sfunc.body[start..],
+            "frame",
+        )?);
+        Ok(result)
+    }
+
     fn emit_mod(&mut self) -> anyhow::Result<()> {
         let mut out = format!("package {PACKAGE};\n\npublic final class Mod {{\n    private Mod() {{}}\n");
         let tail_set = portal_jsc_mob_emit::tail::tail_callable_set(self.module);
@@ -377,7 +437,19 @@ impl<'m> Emitter<'m> {
             };
             let sfunc = lower::lower_body(body)?;
             let rendered = renderer.render_func(func, &sfunc)?;
-            let body = &rendered.body_src;
+            // A frame helper returns to its caller normally, so only split
+            // functions whose final top-level terminator remains an explicit
+            // return in the public method. (Some internal CFG bodies finish
+            // by breaking from a block instead.)
+            let split = !rendered.needs_step
+                && !rendered.has_self_tail
+                && matches!(sfunc.body.last(), Some(SStmt::Return { value: Some(_) }))
+                && Self::split_prefix_len(&sfunc.body) >= 48;
+            let body = if split {
+                self.emit_split_body(&mut out, &mut renderer, func, &sfunc)?
+            } else {
+                rendered.body_src.clone()
+            };
             // Self tail calls compile to a `continue selfTail` inside a
             // wrapping loop (locals re-initialize each iteration, matching
             // frame replacement); everything else is the plain body.
@@ -402,7 +474,7 @@ impl<'m> Emitter<'m> {
                      \x20   public static W.Step {step}({params}) {{\n{}\
                      {fell_through}\
                      \x20   }}\n",
-                    wrap_self(body)
+                    wrap_self(&body)
                 ));
                 let finish = match ret.as_str() {
                     "void" => "return;".to_string(),
@@ -433,7 +505,7 @@ impl<'m> Emitter<'m> {
                      \x20   public static {ret} {fname}({params}) {{\n{}\
                      {fell_through}\
                      \x20   }}\n",
-                    wrap_self(body)
+                    wrap_self(&body)
                 ));
             }
         }

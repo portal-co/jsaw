@@ -2447,10 +2447,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         let index = self.numeric_index(body, block, key)?;
                         self.get_numeric_member(body, block, object, index)
                     }
-                    ValueKind::BigInt | ValueKind::Reference => {
+                    ValueKind::BigInt => {
                         let key = self.dynamic_string_key(body, block, key)?;
                         self.get_string_member(body, block, object, key)
                     }
+                    ValueKind::Reference => self.get_reference_member(body, block, object, key),
                 },
             };
         }
@@ -9107,6 +9108,75 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         self.resolve_property_read(body, block, object, value)
     }
 
+    /// A computed member key read from an object/property slot is boxed at
+    /// the `anyref` boundary. Re-establish the Number case before falling
+    /// back to the existing string-key lowering. This is the cross-function
+    /// form of `state[0][state[1]]`: `state[1]` is a boxed Number even though
+    /// its source expression was numeric.
+    fn get_reference_member(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &LowerValue,
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let (value, kind) = key.wasm()?;
+        debug_assert_eq!(kind, ValueKind::Reference);
+        let is_number = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.number_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let number = body.add_block();
+        let string = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_number,
+                if_true: BlockTarget {
+                    block: number,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: string,
+                    args: vec![],
+                },
+            },
+        );
+        let number_ref = body.add_op(
+            number,
+            Operator::RefCast {
+                ty: self.repr.number_non_null_ty(),
+            },
+            &[value],
+            &[self.repr.number_non_null_ty()],
+        );
+        let number_value = body.add_op(
+            number,
+            Operator::StructGet {
+                sig: self.repr.number,
+                idx: 0,
+            },
+            &[number_ref],
+            &[Type::F64],
+        );
+        let index = self.numeric_index(
+            body,
+            number,
+            &LowerValue::Wasm {
+                value: number_value,
+                kind: ValueKind::Number,
+            },
+        )?;
+        let mut results = self.get_numeric_member(body, number, object, index)?;
+        let string_key = self.dynamic_string_key(body, string, key)?;
+        results.extend(self.get_string_member(body, string, object, string_key)?);
+        Ok(results)
+    }
+
     fn get_property_value_raw(
         &mut self,
         body: &mut FunctionBody,
@@ -9661,8 +9731,57 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         if kind != ValueKind::Reference {
             return Ok((block, self.undef(body, block)));
         }
-        let is_string = body.add_op(
+        // A value carried through a function boundary is only known as an
+        // `anyref`; it may be a raw growable JS array before it is an object
+        // or a string. Handle that representation first. Otherwise an
+        // imported function reading `state[0][state[1]]` reaches the object
+        // cast below and traps on the raw array.
+        let is_raw_array = body.add_op(
             block,
+            Operator::RefTest {
+                ty: self.repr.arguments_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let raw_array = body.add_block();
+        let non_raw = body.add_block();
+        let join = body.add_block();
+        let result = body.add_blockparam(join, self.repr.value);
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_raw_array,
+                if_true: BlockTarget {
+                    block: raw_array,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: non_raw,
+                    args: vec![],
+                },
+            },
+        );
+        let array = body.add_op(
+            raw_array,
+            Operator::RefCast {
+                ty: self.repr.arguments_ty(),
+            },
+            &[value],
+            &[self.repr.arguments_ty()],
+        );
+        let (raw_array, raw_value) = self.get_array_index(body, raw_array, array, index)?;
+        body.set_terminator(
+            raw_array,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![raw_value],
+                },
+            },
+        );
+        let is_string = body.add_op(
+            non_raw,
             Operator::RefTest {
                 ty: self.repr.string_ty(),
             },
@@ -9671,10 +9790,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         );
         let string = body.add_block();
         let non_string = body.add_block();
-        let join = body.add_block();
-        let result = body.add_blockparam(join, self.repr.value);
         body.set_terminator(
-            block,
+            non_raw,
             Terminator::CondBr {
                 cond: is_string,
                 if_true: BlockTarget {

@@ -52,6 +52,9 @@ pub struct Renderer<'m> {
     rets: Vec<Type>,
     /// Per-site temp counter for self-tail argument assignment.
     temp_counter: u32,
+    /// Optional mutable frame variable used when a large Java method is split
+    /// into helpers. Every Wasm local then resolves through this object.
+    frame: Option<String>,
 }
 
 impl<'m> Renderer<'m> {
@@ -66,6 +69,38 @@ impl<'m> Renderer<'m> {
             has_self_tail: false,
             rets: Vec::new(),
             temp_counter: 0,
+            frame: None,
+        }
+    }
+
+    /// Render a straight-line body fragment against a mutable local frame.
+    /// The splitter only passes top-level assignment/effect ranges, so no
+    /// branch label can cross the Java method boundary.
+    pub fn render_fragment_in_frame(
+        &mut self,
+        func: Func,
+        sfunc: &SFunc,
+        stmts: &[SStmt],
+        frame: &str,
+    ) -> anyhow::Result<String> {
+        self.broken_to = BTreeSet::new();
+        self.locals = sfunc.locals.clone();
+        self.current = func;
+        self.rets = sfunc.rets.clone();
+        self.temp_counter = 0;
+        self.needs_step = false;
+        self.has_self_tail = false;
+        self.frame = Some(frame.to_owned());
+        let mut out = String::new();
+        self.render_seq(stmts, &mut out, 1)?;
+        self.frame = None;
+        Ok(out)
+    }
+
+    fn local_name(&self, local: u32) -> String {
+        match &self.frame {
+            Some(frame) => format!("{frame}.{}", names::local_name(local)),
+            None => names::local_name(local),
         }
     }
 
@@ -224,7 +259,7 @@ impl<'m> Renderer<'m> {
             SStmt::Assign { local, expr } => {
                 let ty = self.locals[*local as usize];
                 let e = self.coerce(expr, ty)?;
-                let _ = writeln!(out, "{pad}{} = {};", names::local_name(*local), e);
+                let _ = writeln!(out, "{pad}{} = {};", self.local_name(*local), e);
             }
             SStmt::Effect { expr } => {
                 if let SExpr::Op { op, .. } = expr {
@@ -299,7 +334,7 @@ impl<'m> Renderer<'m> {
                         let _ = writeln!(out, "{pad}{jty} s{site}_{i} = {e};");
                     }
                     for i in 0..exprs.len() {
-                        let _ = writeln!(out, "{pad}{} = s{site}_{i};", names::local_name(i as u32));
+                        let _ = writeln!(out, "{pad}{} = s{site}_{i};", self.local_name(i as u32));
                     }
                     let _ = writeln!(out, "{pad}continue selfTail;");
                 } else if self.needs_step {
@@ -407,7 +442,7 @@ impl<'m> Renderer<'m> {
                     .get(*local as usize)
                     .map(|t| jty_of(*t))
                     .unwrap_or(JTy::Ref);
-                Ok((names::local_name(*local), jty))
+                Ok((self.local_name(*local), jty))
             }
             SExpr::Op { op, args, ty } => self.op_expr(op, args, *ty),
         }

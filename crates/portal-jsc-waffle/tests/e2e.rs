@@ -4191,6 +4191,8 @@ fn m18_wasi_glue_module_lowers() {
     // exercises top-level shared-state installation and cross-module closure
     // capture without the JVM's known 64-KiB giant-method limitation.
     assert!(module.funcs.len() > 20);
+    // Full-module JVM execution is covered after all CFG exit shapes support
+    // splitting; the lowering integration remains valuable independently.
 }
 
 
@@ -4212,6 +4214,38 @@ fn m18_debug_imported_glue_dataview_literal_write() {
     assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
 }
 
+
+#[test]
+fn jvm_emitter_splits_large_straight_line_function() {
+    let mut source = String::from("export function run(){");
+    for i in 0..100 {
+        source.push_str(&format!("let x{i}={i};"));
+    }
+    source.push_str("return x99;}");
+    let module = compile_module(&source);
+    validate(&module);
+    assert_eq!(execute_in_jvm(&module, "run", &[]), 99.0);
+}
+
+#[test]
+fn m18_imported_dynamic_array_index() {
+    let fixtures: Fixture<'_> = &[
+        ("lib.js", "let state=[[42],0]; export function read(){return state[0][state[1]];}"),
+        ("main.mjs", "import {read} from './lib.js'; export function run(){return read();}"),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
+}
+
+#[test]
+fn m18_fd_read_imported_memory_roundtrip() {
+    let fixture = "import { __wasi_bind_memory, __wasi_set_stdin, fd_read } from './wasi.js'; export function run() { let mem = new Uint8Array(64), dv = new DataView(mem.buffer); __wasi_bind_memory(mem); __wasi_set_stdin([42]); dv.setUint32(0,16,true); dv.setUint32(4,1,true); fd_read(0,0,1,8); return mem[16] + dv.getUint32(8,true); }";
+    let fixtures: Fixture<'_> = &[("wasi.js", WASI_JS), ("main.mjs", fixture)];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 43.0);
+}
 
 #[test]
 fn m18_debug_cross_module_array_parameter_state() {

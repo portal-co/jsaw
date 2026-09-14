@@ -2044,6 +2044,26 @@ fn compile_modules(fixtures: Fixture<'_>, entry: &str) -> Module<'static> {
 }
 
 #[test]
+fn lazy_module_ingestion_preserves_export_execution() {
+    let fixtures: Fixture<'_> = &[
+        ("main.mjs", "import { twice } from './lib.js'; export function run(x) { return twice(x) + 1; }"),
+        ("lib.js", "export function twice(x) { return x * 2; }"),
+    ];
+    let set = portal_jsc_waffle::module_set_from_sources_lazy(fixtures.iter().copied())
+        .expect("lazy ingestion should parse and lower the module set");
+    let mut module = Module::empty();
+    portal_jsc_waffle::convert_modules(
+        "main.mjs",
+        &set,
+        &mut module,
+        &portal_jsc_waffle::ConvertOptions::default(),
+    )
+    .expect("lazy-ingested module set should lower");
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "run", &[20.0], 41.0);
+}
+
+#[test]
 fn links_cross_module_imports_and_executes_in_all_runtimes() {
     let fixtures: Fixture<'_> = &[
         ("main.mjs", "import { add } from './lib.js'; export function run(a) { return add(a, 10); }"),

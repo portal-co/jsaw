@@ -1,4 +1,5 @@
 pub mod conv;
+pub mod coregc;
 pub mod ingest;
 pub mod linker;
 pub mod repr;
@@ -7,6 +8,10 @@ pub mod revision;
 pub use conv::{
     ComponentFunctions, ComponentHandle, ConvertOptions, IncrementalConverter, convert,
     convert_module, convert_modules,
+};
+pub use coregc::{
+    COREGC_INVENTORY_SCHEMA, CoreGcError, CoreGcInventory, CoreGcStorage, CoreGcType, CoreGcTypeId,
+    CoreGcTypeKind,
 };
 pub use ingest::{
     module_set_from_sources, module_set_from_sources_lazy, parse_module_source,

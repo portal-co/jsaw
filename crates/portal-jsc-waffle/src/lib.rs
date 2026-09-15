@@ -13,5 +13,6 @@ pub use linker::ModuleSet;
 pub use repr::ConvertError;
 pub use revision::{
     ContentRevisionId, FragmentCache, FullRevisionReason, MemoryFragmentCache, ReloadPlan,
-    ReloadProfile, RevisionCompiler, RevisionManifest, RevisionRequest,
+    ReloadProfile, RevisionArtifact, RevisionCompiler, RevisionManifest, RevisionOutput,
+    RevisionRequest,
 };

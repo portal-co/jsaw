@@ -1,23 +1,21 @@
 //! Revision planning and fragment-cache interfaces for development-mode hot
 //! code reloading.
 //!
-//! This module intentionally plans immutable revision artifacts. It does not
-//! mutate a Wasm module instance: activation is the selected runtime's job.
-//! The portable contract is a deterministic reload plan; `DispatchDelta` is a
-//! runtime-specific optimization whose payload is deliberately opaque here.
+//! This module plans immutable revision artifacts. It never mutates a running
+//! Wasm instance: activation is the selected runtime's responsibility.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use portal_jsc_swc_ssa::module::{FunctionFingerprint, source_fingerprint};
 use sha3::{Digest, Sha3_256};
 
-use crate::{ConvertError, ConvertOptions};
+use crate::{ConvertError, ConvertOptions, ModuleSet, convert_modules, module_set_from_sources};
 
 /// Version marker for serialized cache/revision records.
 pub const REVISION_SCHEMA: &str = "jsaw.revision.v1";
 
-/// A content-derived revision ID. It is safe to use as a cache namespace, but
-/// a runtime must still compare it to its active base before applying a delta.
+/// A content-derived revision ID. A runtime must verify this against its active
+/// base before applying a runtime-specific delta.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContentRevisionId(String);
 
@@ -34,8 +32,7 @@ pub enum ReloadProfile {
     /// Produce a complete artifact; the host restarts the application.
     Restart,
     /// Produce a complete immutable artifact; the runtime switches instances
-    /// between exported calls and resets state unless it has an explicit
-    /// compatible migration adapter.
+    /// between exported calls and resets state unless it owns migration.
     Reinstantiate,
     /// Request a stable-dispatch delta. This planner reports eligibility only;
     /// a runtime owns the payload and may fall back to re-instantiation.
@@ -59,9 +56,9 @@ pub struct ModuleFingerprint {
     pub fingerprint: FunctionFingerprint,
 }
 
-/// A source fragment cache. Cache implementations may evict entries or treat
-/// malformed persisted records as misses; the planner always validates the
-/// fingerprint before reporting reuse.
+/// A source-fragment cache. Cache implementations may evict entries or treat
+/// corrupt persisted records as misses; the planner validates fingerprints
+/// before reporting reuse.
 pub trait FragmentCache {
     fn get(&self, module: &str) -> Option<FunctionFingerprint>;
     fn put(&mut self, module: String, fingerprint: FunctionFingerprint);
@@ -104,9 +101,7 @@ pub struct ReloadPlan {
     pub delta_eligible: bool,
 }
 
-/// Immutable revision metadata. The complete WasmGC/Java/Swift artifacts are
-/// emitted by the existing target pipeline in the next phase; this phase
-/// establishes their cache/reload identity and safety classification.
+/// Immutable revision metadata.
 #[derive(Clone, Debug)]
 pub struct RevisionManifest {
     pub content_id: ContentRevisionId,
@@ -114,6 +109,20 @@ pub struct RevisionManifest {
     pub profile: ReloadProfile,
     pub modules: Vec<ModuleFingerprint>,
     pub reload_plan: ReloadPlan,
+}
+
+/// The complete immutable artifact for one revision. It is the portable
+/// fallback whenever the selected runtime cannot apply a delta.
+#[derive(Clone, Debug)]
+pub struct RevisionArtifact {
+    pub wasm: Vec<u8>,
+}
+
+/// Result of planning and assembling one revision.
+#[derive(Clone, Debug)]
+pub struct RevisionOutput {
+    pub revision: RevisionManifest,
+    pub artifact: RevisionArtifact,
 }
 
 /// Input to the single deep revision-planning operation.
@@ -126,8 +135,7 @@ pub struct RevisionRequest<'a> {
 }
 
 /// The HCR compiler seam. It owns deterministic source hashing, cache lookup,
-/// conservative invalidation, and content ID construction. Callers do not
-/// inspect fragment cache internals or create partial module revisions.
+/// conservative invalidation, complete-artifact assembly, and content IDs.
 pub struct RevisionCompiler<C> {
     cache: C,
     previous: Option<RevisionManifest>,
@@ -145,16 +153,17 @@ impl<C: FragmentCache> RevisionCompiler<C> {
         &self.cache
     }
 
-    /// Plan one immutable source-module revision.
+    /// Plan and assemble one immutable source-module revision.
     ///
-    /// Fingerprints are calculated before cache lookup, so an invalid source
-    /// never aliases a valid cached record. This phase is deliberately
-    /// conservative: any changed module requires a complete revision. Later
-    /// dispatch-mode lowering can loosen only proven-safe body-only edges.
+    /// Fingerprints are calculated before cache lookup, so invalid source never
+    /// aliases valid cached source. This phase is intentionally conservative:
+    /// any changed module requires complete artifact assembly. Dispatch-mode
+    /// lowering may loosen only proven-safe function-body edges in a later
+    /// phase.
     pub fn compile(
         &mut self,
         request: RevisionRequest<'_>,
-    ) -> Result<RevisionManifest, ConvertError> {
+    ) -> Result<RevisionOutput, ConvertError> {
         if !request.sources.contains_key(request.entry) {
             return Err(ConvertError::invalid(format!(
                 "entry module {:?} is not in the revision source set",
@@ -182,9 +191,8 @@ impl<C: FragmentCache> RevisionCompiler<C> {
                 reused_modules.insert(path.clone());
             } else {
                 changed_modules.insert(path.clone());
-                // This source-level phase cannot yet prove whether a change
-                // is a function body, a module surface, or top-level state.
-                // Require a complete revision instead of risking stale init.
+                // Source-level caching cannot yet prove a body-only change is
+                // independent from module init/layout. Require a full revision.
                 full_revision_reasons.insert(path.clone(), FullRevisionReason::TopLevelChanged);
             }
             self.cache.put(path.clone(), fingerprint);
@@ -219,9 +227,29 @@ impl<C: FragmentCache> RevisionCompiler<C> {
                 delta_eligible,
             },
         };
+        let artifact =
+            assemble_complete_artifact(request.entry, request.sources, &request.options)?;
         self.previous = Some(revision.clone());
-        Ok(revision)
+        Ok(RevisionOutput { revision, artifact })
     }
+}
+
+fn assemble_complete_artifact(
+    entry: &str,
+    sources: &BTreeMap<String, String>,
+    options: &ConvertOptions,
+) -> Result<RevisionArtifact, ConvertError> {
+    let pairs: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect();
+    let set: ModuleSet<'_> = module_set_from_sources(pairs)?;
+    let mut module = portal_pc_waffle::Module::empty();
+    convert_modules(entry, &set, &mut module, options)?;
+    let wasm = portal_pc_waffle::to_wasm_bytes(&module).map_err(|error| {
+        ConvertError::invalid(format!("revision Wasm emission failed: {error}"))
+    })?;
+    Ok(RevisionArtifact { wasm })
 }
 
 fn content_id(
@@ -291,12 +319,13 @@ mod tests {
         let mut compiler = RevisionCompiler::new(MemoryFragmentCache::default());
         let first = compiler.compile(request(&inputs)).expect("first revision");
         let second = compiler.compile(request(&inputs)).expect("second revision");
-        assert_eq!(first.content_id, second.content_id);
+        assert_eq!(first.revision.content_id, second.revision.content_id);
+        assert!(!first.artifact.wasm.is_empty());
         assert_eq!(
-            second.reload_plan.reused_modules,
+            second.revision.reload_plan.reused_modules,
             BTreeSet::from(["lib.js".to_owned(), "main.js".to_owned()])
         );
-        assert!(second.reload_plan.changed_modules.is_empty());
+        assert!(second.revision.reload_plan.changed_modules.is_empty());
     }
 
     #[test]
@@ -311,14 +340,18 @@ mod tests {
             .compile(request(&changed))
             .expect("changed revision");
         assert_eq!(
-            revision.reload_plan.changed_modules,
+            revision.revision.reload_plan.changed_modules,
             BTreeSet::from(["main.js".to_owned()])
         );
         assert_eq!(
-            revision.reload_plan.full_revision_reasons.get("main.js"),
+            revision
+                .revision
+                .reload_plan
+                .full_revision_reasons
+                .get("main.js"),
             Some(&FullRevisionReason::TopLevelChanged)
         );
-        assert!(!revision.reload_plan.delta_eligible);
+        assert!(!revision.revision.reload_plan.delta_eligible);
     }
 
     #[test]
@@ -333,7 +366,11 @@ mod tests {
             })
             .expect("revision planning should remain deterministic");
         assert_eq!(
-            revision.reload_plan.full_revision_reasons.get("main.js"),
+            revision
+                .revision
+                .reload_plan
+                .full_revision_reasons
+                .get("main.js"),
             Some(&FullRevisionReason::BaseRevisionUnavailable)
         );
     }

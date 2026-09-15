@@ -1,17 +1,20 @@
 //! Phase-1 coregc artifact emitter.
 //!
-//! This emits a deliberately small core-Wasm module containing the generated
-//! linear memory and a pure-Wasm bump allocator. It is not yet the full
-//! WasmGC-to-core lowering pass: that requires root frames, descriptor scanners,
-//! and rewriting every managed value. Keeping this artifact explicitly limited
-//! prevents callers from mistaking an unlowered WasmGC program for a fallback.
+//! This emits a pure core-Wasm linear-memory runtime with a bounded bump
+//! allocator and typed allocation headers. It is intentionally not yet the
+//! full WasmGC-to-core lowering pass: source functions with WasmGC operations
+//! fail closed rather than being encoded with incorrect semantics.
 
 use portal_pc_waffle::{
-    FuncDecl, FunctionBody, MemoryData, Module, Operator, SignatureData,
-    Terminator, Type,
+    BlockTarget, FuncDecl, FunctionBody, GlobalData, MemoryArg, MemoryData, Module,
+    Operator, SignatureData, Terminator, Type,
 };
 
 use crate::coregc::{CoreGcError, CoreGcInventory};
+
+/// Fixed header ABI reserved for later mark/sweep phases.
+pub const COREGC_HEADER_BYTES: u32 = 24;
+const COREGC_MAGIC_ALLOCATED: u32 = 0xC0DE_0001;
 
 /// Configuration for the phase-1 pure-Wasm runtime skeleton.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,10 +45,10 @@ pub struct CoreGcArtifact {
 
 /// Emit a core-only runtime skeleton from the typed WasmGC inventory.
 ///
-/// Phase 1 intentionally accepts only an otherwise-empty source module. The
-/// resulting artifact validates on a core engine and exposes the generated
-/// allocator for direct runtime tests. A source module with functions or WasmGC
-/// operations fails closed rather than producing semantically incorrect code.
+/// The public allocator has `(type_id, payload_bytes) -> payload_address`.
+/// `type_id == 0`, overflow, or a request beyond the fixed phase-1 heap traps.
+/// The returned pointer is eight-byte aligned and points after a header whose
+/// type ID and payload byte count can be read by later marker/validator code.
 pub fn emit_runtime_skeleton(
     source: &Module<'_>,
     options: &CoreGcOptions,
@@ -65,6 +68,21 @@ pub fn emit_runtime_skeleton(
             message: "coregc requires at least one initial memory page".to_owned(),
         });
     }
+    let initial_bytes = options
+        .initial_pages
+        .checked_mul(0x1_0000)
+        .ok_or_else(|| CoreGcError {
+            message: "coregc initial memory size overflows usize".to_owned(),
+        })?;
+    if usize::try_from(options.heap_base)
+        .ok()
+        .is_none_or(|base| base >= initial_bytes)
+    {
+        return Err(CoreGcError {
+            message: "coregc heap base must lie inside initial memory".to_owned(),
+        });
+    }
+
     let inventory = CoreGcInventory::build(source)?;
     let mut module = Module::empty();
     let memory = module.memories.push(MemoryData {
@@ -75,59 +93,155 @@ pub fn emit_runtime_skeleton(
         shared: false,
         page_size_log2: None,
     });
-
-    // `__coregc_alloc(payload_bytes) -> payload_address`: a checked bump
-    // allocator. Header layout is intentionally fixed at 24 bytes so later
-    // mark/sweep code can begin at this ABI without moving existing payloads.
+    let bump = module.globals.push(GlobalData {
+        ty: Type::I32,
+        value: Some(u64::from(options.heap_base)),
+        mutable: true,
+    });
     let signature = module.signatures.push(SignatureData::Func {
-        params: vec![Type::I32],
+        params: vec![Type::I32, Type::I32],
         returns: vec![Type::I32],
         shared: false,
     });
     let mut body = FunctionBody::new(&module, signature);
-    let block = body.entry;
-    let payload_bytes = body.blocks[block].params[0].1;
-    let heap_base = body.add_op(
-        block,
-        Operator::I32Const {
-            value: options.heap_base,
-        },
+    let entry = body.entry;
+    let type_id = body.blocks[entry].params[0].1;
+    let payload_bytes = body.blocks[entry].params[1].1;
+    let bump_value = body.add_op(
+        entry,
+        Operator::GlobalGet { global_index: bump },
         &[],
         &[Type::I32],
     );
-    let header = body.add_op(block, Operator::I32Const { value: 24 }, &[], &[Type::I32]);
+    let header = i32_const(&mut body, entry, COREGC_HEADER_BYTES);
     let total = body.add_op(
-        block,
+        entry,
         Operator::I32Add,
         &[payload_bytes, header],
         &[Type::I32],
     );
-    // Align allocation total to eight bytes: (total + 7) & ~7.
-    let seven = body.add_op(block, Operator::I32Const { value: 7 }, &[], &[Type::I32]);
-    let rounded = body.add_op(block, Operator::I32Add, &[total, seven], &[Type::I32]);
-    let alignment_mask = body.add_op(
-        block,
-        Operator::I32Const { value: !7u32 },
-        &[],
-        &[Type::I32],
-    );
-    let _aligned_total = body.add_op(
-        block,
+    let seven = i32_const(&mut body, entry, 7);
+    let rounded = body.add_op(entry, Operator::I32Add, &[total, seven], &[Type::I32]);
+    let alignment_mask = i32_const(&mut body, entry, !7u32);
+    let aligned_total = body.add_op(
+        entry,
         Operator::I32And,
         &[rounded, alignment_mask],
         &[Type::I32],
     );
-    // The phase-1 allocator returns a fixed payload base. It is deliberately
-    // not exported as a usable allocator until phase 2 adds bump state and
-    // bounds/grow behavior; returning it lets the core artifact be validated
-    // without pretending allocation semantics are complete.
-    let payload = body.add_op(block, Operator::I32Add, &[heap_base, header], &[Type::I32]);
+    let next = body.add_op(
+        entry,
+        Operator::I32Add,
+        &[bump_value, aligned_total],
+        &[Type::I32],
+    );
+    let wrapped = body.add_op(entry, Operator::I32LtU, &[next, bump_value], &[Type::I32]);
+    let pages = body.add_op(
+        entry,
+        Operator::MemorySize { mem: memory },
+        &[],
+        &[Type::I32],
+    );
+    let shift = i32_const(&mut body, entry, 16);
+    let limit = body.add_op(entry, Operator::I32Shl, &[pages, shift], &[Type::I32]);
+    let out_of_memory = body.add_op(entry, Operator::I32GtU, &[next, limit], &[Type::I32]);
+    let invalid_type = body.add_op(entry, Operator::I32Eqz, &[type_id], &[Type::I32]);
+    let bad_size = body.add_op(
+        entry,
+        Operator::I32LtU,
+        &[aligned_total, total],
+        &[Type::I32],
+    );
+    let invalid = body.add_op(
+        entry,
+        Operator::I32Or,
+        &[wrapped, out_of_memory],
+        &[Type::I32],
+    );
+    let invalid = body.add_op(
+        entry,
+        Operator::I32Or,
+        &[invalid, invalid_type],
+        &[Type::I32],
+    );
+    let invalid = body.add_op(entry, Operator::I32Or, &[invalid, bad_size], &[Type::I32]);
+    let fail = body.add_block();
+    let commit = body.add_block();
     body.set_terminator(
-        block,
+        entry,
+        Terminator::CondBr {
+            cond: invalid,
+            if_true: BlockTarget {
+                block: fail,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: commit,
+                args: vec![],
+            },
+        },
+    );
+    body.set_terminator(fail, Terminator::Unreachable);
+
+    // Header: magic, concrete type ID, payload byte count, next-allocation,
+    // next-free, reserved. Phase 2 wires list fields into mark/sweep.
+    let memory_arg = MemoryArg {
+        align: 2,
+        offset: 0,
+        memory,
+    };
+    let magic = i32_const(&mut body, commit, COREGC_MAGIC_ALLOCATED);
+    body.add_op(
+        commit,
+        Operator::I32Store { memory: memory_arg },
+        &[bump_value, magic],
+        &[],
+    );
+    body.add_op(
+        commit,
+        Operator::I32Store { memory: memory_arg },
+        &[bump_value, type_id],
+        &[],
+    );
+    body.add_op(
+        commit,
+        Operator::I32Store { memory: memory_arg },
+        &[bump_value, payload_bytes],
+        &[],
+    );
+    let zero = i32_const(&mut body, commit, 0);
+    for offset in [12_u64, 16, 20] {
+        body.add_op(
+            commit,
+            Operator::I32Store {
+                memory: MemoryArg {
+                    offset,
+                    ..memory_arg
+                },
+            },
+            &[bump_value, zero],
+            &[],
+        );
+    }
+    body.add_op(
+        commit,
+        Operator::GlobalSet { global_index: bump },
+        &[next],
+        &[],
+    );
+    let payload = body.add_op(
+        commit,
+        Operator::I32Add,
+        &[bump_value, header],
+        &[Type::I32],
+    );
+    body.set_terminator(
+        commit,
         Terminator::Return {
             values: vec![payload],
         },
     );
+
     let allocator = module.funcs.push(FuncDecl::Body(
         signature,
         "__coregc_alloc_phase1".to_owned(),
@@ -145,24 +259,68 @@ pub fn emit_runtime_skeleton(
     Ok(CoreGcArtifact { module, inventory })
 }
 
+fn i32_const(
+    body: &mut FunctionBody,
+    block: portal_pc_waffle::Block,
+    value: u32,
+) -> portal_pc_waffle::Value {
+    body.add_op(block, Operator::I32Const { value }, &[], &[Type::I32])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wasmtime::{Engine, Instance, Module as WasmtimeModule, Store, TypedFunc};
+
+    fn allocator(artifact: &CoreGcArtifact) -> (Store<()>, TypedFunc<(i32, i32), i32>) {
+        let engine = Engine::default();
+        let bytes = portal_pc_waffle::to_wasm_bytes(&artifact.module).expect("core wasm encodes");
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("artifact validates with default core features");
+        let module = WasmtimeModule::new(&engine, bytes).expect("core engine compiles artifact");
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).expect("artifact instantiates");
+        let allocator = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "__coregc_alloc_phase1")
+            .expect("allocator export");
+        (store, allocator)
+    }
 
     #[test]
     fn runtime_skeleton_is_core_wasm_without_gc_features() {
-        let source = Module::empty();
-        let artifact = emit_runtime_skeleton(&source, &CoreGcOptions::default())
+        let artifact = emit_runtime_skeleton(&Module::empty(), &CoreGcOptions::default())
             .expect("empty source accepts the phase-1 skeleton");
         for (_, function) in artifact.module.funcs.entries() {
             if let FuncDecl::Body(_, _, body) = function {
                 body.validate().expect("generated runtime IR validates");
             }
         }
-        let bytes = portal_pc_waffle::to_wasm_bytes(&artifact.module).expect("core wasm encodes");
-        wasmparser::Validator::new()
-            .validate_all(&bytes)
-            .expect("artifact validates with default core features");
+        let (mut store, allocator) = allocator(&artifact);
+        let first = allocator
+            .call(&mut store, (1, 1))
+            .expect("first allocation");
+        let second = allocator
+            .call(&mut store, (1, 8))
+            .expect("second allocation");
+        assert_eq!(
+            first,
+            0x1_0000 + i32::try_from(COREGC_HEADER_BYTES).unwrap()
+        );
+        assert_eq!(
+            second,
+            first + 32,
+            "allocation includes aligned header and payload"
+        );
+    }
+
+    #[test]
+    fn runtime_skeleton_traps_invalid_type_or_capacity_request() {
+        let artifact = emit_runtime_skeleton(&Module::empty(), &CoreGcOptions::default())
+            .expect("runtime skeleton");
+        let (mut store, allocator) = allocator(&artifact);
+        assert!(allocator.call(&mut store, (0, 8)).is_err());
+        assert!(allocator.call(&mut store, (1, i32::MAX)).is_err());
     }
 
     #[test]

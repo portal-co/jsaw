@@ -67,6 +67,7 @@ typenum = "^1.18.0"
 bitflags = "^2.8.0"
 relooper = "^0.1.0"
 cityhasher = "^0.1.0"
+sha3 = { version = "0.10.8", default-features = false }
 
 
 px-llvm-codegen-utils-core={version="^0.1.4",git="https://github.com/portal-co/llvm-codegen-utils.git"}

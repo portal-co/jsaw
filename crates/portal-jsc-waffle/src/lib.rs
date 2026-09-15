@@ -2,6 +2,7 @@ pub mod conv;
 pub mod ingest;
 pub mod linker;
 pub mod repr;
+pub mod revision;
 
 pub use conv::{ConvertOptions, convert, convert_module, convert_modules};
 pub use ingest::{
@@ -10,3 +11,7 @@ pub use ingest::{
 };
 pub use linker::ModuleSet;
 pub use repr::ConvertError;
+pub use revision::{
+    ContentRevisionId, FragmentCache, FullRevisionReason, MemoryFragmentCache, ReloadPlan,
+    ReloadProfile, RevisionCompiler, RevisionManifest, RevisionRequest,
+};

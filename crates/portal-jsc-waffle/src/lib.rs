@@ -4,7 +4,10 @@ pub mod linker;
 pub mod repr;
 pub mod revision;
 
-pub use conv::{ConvertOptions, convert, convert_module, convert_modules};
+pub use conv::{
+    ComponentFunctions, ComponentHandle, ConvertOptions, IncrementalConverter, convert,
+    convert_module, convert_modules,
+};
 pub use ingest::{
     module_set_from_sources, module_set_from_sources_lazy, parse_module_source,
     parse_module_source_lazy, with_globals,

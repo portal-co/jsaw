@@ -50,6 +50,67 @@ fn compile(source: &str) -> Module<'static> {
     lower(source).expect("WasmGC lowering should succeed")
 }
 
+fn nested_function(root: &SFunc) -> &SFunc {
+    root.cfg
+        .values
+        .iter()
+        .find_map(|(_, value)| match &value.value {
+            SValue::Item { item, .. } => item.funcs().next(),
+            _ => None,
+        })
+        .expect("fixture should contain a nested function literal")
+}
+
+#[test]
+fn incremental_converter_rejects_an_abi_changing_replacement() {
+    let initial = script_ssa("let helper = function(x) { return x + 1; }; helper(4);");
+    let replacement = script_ssa("let helper = function(x, y) { return x + y; }; helper(4, 5);");
+    let helper = nested_function(&initial);
+    let replacement_helper = nested_function(&replacement);
+    let mut module = Module::empty();
+    let mut converter = portal_jsc_waffle::IncrementalConverter::new(&mut module);
+    let component = converter.compile(helper).expect("initial helper lowers");
+    let before = converter.functions(component).expect("helper slots");
+    let error = converter
+        .recompile(component, replacement_helper)
+        .expect_err("arity changes require a complete immutable module revision");
+    assert!(error.message.contains("ABI changed"));
+    assert_eq!(before, converter.functions(component).expect("original slots remain"));
+    drop(converter);
+    validate(&module);
+}
+
+#[test]
+fn incremental_converter_recompiles_a_component_in_its_existing_wasm_slots() {
+    let initial = script_ssa("let helper = function(x) { return x + 1; }; helper(4);");
+    let replacement = script_ssa("let helper = function(x) { return x + 2; }; helper(4);");
+    let helper = nested_function(&initial);
+    let replacement_helper = nested_function(&replacement);
+    let mut module = Module::empty();
+    let mut converter = portal_jsc_waffle::IncrementalConverter::new(&mut module);
+    let helper_component = converter.compile(helper).expect("initial helper lowers");
+    let root_component = converter.compile(&initial).expect("initial caller lowers");
+    let helper_before = converter.functions(helper_component).expect("helper slots");
+    let root_before = converter.functions(root_component).expect("caller slots");
+
+    // Replacing the helper invalidates its caller because the caller embeds a
+    // direct native component reference. Both native slots are rebuilt in
+    // place, preserving already-created export/adapter/dispatch references.
+    converter
+        .recompile(helper_component, replacement_helper)
+        .expect("same-ABI helper replacement recompiles its dependency closure");
+    assert_eq!(
+        helper_before,
+        converter.functions(helper_component).expect("helper slots after replacement")
+    );
+    assert_eq!(
+        root_before,
+        converter.functions(root_component).expect("caller slots after replacement")
+    );
+    drop(converter);
+    validate(&module);
+}
+
 fn lower_module(
     source: &str,
     options: &portal_jsc_waffle::ConvertOptions,

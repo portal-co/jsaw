@@ -19,53 +19,7 @@ use crate::repr::{ConvertError, FUNCTION_FIELD_TAG, JS_NULL_SENTINEL, Repr, Type
 /// The generated module has no exports. Use [`convert_module`] for ES-module
 /// lowering with generated Wasm exports.
 pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result<(), ConvertError> {
-    let repr = Repr::new(module);
-    let mut converter = Converter {
-        module,
-        repr,
-        functions: BTreeMap::new(),
-        pending: VecDeque::new(),
-        lowered: BTreeSet::new(),
-        ref_table: None,
-        string_equal: None,
-        strict_equality_helper: None,
-        string_concat: None,
-        string_utf16: None,
-        string_index: None,
-        trie_clone: None,
-        shapes: Vec::new(),
-        property_helpers: None,
-        truthy_helper: None,
-        typeof_helper: None,
-        to_bigint_helper: None,
-        to_string_helper: None,
-        native_function_cache: BTreeMap::new(),
-        context_builder: None,
-        module_init: None,
-        module_init_bodies: Vec::new(),
-        arguments_push_helper: None,
-        arguments_concat_helper: None,
-        trie_enumerate_helper: None,
-        object_enumerate_keys_helper: None,
-        primordial_fast_cores: BTreeMap::new(),
-        shadowed_names: BTreeSet::new(),
-        next_function_tag: USER_TAG_BASE,
-        to_number_helper: None,
-        add_helper: None,
-        return_kinds: BTreeMap::new(),
-        analysis_in_progress: BTreeSet::new(),
-        current_native_returns: ReturnType::Boxed,
-        current_return_kinds: ReturnKinds::default(),
-        function_literal_locals: BTreeMap::new(),
-        function_self_names: BTreeMap::new(),
-        lowering_function: None,
-        lowering_function_key: None,
-        // Bare-script conversion has no module set: the import tables stay
-        // empty and every load resolves through the ordinary context path.
-        import_tables: BTreeMap::new(),
-        module_of_function: BTreeMap::new(),
-        current_module: String::new(),
-    };
+    let mut converter = Converter::new(module);
     converter.collect_shapes(root)?;
     converter.collect_shadowed_names(root, &mut BTreeSet::new());
     converter.ensure_function(root, "")?;
@@ -94,6 +48,84 @@ impl Default for ConvertOptions {
         }
     }
 }
+
+
+/// Opaque identity for a source component registered in an
+/// [`IncrementalConverter`]. It is valid only for the converter session that
+/// returned it; it is intentionally not a source-domain/revision key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComponentHandle(usize);
+
+/// Stable Waffle function slots owned by one source component. Recompilation
+/// replaces the native body in place and retains these handles so existing
+/// exports, adapters, and dispatch arms keep their target slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComponentFunctions {
+    pub native: Func,
+    pub adapter: Func,
+}
+
+/// Stateful lowering seam for hot code reloaders.
+///
+/// A session retains conversion bookkeeping that ordinary [`convert`] discards:
+/// source-component dependencies, helper/type state, and the stable Waffle
+/// function handles assigned to each component. `recompile` invalidates the
+/// reverse component closure and replaces the affected native bodies in place.
+/// It rejects ABI changes, which must become a new immutable module revision.
+pub struct IncrementalConverter<'a, 'module, 'wasm> {
+    converter: Converter<'a, 'module, 'wasm>,
+}
+
+impl<'a, 'module, 'wasm> IncrementalConverter<'a, 'module, 'wasm> {
+    /// Begin an empty component-lowering session over `module`.
+    pub fn new(module: &'module mut Module<'wasm>) -> Self {
+        Self {
+            converter: Converter::new(module),
+        }
+    }
+
+    /// Lower `component` and every source function it reaches.
+    pub fn compile(&mut self, component: &'a SFunc) -> Result<ComponentHandle, ConvertError> {
+        self.converter.collect_shapes(component)?;
+        self.converter
+            .collect_shadowed_names(component, &mut BTreeSet::new());
+        self.converter.ensure_function(component, "")?;
+        self.converter.lower_all()?;
+        Ok(ComponentHandle(Converter::key(component)))
+    }
+
+    /// Return the stable Waffle function slots associated with `component`.
+    pub fn functions(
+        &self,
+        component: ComponentHandle,
+    ) -> Result<ComponentFunctions, ConvertError> {
+        let info = self
+            .converter
+            .functions
+            .get(&component.0)
+            .ok_or_else(|| ConvertError::invalid("unknown incremental component handle"))?;
+        Ok(ComponentFunctions {
+            native: info.native,
+            adapter: info.adapter,
+        })
+    }
+
+    /// Replace `component` with `replacement`, rebuilding every native Waffle
+    /// body that depends on it while retaining their function slots.
+    pub fn recompile(
+        &mut self,
+        component: ComponentHandle,
+        replacement: &'a SFunc,
+    ) -> Result<(), ConvertError> {
+        self.converter.collect_shapes(replacement)?;
+        self.converter
+            .collect_shadowed_names(replacement, &mut BTreeSet::new());
+        self.converter
+            .recompile_components_in_place(&BTreeMap::from([(component.0, replacement)]))?;
+        Ok(())
+    }
+}
+
 
 /// Lower an ES module and expose its function exports through Wasm exports.
 ///
@@ -183,51 +215,8 @@ pub fn convert_modules<'a, 'wasm>(
         }
     }
 
-    let repr = Repr::new(module);
-    let mut converter = Converter {
-        module,
-        repr,
-        functions: BTreeMap::new(),
-        pending: VecDeque::new(),
-        lowered: BTreeSet::new(),
-        ref_table: None,
-        string_equal: None,
-        strict_equality_helper: None,
-        string_concat: None,
-        string_utf16: None,
-        string_index: None,
-        trie_clone: None,
-        shapes: Vec::new(),
-        property_helpers: None,
-        truthy_helper: None,
-        typeof_helper: None,
-        to_bigint_helper: None,
-        to_string_helper: None,
-        native_function_cache: BTreeMap::new(),
-        context_builder: None,
-        module_init: None,
-        module_init_bodies: Vec::new(),
-        arguments_push_helper: None,
-        arguments_concat_helper: None,
-        trie_enumerate_helper: None,
-        object_enumerate_keys_helper: None,
-        primordial_fast_cores: BTreeMap::new(),
-        shadowed_names: BTreeSet::new(),
-        next_function_tag: USER_TAG_BASE,
-        to_number_helper: None,
-        add_helper: None,
-        return_kinds: BTreeMap::new(),
-        analysis_in_progress: BTreeSet::new(),
-        current_native_returns: ReturnType::Boxed,
-        current_return_kinds: ReturnKinds::default(),
-        function_literal_locals: BTreeMap::new(),
-        function_self_names: BTreeMap::new(),
-        lowering_function: None,
-        lowering_function_key: None,
-        import_tables,
-        module_of_function: BTreeMap::new(),
-        current_module: String::new(),
-    };
+    let mut converter = Converter::new(module);
+    converter.import_tables = import_tables;
     // The entry module's top-level body performs the context stores that
     // install hoisted function declarations (`function run(){}` lowers to a
     // `StoreId` of the literal). Walk it first so its assignments participate
@@ -721,7 +710,20 @@ struct Converter<'a, 'module, 'wasm> {
     module: &'module mut Module<'wasm>,
     repr: Repr,
     functions: BTreeMap<usize, FunctionInfo>,
-    pending: VecDeque<&'a SFunc>,
+    /// Source body registered for each Waffle native function. The pointer key
+    /// is compiler-local only; HCR manifests use source-domain fingerprints.
+    function_sources: BTreeMap<usize, &'a SFunc>,
+    /// Callee component -> Wasm-source components which embedded/directly
+    /// referenced it while lowering. A callee edit invalidates this reverse
+    /// closure because native bodies may have inlined/specialized it.
+    component_dependents: BTreeMap<usize, BTreeSet<usize>>,
+    /// The matching forward relation, used to replace a caller's dependency
+    /// edges when its Waffle body is rebuilt in place.
+    component_dependencies: BTreeMap<usize, BTreeSet<usize>>,
+    /// Set only while lowering one source component. `ensure_function` uses it
+    /// to record every nested/imported component pulled into that native body.
+    active_component: Option<usize>,
+    pending: VecDeque<(usize, &'a SFunc)>,
     lowered: BTreeSet<usize>,
     /// A declaration-only table makes every adapter legal as a `ref.func`
     /// target under Wasm's typed-function-reference validation rules.
@@ -851,6 +853,58 @@ struct Converter<'a, 'module, 'wasm> {
 }
 
 impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
+    fn new(module: &'module mut Module<'wasm>) -> Self {
+        let repr = Repr::new(module);
+        Self {
+            module,
+            repr,
+            functions: BTreeMap::new(),
+            function_sources: BTreeMap::new(),
+            component_dependents: BTreeMap::new(),
+            component_dependencies: BTreeMap::new(),
+            active_component: None,
+            pending: VecDeque::new(),
+            lowered: BTreeSet::new(),
+            ref_table: None,
+            string_equal: None,
+            strict_equality_helper: None,
+            string_concat: None,
+            string_utf16: None,
+            string_index: None,
+            trie_clone: None,
+            shapes: Vec::new(),
+            property_helpers: None,
+            truthy_helper: None,
+            typeof_helper: None,
+            to_bigint_helper: None,
+            to_string_helper: None,
+            native_function_cache: BTreeMap::new(),
+            context_builder: None,
+            module_init: None,
+            module_init_bodies: Vec::new(),
+            arguments_push_helper: None,
+            arguments_concat_helper: None,
+            trie_enumerate_helper: None,
+            object_enumerate_keys_helper: None,
+            primordial_fast_cores: BTreeMap::new(),
+            shadowed_names: BTreeSet::new(),
+            next_function_tag: USER_TAG_BASE,
+            to_number_helper: None,
+            add_helper: None,
+            return_kinds: BTreeMap::new(),
+            analysis_in_progress: BTreeSet::new(),
+            current_native_returns: ReturnType::Boxed,
+            current_return_kinds: ReturnKinds::default(),
+            function_literal_locals: BTreeMap::new(),
+            function_self_names: BTreeMap::new(),
+            lowering_function: None,
+            lowering_function_key: None,
+            import_tables: BTreeMap::new(),
+            module_of_function: BTreeMap::new(),
+            current_module: String::new(),
+        }
+    }
+
     fn key(func: &SFunc) -> usize {
         func as *const SFunc as usize
     }
@@ -1415,6 +1469,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         module: &str,
     ) -> Result<FunctionInfo, ConvertError> {
         let key = Self::key(sfunc);
+        if let Some(owner) = self.active_component.filter(|owner| *owner != key) {
+            self.component_dependencies.entry(owner).or_default().insert(key);
+            self.component_dependents.entry(key).or_default().insert(owner);
+        }
         if let Some(info) = self.functions.get(&key) {
             return Ok(*info);
         }
@@ -1470,7 +1528,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         self.functions.insert(key, info);
         self.module_of_function
             .insert(key, module.to_string());
-        self.pending.push_back(sfunc);
+        self.function_sources.insert(key, sfunc);
+        self.pending.push_back((key, sfunc));
         Ok(*self.functions.get(&key).expect("just inserted"))
     }
 
@@ -1786,8 +1845,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn lower_all(&mut self) -> Result<(), ConvertError> {
-        while let Some(sfunc) = self.pending.pop_front() {
-            let key = Self::key(sfunc);
+        while let Some((key, sfunc)) = self.pending.pop_front() {
             if !self.lowered.insert(key) {
                 continue;
             }
@@ -1808,7 +1866,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 })?;
                 self.current_native_returns = ReturnType::from_kinds(info.returns);
                 self.current_return_kinds = info.returns;
+                let previous_component = self.active_component.replace(key);
                 let result = self.lower_function(sfunc, body);
+                self.active_component = previous_component;
                 self.current_native_returns = ReturnType::Boxed;
                 self.current_return_kinds = ReturnKinds::default();
                 result
@@ -1817,6 +1877,89 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             result?;
         }
         Ok(())
+    }
+
+    /// Return every generated Wasm source component that must be rebuilt when
+    /// one source component changes. The reverse closure is required because
+    /// native bodies can embed/directly specialize component calls.
+    fn invalidated_components(&self, changed: impl IntoIterator<Item = usize>) -> BTreeSet<usize> {
+        let mut invalidated = BTreeSet::new();
+        let mut pending: VecDeque<usize> = changed.into_iter().collect();
+        while let Some(component) = pending.pop_front() {
+            if !invalidated.insert(component) {
+                continue;
+            }
+            if let Some(callers) = self.component_dependents.get(&component) {
+                pending.extend(callers.iter().copied());
+            }
+        }
+        invalidated
+    }
+
+    /// Rebuild an invalidated source-component closure in place.
+    ///
+    /// Native and adapter [`Func`] handles are retained, so already-built
+    /// export wrappers and dispatch arms target the new native bodies. Helpers,
+    /// shapes, and nested functions requested by re-lowering are still minted
+    /// through their ordinary `ensure_*` paths. ABI changes cannot preserve
+    /// those stable handles and are rejected for the revision layer to
+    /// escalate to a complete immutable module revision.
+    fn recompile_components_in_place(
+        &mut self,
+        replacements: &BTreeMap<usize, &'a SFunc>,
+    ) -> Result<BTreeSet<usize>, ConvertError> {
+        for (component, replacement) in replacements {
+            let Some(info) = self.functions.get(component).copied() else {
+                return Err(ConvertError::invalid(format!(
+                    "cannot replace unknown source component {component:#x}"
+                )));
+            };
+            self.return_kinds.remove(component);
+            let returns = self.analyze_return_kinds(replacement);
+            let arity = replacement.cfg.blocks[replacement.entry].params.len();
+            if arity != info.arity || returns != info.returns {
+                return Err(ConvertError::invalid(
+                    "component ABI changed; a complete module revision is required",
+                ));
+            }
+        }
+
+        let invalidated = self.invalidated_components(replacements.keys().copied());
+        for component in &invalidated {
+            // Replace the old forward edges with the dependencies found while
+            // lowering the new body, so stale callers do not poison later
+            // invalidation closures.
+            if let Some(dependencies) = self.component_dependencies.remove(component) {
+                for dependency in dependencies {
+                    if let Some(dependents) = self.component_dependents.get_mut(&dependency) {
+                        dependents.remove(component);
+                    }
+                }
+            }
+            self.lowered.remove(component);
+        }
+        self.pending
+            .retain(|(component, _)| !invalidated.contains(component));
+
+        for component in &invalidated {
+            let source = replacements
+                .get(component)
+                .copied()
+                .or_else(|| self.function_sources.get(component).copied())
+                .ok_or_else(|| ConvertError::invalid("missing invalidated component source"))?;
+            let info = *self
+                .functions
+                .get(component)
+                .ok_or_else(|| ConvertError::invalid("missing invalidated function info"))?;
+            let signature = self.module.funcs[info.native].sig();
+            let name = self.module.funcs[info.native].name().to_owned();
+            let body = FunctionBody::new(self.module, signature);
+            self.module.funcs[info.native] = FuncDecl::Body(signature, name, body);
+            self.function_sources.insert(*component, source);
+            self.pending.push_back((*component, source));
+        }
+        self.lower_all()?;
+        Ok(invalidated)
     }
 
     fn lower_function(

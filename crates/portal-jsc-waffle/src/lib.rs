@@ -1,6 +1,7 @@
 pub mod conv;
 pub mod coregc;
 pub mod coregc_emit;
+pub mod coregc_layout;
 pub mod ingest;
 pub mod linker;
 pub mod repr;
@@ -15,6 +16,10 @@ pub use coregc::{
     CoreGcTypeKind,
 };
 pub use coregc_emit::{CoreGcArtifact, CoreGcOptions, emit_runtime_skeleton};
+pub use coregc_layout::{
+    COREGC_DESCRIPTOR_MAGIC, COREGC_DESCRIPTOR_VERSION, CoreGcDescriptorTable, CoreGcPayloadLayout,
+    CoreGcSlotLayout,
+};
 pub use ingest::{
     module_set_from_sources, module_set_from_sources_lazy, parse_module_source,
     parse_module_source_lazy, with_globals,

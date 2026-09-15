@@ -6,11 +6,14 @@
 //! fail closed rather than being encoded with incorrect semantics.
 
 use portal_pc_waffle::{
-    BlockTarget, FuncDecl, FunctionBody, GlobalData, MemoryArg, MemoryData, Module,
+    BlockTarget, FuncDecl, FunctionBody, GlobalData, MemoryArg, MemoryData, MemorySegment, Module,
     Operator, SignatureData, Terminator, Type,
 };
 
-use crate::coregc::{CoreGcError, CoreGcInventory};
+use crate::{
+    coregc::{CoreGcError, CoreGcInventory},
+    coregc_layout::CoreGcDescriptorTable,
+};
 
 /// Fixed header ABI reserved for later mark/sweep phases.
 pub const COREGC_HEADER_BYTES: u32 = 24;
@@ -41,6 +44,8 @@ impl Default for CoreGcOptions {
 pub struct CoreGcArtifact {
     pub module: Module<'static>,
     pub inventory: CoreGcInventory,
+    /// Runtime descriptors copied into immutable reserved memory at offset zero.
+    pub descriptors: CoreGcDescriptorTable,
 }
 
 /// Emit a core-only runtime skeleton from the typed WasmGC inventory.
@@ -84,11 +89,27 @@ pub fn emit_runtime_skeleton(
     }
 
     let inventory = CoreGcInventory::build(source)?;
+    let descriptors = CoreGcDescriptorTable::build(&inventory)?;
+    if usize::try_from(options.heap_base)
+        .ok()
+        .is_none_or(|heap_base| heap_base < descriptors.bytes.len())
+    {
+        return Err(CoreGcError {
+            message: format!(
+                "coregc heap base {} overlaps {} bytes of generated descriptors",
+                options.heap_base,
+                descriptors.bytes.len()
+            ),
+        });
+    }
     let mut module = Module::empty();
     let memory = module.memories.push(MemoryData {
         initial_pages: options.initial_pages,
         maximum_pages: options.maximum_pages,
-        segments: vec![],
+        segments: vec![MemorySegment {
+            offset: 0,
+            data: descriptors.bytes.clone(),
+        }],
         memory64: false,
         shared: false,
         page_size_log2: None,
@@ -256,7 +277,11 @@ pub fn emit_runtime_skeleton(
         kind: portal_pc_waffle::ExportKind::Memory(memory),
     });
 
-    Ok(CoreGcArtifact { module, inventory })
+    Ok(CoreGcArtifact {
+        module,
+        inventory,
+        descriptors,
+    })
 }
 
 fn i32_const(
@@ -311,6 +336,26 @@ mod tests {
             second,
             first + 32,
             "allocation includes aligned header and payload"
+        );
+    }
+
+    #[test]
+    fn runtime_skeleton_embeds_generated_descriptor_table() {
+        let artifact = emit_runtime_skeleton(&Module::empty(), &CoreGcOptions::default())
+            .expect("runtime skeleton");
+        let memory = artifact
+            .module
+            .memories
+            .iter()
+            .next()
+            .expect("runtime memory");
+        let memory = &artifact.module.memories[memory];
+        assert_eq!(memory.segments.len(), 1);
+        assert_eq!(memory.segments[0].offset, 0);
+        assert_eq!(memory.segments[0].data, artifact.descriptors.bytes);
+        assert_eq!(
+            u32::from_le_bytes(memory.segments[0].data[0..4].try_into().unwrap()),
+            crate::coregc_layout::COREGC_DESCRIPTOR_MAGIC
         );
     }
 

@@ -9,8 +9,13 @@ use std::{
     sync::Arc,
 };
 
-use portal_jsc_swc_ssa::module::{FunctionFingerprint, source_fingerprint};
+use portal_jsc_swc_ssa::module::{FunctionFingerprint, semantic_fingerprint, source_fingerprint};
 use sha3::{Digest, Sha3_256};
+use swc_common::{FileName, SourceMap, sync::Lrc};
+use swc_ecma_ast::{
+    Decl, DefaultDecl, EsVersion, Expr, FnExpr, Function, Module, ModuleDecl, ModuleItem, Stmt,
+};
+use swc_ecma_parser::{EsSyntax, Syntax, parse_file_as_module};
 
 use crate::{ConvertError, ConvertOptions, ModuleSet, convert_modules, module_set_from_sources};
 
@@ -91,6 +96,8 @@ pub enum FullRevisionReason {
     /// A top-level executable statement changed, so initialization/state may
     /// differ even if a hoisted function body did not.
     TopLevelChanged,
+    /// A reloadable function's observable calling convention changed.
+    FunctionAbiChanged,
     /// The requested base was not the planner's immediately prior revision.
     BaseRevisionUnavailable,
 }
@@ -126,6 +133,39 @@ pub struct RevisionArtifact {
 pub struct RevisionOutput {
     pub revision: RevisionManifest,
     pub artifact: RevisionArtifact,
+    /// A runtime-neutral delta *plan*. It never contains mutable Wasm binary
+    /// edits; a selected runtime turns these stable-key operations into its
+    /// own payload or falls back to `artifact`.
+    pub delta: Option<ModuleDelta>,
+}
+
+/// A base-checked set of function-cell replacements. Function keys are source
+/// keys, never Wasm function/type indices.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleDelta {
+    pub base: ContentRevisionId,
+    pub target: ContentRevisionId,
+    pub operations: Vec<DeltaOperation>,
+}
+
+/// One compatible replacement requested by a dispatch-mode revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeltaOperation {
+    pub function: String,
+    pub abi: FunctionFingerprint,
+    pub body: FunctionFingerprint,
+}
+
+#[derive(Clone, Debug)]
+struct ModuleAnalysis {
+    surface: FunctionFingerprint,
+    functions: BTreeMap<String, FunctionAnalysis>,
+}
+
+#[derive(Clone, Debug)]
+struct FunctionAnalysis {
+    abi: FunctionFingerprint,
+    body: FunctionFingerprint,
 }
 
 /// A runtime activation error. The runtime checks the base content ID rather
@@ -201,6 +241,7 @@ pub struct RevisionRequest<'a> {
 pub struct RevisionCompiler<C> {
     cache: C,
     previous: Option<RevisionManifest>,
+    previous_analysis: Option<BTreeMap<String, ModuleAnalysis>>,
 }
 
 impl<C: FragmentCache> RevisionCompiler<C> {
@@ -208,6 +249,7 @@ impl<C: FragmentCache> RevisionCompiler<C> {
         Self {
             cache,
             previous: None,
+            previous_analysis: None,
         }
     }
 
@@ -239,9 +281,14 @@ impl<C: FragmentCache> RevisionCompiler<C> {
             .map(|revision| revision.content_id.clone());
         let base_available = request.base == expected_base;
         let mut modules = Vec::with_capacity(request.sources.len());
+        let mut analyses = BTreeMap::new();
         let mut reused_modules = BTreeSet::new();
         let mut changed_modules = BTreeSet::new();
         let mut full_revision_reasons = BTreeMap::new();
+        let mut operations = Vec::new();
+        let mut dispatch_compatible = request.profile == ReloadProfile::DispatchDelta
+            && request.base.is_some()
+            && base_available;
 
         for (path, source) in request.sources {
             let fingerprint = source_fingerprint(source).map_err(|error| {
@@ -249,15 +296,37 @@ impl<C: FragmentCache> RevisionCompiler<C> {
                     "parse of revision module {path:?} failed: {error:?}"
                 ))
             })?;
+            let analysis = analyze_module(path, source)?;
             if self.cache.get(path) == Some(fingerprint) {
                 reused_modules.insert(path.clone());
             } else {
                 changed_modules.insert(path.clone());
-                // Source-level caching cannot yet prove a body-only change is
-                // independent from module init/layout. Require a full revision.
-                full_revision_reasons.insert(path.clone(), FullRevisionReason::TopLevelChanged);
+                let prior = self
+                    .previous_analysis
+                    .as_ref()
+                    .and_then(|all| all.get(path));
+                match prior {
+                    Some(prior) if prior.surface != analysis.surface => {
+                        dispatch_compatible = false;
+                        full_revision_reasons
+                            .insert(path.clone(), FullRevisionReason::ModuleSurfaceChanged);
+                    }
+                    Some(prior) => {
+                        if !collect_delta_operations(prior, &analysis, &mut operations) {
+                            dispatch_compatible = false;
+                            full_revision_reasons
+                                .insert(path.clone(), FullRevisionReason::FunctionAbiChanged);
+                        }
+                    }
+                    None => {
+                        dispatch_compatible = false;
+                        full_revision_reasons
+                            .insert(path.clone(), FullRevisionReason::TopLevelChanged);
+                    }
+                }
             }
             self.cache.put(path.clone(), fingerprint);
+            analyses.insert(path.clone(), analysis);
             modules.push(ModuleFingerprint {
                 path: path.clone(),
                 fingerprint,
@@ -273,13 +342,11 @@ impl<C: FragmentCache> RevisionCompiler<C> {
         }
 
         let content_id = content_id(request.entry, &modules, &request.options, request.profile);
-        let delta_eligible = request.profile == ReloadProfile::DispatchDelta
-            && request.base.is_some()
-            && base_available
-            && changed_modules.is_empty();
+        let delta_eligible =
+            dispatch_compatible && !operations.is_empty() && full_revision_reasons.is_empty();
         let revision = RevisionManifest {
             content_id,
-            base: request.base,
+            base: request.base.clone(),
             profile: request.profile,
             modules,
             reload_plan: ReloadPlan {
@@ -291,9 +358,176 @@ impl<C: FragmentCache> RevisionCompiler<C> {
         };
         let artifact =
             assemble_complete_artifact(request.entry, request.sources, &request.options)?;
+        let delta = if delta_eligible {
+            Some(ModuleDelta {
+                base: request
+                    .base
+                    .clone()
+                    .expect("delta eligibility requires a base"),
+                target: revision.content_id.clone(),
+                operations,
+            })
+        } else {
+            None
+        };
         self.previous = Some(revision.clone());
-        Ok(RevisionOutput { revision, artifact })
+        self.previous_analysis = Some(analyses);
+        Ok(RevisionOutput {
+            revision,
+            artifact,
+            delta,
+        })
     }
+}
+
+fn analyze_module(path: &str, source: &str) -> Result<ModuleAnalysis, ConvertError> {
+    let source_map: Lrc<SourceMap> = Lrc::new(SourceMap::default());
+    let file = source_map.new_source_file(
+        Lrc::new(FileName::Custom(path.to_owned())),
+        source.to_owned(),
+    );
+    let mut errors = Vec::new();
+    let module = parse_file_as_module(
+        &file,
+        Syntax::Es(EsSyntax::default()),
+        EsVersion::Es2022,
+        None,
+        &mut errors,
+    )
+    .map_err(|error| {
+        ConvertError::invalid(format!(
+            "parse of revision module {path:?} failed: {error:?}"
+        ))
+    })?;
+    if !errors.is_empty() {
+        return Err(ConvertError::invalid(format!(
+            "parse of revision module {path:?} reported diagnostics: {errors:?}"
+        )));
+    }
+
+    let mut surface = String::new();
+    let mut functions = BTreeMap::new();
+    for item in module.body {
+        match item {
+            ModuleItem::Stmt(Stmt::Decl(Decl::Fn(function))) => {
+                insert_function(
+                    &mut functions,
+                    function.ident.sym.to_string(),
+                    *function.function,
+                )?;
+            }
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => match export.decl {
+                Decl::Fn(function) => {
+                    surface.push_str("export:");
+                    surface.push_str(&function.ident.sym);
+                    surface.push('\n');
+                    insert_function(
+                        &mut functions,
+                        function.ident.sym.to_string(),
+                        *function.function,
+                    )?;
+                }
+                declaration => append_surface_item(
+                    &mut surface,
+                    ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(swc_ecma_ast::ExportDecl {
+                        decl: declaration,
+                        ..export
+                    })),
+                ),
+            },
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(export)) => match export.decl {
+                DefaultDecl::Fn(function) => {
+                    surface.push_str("export:default\n");
+                    let name = function
+                        .ident
+                        .as_ref()
+                        .map(|ident| ident.sym.to_string())
+                        .unwrap_or_else(|| "*default*".to_owned());
+                    insert_function(&mut functions, name, *function.function)?;
+                }
+                declaration => append_surface_item(
+                    &mut surface,
+                    ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(
+                        swc_ecma_ast::ExportDefaultDecl {
+                            decl: declaration,
+                            ..export
+                        },
+                    )),
+                ),
+            },
+            item => append_surface_item(&mut surface, item),
+        }
+    }
+    Ok(ModuleAnalysis {
+        surface: semantic_fingerprint(&surface),
+        functions,
+    })
+}
+
+fn append_surface_item(surface: &mut String, item: ModuleItem) {
+    let module = Module {
+        span: swc_common::DUMMY_SP,
+        body: vec![item],
+        shebang: None,
+    };
+    surface.push_str(&swc_ecma_codegen::to_code(&module));
+    surface.push('\n');
+}
+
+fn insert_function(
+    functions: &mut BTreeMap<String, FunctionAnalysis>,
+    key: String,
+    function: Function,
+) -> Result<(), ConvertError> {
+    if functions.contains_key(&key) {
+        return Err(ConvertError::invalid(format!(
+            "duplicate reloadable function key {key:?} in one module"
+        )));
+    }
+    let body = Expr::Fn(FnExpr {
+        ident: None,
+        function: Box::new(function.clone()),
+    });
+    let mut abi_function = function;
+    abi_function.body = None;
+    let abi = Expr::Fn(FnExpr {
+        ident: None,
+        function: Box::new(abi_function),
+    });
+    functions.insert(
+        key,
+        FunctionAnalysis {
+            abi: semantic_fingerprint(&swc_ecma_codegen::to_code(&abi)),
+            body: semantic_fingerprint(&swc_ecma_codegen::to_code(&body)),
+        },
+    );
+    Ok(())
+}
+
+fn collect_delta_operations(
+    prior: &ModuleAnalysis,
+    current: &ModuleAnalysis,
+    operations: &mut Vec<DeltaOperation>,
+) -> bool {
+    if prior.functions.len() != current.functions.len() {
+        return false;
+    }
+    for (key, current_function) in &current.functions {
+        let Some(prior_function) = prior.functions.get(key) else {
+            return false;
+        };
+        if prior_function.abi != current_function.abi {
+            return false;
+        }
+        if prior_function.body != current_function.body {
+            operations.push(DeltaOperation {
+                function: key.clone(),
+                abi: current_function.abi,
+                body: current_function.body,
+            });
+        }
+    }
+    true
 }
 
 fn assemble_complete_artifact(
@@ -405,15 +639,74 @@ mod tests {
             revision.revision.reload_plan.changed_modules,
             BTreeSet::from(["main.js".to_owned()])
         );
-        assert_eq!(
+        // Reinstantiate always ships a complete immutable artifact, but a
+        // function-body-only edit does not falsely claim a top-level/module
+        // surface incompatibility.
+        assert!(
             revision
                 .revision
                 .reload_plan
                 .full_revision_reasons
-                .get("main.js"),
-            Some(&FullRevisionReason::TopLevelChanged)
+                .is_empty()
         );
         assert!(!revision.revision.reload_plan.delta_eligible);
+    }
+
+    #[test]
+    fn dispatch_profile_plans_a_same_abi_function_body_delta() {
+        let initial = sources("export function run(x) { return x + 1; }");
+        let changed = sources("export function run(x) { return x + 2; }");
+        let mut compiler = RevisionCompiler::new(MemoryFragmentCache::default());
+        let first = compiler
+            .compile(RevisionRequest {
+                profile: ReloadProfile::DispatchDelta,
+                ..request(&initial)
+            })
+            .expect("initial revision");
+        let second = compiler
+            .compile(RevisionRequest {
+                profile: ReloadProfile::DispatchDelta,
+                base: Some(first.revision.content_id.clone()),
+                ..request(&changed)
+            })
+            .expect("changed revision");
+        let delta = second
+            .delta
+            .expect("same-ABI body edit should plan a delta");
+        assert_eq!(delta.base, first.revision.content_id);
+        assert_eq!(delta.target, second.revision.content_id);
+        assert_eq!(delta.operations.len(), 1);
+        assert_eq!(delta.operations[0].function, "run");
+        assert!(second.revision.reload_plan.delta_eligible);
+    }
+
+    #[test]
+    fn dispatch_profile_rejects_an_arity_change_as_a_delta() {
+        let initial = sources("export function run(x) { return x + 1; }");
+        let changed = sources("export function run(x, y) { return x + y; }");
+        let mut compiler = RevisionCompiler::new(MemoryFragmentCache::default());
+        let first = compiler
+            .compile(RevisionRequest {
+                profile: ReloadProfile::DispatchDelta,
+                ..request(&initial)
+            })
+            .expect("initial revision");
+        let second = compiler
+            .compile(RevisionRequest {
+                profile: ReloadProfile::DispatchDelta,
+                base: Some(first.revision.content_id.clone()),
+                ..request(&changed)
+            })
+            .expect("changed revision");
+        assert!(second.delta.is_none());
+        assert_eq!(
+            second
+                .revision
+                .reload_plan
+                .full_revision_reasons
+                .get("main.js"),
+            Some(&FullRevisionReason::FunctionAbiChanged)
+        );
     }
 
     #[test]
@@ -453,6 +746,7 @@ mod tests {
                 ..output.revision.clone()
             },
             artifact: output.artifact.clone(),
+            delta: None,
         };
         assert!(matches!(
             activator.activate(&stale),

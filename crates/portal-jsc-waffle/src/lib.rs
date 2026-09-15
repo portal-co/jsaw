@@ -12,7 +12,8 @@ pub use ingest::{
 pub use linker::ModuleSet;
 pub use repr::ConvertError;
 pub use revision::{
-    ActivationError, ActiveRevision, ContentRevisionId, FragmentCache, FullRevisionReason,
-    MemoryFragmentCache, ReinstantiatingActivator, ReloadPlan, ReloadProfile, RevisionArtifact,
-    RevisionCompiler, RevisionManifest, RevisionOutput, RevisionRequest,
+    ActivationError, ActiveRevision, ContentRevisionId, DeltaOperation, FragmentCache,
+    FullRevisionReason, MemoryFragmentCache, ModuleDelta, ReinstantiatingActivator, ReloadPlan,
+    ReloadProfile, RevisionArtifact, RevisionCompiler, RevisionManifest, RevisionOutput,
+    RevisionRequest,
 };

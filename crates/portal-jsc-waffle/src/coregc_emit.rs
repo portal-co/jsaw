@@ -119,6 +119,13 @@ pub fn emit_runtime_skeleton(
         value: Some(u64::from(options.heap_base)),
         mutable: true,
     });
+    // Head is a payload address. The allocation header stores the previous
+    // head at offset 12, providing the intrusive list Phase 2 will sweep.
+    let allocation_head = module.globals.push(GlobalData {
+        ty: Type::I32,
+        value: Some(0),
+        mutable: true,
+    });
     let signature = module.signatures.push(SignatureData::Func {
         params: vec![Type::I32, Type::I32],
         returns: vec![Type::I32],
@@ -165,7 +172,7 @@ pub fn emit_runtime_skeleton(
     );
     let shift = i32_const(&mut body, entry, 16);
     let limit = body.add_op(entry, Operator::I32Shl, &[pages, shift], &[Type::I32]);
-    let out_of_memory = body.add_op(entry, Operator::I32GtU, &[next, limit], &[Type::I32]);
+    let needs_grow = body.add_op(entry, Operator::I32GtU, &[next, limit], &[Type::I32]);
     let invalid_type = body.add_op(entry, Operator::I32Eqz, &[type_id], &[Type::I32]);
     let bad_size = body.add_op(
         entry,
@@ -176,17 +183,13 @@ pub fn emit_runtime_skeleton(
     let invalid = body.add_op(
         entry,
         Operator::I32Or,
-        &[wrapped, out_of_memory],
-        &[Type::I32],
-    );
-    let invalid = body.add_op(
-        entry,
-        Operator::I32Or,
-        &[invalid, invalid_type],
+        &[wrapped, invalid_type],
         &[Type::I32],
     );
     let invalid = body.add_op(entry, Operator::I32Or, &[invalid, bad_size], &[Type::I32]);
     let fail = body.add_block();
+    let grow_check = body.add_block();
+    let grow = body.add_block();
     let commit = body.add_block();
     body.set_terminator(
         entry,
@@ -197,12 +200,65 @@ pub fn emit_runtime_skeleton(
                 args: vec![],
             },
             if_false: BlockTarget {
-                block: commit,
+                block: grow_check,
                 args: vec![],
             },
         },
     );
     body.set_terminator(fail, Terminator::Unreachable);
+    body.set_terminator(
+        grow_check,
+        Terminator::CondBr {
+            cond: needs_grow,
+            if_true: BlockTarget {
+                block: grow,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: commit,
+                args: vec![],
+            },
+        },
+    );
+    // `memory.grow` returns -1 on failure. Grow only the pages needed for
+    // this allocation; an engine-enforced maximum therefore remains a trap.
+    let deficit = body.add_op(grow, Operator::I32Sub, &[next, limit], &[Type::I32]);
+    let page_mask = i32_const(&mut body, grow, 0xffff);
+    let rounded_deficit = body.add_op(grow, Operator::I32Add, &[deficit, page_mask], &[Type::I32]);
+    let page_shift = i32_const(&mut body, grow, 16);
+    let grow_pages = body.add_op(
+        grow,
+        Operator::I32ShrU,
+        &[rounded_deficit, page_shift],
+        &[Type::I32],
+    );
+    let previous_pages = body.add_op(
+        grow,
+        Operator::MemoryGrow { mem: memory },
+        &[grow_pages],
+        &[Type::I32],
+    );
+    let grow_failed_value = i32_const(&mut body, grow, u32::MAX);
+    let grow_failed = body.add_op(
+        grow,
+        Operator::I32Eq,
+        &[previous_pages, grow_failed_value],
+        &[Type::I32],
+    );
+    body.set_terminator(
+        grow,
+        Terminator::CondBr {
+            cond: grow_failed,
+            if_true: BlockTarget {
+                block: fail,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: commit,
+                args: vec![],
+            },
+        },
+    );
 
     // Header: magic, concrete type ID, payload byte count, next-allocation,
     // next-free, reserved. Phase 2 wires list fields into mark/sweep.
@@ -240,8 +296,27 @@ pub fn emit_runtime_skeleton(
         &[bump_value, payload_bytes],
         &[],
     );
+    let previous_allocation = body.add_op(
+        commit,
+        Operator::GlobalGet {
+            global_index: allocation_head,
+        },
+        &[],
+        &[Type::I32],
+    );
+    body.add_op(
+        commit,
+        Operator::I32Store {
+            memory: MemoryArg {
+                offset: 12,
+                ..memory_arg
+            },
+        },
+        &[bump_value, previous_allocation],
+        &[],
+    );
     let zero = i32_const(&mut body, commit, 0);
-    for offset in [12_u64, 16, 20] {
+    for offset in [16_u64, 20] {
         body.add_op(
             commit,
             Operator::I32Store {
@@ -265,6 +340,14 @@ pub fn emit_runtime_skeleton(
         Operator::I32Add,
         &[bump_value, header],
         &[Type::I32],
+    );
+    body.add_op(
+        commit,
+        Operator::GlobalSet {
+            global_index: allocation_head,
+        },
+        &[payload],
+        &[],
     );
     body.set_terminator(
         commit,
@@ -537,11 +620,45 @@ mod tests {
 
     #[test]
     fn runtime_skeleton_traps_invalid_type_or_capacity_request() {
-        let artifact = emit_runtime_skeleton(&Module::empty(), &CoreGcOptions::default())
-            .expect("runtime skeleton");
+        let artifact = emit_runtime_skeleton(
+            &Module::empty(),
+            &CoreGcOptions {
+                maximum_pages: Some(2),
+                ..CoreGcOptions::default()
+            },
+        )
+        .expect("runtime skeleton");
         let (mut store, allocator) = allocator(&artifact);
         assert!(allocator.call(&mut store, (0, 8)).is_err());
         assert!(allocator.call(&mut store, (1, i32::MAX)).is_err());
+    }
+
+    #[test]
+    fn runtime_skeleton_grows_memory_until_its_configured_cap() {
+        let artifact = emit_runtime_skeleton(
+            &Module::empty(),
+            &CoreGcOptions {
+                maximum_pages: Some(3),
+                ..CoreGcOptions::default()
+            },
+        )
+        .expect("runtime skeleton");
+        let engine = Engine::default();
+        let bytes = portal_pc_waffle::to_wasm_bytes(&artifact.module).expect("core wasm encodes");
+        let module = WasmtimeModule::new(&engine, bytes).expect("core engine compiles artifact");
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).expect("artifact instantiates");
+        let allocator = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "__coregc_alloc_phase1")
+            .expect("allocator export");
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .expect("memory export");
+        allocator
+            .call(&mut store, (1, 70_000))
+            .expect("allocation grows one page");
+        assert_eq!(memory.size(&store), 3);
+        assert!(allocator.call(&mut store, (1, 70_000)).is_err());
     }
 
     #[test]

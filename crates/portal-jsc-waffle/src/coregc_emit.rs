@@ -58,6 +58,15 @@ pub fn emit_runtime_skeleton(
     source: &Module<'_>,
     options: &CoreGcOptions,
 ) -> Result<CoreGcArtifact, CoreGcError> {
+    let inventory = CoreGcInventory::build(source)?;
+    if let Some(operation) = inventory.gc_operations.first() {
+        return Err(CoreGcError {
+            message: format!(
+                "coregc phase 1 cannot lower {} in function {} at value {}; source code lowering is not enabled yet",
+                operation.name, operation.function_index, operation.value_index
+            ),
+        });
+    }
     if !source.funcs.entries().next().is_none()
         || !source.exports.is_empty()
         || !source.globals.entries().next().is_none()
@@ -88,7 +97,6 @@ pub fn emit_runtime_skeleton(
         });
     }
 
-    let inventory = CoreGcInventory::build(source)?;
     let descriptors = CoreGcDescriptorTable::build(&inventory)?;
     if usize::try_from(options.heap_base)
         .ok()
@@ -685,6 +693,39 @@ mod tests {
         assert!(validator.call(&mut store, (address, 2)).is_err());
         assert!(validator.call(&mut store, (0, 1)).is_err());
         assert!(validator.call(&mut store, (address, 0)).is_err());
+    }
+
+    #[test]
+    fn runtime_skeleton_names_unsupported_gc_operation() {
+        let mut source = Module::empty();
+        let signature = source.signatures.push(SignatureData::Func {
+            params: vec![],
+            returns: vec![],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(&source, signature);
+        let one = body.add_op(
+            body.entry,
+            Operator::I32Const { value: 1 },
+            &[],
+            &[Type::I32],
+        );
+        body.add_op(
+            body.entry,
+            Operator::RefI31,
+            &[one],
+            &[Type::Heap(portal_pc_waffle::WithNullable {
+                nullable: false,
+                value: portal_pc_waffle::HeapType::I31,
+            })],
+        );
+        source
+            .funcs
+            .push(FuncDecl::Body(signature, "source".to_owned(), body));
+        let error = emit_runtime_skeleton(&source, &CoreGcOptions::default())
+            .expect_err("unlowered GC operations must fail closed");
+        assert!(error.message.contains("ref.i31"));
+        assert!(error.message.contains("function 0"));
     }
 
     #[test]

@@ -12,8 +12,8 @@ pub use conv::{
     convert_module, convert_modules,
 };
 pub use coregc::{
-    COREGC_INVENTORY_SCHEMA, CoreGcError, CoreGcInventory, CoreGcStorage, CoreGcType, CoreGcTypeId,
-    CoreGcTypeKind,
+    COREGC_INVENTORY_SCHEMA, CoreGcError, CoreGcInventory, CoreGcOperation, CoreGcStorage,
+    CoreGcType, CoreGcTypeId, CoreGcTypeKind,
 };
 pub use coregc_emit::{CoreGcArtifact, CoreGcOptions, emit_runtime_skeleton};
 pub use coregc_layout::{

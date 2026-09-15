@@ -8,7 +8,10 @@
 
 use std::collections::BTreeMap;
 
-use portal_pc_waffle::{EntityRef, HeapType, Module, Signature, SignatureData, StorageType, Type};
+use portal_pc_waffle::{
+    EntityRef, FuncDecl, HeapType, Module, Operator, Signature, SignatureData, StorageType, Type,
+    ValueDef,
+};
 
 /// Schema carried by a coregc artifact and its descriptor manifest.
 pub const COREGC_INVENTORY_SCHEMA: &str = "jsaw.coregc.inventory.v1";
@@ -69,6 +72,16 @@ pub struct CoreGcInventory {
     pub types: Vec<CoreGcType>,
     /// Waffle signature -> generated nonzero runtime type ID.
     pub type_ids: BTreeMap<Signature, CoreGcTypeId>,
+    /// Native WasmGC operations found before a core backend erases them.
+    pub gc_operations: Vec<CoreGcOperation>,
+}
+
+/// A typed WasmGC operation that needs explicit fallback lowering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoreGcOperation {
+    pub function_index: usize,
+    pub value_index: usize,
+    pub name: &'static str,
 }
 
 /// A fail-closed unsupported-source diagnostic.
@@ -137,6 +150,7 @@ impl CoreGcInventory {
             schema: COREGC_INVENTORY_SCHEMA,
             types: Vec::with_capacity(candidates.len()),
             type_ids: BTreeMap::new(),
+            gc_operations: Vec::new(),
         };
         for (index, (_, signature, kind)) in candidates.into_iter().enumerate() {
             let id = u32::try_from(index + 1).map_err(|_| CoreGcError {
@@ -151,12 +165,60 @@ impl CoreGcInventory {
                 shared: false,
             });
         }
+        for (function, declaration) in module.funcs.entries() {
+            if let FuncDecl::Body(_, _, body) = declaration {
+                for (value, definition) in body.values.entries() {
+                    if let ValueDef::Operator(operator, _, _) = definition {
+                        if let Some(name) = gc_operator_name(operator) {
+                            inventory.gc_operations.push(CoreGcOperation {
+                                function_index: function.index(),
+                                value_index: value.index(),
+                                name,
+                            });
+                        }
+                    }
+                }
+            }
+        }
         Ok(inventory)
     }
 
     pub fn id_for(&self, signature: Signature) -> Option<CoreGcTypeId> {
         self.type_ids.get(&signature).copied()
     }
+}
+
+/// Operations which cannot be silently reinterpreted by a core backend.
+fn gc_operator_name(operator: &Operator) -> Option<&'static str> {
+    Some(match operator {
+        Operator::StructNew { .. } => "struct.new",
+        Operator::StructGet { .. } => "struct.get",
+        Operator::StructSet { .. } => "struct.set",
+        Operator::StructNewDefault { .. } => "struct.new_default",
+        Operator::StructGetS { .. } => "struct.get_s",
+        Operator::StructGetU { .. } => "struct.get_u",
+        Operator::ArrayNew { .. } => "array.new",
+        Operator::ArrayNewFixed { .. } => "array.new_fixed",
+        Operator::ArrayGet { .. } => "array.get",
+        Operator::ArraySet { .. } => "array.set",
+        Operator::ArrayFill { .. } => "array.fill",
+        Operator::ArrayCopy { .. } => "array.copy",
+        Operator::ArrayLen => "array.len",
+        Operator::ArrayNewDefault { .. } => "array.new_default",
+        Operator::ArrayNewData { .. } => "array.new_data",
+        Operator::ArrayNewElem { .. } => "array.new_elem",
+        Operator::ArrayGetS { .. } => "array.get_s",
+        Operator::ArrayGetU { .. } => "array.get_u",
+        Operator::ArrayInitData { .. } => "array.init_data",
+        Operator::ArrayInitElem { .. } => "array.init_elem",
+        Operator::RefEq => "ref.eq",
+        Operator::RefI31 => "ref.i31",
+        Operator::I31GetS => "i31.get_s",
+        Operator::I31GetU => "i31.get_u",
+        Operator::RefTest { .. } => "ref.test",
+        Operator::RefCast { .. } => "ref.cast",
+        _ => return None,
+    })
 }
 
 fn storage(storage: StorageType) -> Result<CoreGcStorage, CoreGcError> {
@@ -264,6 +326,44 @@ mod tests {
             CoreGcTypeKind::Struct { fields }
                 if matches!(fields.as_slice(), [CoreGcStorage::ManagedRef { nullable: true, target }] if *target == node)
         ));
+    }
+
+    #[test]
+    fn inventory_records_native_gc_operations() {
+        let mut module = Module::empty();
+        let signature = module.signatures.push(SignatureData::Func {
+            params: vec![],
+            returns: vec![],
+            shared: false,
+        });
+        let mut body = portal_pc_waffle::FunctionBody::new(&module, signature);
+        let seven = body.add_op(
+            body.entry,
+            Operator::I32Const { value: 7 },
+            &[],
+            &[Type::I32],
+        );
+        body.add_op(
+            body.entry,
+            Operator::RefI31,
+            &[seven],
+            &[Type::Heap(WithNullable {
+                nullable: false,
+                value: HeapType::I31,
+            })],
+        );
+        module
+            .funcs
+            .push(FuncDecl::Body(signature, "uses_i31".to_owned(), body));
+        let inventory = CoreGcInventory::build(&module).expect("inventory");
+        assert_eq!(
+            inventory
+                .gc_operations
+                .iter()
+                .map(|operation| operation.name)
+                .collect::<Vec<_>>(),
+            ["ref.i31"]
+        );
     }
 
     #[test]

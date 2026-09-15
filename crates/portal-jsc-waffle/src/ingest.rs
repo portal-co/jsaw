@@ -162,6 +162,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn source_fingerprint_ignores_formatting_but_not_semantics() {
+        let formatted = portal_jsc_swc_ssa::module::source_fingerprint(
+            "export function f(x) { return x + 1; }",
+        )
+        .expect("valid source should fingerprint");
+        let comments_and_whitespace = portal_jsc_swc_ssa::module::source_fingerprint(
+            "// formatting must not create a cache miss\nexport function f( x ) { /* comment */ return x + 1; }",
+        )
+        .expect("valid source should fingerprint");
+        let changed = portal_jsc_swc_ssa::module::source_fingerprint(
+            "export function f(x) { return x + 2; }",
+        )
+        .expect("valid source should fingerprint");
+        assert_eq!(formatted, comments_and_whitespace);
+        assert_ne!(formatted, changed);
+    }
+
+    #[test]
     fn lazy_module_ingestion_matches_whole_module_metadata() {
         let source = r#"
             import { twice } from './dep.js';

@@ -200,6 +200,68 @@ pub struct ReinstantiatingActivator {
     active: Option<ActiveRevision>,
 }
 
+/// Reference implementation of a runtime-specific stable dispatch table.
+///
+/// It models only the runtime contract: stable source function keys map to an
+/// opaque implementation fingerprint. A real engine supplies code objects or
+/// table entries instead. Updates are planned on a cloned table and committed
+/// only after base validation, so a rejected delta cannot leave a partial swap.
+#[derive(Clone, Debug, Default)]
+pub struct DispatchDeltaActivator {
+    active: Option<ContentRevisionId>,
+    cells: BTreeMap<String, FunctionFingerprint>,
+}
+
+impl DispatchDeltaActivator {
+    pub fn active_revision(&self) -> Option<&ContentRevisionId> {
+        self.active.as_ref()
+    }
+
+    pub fn implementation_of(&self, function: &str) -> Option<FunctionFingerprint> {
+        self.cells.get(function).copied()
+    }
+
+    /// Apply one base-checked delta atomically from the reference runtime's
+    /// perspective. Actual Wasm code compilation/table mutation remains the
+    /// host runtime's adapter behind this same contract.
+    pub fn apply(&mut self, delta: &ModuleDelta) -> Result<(), ActivationError> {
+        if self.active.as_ref() != Some(&delta.base) {
+            return Err(ActivationError::BaseMismatch {
+                active: self.active.clone(),
+                requested: Some(delta.base.clone()),
+            });
+        }
+        let mut next_cells = self.cells.clone();
+        for operation in &delta.operations {
+            next_cells.insert(operation.function.clone(), operation.body);
+        }
+        self.cells = next_cells;
+        self.active = Some(delta.target.clone());
+        Ok(())
+    }
+
+    /// Seed the first dispatch revision. It has no base because there is no
+    /// previously active dispatch table.
+    pub fn initialize(
+        &mut self,
+        revision: ContentRevisionId,
+        operations: impl IntoIterator<Item = DeltaOperation>,
+    ) -> Result<(), ActivationError> {
+        if self.active.is_some() {
+            return Err(ActivationError::BaseMismatch {
+                active: self.active.clone(),
+                requested: None,
+            });
+        }
+        self.cells = operations
+            .into_iter()
+            .map(|operation| (operation.function, operation.body))
+            .collect();
+        self.active = Some(revision);
+        Ok(())
+    }
+}
+
 impl ReinstantiatingActivator {
     /// Snapshot the artifact for an exported call. Holding the returned value
     /// keeps an in-flight call on its original revision across later switches.
@@ -650,6 +712,47 @@ mod tests {
                 .is_empty()
         );
         assert!(!revision.revision.reload_plan.delta_eligible);
+    }
+
+    #[test]
+    fn dispatch_delta_updates_cells_atomically_after_base_validation() {
+        let initial = sources("export function run(x) { return x + 1; }");
+        let changed = sources("export function run(x) { return x + 2; }");
+        let mut compiler = RevisionCompiler::new(MemoryFragmentCache::default());
+        let first = compiler
+            .compile(RevisionRequest {
+                profile: ReloadProfile::DispatchDelta,
+                ..request(&initial)
+            })
+            .expect("initial revision");
+        let second = compiler
+            .compile(RevisionRequest {
+                profile: ReloadProfile::DispatchDelta,
+                base: Some(first.revision.content_id.clone()),
+                ..request(&changed)
+            })
+            .expect("changed revision");
+        let delta = second.delta.clone().expect("compatible delta");
+        let mut runtime = DispatchDeltaActivator::default();
+        runtime
+            .initialize(first.revision.content_id.clone(), [])
+            .expect("initial dispatch table");
+        runtime.apply(&delta).expect("base-compatible delta");
+        assert_eq!(runtime.active_revision(), Some(&second.revision.content_id));
+        assert_eq!(
+            runtime.implementation_of("run"),
+            Some(delta.operations[0].body)
+        );
+
+        let stale = ModuleDelta {
+            base: ContentRevisionId("stale-base".to_owned()),
+            ..delta
+        };
+        assert!(matches!(
+            runtime.apply(&stale),
+            Err(ActivationError::BaseMismatch { .. })
+        ));
+        assert_eq!(runtime.active_revision(), Some(&second.revision.content_id));
     }
 
     #[test]

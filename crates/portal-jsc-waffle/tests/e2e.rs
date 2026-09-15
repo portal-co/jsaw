@@ -157,6 +157,13 @@ fn coregc_inventory_accepts_jsaw_generated_wasmgc_types() {
         !inventory.types.is_empty(),
         "array/object lowering should produce managed aggregate descriptors"
     );
+    assert!(
+        inventory
+            .gc_operations
+            .iter()
+            .any(|operation| operation.name == "struct.new"),
+        "operation inventory must retain native operations for the fail-closed core lowering gate"
+    );
 }
 
 fn validate(module: &Module<'_>) {

@@ -4,7 +4,10 @@
 //! This module plans immutable revision artifacts. It never mutates a running
 //! Wasm instance: activation is the selected runtime's responsibility.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use portal_jsc_swc_ssa::module::{FunctionFingerprint, source_fingerprint};
 use sha3::{Digest, Sha3_256};
@@ -123,6 +126,65 @@ pub struct RevisionArtifact {
 pub struct RevisionOutput {
     pub revision: RevisionManifest,
     pub artifact: RevisionArtifact,
+}
+
+/// A runtime activation error. The runtime checks the base content ID rather
+/// than trusting a host-provided sequence number.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActivationError {
+    BaseMismatch {
+        active: Option<ContentRevisionId>,
+        requested: Option<ContentRevisionId>,
+    },
+}
+
+/// One immutable artifact selected by the reference reinstantiate adapter.
+/// Existing calls retain this `Arc`; later calls read the adapter's current
+/// artifact. This models the only portable Wasm behavior: no call frame is
+/// rewritten when a revision becomes active.
+#[derive(Clone, Debug)]
+pub struct ActiveRevision {
+    pub content_id: ContentRevisionId,
+    pub artifact: Arc<RevisionArtifact>,
+}
+
+/// Reference runtime adapter for the `Reinstantiate` profile.
+///
+/// It deliberately does not instantiate Wasm itself: an embedding runtime
+/// owns that task. It gives that runtime the correct switch-point contract and
+/// verifies base identity before atomically selecting the next immutable
+/// artifact. A real Wasmtime host can instantiate `artifact.wasm` before
+/// calling `activate`, then use the same selection rule for its instance.
+#[derive(Clone, Debug, Default)]
+pub struct ReinstantiatingActivator {
+    active: Option<ActiveRevision>,
+}
+
+impl ReinstantiatingActivator {
+    /// Snapshot the artifact for an exported call. Holding the returned value
+    /// keeps an in-flight call on its original revision across later switches.
+    pub fn begin_call(&self) -> Option<ActiveRevision> {
+        self.active.clone()
+    }
+
+    /// Select a complete immutable artifact for subsequent calls.
+    pub fn activate(&mut self, output: &RevisionOutput) -> Result<(), ActivationError> {
+        let active = self
+            .active
+            .as_ref()
+            .map(|revision| revision.content_id.clone());
+        if output.revision.base != active {
+            return Err(ActivationError::BaseMismatch {
+                active,
+                requested: output.revision.base.clone(),
+            });
+        }
+        self.active = Some(ActiveRevision {
+            content_id: output.revision.content_id.clone(),
+            artifact: Arc::new(output.artifact.clone()),
+        });
+        Ok(())
+    }
 }
 
 /// Input to the single deep revision-planning operation.
@@ -352,6 +414,50 @@ mod tests {
             Some(&FullRevisionReason::TopLevelChanged)
         );
         assert!(!revision.revision.reload_plan.delta_eligible);
+    }
+
+    #[test]
+    fn reinstantiate_switch_keeps_inflight_calls_on_the_prior_artifact() {
+        let initial = sources("export function run(x) { return x + 1; }");
+        let changed = sources("export function run(x) { return x + 2; }");
+        let mut compiler = RevisionCompiler::new(MemoryFragmentCache::default());
+        let first = compiler
+            .compile(request(&initial))
+            .expect("initial revision");
+        let mut activator = ReinstantiatingActivator::default();
+        activator.activate(&first).expect("initial activation");
+        let in_flight = activator.begin_call().expect("active revision");
+
+        let second = compiler
+            .compile(RevisionRequest {
+                base: Some(first.revision.content_id.clone()),
+                ..request(&changed)
+            })
+            .expect("changed revision");
+        activator.activate(&second).expect("compatible switch");
+        let current = activator.begin_call().expect("new active revision");
+        assert_eq!(in_flight.content_id, first.revision.content_id);
+        assert_eq!(current.content_id, second.revision.content_id);
+        assert_ne!(in_flight.content_id, current.content_id);
+    }
+
+    #[test]
+    fn reinstantiate_switch_rejects_a_stale_base() {
+        let inputs = sources("export function run(x) { return x + 1; }");
+        let mut compiler = RevisionCompiler::new(MemoryFragmentCache::default());
+        let output = compiler.compile(request(&inputs)).expect("revision");
+        let mut activator = ReinstantiatingActivator::default();
+        let stale = RevisionOutput {
+            revision: RevisionManifest {
+                base: Some(ContentRevisionId("not-active".to_owned())),
+                ..output.revision.clone()
+            },
+            artifact: output.artifact.clone(),
+        };
+        assert!(matches!(
+            activator.activate(&stale),
+            Err(ActivationError::BaseMismatch { .. })
+        ));
     }
 
     #[test]

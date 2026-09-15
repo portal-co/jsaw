@@ -146,6 +146,19 @@ fn compile_module(source: &str) -> Module<'static> {
         .expect("WasmGC module lowering should succeed")
 }
 
+#[test]
+fn coregc_inventory_accepts_jsaw_generated_wasmgc_types() {
+    let module = compile_module(
+        "export function run(n) { let a = [n, n + 1], o = { a: a }; return o.a[1]; }",
+    );
+    let inventory = portal_jsc_waffle::CoreGcInventory::build(&module)
+        .expect("the fallback inventory should understand jsaw's emitted aggregate types");
+    assert!(
+        !inventory.types.is_empty(),
+        "array/object lowering should produce managed aggregate descriptors"
+    );
+}
+
 fn validate(module: &Module<'_>) {
     for (_, declaration) in module.funcs.entries() {
         if let FuncDecl::Body(_, _, body) = declaration {

@@ -220,13 +220,23 @@ pub fn emit_runtime_skeleton(
     );
     body.add_op(
         commit,
-        Operator::I32Store { memory: memory_arg },
+        Operator::I32Store {
+            memory: MemoryArg {
+                offset: 4,
+                ..memory_arg
+            },
+        },
         &[bump_value, type_id],
         &[],
     );
     body.add_op(
         commit,
-        Operator::I32Store { memory: memory_arg },
+        Operator::I32Store {
+            memory: MemoryArg {
+                offset: 8,
+                ..memory_arg
+            },
+        },
         &[bump_value, payload_bytes],
         &[],
     );
@@ -268,9 +278,14 @@ pub fn emit_runtime_skeleton(
         "__coregc_alloc_phase1".to_owned(),
         body,
     ));
+    let validator = add_ref_validator(&mut module, memory);
     module.exports.push(portal_pc_waffle::Export {
         name: "__coregc_alloc_phase1".to_owned(),
         kind: portal_pc_waffle::ExportKind::Func(allocator),
+    });
+    module.exports.push(portal_pc_waffle::Export {
+        name: "__coregc_validate_ref_phase1".to_owned(),
+        kind: portal_pc_waffle::ExportKind::Func(validator),
     });
     module.exports.push(portal_pc_waffle::Export {
         name: "memory".to_owned(),
@@ -282,6 +297,167 @@ pub fn emit_runtime_skeleton(
         inventory,
         descriptors,
     })
+}
+
+/// Add the runtime fat-reference validator shared by future scanners and
+/// generated direct field accesses. Null is represented *only* as `(0, 0)`.
+fn add_ref_validator(
+    module: &mut Module<'static>,
+    memory: portal_pc_waffle::Memory,
+) -> portal_pc_waffle::Func {
+    let signature = module.signatures.push(SignatureData::Func {
+        params: vec![Type::I32, Type::I32],
+        returns: vec![Type::I32],
+        shared: false,
+    });
+    let mut body = FunctionBody::new(module, signature);
+    let entry = body.entry;
+    let address = body.blocks[entry].params[0].1;
+    let type_id = body.blocks[entry].params[1].1;
+    let null = body.add_block();
+    let non_null = body.add_block();
+    let null_ok = body.add_block();
+    let validate = body.add_block();
+    let success = body.add_block();
+    let fail = body.add_block();
+    let address_is_null = body.add_op(entry, Operator::I32Eqz, &[address], &[Type::I32]);
+    body.set_terminator(
+        entry,
+        Terminator::CondBr {
+            cond: address_is_null,
+            if_true: BlockTarget {
+                block: null,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: non_null,
+                args: vec![],
+            },
+        },
+    );
+    let null_type = body.add_op(null, Operator::I32Eqz, &[type_id], &[Type::I32]);
+    body.set_terminator(
+        null,
+        Terminator::CondBr {
+            cond: null_type,
+            if_true: BlockTarget {
+                block: null_ok,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: fail,
+                args: vec![],
+            },
+        },
+    );
+    body.set_terminator(
+        null_ok,
+        Terminator::Return {
+            values: vec![address],
+        },
+    );
+
+    let zero_type = body.add_op(non_null, Operator::I32Eqz, &[type_id], &[Type::I32]);
+    let header_bytes = i32_const(&mut body, non_null, COREGC_HEADER_BYTES);
+    let before_heap = body.add_op(
+        non_null,
+        Operator::I32LtU,
+        &[address, header_bytes],
+        &[Type::I32],
+    );
+    let invalid = body.add_op(
+        non_null,
+        Operator::I32Or,
+        &[zero_type, before_heap],
+        &[Type::I32],
+    );
+    body.set_terminator(
+        non_null,
+        Terminator::CondBr {
+            cond: invalid,
+            if_true: BlockTarget {
+                block: fail,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: validate,
+                args: vec![],
+            },
+        },
+    );
+    let header_address = body.add_op(
+        validate,
+        Operator::I32Sub,
+        &[address, header_bytes],
+        &[Type::I32],
+    );
+    let memory_arg = MemoryArg {
+        align: 2,
+        offset: 0,
+        memory,
+    };
+    let magic = body.add_op(
+        validate,
+        Operator::I32Load { memory: memory_arg },
+        &[header_address],
+        &[Type::I32],
+    );
+    let actual_type = body.add_op(
+        validate,
+        Operator::I32Load {
+            memory: MemoryArg {
+                offset: 4,
+                ..memory_arg
+            },
+        },
+        &[header_address],
+        &[Type::I32],
+    );
+    let expected_magic = i32_const(&mut body, validate, COREGC_MAGIC_ALLOCATED);
+    let bad_magic = body.add_op(
+        validate,
+        Operator::I32Ne,
+        &[magic, expected_magic],
+        &[Type::I32],
+    );
+    let bad_type = body.add_op(
+        validate,
+        Operator::I32Ne,
+        &[actual_type, type_id],
+        &[Type::I32],
+    );
+    let invalid = body.add_op(
+        validate,
+        Operator::I32Or,
+        &[bad_magic, bad_type],
+        &[Type::I32],
+    );
+    body.set_terminator(
+        validate,
+        Terminator::CondBr {
+            cond: invalid,
+            if_true: BlockTarget {
+                block: fail,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: success,
+                args: vec![],
+            },
+        },
+    );
+    body.set_terminator(
+        success,
+        Terminator::Return {
+            values: vec![address],
+        },
+    );
+    body.set_terminator(fail, Terminator::Unreachable);
+    module.funcs.push(FuncDecl::Body(
+        signature,
+        "__coregc_validate_ref_phase1".to_owned(),
+        body,
+    ))
 }
 
 fn i32_const(
@@ -366,6 +542,32 @@ mod tests {
         let (mut store, allocator) = allocator(&artifact);
         assert!(allocator.call(&mut store, (0, 8)).is_err());
         assert!(allocator.call(&mut store, (1, i32::MAX)).is_err());
+    }
+
+    #[test]
+    fn fat_reference_validator_accepts_only_matching_live_pairs() {
+        let artifact = emit_runtime_skeleton(&Module::empty(), &CoreGcOptions::default())
+            .expect("runtime skeleton");
+        let engine = Engine::default();
+        let bytes = portal_pc_waffle::to_wasm_bytes(&artifact.module).expect("core wasm encodes");
+        let module = WasmtimeModule::new(&engine, bytes).expect("core engine compiles artifact");
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).expect("artifact instantiates");
+        let allocator = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "__coregc_alloc_phase1")
+            .expect("allocator export");
+        let validator = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "__coregc_validate_ref_phase1")
+            .expect("validator export");
+        let address = allocator.call(&mut store, (1, 8)).expect("allocation");
+        assert_eq!(
+            validator.call(&mut store, (address, 1)).expect("live pair"),
+            address
+        );
+        assert_eq!(validator.call(&mut store, (0, 0)).expect("null pair"), 0);
+        assert!(validator.call(&mut store, (address, 2)).is_err());
+        assert!(validator.call(&mut store, (0, 1)).is_err());
+        assert!(validator.call(&mut store, (address, 0)).is_err());
     }
 
     #[test]

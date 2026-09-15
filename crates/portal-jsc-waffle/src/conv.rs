@@ -1914,10 +1914,22 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     "cannot replace unknown source component {component:#x}"
                 )));
             };
-            self.return_kinds.remove(component);
+            // Probe the replacement's return ABI without leaving a rejected
+            // update in the analysis cache: callers may continue running the
+            // current revision after this method reports the required full
+            // module replacement.
+            let previous_returns = self.return_kinds.remove(component);
             let returns = self.analyze_return_kinds(replacement);
             let arity = replacement.cfg.blocks[replacement.entry].params.len();
             if arity != info.arity || returns != info.returns {
+                match previous_returns {
+                    Some(previous) => {
+                        self.return_kinds.insert(*component, previous);
+                    }
+                    None => {
+                        self.return_kinds.remove(component);
+                    }
+                }
                 return Err(ConvertError::invalid(
                     "component ABI changed; a complete module revision is required",
                 ));
@@ -1947,6 +1959,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 .copied()
                 .or_else(|| self.function_sources.get(component).copied())
                 .ok_or_else(|| ConvertError::invalid("missing invalidated component source"))?;
+            // A rebuilt caller can discover new object shapes, helpers, or
+            // nested component functions. Register those before replacing its
+            // body, then rebuild its function-literal provenance analysis so
+            // direct/guarded dispatch stays consistent with the new source.
+            self.collect_shapes(source)?;
+            self.shadowed_names.clear();
+            self.function_literal_locals.clear();
+            self.collect_shadowed_names(source, &mut BTreeSet::new());
             let info = *self
                 .functions
                 .get(component)

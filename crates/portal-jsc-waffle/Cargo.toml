@@ -20,10 +20,10 @@ swc_common.workspace = true
 swc_ecma_ast.workspace = true
 swc_ecma_codegen.workspace = true
 swc_ecma_parser.workspace = true
+wasmparser = { version = "0.240", features = ["validate"] }
 
 [dev-dependencies]
 portal-jsc-mob-emit = { path = "../mobile/portal-jsc-mob-emit" }
 portal-jsc-jvm-emit = { path = "../mobile/portal-jsc-jvm-emit" }
 portal-jsc-swift-emit = { path = "../mobile/portal-jsc-swift-emit" }
-wasmparser = { version = "0.240", features = ["validate"] }
 wasmtime = { version = "47", default-features = false, features = ["cranelift", "gc-null", "runtime"] }

@@ -1518,6 +1518,63 @@ impl<'a> FunctionLowering<'a> {
     }
 }
 
+/// Debug root-discipline verifier (`docs/plan-coregc-atomic-collector-and-lowering.md`
+/// §6.4 item 7).
+///
+/// Checks that every value required to be rooted at a checkpoint has an
+/// assigned shadow-frame slot, and that every slot-holding value is actually
+/// defined somewhere in the source body (as a block parameter or an
+/// instruction result — those are exactly the two sites where codegen emits
+/// the corresponding `root_store`). A dominance argument is deliberately
+/// unnecessary: the source body is valid SSA (Waffle validates
+/// def-dominates-use), so the root_store emitted at each spilled value's
+/// definition site necessarily dominates every checkpoint that needs it.
+///
+/// A violation is an internal lowering bug, not a source-level diagnostic.
+fn verify_root_discipline(
+    body: &FunctionBody,
+    liveness: &Liveness,
+    slot_of: &BTreeMap<Value, u32>,
+    func: Func,
+) -> Result<(), CoreGcError> {
+    for (checkpoint, required) in &liveness.checkpoint_live {
+        for &value in required {
+            if !slot_of.contains_key(&value) {
+                return Err(CoreGcError {
+                    message: format!(
+                        "coregc root verifier: function {} checkpoint at value {} requires \
+                         value {} to be rooted, but no shadow-frame slot was assigned to it",
+                        func.index(),
+                        checkpoint.index(),
+                        value.index()
+                    ),
+                });
+            }
+        }
+    }
+    for &value in slot_of.keys() {
+        let defined = match &body.values[value] {
+            ValueDef::BlockParam(..) | ValueDef::Operator(..) => true,
+            // Aliases resolve to their target before use, so a spilled value
+            // is always stored at its resolved definition site; the alias
+            // itself is not a definition site.
+            ValueDef::Alias(_) => true,
+            ValueDef::PickOutput(..) | ValueDef::Placeholder(_) | ValueDef::None => false,
+        };
+        if !defined {
+            return Err(CoreGcError {
+                message: format!(
+                    "coregc root verifier: function {} assigns a root slot to value {} which has \
+                     no definition site in the body",
+                    func.index(),
+                    value.index()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn classify_function_body(
     source: &Module<'_>,
     inventory: &CoreGcInventory,
@@ -1569,6 +1626,7 @@ fn lower_function(
         .enumerate()
         .map(|(index, &value)| (value, index as u32))
         .collect();
+    verify_root_discipline(source_body, &computed, &slot_of, source_func)?;
 
     // Create every block (and its flattened params) up front so any
     // instruction later can resolve a branch-target/use regardless of
@@ -1821,7 +1879,7 @@ pub(crate) fn lower(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests_fixtures {
     use super::*;
     use crate::coregc::CoreGcInventory;
     use crate::coregc_runtime::{self, CoreGcOptions};
@@ -1830,7 +1888,7 @@ mod tests {
     };
     use wasmtime::{Engine, Instance, Module as WasmtimeModule, Store};
 
-    fn field(value: StorageType) -> WithMutablility<StorageType> {
+    pub(crate) fn field(value: StorageType) -> WithMutablility<StorageType> {
         WithMutablility {
             mutable: true,
             value,
@@ -1844,7 +1902,7 @@ mod tests {
     /// allocated node must survive every later collection for this to return
     /// the correct sum, exercising retention across a loop-carried fat-ref
     /// block parameter through many collections, not just one.
-    fn list_sum_source() -> (Module<'static>, Signature) {
+    pub(crate) fn list_sum_source() -> (Module<'static>, Signature) {
         let mut module = Module::empty();
         let node = module.signatures.push(SignatureData::Struct {
             fields: vec![],
@@ -2004,7 +2062,7 @@ mod tests {
     /// element (`array.get`/`array.len`/`struct.get`). The array itself and
     /// every already-stored node must survive the *other* nodes' allocating
     /// checkpoints.
-    fn array_sum_source() -> Module<'static> {
+    pub(crate) fn array_sum_source() -> Module<'static> {
         let mut module = Module::empty();
         let node = module.signatures.push(SignatureData::Struct {
             fields: vec![],
@@ -2174,7 +2232,7 @@ mod tests {
     /// `Operator::Call`) to allocate a second, and finally reads both
     /// `.value` fields. The directly-allocated node is only used *after*
     /// the call, so it must survive the call's own checkpoint.
-    fn direct_call_source() -> Module<'static> {
+    pub(crate) fn direct_call_source() -> Module<'static> {
         let mut module = Module::empty();
         let node = module.signatures.push(SignatureData::Struct {
             fields: vec![],
@@ -2273,7 +2331,7 @@ mod tests {
     /// `else` arm calls through a deliberate null function reference to
     /// prove that traps deterministically with no coregc-specific runtime
     /// support (core Wasm's own `call_indirect` semantics).
-    fn call_ref_source() -> Module<'static> {
+    pub(crate) fn call_ref_source() -> Module<'static> {
         let mut module = Module::empty();
         let unary_sig = module.signatures.push(SignatureData::Func {
             params: vec![Type::I32],
@@ -2384,7 +2442,55 @@ mod tests {
     }
 
 
-    fn lower_and_instantiate(source: &Module<'_>, options: CoreGcOptions) -> (Store<()>, Instance) {
+    /// A fixture whose only unusual feature is a `ReturnCallRef` tail-call
+    /// terminator — rejected by v1 preflight with a named diagnostic.
+    pub(crate) fn tail_call_source() -> Module<'static> {
+        let mut module = Module::empty();
+        let unary_sig = module.signatures.push(SignatureData::Func {
+            params: vec![Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let unary_ref = Type::Heap(WithNullable {
+            nullable: true,
+            value: HeapType::Sig {
+                sig_index: unary_sig,
+            },
+        });
+        let mut callee_body = FunctionBody::new(&module, unary_sig);
+        let callee_entry = callee_body.entry;
+        let x = callee_body.blocks[callee_entry].params[0].1;
+        callee_body.set_terminator(callee_entry, Terminator::Return { values: vec![x] });
+        callee_body.recompute_edges();
+        callee_body.validate().unwrap();
+        module
+            .funcs
+            .push(FuncDecl::Body(unary_sig, "callee".to_owned(), callee_body));
+
+        let mut body = FunctionBody::new(&module, unary_sig);
+        let entry = body.entry;
+        let x = body.blocks[entry].params[0].1;
+        let null_ref = body.add_op(entry, Operator::RefNull { ty: unary_ref }, &[], &[unary_ref]);
+        body.set_terminator(
+            entry,
+            Terminator::ReturnCallRef {
+                sig: unary_sig,
+                args: vec![x, null_ref],
+            },
+        );
+        body.recompute_edges();
+        body.validate().unwrap();
+        let f = module
+            .funcs
+            .push(FuncDecl::Body(unary_sig, "tail_caller".to_owned(), body));
+        module.exports.push(Export {
+            name: "tail_caller".to_owned(),
+            kind: ExportKind::Func(f),
+        });
+        module
+    }
+
+    pub(crate) fn lower_and_instantiate(source: &Module<'_>, options: CoreGcOptions) -> (Store<()>, Instance) {
         let inventory = CoreGcInventory::build(source).expect("inventory");
         let descriptors = CoreGcDescriptorTable::build(&inventory).expect("descriptors");
         let mut out = Module::empty();
@@ -2421,6 +2527,20 @@ mod tests {
         (store, instance)
     }
 
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coregc::CoreGcInventory;
+    use crate::coregc_runtime::{self, CoreGcOptions};
+    use portal_pc_waffle::{
+        Export, ExportKind, SignatureData, StorageType, WithMutablility, WithNullable,
+    };
+    use wasmtime::{Engine, Instance, Module as WasmtimeModule, Store};
+
+    use super::tests_fixtures::*;
     #[test]
     fn list_built_and_summed_survives_a_forced_collection_at_every_allocation() {
         let (source, _) = list_sum_source();
@@ -2438,6 +2558,46 @@ mod tests {
         // and every traversal read: nothing before the current node in the
         // loop-carried `cur1`/`cur2` chain may be reclaimed early.
         assert_eq!(build.call(&mut store, 20).expect("build(20)"), (0..20).sum::<i32>());
+    }
+
+    #[test]
+    fn root_verifier_rejects_a_checkpoint_value_without_a_slot() {
+        // Simulates a broken lowering that failed to assign a shadow-frame
+        // slot to a value the collector needs: the verifier must catch the
+        // omission, proving it is not a no-op.
+        let (source, _) = list_sum_source();
+        let FuncDecl::Body(_, _, body) = &source.funcs.values().next().unwrap() else {
+            unreachable!()
+        };
+        let inventory = CoreGcInventory::build(&source).expect("inventory");
+        let value_plan = classify_function_body(&source, &inventory, body).expect("classification");
+        let is_fatref = |v: Value| value_plan.get(&v).is_some_and(|p| p.is_fatref());
+        let mut liveness = super::liveness::compute(body, is_fatref, is_checkpoint_operator)
+            .expect("liveness");
+        let slot_of: BTreeMap<Value, u32> = BTreeMap::new();
+        assert!(verify_root_discipline(body, &liveness, &slot_of, Func::new(0)).is_err());
+        // Sanity check: with honest slot assignment, verification passes.
+        let spilled: BTreeSet<Value> = liveness
+            .checkpoint_live
+            .values()
+            .flatten()
+            .copied()
+            .collect();
+        let honest: BTreeMap<Value, u32> = spilled
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| (value, index as u32))
+            .collect();
+        verify_root_discipline(body, &liveness, &honest, Func::new(0)).expect("honest passes");
+        // And a doctored liveness map with a bogus extra requirement fails.
+        let fake = Value::new(u32::MAX as usize - 1);
+        let first_checkpoint = *liveness.checkpoint_live.keys().next().unwrap();
+        liveness
+            .checkpoint_live
+            .entry(first_checkpoint)
+            .or_default()
+            .push(fake);
+        assert!(verify_root_discipline(body, &liveness, &honest, Func::new(0)).is_err());
     }
 
     #[test]
@@ -2567,6 +2727,7 @@ mod tests {
         collect.call(&mut store, ()).expect("forced collection after both calls");
     }
 }
+
 
 #[cfg(test)]
 mod call_indirect_regressions {

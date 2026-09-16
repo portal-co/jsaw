@@ -1,5 +1,6 @@
 pub mod conv;
 pub mod coregc;
+pub mod coregc_emit;
 pub mod coregc_layout;
 pub mod coregc_lower;
 pub mod coregc_roots;
@@ -17,6 +18,7 @@ pub use coregc::{
     COREGC_INVENTORY_SCHEMA, CoreGcError, CoreGcInventory, CoreGcOperation, CoreGcStorage,
     CoreGcType, CoreGcTypeId, CoreGcTypeKind,
 };
+pub use coregc_emit::{CoreGcArtifact, CoreGcOptions, emit_coregc};
 pub use coregc_layout::{
     COREGC_DESCRIPTOR_MAGIC, COREGC_DESCRIPTOR_VERSION, CoreGcDescriptorTable, CoreGcPayloadLayout,
     CoreGcSlotLayout,

@@ -75,6 +75,9 @@ pub struct CoreGcOptions {
     /// triggers a collection. `0` forces a collection at every checkpoint
     /// (used by the forced-collection acceptance fixtures).
     pub collect_threshold_bytes: u32,
+    /// Export `__coregc_collect` and `memory` for host-driven debugging.
+    /// Production artifacts keep only the program's own exports.
+    pub export_runtime_debug: bool,
 }
 
 impl Default for CoreGcOptions {
@@ -86,6 +89,7 @@ impl Default for CoreGcOptions {
             root_stack_bytes: 4096,
             worklist_bytes: 8192,
             collect_threshold_bytes: 1 << 20,
+            export_runtime_debug: false,
         }
     }
 }

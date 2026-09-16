@@ -370,6 +370,7 @@ pub fn emit_runtime_skeleton(
         body,
     ));
     let validator = add_ref_validator(&mut module, memory);
+    let array_bounds = add_array_bounds_check(&mut module, memory, validator);
     module.exports.push(portal_pc_waffle::Export {
         name: "__coregc_alloc_phase1".to_owned(),
         kind: portal_pc_waffle::ExportKind::Func(allocator),
@@ -377,6 +378,10 @@ pub fn emit_runtime_skeleton(
     module.exports.push(portal_pc_waffle::Export {
         name: "__coregc_validate_ref_phase1".to_owned(),
         kind: portal_pc_waffle::ExportKind::Func(validator),
+    });
+    module.exports.push(portal_pc_waffle::Export {
+        name: "__coregc_array_bounds_phase1".to_owned(),
+        kind: portal_pc_waffle::ExportKind::Func(array_bounds),
     });
     module.exports.push(portal_pc_waffle::Export {
         name: "memory".to_owned(),
@@ -551,6 +556,78 @@ fn add_ref_validator(
     ))
 }
 
+/// Validate a concrete array reference and its unsigned element index.
+///
+/// The returned index is intentionally identical to the argument, which makes
+/// a following typed load/store explicit about its dominating bounds check.
+fn add_array_bounds_check(
+    module: &mut Module<'static>,
+    memory: portal_pc_waffle::Memory,
+    validator: portal_pc_waffle::Func,
+) -> portal_pc_waffle::Func {
+    let signature = module.signatures.push(SignatureData::Func {
+        params: vec![Type::I32, Type::I32, Type::I32],
+        returns: vec![Type::I32],
+        shared: false,
+    });
+    let mut body = FunctionBody::new(module, signature);
+    let entry = body.entry;
+    let address = body.blocks[entry].params[0].1;
+    let type_id = body.blocks[entry].params[1].1;
+    let index = body.blocks[entry].params[2].1;
+    let checked_address = body.add_op(
+        entry,
+        Operator::Call {
+            function_index: validator,
+        },
+        &[address, type_id],
+        &[Type::I32],
+    );
+    // Array payloads reserve their first word for length. Only generated
+    // array accesses call this helper with a concrete array type ID.
+    let length = body.add_op(
+        entry,
+        Operator::I32Load {
+            memory: MemoryArg {
+                align: 2,
+                offset: 0,
+                memory,
+            },
+        },
+        &[checked_address],
+        &[Type::I32],
+    );
+    let in_bounds = body.add_op(entry, Operator::I32LtU, &[index, length], &[Type::I32]);
+    let success = body.add_block();
+    let fail = body.add_block();
+    body.set_terminator(
+        entry,
+        Terminator::CondBr {
+            cond: in_bounds,
+            if_true: BlockTarget {
+                block: success,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: fail,
+                args: vec![],
+            },
+        },
+    );
+    body.set_terminator(
+        success,
+        Terminator::Return {
+            values: vec![index],
+        },
+    );
+    body.set_terminator(fail, Terminator::Unreachable);
+    module.funcs.push(FuncDecl::Body(
+        signature,
+        "__coregc_array_bounds_phase1".to_owned(),
+        body,
+    ))
+}
+
 fn i32_const(
     body: &mut FunctionBody,
     block: portal_pc_waffle::Block,
@@ -588,22 +665,10 @@ mod tests {
                 body.validate().expect("generated runtime IR validates");
             }
         }
-        let (mut store, allocator) = allocator(&artifact);
-        let first = allocator
-            .call(&mut store, (1, 1))
-            .expect("first allocation");
-        let second = allocator
-            .call(&mut store, (1, 8))
-            .expect("second allocation");
-        assert_eq!(
-            first,
-            0x1_0000 + i32::try_from(COREGC_HEADER_BYTES).unwrap()
-        );
-        assert_eq!(
-            second,
-            first + 32,
-            "allocation includes aligned header and payload"
-        );
+        let bytes = portal_pc_waffle::to_wasm_bytes(&artifact.module).expect("core wasm encodes");
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("artifact validates with default core features");
     }
 
     #[test]
@@ -627,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_skeleton_traps_invalid_type_or_capacity_request() {
+    fn allocator_bumps_aligned_and_traps_invalid_type_or_capacity() {
         let artifact = emit_runtime_skeleton(
             &Module::empty(),
             &CoreGcOptions {
@@ -637,12 +702,27 @@ mod tests {
         )
         .expect("runtime skeleton");
         let (mut store, allocator) = allocator(&artifact);
+        let first = allocator
+            .call(&mut store, (1, 1))
+            .expect("first allocation");
+        let second = allocator
+            .call(&mut store, (1, 8))
+            .expect("second allocation");
+        assert_eq!(
+            first,
+            0x1_0000 + i32::try_from(COREGC_HEADER_BYTES).unwrap()
+        );
+        assert_eq!(
+            second,
+            first + 32,
+            "allocation includes aligned header and payload"
+        );
         assert!(allocator.call(&mut store, (0, 8)).is_err());
         assert!(allocator.call(&mut store, (1, i32::MAX)).is_err());
     }
 
     #[test]
-    fn runtime_skeleton_grows_memory_until_its_configured_cap() {
+    fn allocator_grows_memory_until_its_configured_cap() {
         let artifact = emit_runtime_skeleton(
             &Module::empty(),
             &CoreGcOptions {
@@ -667,6 +747,38 @@ mod tests {
             .expect("allocation grows one page");
         assert_eq!(memory.size(&store), 3);
         assert!(allocator.call(&mut store, (1, 70_000)).is_err());
+    }
+
+    #[test]
+    fn array_bounds_check_accepts_in_bounds_and_traps_out_of_bounds() {
+        let artifact = emit_runtime_skeleton(&Module::empty(), &CoreGcOptions::default())
+            .expect("runtime skeleton");
+        let engine = Engine::default();
+        let bytes = portal_pc_waffle::to_wasm_bytes(&artifact.module).expect("core wasm encodes");
+        let module = WasmtimeModule::new(&engine, bytes).expect("core engine compiles artifact");
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).expect("artifact instantiates");
+        // Allocate an array whose payload begins with a length word (= 1).
+        // The bounds helper only checks its own argument against that word.
+        let allocator = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "__coregc_alloc_phase1")
+            .expect("allocator export");
+        let bounds = instance
+            .get_typed_func::<(i32, i32, i32), i32>(&mut store, "__coregc_array_bounds_phase1")
+            .expect("bounds export");
+        let address = allocator.call(&mut store, (1, 8)).expect("allocation");
+        // Write the length word at payload[0].
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .expect("memory export");
+        memory
+            .write(&mut store, (address as u32) as usize, &1u32.to_le_bytes())
+            .expect("length write");
+        assert_eq!(
+            bounds.call(&mut store, (address, 1, 0)).expect("index 0"),
+            0
+        );
+        assert!(bounds.call(&mut store, (address, 1, 1)).is_err());
     }
 
     #[test]

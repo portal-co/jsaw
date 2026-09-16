@@ -526,8 +526,7 @@ impl Repr {
 pub(crate) const SLOT_WRITABLE: i32 = 1 << 0;
 pub(crate) const SLOT_ENUMERABLE: i32 = 1 << 1;
 pub(crate) const SLOT_CONFIGURABLE: i32 = 1 << 2;
-pub(crate) const SLOT_FLAGS_DEFAULT: i32 =
-    SLOT_WRITABLE | SLOT_ENUMERABLE | SLOT_CONFIGURABLE;
+pub(crate) const SLOT_FLAGS_DEFAULT: i32 = SLOT_WRITABLE | SLOT_ENUMERABLE | SLOT_CONFIGURABLE;
 
 /// Index of the primordial-tag field within the `function` struct (see the
 /// field's declaration in [`Repr::new`]).

@@ -1,3 +1,11 @@
+//! Exact shadow-root frame ABI for the coregc collector.
+//!
+//! Owns the shadow-frame memory layout (`docs/plan-coregc-atomic-collector-and-lowering.md`
+//! §3.7), frame push/pop/store/clear, and root iteration (walking the linked
+//! frame chain and calling a marker for every root pair). It does not decide
+//! mark/sweep policy or interpret descriptors; `coregc_runtime` owns that and
+//! calls [`add_root_walk`] as one step of its collection algorithm.
+
 use portal_pc_waffle::{
     BlockTarget, FuncDecl, FunctionBody, MemoryArg, Module, Operator, SignatureData, Terminator,
     Type,
@@ -11,7 +19,7 @@ fn i32_const(
     body.add_op(block, Operator::I32Const { value }, &[], &[Type::I32])
 }
 
-/// Functions that form the Phase-3 precise shadow-root ABI.
+/// Functions that form the shadow-root ABI (`docs/plan-coregc-atomic-collector-and-lowering.md` §3.7).
 pub(crate) struct ShadowRootFunctions {
     pub(crate) push: portal_pc_waffle::Func,
     pub(crate) pop: portal_pc_waffle::Func,
@@ -22,8 +30,9 @@ pub(crate) struct ShadowRootFunctions {
 /// Generate frame management for exact `(address, type_id)` root pairs.
 ///
 /// A frame is `{ previous: i32, slot_count: i32, slots: [addr, type] }` in
-/// reserved linear memory. Frames are append-only during an activation; popping
-/// resets the bump only after proving the frame is the stack head.
+/// reserved linear memory below the managed heap. Frames are append-only
+/// during an activation; popping resets the bump only after proving the
+/// frame is the stack head.
 pub(crate) fn add_shadow_roots(
     module: &mut Module<'static>,
     memory: portal_pc_waffle::Memory,
@@ -45,7 +54,7 @@ pub(crate) fn add_shadow_roots(
 
 fn add_root_push(
     module: &mut Module<'static>,
-    _memory: portal_pc_waffle::Memory,
+    memory: portal_pc_waffle::Memory,
     heap_base: u32,
     root_head: portal_pc_waffle::Global,
     root_bump: portal_pc_waffle::Global,
@@ -103,7 +112,7 @@ fn add_root_push(
     let mem = MemoryArg {
         align: 2,
         offset: 0,
-        memory: _memory,
+        memory,
     };
     body.add_op(
         commit,
@@ -141,11 +150,9 @@ fn add_root_push(
             values: vec![frame],
         },
     );
-    module.funcs.push(FuncDecl::Body(
-        signature,
-        "__coregc_push_frame_phase3".to_owned(),
-        body,
-    ))
+    module
+        .funcs
+        .push(FuncDecl::Body(signature, "__coregc_push_frame".to_owned(), body))
 }
 
 fn add_root_pop(
@@ -218,11 +225,9 @@ fn add_root_pop(
         &[],
     );
     body.set_terminator(commit, Terminator::Return { values: vec![] });
-    module.funcs.push(FuncDecl::Body(
-        signature,
-        "__coregc_pop_frame_phase3".to_owned(),
-        body,
-    ))
+    module
+        .funcs
+        .push(FuncDecl::Body(signature, "__coregc_pop_frame".to_owned(), body))
 }
 
 fn add_root_store(
@@ -295,11 +300,9 @@ fn add_root_store(
         &[],
     );
     body.set_terminator(commit, Terminator::Return { values: vec![] });
-    module.funcs.push(FuncDecl::Body(
-        signature,
-        "__coregc_root_store_phase3".to_owned(),
-        body,
-    ))
+    module
+        .funcs
+        .push(FuncDecl::Body(signature, "__coregc_root_store".to_owned(), body))
 }
 
 fn add_root_clear(
@@ -371,24 +374,22 @@ fn add_root_clear(
         &[],
     );
     body.set_terminator(commit, Terminator::Return { values: vec![] });
-    module.funcs.push(FuncDecl::Body(
-        signature,
-        "__coregc_root_clear_phase3".to_owned(),
-        body,
-    ))
+    module
+        .funcs
+        .push(FuncDecl::Body(signature, "__coregc_root_clear".to_owned(), body))
 }
 
-/// Generate the Phase-3 root-aware collection checkpoint. It marks every
-/// exact root pair in the linked frame chain. Full descriptor scanning/sweep
-/// stays behind Phase-2's operation gate, so this function deliberately does
-/// not reclaim allocations yet: preserving a marked root is more important
-/// than unsafely freeing an object whose descriptor scanner is not generated.
-pub(crate) fn add_root_collect(
+/// Generate a root-iteration function: walk the linked shadow-frame chain
+/// from `root_head` and call `mark_ref(addr, type_id)` for every slot in
+/// every frame. This is the only place that knows the frame/slot memory
+/// layout on the read side; `coregc_runtime`'s collector calls the returned
+/// `Func` as the first step of `collect` (docs plan §3.6) and otherwise does
+/// not know how frames are laid out.
+pub(crate) fn add_root_walk(
     module: &mut Module<'static>,
     memory: portal_pc_waffle::Memory,
-    _allocation_head: portal_pc_waffle::Global,
     root_head: portal_pc_waffle::Global,
-    marker: portal_pc_waffle::Func,
+    mark_ref: portal_pc_waffle::Func,
 ) -> portal_pc_waffle::Func {
     let signature = module.signatures.push(SignatureData::Func {
         params: vec![],
@@ -514,7 +515,7 @@ pub(crate) fn add_root_collect(
     body.add_op(
         mark_slot,
         Operator::Call {
-            function_index: marker,
+            function_index: mark_ref,
         },
         &[address, type_id],
         &[],
@@ -558,9 +559,7 @@ pub(crate) fn add_root_collect(
         },
     );
     body.set_terminator(done, Terminator::Return { values: vec![] });
-    module.funcs.push(FuncDecl::Body(
-        signature,
-        "__coregc_collect".to_owned(),
-        body,
-    ))
+    module
+        .funcs
+        .push(FuncDecl::Body(signature, "__coregc_walk_roots".to_owned(), body))
 }

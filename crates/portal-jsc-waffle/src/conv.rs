@@ -6,13 +6,15 @@ use std::{
 use portal_jsc_swc_ssa::{SBlockId, SFunc, SValue, SValueId, module::SModule};
 use portal_jsc_swc_tac::{Item, LId, PropKey, PropVal, TCallee, TTerm};
 use portal_pc_waffle::{
-    Block, BlockTarget, EntityRef, Export, ExportKind, Func, FuncDecl, FunctionBody, HeapType, Module,
-    Operator, SignatureData, Table, TableData, Terminator, Type, Value, WithNullable,
+    Block, BlockTarget, EntityRef, Export, ExportKind, Func, FuncDecl, FunctionBody, HeapType,
+    Module, Operator, SignatureData, Table, TableData, Terminator, Type, Value, WithNullable,
 };
 use swc_ecma_ast::{BinaryOp, Id as Ident, Lit, UnaryOp};
 
 use crate::linker::{ImportTarget, ModuleSet};
-use crate::repr::{ConvertError, FUNCTION_FIELD_TAG, JS_NULL_SENTINEL, Repr, TypedArrayKind, field, ref_sig};
+use crate::repr::{
+    ConvertError, FUNCTION_FIELD_TAG, JS_NULL_SENTINEL, Repr, TypedArrayKind, field, ref_sig,
+};
 
 /// Convert jsaw-core SSA into a WasmGC module.
 ///
@@ -48,7 +50,6 @@ impl Default for ConvertOptions {
         }
     }
 }
-
 
 /// Opaque identity for a source component registered in an
 /// [`IncrementalConverter`]. It is valid only for the converter session that
@@ -125,7 +126,6 @@ impl<'a, 'module, 'wasm> IncrementalConverter<'a, 'module, 'wasm> {
         Ok(())
     }
 }
-
 
 /// Lower an ES module and expose its function exports through Wasm exports.
 ///
@@ -467,7 +467,9 @@ fn parse_bigint_i64(raw: Option<&str>, span: &impl std::fmt::Debug) -> Result<i6
     } else {
         digits.replace('_', "").parse::<u64>()
     }
-    .map_err(|_| ConvertError::unsupported(format!("BigInt literal {text} out of i64 range"), span))?;
+    .map_err(|_| {
+        ConvertError::unsupported(format!("BigInt literal {text} out of i64 range"), span)
+    })?;
     let value = if negative {
         (parsed as i64).wrapping_neg()
     } else {
@@ -479,13 +481,11 @@ fn parse_bigint_i64(raw: Option<&str>, span: &impl std::fmt::Debug) -> Result<i6
 /// One kind's payload slot in a dedicated multi layout: the field index and
 /// the slot's storage type. Canonical field order is `tag, r, i, f` with
 /// absent groups elided, so the index follows from which groups precede.
-fn multi_slot(
-    layout: portal_pc_waffle::Signature,
-    repr: &Repr,
-    kind: ValueKind,
-) -> (usize, Type) {
-    let has_ref = matches!(layout, l if l == repr.multi_rf || l == repr.multi_ri || l == repr.multi_rif);
-    let has_i32 = matches!(layout, l if l == repr.multi_ri || l == repr.multi_if || l == repr.multi_rif);
+fn multi_slot(layout: portal_pc_waffle::Signature, repr: &Repr, kind: ValueKind) -> (usize, Type) {
+    let has_ref =
+        matches!(layout, l if l == repr.multi_rf || l == repr.multi_ri || l == repr.multi_rif);
+    let has_i32 =
+        matches!(layout, l if l == repr.multi_ri || l == repr.multi_if || l == repr.multi_rif);
     match kind {
         ValueKind::Reference => {
             debug_assert!(has_ref, "layout must carry the reference slot");
@@ -955,11 +955,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     /// nested closures) assigns. A primordial name that is never assigned in
     /// an enclosing scope chain cannot be shadowed, so call sites can skip
     /// the runtime tag check entirely. Collected into `shadowed_names`.
-    fn collect_shadowed_names(
-        &mut self,
-        func: &'a SFunc,
-        visited: &mut BTreeSet<usize>,
-    ) {
+    fn collect_shadowed_names(&mut self, func: &'a SFunc, visited: &mut BTreeSet<usize>) {
         self.collect_shadowed_names_nested(func, visited, false)
     }
 
@@ -1164,9 +1160,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 TailCalleeKinds::InProgress => {}
                 TailCalleeKinds::Unknown => kinds.insert(ValueKind::Reference),
             },
-            TTerm::Jmp(target) => {
-                self.scan_return_kinds(root, target.block, kinds, visited_blocks)
-            }
+            TTerm::Jmp(target) => self.scan_return_kinds(root, target.block, kinds, visited_blocks),
             TTerm::CondJmp {
                 if_true, if_false, ..
             } => {
@@ -1191,38 +1185,38 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let TCallee::Val(value) = callee else {
             return TailCalleeKinds::Unknown;
         };
-        let callee_sfunc: Option<&'a SFunc> =
-            match &root.cfg.values[*value].value {
-                // A direct function literal.
-                SValue::Item { item: Item::Func { func, .. }, .. } => Some(func),
-                // A load of a single-assignment function-literal local, a
-                // self-recursive name, or an import binding: the same
-                // provenance the lowering arm accepts.
-                SValue::LoadId(id) => {
-                    let is_self_name = self
-                        .lowering_function_key
-                        .is_some_and(|current| {
-                            self.function_self_names
-                                .get(&current)
-                                .is_some_and(|name| name == id)
-                        });
-                    let resolved = if is_self_name {
-                        self.lowering_function
-                    } else if let Some(literal) = self.function_literal_locals.get(id).copied() {
-                        Some(literal)
-                    } else if let Some(target) = self
-                        .import_tables
-                        .get(&self.current_module)
-                        .and_then(|table| table.get(id))
-                    {
-                        Some(target.function)
-                    } else {
-                        None
-                    };
-                    resolved
-                }
-                _ => None,
-            };
+        let callee_sfunc: Option<&'a SFunc> = match &root.cfg.values[*value].value {
+            // A direct function literal.
+            SValue::Item {
+                item: Item::Func { func, .. },
+                ..
+            } => Some(func),
+            // A load of a single-assignment function-literal local, a
+            // self-recursive name, or an import binding: the same
+            // provenance the lowering arm accepts.
+            SValue::LoadId(id) => {
+                let is_self_name = self.lowering_function_key.is_some_and(|current| {
+                    self.function_self_names
+                        .get(&current)
+                        .is_some_and(|name| name == id)
+                });
+                let resolved = if is_self_name {
+                    self.lowering_function
+                } else if let Some(literal) = self.function_literal_locals.get(id).copied() {
+                    Some(literal)
+                } else if let Some(target) = self
+                    .import_tables
+                    .get(&self.current_module)
+                    .and_then(|table| table.get(id))
+                {
+                    Some(target.function)
+                } else {
+                    None
+                };
+                resolved
+            }
+            _ => None,
+        };
         let Some(func) = callee_sfunc else {
             return TailCalleeKinds::Unknown;
         };
@@ -1242,11 +1236,18 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     /// select or logical operator) still has *arm-wise* kinds: insert every
     /// arm's kind. Falls back to the boxed reference join only when even
     /// the arms cannot be classified.
-    fn insert_mixed_site_kinds(&mut self, root: &'a SFunc, value: SValueId, kinds: &mut ReturnKinds) {
+    fn insert_mixed_site_kinds(
+        &mut self,
+        root: &'a SFunc,
+        value: SValueId,
+        kinds: &mut ReturnKinds,
+    ) {
         let mut inserted = false;
         if let SValue::Item { item, .. } = &root.cfg.values[value].value {
             let arms: Vec<SValueId> = match item {
-                Item::Select { then, otherwise, .. } => vec![*then, *otherwise],
+                Item::Select {
+                    then, otherwise, ..
+                } => vec![*then, *otherwise],
                 Item::Bin { left, right, op }
                     if matches!(
                         op,
@@ -1291,7 +1292,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         }
     }
 
-    fn classify_return_item(&mut self, root: &'a SFunc, item: &Item<SValueId, SFunc>) -> Option<ValueKind> {
+    fn classify_return_item(
+        &mut self,
+        root: &'a SFunc,
+        item: &Item<SValueId, SFunc>,
+    ) -> Option<ValueKind> {
         match item {
             Item::Just { id } => self.classify_return_value(root, *id),
             Item::Lit { lit } => match lit {
@@ -1319,7 +1324,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 // Numeric coercions keep the raw f64/i32 representations.
                 UnaryOp::Plus | UnaryOp::Minus => self
                     .classify_return_value(root, *arg)
-                    .filter(|kind| matches!(kind, ValueKind::Number | ValueKind::Boolean | ValueKind::Integer))
+                    .filter(|kind| {
+                        matches!(
+                            kind,
+                            ValueKind::Number | ValueKind::Boolean | ValueKind::Integer
+                        )
+                    })
                     .or(Some(ValueKind::Number)),
                 UnaryOp::Bang => Some(ValueKind::Boolean),
                 UnaryOp::Tilde => {
@@ -1332,7 +1342,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 UnaryOp::Void | UnaryOp::TypeOf | UnaryOp::Delete => Some(ValueKind::Reference),
             },
             Item::Bin { left, right, op } => self.classify_return_bin(root, *left, *right, *op),
-            Item::Select { cond, then, otherwise } => {
+            Item::Select {
+                cond,
+                then,
+                otherwise,
+            } => {
                 let then_kind = self.classify_return_value(root, *then);
                 let otherwise_kind = self.classify_return_value(root, *otherwise);
                 match (then_kind, otherwise_kind) {
@@ -1381,8 +1395,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 }
                 Some(ValueKind::Number)
             }
-            Lt | LtEq | Gt | GtEq | EqEq | EqEqEq | NotEq | NotEqEq
-            | InstanceOf | In => Some(ValueKind::Boolean),
+            Lt | LtEq | Gt | GtEq | EqEq | EqEqEq | NotEq | NotEqEq | InstanceOf | In => {
+                Some(ValueKind::Boolean)
+            }
             BitAnd | BitOr | BitXor | LShift | RShift | ZeroFillRShift => {
                 // BigInt bitwise ops yield a BigInt; number bitwise ops an i32.
                 let left_kind = self.classify_return_value(root, left);
@@ -1417,8 +1432,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             TCallee::Val(value) => {
                 // A direct call to a local function literal or a hoisted
                 // declaration: reuse (or compute) that callee's analysis.
-                if let SValue::Item { item: Item::Func { func, .. }, .. } =
-                    &root.cfg.values[*value].value
+                if let SValue::Item {
+                    item: Item::Func { func, .. },
+                    ..
+                } = &root.cfg.values[*value].value
                 {
                     let kinds = self.analyze_return_kinds(func);
                     // A multi-return callee's kind is a runtime tag, not a
@@ -1470,8 +1487,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     ) -> Result<FunctionInfo, ConvertError> {
         let key = Self::key(sfunc);
         if let Some(owner) = self.active_component.filter(|owner| *owner != key) {
-            self.component_dependencies.entry(owner).or_default().insert(key);
-            self.component_dependents.entry(key).or_default().insert(owner);
+            self.component_dependencies
+                .entry(owner)
+                .or_default()
+                .insert(key);
+            self.component_dependents
+                .entry(key)
+                .or_default()
+                .insert(owner);
         }
         if let Some(info) = self.functions.get(&key) {
             return Ok(*info);
@@ -1526,8 +1549,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         };
         // Replaces the provisional entry registered before `make_adapter`.
         self.functions.insert(key, info);
-        self.module_of_function
-            .insert(key, module.to_string());
+        self.module_of_function.insert(key, module.to_string());
         self.function_sources.insert(key, sfunc);
         self.pending.push_back((key, sfunc));
         Ok(*self.functions.get(&key).expect("just inserted"))
@@ -2034,7 +2056,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             }
             let sblock = state.source;
             #[cfg(feature = "lower_trace")]
-            eprintln!("[trace] lowering source block {sblock:?} kinds={:?} term={:?}", state.params, sfunc.cfg.blocks[sblock].postcedent.term);
+            eprintln!(
+                "[trace] lowering source block {sblock:?} kinds={:?} term={:?}",
+                state.params, sfunc.cfg.blocks[sblock].postcedent.term
+            );
             let original_block = *blocks
                 .get(&state)
                 .ok_or_else(|| ConvertError::invalid("missing source block mapping"))?;
@@ -2235,15 +2260,17 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                             continue;
                         }
                         if matches!(self.current_native_returns, ReturnType::Boxed) {
-                            for (block, call_context, receiver, array, code) in self.lower_call_parts(
-                                body,
-                                continuation.block,
-                                context,
-                                this.clone(),
-                                &continuation.values,
-                                callee,
-                                args,
-                            )? {
+                            for (block, call_context, receiver, array, code) in self
+                                .lower_call_parts(
+                                    body,
+                                    continuation.block,
+                                    context,
+                                    this.clone(),
+                                    &continuation.values,
+                                    callee,
+                                    args,
+                                )?
+                            {
                                 body.set_terminator(
                                     block,
                                     Terminator::ReturnCallRef {
@@ -2427,13 +2454,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 // path below (they mint a provenance-fresh function
                 // object); everything else resolves through the ordinary
                 // context property read.
-                let is_self_name = self
-                    .lowering_function_key
-                    .is_some_and(|current| {
-                        self.function_self_names
-                            .get(&current)
-                            .is_some_and(|name| name == id)
-                    });
+                let is_self_name = self.lowering_function_key.is_some_and(|current| {
+                    self.function_self_names
+                        .get(&current)
+                        .is_some_and(|name| name == id)
+                });
                 let literal = if is_self_name {
                     self.lowering_function
                 } else {
@@ -2483,7 +2508,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                             fresh: is_self_name,
                         }
                     } else {
-                        LowerValue::ReferenceKey { value, key: key.clone() }
+                        LowerValue::ReferenceKey {
+                            value,
+                            key: key.clone(),
+                        }
                     };
                     results.push((block, value));
                 }
@@ -2522,7 +2550,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                                     let key = self.dynamic_string_key(body, block, key)?;
                                     self.set_string_member(body, block, object, key, value)?
                                 }
-                            }
+                            },
                         };
                         Ok(blocks
                             .into_iter()
@@ -2738,15 +2766,17 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                             // Load the method through the ordinary lookup
                             // (shape/trie machinery, correct for every
                             // receiver), then guard on the tag.
-                            let callees =
-                                self.get_property_value(body, block, receiver, &key)?;
+                            let callees = self.get_property_value(body, block, receiver, &key)?;
                             let mut continuations = Vec::new();
                             for (callee_block, callee_value) in callees {
                                 let fallback_callee = callee_value.clone();
                                 let fallback = |this: &mut Self,
                                                 body: &mut FunctionBody,
                                                 slow: Block|
-                                 -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+                                 -> Result<
+                                    Vec<(Block, LowerValue)>,
+                                    ConvertError,
+                                > {
                                     let (ctx, this_v, code, _arrow) = this.callable_parts(
                                         body,
                                         slow,
@@ -2836,10 +2866,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 let module = self.current_module.clone();
                 let info = self.ensure_function(func, &module)?;
                 match self.function_object(body, block, context, this, func, *arrow)? {
-                    LowerValue::FunctionRef {
-                        value,
-                        ..
-                    } => LowerValue::FunctionRef {
+                    LowerValue::FunctionRef { value, .. } => LowerValue::FunctionRef {
                         value,
                         info,
                         fresh: true,
@@ -3185,7 +3212,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 // rather than dragging num-bigint in as a direct dependency.
                 let bits = parse_bigint_i64(bigint.raw.as_ref().map(|a| a.as_str()), span)?;
                 LowerValue::Wasm {
-                    value: body.add_op(block, Operator::I64Const { value: bits as u64 }, &[], &[Type::I64]),
+                    value: body.add_op(
+                        block,
+                        Operator::I64Const { value: bits as u64 },
+                        &[],
+                        &[Type::I64],
+                    ),
                     kind: ValueKind::BigInt,
                 }
             }
@@ -3775,7 +3807,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             return Ok(match op {
                 UnaryOp::Minus => {
                     let arg = self.as_i64(body, block, arg)?;
-                    let zero = body.add_op(block, Operator::I64Const { value: 0 }, &[], &[Type::I64]);
+                    let zero =
+                        body.add_op(block, Operator::I64Const { value: 0 }, &[], &[Type::I64]);
                     LowerValue::Wasm {
                         value: body.add_op(block, Operator::I64Sub, &[zero, arg], &[Type::I64]),
                         kind: ValueKind::BigInt,
@@ -3919,7 +3952,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 let equal = self.ensure_string_equal()?;
                 let equal = body.add_op(
                     block,
-                    Operator::Call { function_index: equal },
+                    Operator::Call {
+                        function_index: equal,
+                    },
                     &[left_value, right_value],
                     &[Type::I32],
                 );
@@ -3937,15 +3972,18 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             // primitive (a value that crossed a call/property boundary), so
             // reference-vs-primitive must still go through the runtime
             // helper with the primitive side boxed.
-            (_, _) if matches!(left_kind, ValueKind::Reference)
-                || matches!(right_kind, ValueKind::Reference) =>
+            (_, _)
+                if matches!(left_kind, ValueKind::Reference)
+                    || matches!(right_kind, ValueKind::Reference) =>
             {
                 let helper = self.ensure_strict_equality_helper()?;
                 let left = self.box_value(body, block, left)?;
                 let right = self.box_value(body, block, right)?;
                 let equal = body.add_op(
                     block,
-                    Operator::Call { function_index: helper },
+                    Operator::Call {
+                        function_index: helper,
+                    },
                     &[left, right],
                     &[Type::I32],
                 );
@@ -4473,7 +4511,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[number_struct],
             &[Type::F64],
         );
-        body.set_terminator(unbox, Terminator::Return { values: vec![number] });
+        body.set_terminator(
+            unbox,
+            Terminator::Return {
+                values: vec![number],
+            },
+        );
 
         body.set_terminator(
             check_boolean,
@@ -4533,7 +4576,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 },
             },
         );
-        let zero = body.add_op(null_hit, Operator::F64Const { value: 0.0f64.to_bits() }, &[], &[Type::F64]);
+        let zero = body.add_op(
+            null_hit,
+            Operator::F64Const {
+                value: 0.0f64.to_bits(),
+            },
+            &[],
+            &[Type::F64],
+        );
         body.set_terminator(null_hit, Terminator::Return { values: vec![zero] });
 
         // BigInt: `Number(x)` is exact for the fixed-width i64 payload. This
@@ -4614,10 +4664,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[],
             &[Type::F64],
         );
-        body.set_terminator(
-            undefined_hit,
-            Terminator::Return { values: vec![nan] },
-        );
+        body.set_terminator(undefined_hit, Terminator::Return { values: vec![nan] });
         // Per spec, ToNumber of a plain object is NaN (ToPrimitive
         // yields "[object Object]", which parses as NaN). Any reference
         // shape this helper does not otherwise recognize — objects,
@@ -4631,7 +4678,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[],
             &[Type::F64],
         );
-        body.set_terminator(other, Terminator::Return { values: vec![object_nan] });
+        body.set_terminator(
+            other,
+            Terminator::Return {
+                values: vec![object_nan],
+            },
+        );
 
         let func = self.module.funcs.push(FuncDecl::Body(
             sig,
@@ -4641,8 +4693,6 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         self.to_number_helper = Some(func);
         Ok(func)
     }
-
-
 
     fn as_i32(
         &mut self,
@@ -4784,11 +4834,13 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 },
             },
         );
-        let zero = body.add_op(is_null_block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
-        body.set_terminator(
+        let zero = body.add_op(
             is_null_block,
-            Terminator::Return { values: vec![zero] },
+            Operator::I32Const { value: 0 },
+            &[],
+            &[Type::I32],
         );
+        body.set_terminator(is_null_block, Terminator::Return { values: vec![zero] });
 
         let boolean_non_null_ty = Type::Heap(WithNullable {
             value: HeapType::Sig {
@@ -4927,10 +4979,30 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[],
             &[Type::F64],
         );
-        let is_nonzero = body.add_op(number_check, Operator::F64Ne, &[number_value, zero_f64], &[Type::I32]);
-        let is_not_nan = body.add_op(number_check, Operator::F64Eq, &[number_value, number_value], &[Type::I32]);
-        let number_truthy = body.add_op(number_check, Operator::I32And, &[is_nonzero, is_not_nan], &[Type::I32]);
-        body.set_terminator(number_check, Terminator::Return { values: vec![number_truthy] });
+        let is_nonzero = body.add_op(
+            number_check,
+            Operator::F64Ne,
+            &[number_value, zero_f64],
+            &[Type::I32],
+        );
+        let is_not_nan = body.add_op(
+            number_check,
+            Operator::F64Eq,
+            &[number_value, number_value],
+            &[Type::I32],
+        );
+        let number_truthy = body.add_op(
+            number_check,
+            Operator::I32And,
+            &[is_nonzero, is_not_nan],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            number_check,
+            Terminator::Return {
+                values: vec![number_truthy],
+            },
+        );
 
         // 3. A string struct is falsy when it is empty (UTF-8 length 0).
         let is_string = body.add_op(
@@ -4975,9 +5047,24 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[ref_sig(self.repr.utf8)],
         );
         let utf8_len = body.add_op(string_check, Operator::ArrayLen, &[utf8], &[Type::I32]);
-        let zero_i32 = body.add_op(string_check, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
-        let string_truthy = body.add_op(string_check, Operator::I32Ne, &[utf8_len, zero_i32], &[Type::I32]);
-        body.set_terminator(string_check, Terminator::Return { values: vec![string_truthy] });
+        let zero_i32 = body.add_op(
+            string_check,
+            Operator::I32Const { value: 0 },
+            &[],
+            &[Type::I32],
+        );
+        let string_truthy = body.add_op(
+            string_check,
+            Operator::I32Ne,
+            &[utf8_len, zero_i32],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            string_check,
+            Terminator::Return {
+                values: vec![string_truthy],
+            },
+        );
 
         // 4. A bigint struct is falsy when it is `0n`.
         let is_bigint = body.add_op(
@@ -5021,12 +5108,32 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[bigint_ref],
             &[Type::I64],
         );
-        let zero_i64 = body.add_op(bigint_check, Operator::I64Const { value: 0 }, &[], &[Type::I64]);
-        let bigint_truthy = body.add_op(bigint_check, Operator::I64Ne, &[bigint_value, zero_i64], &[Type::I32]);
-        body.set_terminator(bigint_check, Terminator::Return { values: vec![bigint_truthy] });
+        let zero_i64 = body.add_op(
+            bigint_check,
+            Operator::I64Const { value: 0 },
+            &[],
+            &[Type::I64],
+        );
+        let bigint_truthy = body.add_op(
+            bigint_check,
+            Operator::I64Ne,
+            &[bigint_value, zero_i64],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            bigint_check,
+            Terminator::Return {
+                values: vec![bigint_truthy],
+            },
+        );
 
         // 5. Objects and functions are truthy.
-        let one = body.add_op(not_bigint, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        let one = body.add_op(
+            not_bigint,
+            Operator::I32Const { value: 1 },
+            &[],
+            &[Type::I32],
+        );
         body.set_terminator(not_bigint, Terminator::Return { values: vec![one] });
 
         let func = self.module.funcs.push(FuncDecl::Body(
@@ -5095,9 +5202,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         // exotic reference not enumerated above, which has no JS name and
         // should not occur.
         let undefined_name = self.new_string(&mut body, block, b"undefined")?;
-        body.set_terminator(block, Terminator::Return {
-            values: vec![undefined_name],
-        });
+        body.set_terminator(
+            block,
+            Terminator::Return {
+                values: vec![undefined_name],
+            },
+        );
 
         let func = self.module.funcs.push(FuncDecl::Body(
             sig,
@@ -5287,7 +5397,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             ValueKind::Number
         };
         let (value, actual) = value.wasm()?;
-        debug_assert_eq!(kind, actual, "multi-return packing expects the classified kind");
+        debug_assert_eq!(
+            kind, actual,
+            "multi-return packing expects the classified kind"
+        );
         let (tag, r, i, f) = match kind {
             ValueKind::Reference => {
                 let boxed = self.anyref(body, block, value);
@@ -5303,12 +5416,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             }
         };
         let undef = |body: &mut FunctionBody, ty: Type| {
-            body.add_op(
-                block,
-                Operator::RefNull { ty },
-                &[],
-                &[ty],
-            )
+            body.add_op(block, Operator::RefNull { ty }, &[], &[ty])
         };
         // Zero-fill the layout's dead slots; live slots carry the value.
         let r = r.unwrap_or_else(|| undef(body, self.repr.value));
@@ -5325,9 +5433,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let f = f.unwrap_or(zero_f);
         let tag = body.add_op(
             block,
-            Operator::I32Const {
-                value: tag as u32,
-            },
+            Operator::I32Const { value: tag as u32 },
             &[],
             &[Type::I32],
         );
@@ -5414,10 +5520,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             let (idx, payload_ty) = multi_slot(layout, &self.repr, kind);
             let payload = body.add_op(
                 arm,
-                Operator::StructGet {
-                    sig: layout,
-                    idx,
-                },
+                Operator::StructGet { sig: layout, idx },
                 &[result],
                 &[payload_ty],
             );
@@ -5640,13 +5743,17 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         );
         let properties = body.add_op(
             block,
-            Operator::RefNull { ty: self.repr.value },
+            Operator::RefNull {
+                ty: self.repr.value,
+            },
             &[],
             &[self.repr.value],
         );
         let typed_data = body.add_op(
             block,
-            Operator::RefNull { ty: self.repr.value },
+            Operator::RefNull {
+                ty: self.repr.value,
+            },
             &[],
             &[self.repr.value],
         );
@@ -5692,7 +5799,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         )
     }
 
-    fn new_shape(&self, body: &mut FunctionBody, block: Block, index: usize) -> Result<Value, ConvertError> {
+    fn new_shape(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        index: usize,
+    ) -> Result<Value, ConvertError> {
         let shape = self
             .shapes
             .get(index)
@@ -5734,7 +5846,13 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
 
     /// Like [`Self::new_slot`], but for a flags bitset known at generation
     /// time (an [`crate::repr::SLOT_WRITABLE`]-style constant combination).
-    fn new_slot_literal(&self, body: &mut FunctionBody, block: Block, value: Value, flags: i32) -> Value {
+    fn new_slot_literal(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        value: Value,
+        flags: i32,
+    ) -> Value {
         let flags = body.add_op(
             block,
             Operator::I32Const {
@@ -5819,7 +5937,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     /// Extract a (possibly null) property slot's attribute flags, defaulting
     /// to [`crate::repr::SLOT_FLAGS_DEFAULT`] for an absent slot (a brand new
     /// own property behaves as ordinary/unrestricted until told otherwise).
-    fn slot_flags_or_default(&self, body: &mut FunctionBody, block: Block, slot: Value) -> (Block, Value) {
+    fn slot_flags_or_default(
+        &self,
+        body: &mut FunctionBody,
+        block: Block,
+        slot: Value,
+    ) -> (Block, Value) {
         let is_null = body.add_op(block, Operator::RefIsNull, &[slot], &[Type::I32]);
         let absent = body.add_block();
         let present = body.add_block();
@@ -5952,13 +6075,17 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let trie = self.anyref(body, block, trie);
         let properties = body.add_op(
             block,
-            Operator::RefNull { ty: self.repr.value },
+            Operator::RefNull {
+                ty: self.repr.value,
+            },
             &[],
             &[self.repr.value],
         );
         let typed_data = body.add_op(
             block,
-            Operator::RefNull { ty: self.repr.value },
+            Operator::RefNull {
+                ty: self.repr.value,
+            },
             &[],
             &[self.repr.value],
         );
@@ -6053,15 +6180,26 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[right],
             &[Type::I32],
         );
-        let both = body.add_op(entry, Operator::I32And, &[left_string, right_string], &[Type::I32]);
+        let both = body.add_op(
+            entry,
+            Operator::I32And,
+            &[left_string, right_string],
+            &[Type::I32],
+        );
         let concat = body.add_block();
         let numeric = body.add_block();
         body.set_terminator(
             entry,
             Terminator::CondBr {
                 cond: both,
-                if_true: BlockTarget { block: concat, args: vec![] },
-                if_false: BlockTarget { block: numeric, args: vec![] },
+                if_true: BlockTarget {
+                    block: concat,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: numeric,
+                    args: vec![],
+                },
             },
         );
 
@@ -6092,11 +6230,18 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         );
         let string_result = body.add_op(
             concat,
-            Operator::RefCast { ty: self.repr.value },
+            Operator::RefCast {
+                ty: self.repr.value,
+            },
             &[string],
             &[self.repr.value],
         );
-        body.set_terminator(concat, Terminator::Return { values: vec![string_result] });
+        body.set_terminator(
+            concat,
+            Terminator::Return {
+                values: vec![string_result],
+            },
+        );
 
         let to_number = self.ensure_to_number_helper()?;
         let left_number = body.add_op(
@@ -6115,20 +6260,34 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[right],
             &[Type::F64],
         );
-        let sum = body.add_op(numeric, Operator::F64Add, &[left_number, right_number], &[Type::F64]);
+        let sum = body.add_op(
+            numeric,
+            Operator::F64Add,
+            &[left_number, right_number],
+            &[Type::F64],
+        );
         let boxed = body.add_op(
             numeric,
-            Operator::StructNew { sig: self.repr.number },
+            Operator::StructNew {
+                sig: self.repr.number,
+            },
             &[sum],
             &[self.repr.number_ty()],
         );
         let boxed_result = body.add_op(
             numeric,
-            Operator::RefCast { ty: self.repr.value },
+            Operator::RefCast {
+                ty: self.repr.value,
+            },
             &[boxed],
             &[self.repr.value],
         );
-        body.set_terminator(numeric, Terminator::Return { values: vec![boxed_result] });
+        body.set_terminator(
+            numeric,
+            Terminator::Return {
+                values: vec![boxed_result],
+            },
+        );
 
         let func = self.module.funcs.push(FuncDecl::Body(
             signature,
@@ -6154,22 +6313,35 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let right = body.blocks[entry].params[1].1;
         let left_bytes = body.add_op(
             entry,
-            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            Operator::StructGet {
+                sig: self.repr.string,
+                idx: 0,
+            },
             &[left],
             &[self.repr.utf8_ty()],
         );
         let right_bytes = body.add_op(
             entry,
-            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            Operator::StructGet {
+                sig: self.repr.string,
+                idx: 0,
+            },
             &[right],
             &[self.repr.utf8_ty()],
         );
         let left_len = body.add_op(entry, Operator::ArrayLen, &[left_bytes], &[Type::I32]);
         let right_len = body.add_op(entry, Operator::ArrayLen, &[right_bytes], &[Type::I32]);
-        let total = body.add_op(entry, Operator::I32Add, &[left_len, right_len], &[Type::I32]);
+        let total = body.add_op(
+            entry,
+            Operator::I32Add,
+            &[left_len, right_len],
+            &[Type::I32],
+        );
         let bytes = body.add_op(
             entry,
-            Operator::ArrayNewDefault { sig: self.repr.utf8 },
+            Operator::ArrayNewDefault {
+                sig: self.repr.utf8,
+            },
             &[total],
             &[self.repr.utf8_ty()],
         );
@@ -6202,11 +6374,18 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         );
         let string = body.add_op(
             entry,
-            Operator::StructNew { sig: self.repr.string },
+            Operator::StructNew {
+                sig: self.repr.string,
+            },
             &[bytes, cache],
             &[self.repr.string_ty()],
         );
-        body.set_terminator(entry, Terminator::Return { values: vec![string] });
+        body.set_terminator(
+            entry,
+            Terminator::Return {
+                values: vec![string],
+            },
+        );
         let function = self.module.funcs.push(FuncDecl::Body(
             signature,
             format!("js_string_concat_{}", self.module.funcs.len()),
@@ -6314,7 +6493,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let string = body.blocks[entry].params[0].1;
         let cache = body.add_op(
             entry,
-            Operator::StructGet { sig: self.repr.string, idx: 1 },
+            Operator::StructGet {
+                sig: self.repr.string,
+                idx: 1,
+            },
             &[string],
             &[self.repr.utf16_ty()],
         );
@@ -6325,15 +6507,29 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             entry,
             Terminator::CondBr {
                 cond: absent,
-                if_true: BlockTarget { block: compute, args: vec![] },
-                if_false: BlockTarget { block: cached, args: vec![] },
+                if_true: BlockTarget {
+                    block: compute,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: cached,
+                    args: vec![],
+                },
             },
         );
-        body.set_terminator(cached, Terminator::Return { values: vec![cache] });
+        body.set_terminator(
+            cached,
+            Terminator::Return {
+                values: vec![cache],
+            },
+        );
 
         let bytes = body.add_op(
             compute,
-            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            Operator::StructGet {
+                sig: self.repr.string,
+                idx: 0,
+            },
             &[string],
             &[self.repr.utf8_ty()],
         );
@@ -6345,23 +6541,39 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         body.set_terminator(
             compute,
             Terminator::Br {
-                target: BlockTarget { block: scan, args: vec![zero, zero] },
+                target: BlockTarget {
+                    block: scan,
+                    args: vec![zero, zero],
+                },
             },
         );
-        let complete = body.add_op(scan, Operator::I32GeU, &[position, byte_length], &[Type::I32]);
+        let complete = body.add_op(
+            scan,
+            Operator::I32GeU,
+            &[position, byte_length],
+            &[Type::I32],
+        );
         let allocate = body.add_block();
         let step = body.add_block();
         body.set_terminator(
             scan,
             Terminator::CondBr {
                 cond: complete,
-                if_true: BlockTarget { block: allocate, args: vec![] },
-                if_false: BlockTarget { block: step, args: vec![] },
+                if_true: BlockTarget {
+                    block: allocate,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: step,
+                    args: vec![],
+                },
             },
         );
         let byte = body.add_op(
             step,
-            Operator::ArrayGetU { sig: self.repr.utf8 },
+            Operator::ArrayGetU {
+                sig: self.repr.utf8,
+            },
             &[bytes, position],
             &[Type::I32],
         );
@@ -6410,18 +6622,26 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         body.set_terminator(
             step,
             Terminator::Br {
-                target: BlockTarget { block: scan, args: vec![next_position, next_units] },
+                target: BlockTarget {
+                    block: scan,
+                    args: vec![next_position, next_units],
+                },
             },
         );
         let allocated = body.add_op(
             allocate,
-            Operator::ArrayNewDefault { sig: self.repr.utf16 },
+            Operator::ArrayNewDefault {
+                sig: self.repr.utf16,
+            },
             &[units],
             &[self.repr.utf16_ty()],
         );
         body.add_op(
             allocate,
-            Operator::StructSet { sig: self.repr.string, idx: 1 },
+            Operator::StructSet {
+                sig: self.repr.string,
+                idx: 1,
+            },
             &[string, allocated],
             &[],
         );
@@ -6467,7 +6687,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         );
         let first = body.add_op(
             fill_step,
-            Operator::ArrayGetU { sig: self.repr.utf8 },
+            Operator::ArrayGetU {
+                sig: self.repr.utf8,
+            },
             &[bytes, fill_position],
             &[Type::I32],
         );
@@ -6540,7 +6762,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         );
         body.add_op(
             write_ascii,
-            Operator::ArraySet { sig: self.repr.utf16 },
+            Operator::ArraySet {
+                sig: self.repr.utf16,
+            },
             &[allocated, fill_unit, first],
             &[],
         );
@@ -6636,7 +6860,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         );
         let second = body.add_op(
             write_two,
-            Operator::ArrayGetU { sig: self.repr.utf8 },
+            Operator::ArrayGetU {
+                sig: self.repr.utf8,
+            },
             &[bytes, second_position],
             &[Type::I32],
         );
@@ -6666,7 +6892,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         );
         body.add_op(
             write_two,
-            Operator::ArraySet { sig: self.repr.utf16 },
+            Operator::ArraySet {
+                sig: self.repr.utf16,
+            },
             &[allocated, fill_unit, unit],
             &[],
         );
@@ -6730,13 +6958,17 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         );
         let second = body.add_op(
             write_three,
-            Operator::ArrayGetU { sig: self.repr.utf8 },
+            Operator::ArrayGetU {
+                sig: self.repr.utf8,
+            },
             &[bytes, second_position],
             &[Type::I32],
         );
         let third = body.add_op(
             write_three,
-            Operator::ArrayGetU { sig: self.repr.utf8 },
+            Operator::ArrayGetU {
+                sig: self.repr.utf8,
+            },
             &[bytes, third_position],
             &[Type::I32],
         );
@@ -6764,12 +6996,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[second_payload, shift_six],
             &[Type::I32],
         );
-        let high_middle = body.add_op(
-            write_three,
-            Operator::I32Or,
-            &[high, middle],
-            &[Type::I32],
-        );
+        let high_middle = body.add_op(write_three, Operator::I32Or, &[high, middle], &[Type::I32]);
         let third_payload = body.add_op(
             write_three,
             Operator::I32And,
@@ -6784,7 +7011,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         );
         body.add_op(
             write_three,
-            Operator::ArraySet { sig: self.repr.utf16 },
+            Operator::ArraySet {
+                sig: self.repr.utf16,
+            },
             &[allocated, fill_unit, unit],
             &[],
         );
@@ -6860,19 +7089,25 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         );
         let second = body.add_op(
             write_four,
-            Operator::ArrayGetU { sig: self.repr.utf8 },
+            Operator::ArrayGetU {
+                sig: self.repr.utf8,
+            },
             &[bytes, second_position],
             &[Type::I32],
         );
         let third = body.add_op(
             write_four,
-            Operator::ArrayGetU { sig: self.repr.utf8 },
+            Operator::ArrayGetU {
+                sig: self.repr.utf8,
+            },
             &[bytes, third_position],
             &[Type::I32],
         );
         let fourth = body.add_op(
             write_four,
-            Operator::ArrayGetU { sig: self.repr.utf8 },
+            Operator::ArrayGetU {
+                sig: self.repr.utf8,
+            },
             &[bytes, fourth_position],
             &[Type::I32],
         );
@@ -6972,12 +7207,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[],
             &[Type::I32],
         );
-        let high_payload = body.add_op(
-            write_four,
-            Operator::I32ShrU,
-            &[pair, ten],
-            &[Type::I32],
-        );
+        let high_payload = body.add_op(write_four, Operator::I32ShrU, &[pair, ten], &[Type::I32]);
         let high_unit = body.add_op(
             write_four,
             Operator::I32Or,
@@ -6998,7 +7228,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         );
         body.add_op(
             write_four,
-            Operator::ArraySet { sig: self.repr.utf16 },
+            Operator::ArraySet {
+                sig: self.repr.utf16,
+            },
             &[allocated, fill_unit, high_unit],
             &[],
         );
@@ -7010,7 +7242,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         );
         body.add_op(
             write_four,
-            Operator::ArraySet { sig: self.repr.utf16 },
+            Operator::ArraySet {
+                sig: self.repr.utf16,
+            },
             &[allocated, low_index, low_unit],
             &[],
         );
@@ -7053,7 +7287,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let helper = self.ensure_string_utf16()?;
         let utf16 = body.add_op(
             block,
-            Operator::Call { function_index: helper },
+            Operator::Call {
+                function_index: helper,
+            },
             &[string],
             &[self.repr.utf16_ty()],
         );
@@ -7061,14 +7297,18 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let length = body.add_op(block, Operator::F64ConvertI32S, &[length], &[Type::F64]);
         let length = body.add_op(
             block,
-            Operator::StructNew { sig: self.repr.number },
+            Operator::StructNew {
+                sig: self.repr.number,
+            },
             &[length],
             &[self.repr.number_ty()],
         );
         Ok(LowerValue::Wasm {
             value: body.add_op(
                 block,
-                Operator::RefCast { ty: self.repr.value },
+                Operator::RefCast {
+                    ty: self.repr.value,
+                },
                 &[length],
                 &[self.repr.value],
             ),
@@ -7132,7 +7372,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[],
             &[Type::I32],
         );
-        let ascii = body.add_op(present, Operator::I32LtU, &[unit, ascii_limit], &[Type::I32]);
+        let ascii = body.add_op(
+            present,
+            Operator::I32LtU,
+            &[unit, ascii_limit],
+            &[Type::I32],
+        );
         let one_byte = body.add_block();
         let more_bytes = body.add_block();
         body.set_terminator(
@@ -7335,12 +7580,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[prefix, first_payload],
             &[Type::I32],
         );
-        let middle_shifted = body.add_op(
-            three_bytes,
-            Operator::I32ShrU,
-            &[unit, six],
-            &[Type::I32],
-        );
+        let middle_shifted =
+            body.add_op(three_bytes, Operator::I32ShrU, &[unit, six], &[Type::I32]);
         let middle_payload = body.add_op(
             three_bytes,
             Operator::I32And,
@@ -7353,12 +7594,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[continuation, middle_payload],
             &[Type::I32],
         );
-        let final_payload = body.add_op(
-            three_bytes,
-            Operator::I32And,
-            &[unit, mask],
-            &[Type::I32],
-        );
+        let final_payload = body.add_op(three_bytes, Operator::I32And, &[unit, mask], &[Type::I32]);
         let third = body.add_op(
             three_bytes,
             Operator::I32Or,
@@ -7497,25 +7733,33 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
 
         let first = body.add_op(
             parse_first,
-            Operator::ArrayGetU { sig: self.repr.utf8 },
+            Operator::ArrayGetU {
+                sig: self.repr.utf8,
+            },
             &[bytes, zero],
             &[Type::I32],
         );
         let char_zero = body.add_op(
             parse_first,
-            Operator::I32Const { value: u32::from(b'0') },
+            Operator::I32Const {
+                value: u32::from(b'0'),
+            },
             &[],
             &[Type::I32],
         );
         let char_one = body.add_op(
             parse_first,
-            Operator::I32Const { value: u32::from(b'1') },
+            Operator::I32Const {
+                value: u32::from(b'1'),
+            },
             &[],
             &[Type::I32],
         );
         let char_nine = body.add_op(
             parse_first,
-            Operator::I32Const { value: u32::from(b'9') },
+            Operator::I32Const {
+                value: u32::from(b'9'),
+            },
             &[],
             &[Type::I32],
         );
@@ -7547,12 +7791,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[],
             &[Type::I32],
         );
-        let zero_is_canonical = body.add_op(
-            zero_first,
-            Operator::I32Eq,
-            &[length, one],
-            &[Type::I32],
-        );
+        let zero_is_canonical =
+            body.add_op(zero_first, Operator::I32Eq, &[length, one], &[Type::I32]);
         let zero_result = body.add_block();
         body.set_terminator(
             zero_first,
@@ -7649,25 +7889,22 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 },
             },
         );
-        body.set_terminator(parsed, Terminator::Return { values: vec![value] });
+        body.set_terminator(
+            parsed,
+            Terminator::Return {
+                values: vec![value],
+            },
+        );
         let byte = body.add_op(
             digit,
-            Operator::ArrayGetU { sig: self.repr.utf8 },
+            Operator::ArrayGetU {
+                sig: self.repr.utf8,
+            },
             &[bytes, position],
             &[Type::I32],
         );
-        let at_least_zero = body.add_op(
-            digit,
-            Operator::I32GeU,
-            &[byte, char_zero],
-            &[Type::I32],
-        );
-        let at_most_nine = body.add_op(
-            digit,
-            Operator::I32LeU,
-            &[byte, char_nine],
-            &[Type::I32],
-        );
+        let at_least_zero = body.add_op(digit, Operator::I32GeU, &[byte, char_zero], &[Type::I32]);
+        let at_most_nine = body.add_op(digit, Operator::I32LeU, &[byte, char_nine], &[Type::I32]);
         let is_digit = body.add_op(
             digit,
             Operator::I32And,
@@ -7815,27 +8052,40 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let right = body.blocks[entry].params[1].1;
         let left_bytes = body.add_op(
             entry,
-            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            Operator::StructGet {
+                sig: self.repr.string,
+                idx: 0,
+            },
             &[left],
             &[self.repr.utf8_ty()],
         );
         let right_bytes = body.add_op(
             entry,
-            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            Operator::StructGet {
+                sig: self.repr.string,
+                idx: 0,
+            },
             &[right],
             &[self.repr.utf8_ty()],
         );
         let left_len = body.add_op(entry, Operator::ArrayLen, &[left_bytes], &[Type::I32]);
         let right_len = body.add_op(entry, Operator::ArrayLen, &[right_bytes], &[Type::I32]);
-        let lengths_match = body.add_op(entry, Operator::I32Eq, &[left_len, right_len], &[Type::I32]);
+        let lengths_match =
+            body.add_op(entry, Operator::I32Eq, &[left_len, right_len], &[Type::I32]);
         let compare = body.add_block();
         let unequal = body.add_block();
         body.set_terminator(
             entry,
             Terminator::CondBr {
                 cond: lengths_match,
-                if_true: BlockTarget { block: compare, args: vec![] },
-                if_false: BlockTarget { block: unequal, args: vec![] },
+                if_true: BlockTarget {
+                    block: compare,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: unequal,
+                    args: vec![],
+                },
             },
         );
         let zero = body.add_op(unequal, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
@@ -7846,42 +8096,71 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         body.set_terminator(
             compare,
             Terminator::Br {
-                target: BlockTarget { block: loop_block, args: vec![zero] },
+                target: BlockTarget {
+                    block: loop_block,
+                    args: vec![zero],
+                },
             },
         );
-        let complete = body.add_op(loop_block, Operator::I32GeU, &[index, left_len], &[Type::I32]);
+        let complete = body.add_op(
+            loop_block,
+            Operator::I32GeU,
+            &[index, left_len],
+            &[Type::I32],
+        );
         let equal = body.add_block();
         let step = body.add_block();
         body.set_terminator(
             loop_block,
             Terminator::CondBr {
                 cond: complete,
-                if_true: BlockTarget { block: equal, args: vec![] },
-                if_false: BlockTarget { block: step, args: vec![] },
+                if_true: BlockTarget {
+                    block: equal,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: step,
+                    args: vec![],
+                },
             },
         );
         let one = body.add_op(equal, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
         body.set_terminator(equal, Terminator::Return { values: vec![one] });
         let left_byte = body.add_op(
             step,
-            Operator::ArrayGetU { sig: self.repr.utf8 },
+            Operator::ArrayGetU {
+                sig: self.repr.utf8,
+            },
             &[left_bytes, index],
             &[Type::I32],
         );
         let right_byte = body.add_op(
             step,
-            Operator::ArrayGetU { sig: self.repr.utf8 },
+            Operator::ArrayGetU {
+                sig: self.repr.utf8,
+            },
             &[right_bytes, index],
             &[Type::I32],
         );
-        let same = body.add_op(step, Operator::I32Eq, &[left_byte, right_byte], &[Type::I32]);
+        let same = body.add_op(
+            step,
+            Operator::I32Eq,
+            &[left_byte, right_byte],
+            &[Type::I32],
+        );
         let next = body.add_block();
         body.set_terminator(
             step,
             Terminator::CondBr {
                 cond: same,
-                if_true: BlockTarget { block: next, args: vec![] },
-                if_false: BlockTarget { block: unequal, args: vec![] },
+                if_true: BlockTarget {
+                    block: next,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: unequal,
+                    args: vec![],
+                },
             },
         );
         let one = body.add_op(next, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
@@ -7889,7 +8168,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         body.set_terminator(
             next,
             Terminator::Br {
-                target: BlockTarget { block: loop_block, args: vec![next_index] },
+                target: BlockTarget {
+                    block: loop_block,
+                    args: vec![next_index],
+                },
             },
         );
         let function = self.module.funcs.push(FuncDecl::Body(
@@ -7922,7 +8204,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             shared: false,
         });
         let set_sig = self.module.signatures.push(SignatureData::Func {
-            params: vec![self.repr.value, self.repr.string_ty(), self.repr.slot_ty(), Type::I32],
+            params: vec![
+                self.repr.value,
+                self.repr.string_ty(),
+                self.repr.slot_ty(),
+                Type::I32,
+            ],
             returns: vec![],
             shared: false,
         });
@@ -8043,8 +8330,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 current,
                 Terminator::CondBr {
                     cond: matches,
-                    if_true: BlockTarget { block: found, args: vec![] },
-                    if_false: BlockTarget { block: next, args: vec![] },
+                    if_true: BlockTarget {
+                        block: found,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: next,
+                        args: vec![],
+                    },
                 },
             );
             let value = body.add_op(
@@ -8056,12 +8349,20 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 &[instance],
                 &[self.repr.slot_ty()],
             );
-            body.set_terminator(found, Terminator::Return { values: vec![value] });
+            body.set_terminator(
+                found,
+                Terminator::Return {
+                    values: vec![value],
+                },
+            );
             current = next;
         }
         let fallback = body.add_op(
             current,
-            Operator::StructGet { sig: shape.sig, idx: 0 },
+            Operator::StructGet {
+                sig: shape.sig,
+                idx: 0,
+            },
             &[instance],
             &[self.repr.trie_ty()],
         );
@@ -8072,11 +8373,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 args: vec![fallback, key, offset],
             },
         );
-        self.module.funcs[function] = FuncDecl::Body(
-            signature,
-            format!("js_shape_lookup_{index}"),
-            body,
-        );
+        self.module.funcs[function] =
+            FuncDecl::Body(signature, format!("js_shape_lookup_{index}"), body);
         Ok(())
     }
 
@@ -8114,8 +8412,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 current,
                 Terminator::CondBr {
                     cond: matches,
-                    if_true: BlockTarget { block: found, args: vec![] },
-                    if_false: BlockTarget { block: next, args: vec![] },
+                    if_true: BlockTarget {
+                        block: found,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: next,
+                        args: vec![],
+                    },
                 },
             );
             body.add_op(
@@ -8132,7 +8436,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         }
         let fallback = body.add_op(
             current,
-            Operator::StructGet { sig: shape.sig, idx: 0 },
+            Operator::StructGet {
+                sig: shape.sig,
+                idx: 0,
+            },
             &[instance],
             &[self.repr.trie_ty()],
         );
@@ -8143,11 +8450,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 args: vec![fallback, key, value, offset],
             },
         );
-        self.module.funcs[function] = FuncDecl::Body(
-            signature,
-            format!("js_shape_set_{index}"),
-            body,
-        );
+        self.module.funcs[function] =
+            FuncDecl::Body(signature, format!("js_shape_set_{index}"), body);
         Ok(())
     }
 
@@ -8174,20 +8478,30 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 current,
                 Terminator::CondBr {
                     cond: matches,
-                    if_true: BlockTarget { block: found, args: vec![] },
-                    if_false: BlockTarget { block: next, args: vec![] },
+                    if_true: BlockTarget {
+                        block: found,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: next,
+                        args: vec![],
+                    },
                 },
             );
             let shape_value = body.add_op(
                 found,
-                Operator::RefCast { ty: ref_sig(shape.sig) },
+                Operator::RefCast {
+                    ty: ref_sig(shape.sig),
+                },
                 &[root],
                 &[ref_sig(shape.sig)],
             );
             body.set_terminator(
                 found,
                 Terminator::ReturnCall {
-                    func: shape.lookup.ok_or_else(|| ConvertError::invalid("shape lookup missing"))?,
+                    func: shape
+                        .lookup
+                        .ok_or_else(|| ConvertError::invalid("shape lookup missing"))?,
                     args: vec![shape_value, key, offset],
                 },
             );
@@ -8240,20 +8554,30 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 current,
                 Terminator::CondBr {
                     cond: matches,
-                    if_true: BlockTarget { block: found, args: vec![] },
-                    if_false: BlockTarget { block: next, args: vec![] },
+                    if_true: BlockTarget {
+                        block: found,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: next,
+                        args: vec![],
+                    },
                 },
             );
             let shape_value = body.add_op(
                 found,
-                Operator::RefCast { ty: ref_sig(shape.sig) },
+                Operator::RefCast {
+                    ty: ref_sig(shape.sig),
+                },
                 &[root],
                 &[ref_sig(shape.sig)],
             );
             body.set_terminator(
                 found,
                 Terminator::ReturnCall {
-                    func: shape.set.ok_or_else(|| ConvertError::invalid("shape setter missing"))?,
+                    func: shape
+                        .set
+                        .ok_or_else(|| ConvertError::invalid("shape setter missing"))?,
                     args: vec![shape_value, key, value, offset],
                 },
             );
@@ -8291,7 +8615,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let offset = body.blocks[entry].params[2].1;
         let bytes = body.add_op(
             entry,
-            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            Operator::StructGet {
+                sig: self.repr.string,
+                idx: 0,
+            },
             &[key],
             &[self.repr.utf8_ty()],
         );
@@ -8303,20 +8630,36 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             entry,
             Terminator::CondBr {
                 cond: complete,
-                if_true: BlockTarget { block: terminal, args: vec![] },
-                if_false: BlockTarget { block: step, args: vec![] },
+                if_true: BlockTarget {
+                    block: terminal,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: step,
+                    args: vec![],
+                },
             },
         );
         let result = body.add_op(
             terminal,
-            Operator::StructGet { sig: self.repr.trie, idx: 0 },
+            Operator::StructGet {
+                sig: self.repr.trie,
+                idx: 0,
+            },
             &[trie],
             &[self.repr.slot_ty()],
         );
-        body.set_terminator(terminal, Terminator::Return { values: vec![result] });
+        body.set_terminator(
+            terminal,
+            Terminator::Return {
+                values: vec![result],
+            },
+        );
         let byte = body.add_op(
             step,
-            Operator::ArrayGetU { sig: self.repr.utf8 },
+            Operator::ArrayGetU {
+                sig: self.repr.utf8,
+            },
             &[bytes, offset],
             &[Type::I32],
         );
@@ -8354,20 +8697,22 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     &[],
                     &[Type::I32],
                 );
-                let matches = body.add_op(
-                    current,
-                    Operator::I32Eq,
-                    &[byte, candidate],
-                    &[Type::I32],
-                );
+                let matches =
+                    body.add_op(current, Operator::I32Eq, &[byte, candidate], &[Type::I32]);
                 let selected = body.add_block();
                 let next = body.add_block();
                 body.set_terminator(
                     current,
                     Terminator::CondBr {
                         cond: matches,
-                        if_true: BlockTarget { block: selected, args: vec![] },
-                        if_false: BlockTarget { block: next, args: vec![] },
+                        if_true: BlockTarget {
+                            block: selected,
+                            args: vec![],
+                        },
+                        if_false: BlockTarget {
+                            block: next,
+                            args: vec![],
+                        },
                     },
                 );
                 current = next;
@@ -8389,8 +8734,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 selected,
                 Terminator::CondBr {
                     cond: missing,
-                    if_true: BlockTarget { block: absent, args: vec![] },
-                    if_false: BlockTarget { block: present, args: vec![] },
+                    if_true: BlockTarget {
+                        block: absent,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: present,
+                        args: vec![],
+                    },
                 },
             );
             let undef = body.add_op(
@@ -8401,7 +8752,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 &[],
                 &[self.repr.slot_ty()],
             );
-            body.set_terminator(absent, Terminator::Return { values: vec![undef] });
+            body.set_terminator(
+                absent,
+                Terminator::Return {
+                    values: vec![undef],
+                },
+            );
             body.set_terminator(
                 present,
                 Terminator::ReturnCall {
@@ -8422,7 +8778,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let offset = body.blocks[entry].params[3].1;
         let bytes = body.add_op(
             entry,
-            Operator::StructGet { sig: self.repr.string, idx: 0 },
+            Operator::StructGet {
+                sig: self.repr.string,
+                idx: 0,
+            },
             &[key],
             &[self.repr.utf8_ty()],
         );
@@ -8434,20 +8793,31 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             entry,
             Terminator::CondBr {
                 cond: complete,
-                if_true: BlockTarget { block: terminal, args: vec![] },
-                if_false: BlockTarget { block: step, args: vec![] },
+                if_true: BlockTarget {
+                    block: terminal,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: step,
+                    args: vec![],
+                },
             },
         );
         body.add_op(
             terminal,
-            Operator::StructSet { sig: self.repr.trie, idx: 0 },
+            Operator::StructSet {
+                sig: self.repr.trie,
+                idx: 0,
+            },
             &[trie, value],
             &[],
         );
         body.set_terminator(terminal, Terminator::Return { values: vec![] });
         let byte = body.add_op(
             step,
-            Operator::ArrayGetU { sig: self.repr.utf8 },
+            Operator::ArrayGetU {
+                sig: self.repr.utf8,
+            },
             &[bytes, offset],
             &[Type::I32],
         );
@@ -8495,20 +8865,22 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     &[],
                     &[Type::I32],
                 );
-                let matches = body.add_op(
-                    current,
-                    Operator::I32Eq,
-                    &[byte, candidate],
-                    &[Type::I32],
-                );
+                let matches =
+                    body.add_op(current, Operator::I32Eq, &[byte, candidate], &[Type::I32]);
                 let selected = body.add_block();
                 let next = body.add_block();
                 body.set_terminator(
                     current,
                     Terminator::CondBr {
                         cond: matches,
-                        if_true: BlockTarget { block: selected, args: vec![] },
-                        if_false: BlockTarget { block: next, args: vec![] },
+                        if_true: BlockTarget {
+                            block: selected,
+                            args: vec![],
+                        },
+                        if_false: BlockTarget {
+                            block: next,
+                            args: vec![],
+                        },
                     },
                 );
                 current = next;
@@ -8530,13 +8902,21 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 selected,
                 Terminator::CondBr {
                     cond: missing,
-                    if_true: BlockTarget { block: allocate, args: vec![] },
-                    if_false: BlockTarget { block: present, args: vec![] },
+                    if_true: BlockTarget {
+                        block: allocate,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: present,
+                        args: vec![],
+                    },
                 },
             );
             let allocated = body.add_op(
                 allocate,
-                Operator::StructNewDefault { sig: self.repr.trie },
+                Operator::StructNewDefault {
+                    sig: self.repr.trie,
+                },
                 &[],
                 &[self.repr.trie_ty()],
             );
@@ -8611,7 +8991,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         );
         let properties = body.add_op(
             block,
-            Operator::RefNull { ty: self.repr.value },
+            Operator::RefNull {
+                ty: self.repr.value,
+            },
             &[],
             &[self.repr.value],
         );
@@ -8715,12 +9097,15 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         .cloned()
                         .ok_or_else(|| ConvertError::invalid("undefined object property value"))?;
                     accessors.remove(&key);
-                    *block = self.set_static_property_value_raw(body, *block, &object, &key, &value)?;
+                    *block =
+                        self.set_static_property_value_raw(body, *block, &object, &key, &value)?;
                 }
                 PropVal::Method(func) => {
-                    let value = self.function_object(body, *block, context, this.clone(), func, false)?;
+                    let value =
+                        self.function_object(body, *block, context, this.clone(), func, false)?;
                     accessors.remove(&key);
-                    *block = self.set_static_property_value_raw(body, *block, &object, &key, &value)?;
+                    *block =
+                        self.set_static_property_value_raw(body, *block, &object, &key, &value)?;
                     // Record the method's identity so member calls on this
                     // literal can verify the slot still holds it.
                     if let LowerValue::FunctionRef { info, .. } = &value {
@@ -8747,7 +9132,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         accessors.insert(key.clone(), descriptor);
                         descriptor
                     };
-                    let function = self.function_object(body, *block, context, this.clone(), func, false)?;
+                    let function =
+                        self.function_object(body, *block, context, this.clone(), func, false)?;
                     let function = self.box_value(body, *block, &function)?;
                     let index = match property {
                         PropVal::Getter(_) => 0,
@@ -9367,10 +9753,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         if let LowerValue::String { bytes, .. } = object
             && let Some(index) = Self::static_array_index(key)
         {
-            return Ok((
-                block,
-                self.literal_string_index(body, block, bytes, index)?,
-            ));
+            return Ok((block, self.literal_string_index(body, block, bytes, index)?));
         }
         let string_index = Self::static_array_index(key);
         if key != "length" && string_index.is_none() {
@@ -9591,13 +9974,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         if let LowerValue::String { bytes, .. } = object
             && let Some(index) = Self::static_array_index(key)
         {
-            return Ok((
-                block,
-                self.literal_string_index(body, block, bytes, index)?,
-            ));
+            return Ok((block, self.literal_string_index(body, block, bytes, index)?));
         }
         let (value, kind) = object.wasm()?;
-        if kind != ValueKind::Reference || !(key == "length" || Self::static_array_index(key).is_some()) {
+        if kind != ValueKind::Reference
+            || !(key == "length" || Self::static_array_index(key).is_some())
+        {
             return self.get_object_property_value(body, block, object, key);
         }
 
@@ -9620,13 +10002,21 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             block,
             Terminator::CondBr {
                 cond: is_raw_array,
-                if_true: BlockTarget { block: raw_array, args: vec![] },
-                if_false: BlockTarget { block: non_raw, args: vec![] },
+                if_true: BlockTarget {
+                    block: raw_array,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: non_raw,
+                    args: vec![],
+                },
             },
         );
         let array = body.add_op(
             raw_array,
-            Operator::RefCast { ty: self.repr.arguments_ty() },
+            Operator::RefCast {
+                ty: self.repr.arguments_ty(),
+            },
             &[value],
             &[self.repr.arguments_ty()],
         );
@@ -9634,13 +10024,18 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         body.set_terminator(
             raw_array,
             Terminator::Br {
-                target: BlockTarget { block: join, args: vec![raw_value] },
+                target: BlockTarget {
+                    block: join,
+                    args: vec![raw_value],
+                },
             },
         );
 
         let is_object = body.add_op(
             non_raw,
-            Operator::RefTest { ty: self.repr.object_ty() },
+            Operator::RefTest {
+                ty: self.repr.object_ty(),
+            },
             &[value],
             &[Type::I32],
         );
@@ -9650,8 +10045,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             non_raw,
             Terminator::CondBr {
                 cond: is_object,
-                if_true: BlockTarget { block: object_array, args: vec![] },
-                if_false: BlockTarget { block: fallback, args: vec![] },
+                if_true: BlockTarget {
+                    block: object_array,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: fallback,
+                    args: vec![],
+                },
             },
         );
         // A primitive fallback may still be a string: strings answer
@@ -9660,7 +10061,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         // string (`'abc'[1]`) reports `length` as `undefined`.
         let is_string = body.add_op(
             fallback,
-            Operator::RefTest { ty: self.repr.string_ty() },
+            Operator::RefTest {
+                ty: self.repr.string_ty(),
+            },
             &[value],
             &[Type::I32],
         );
@@ -9670,13 +10073,21 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             fallback,
             Terminator::CondBr {
                 cond: is_string,
-                if_true: BlockTarget { block: string, args: vec![] },
-                if_false: BlockTarget { block: non_string, args: vec![] },
+                if_true: BlockTarget {
+                    block: string,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: non_string,
+                    args: vec![],
+                },
             },
         );
         let string_value = body.add_op(
             string,
-            Operator::RefCast { ty: self.repr.string_ty() },
+            Operator::RefCast {
+                ty: self.repr.string_ty(),
+            },
             &[value],
             &[self.repr.string_ty()],
         );
@@ -9698,19 +10109,27 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         body.set_terminator(
             string,
             Terminator::Br {
-                target: BlockTarget { block: join, args: vec![string_length_value] },
+                target: BlockTarget {
+                    block: join,
+                    args: vec![string_length_value],
+                },
             },
         );
         let fallback = non_string;
         let plain = body.add_op(
             object_array,
-            Operator::RefCast { ty: self.repr.object_ty() },
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
             &[value],
             &[self.repr.object_ty()],
         );
         let elements = body.add_op(
             object_array,
-            Operator::StructGet { sig: self.repr.object, idx: 1 },
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 1,
+            },
             &[plain],
             &[self.repr.arguments_ty()],
         );
@@ -9721,8 +10140,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             object_array,
             Terminator::CondBr {
                 cond: no_elements,
-                if_true: BlockTarget { block: no_component, args: vec![] },
-                if_false: BlockTarget { block: array_component, args: vec![] },
+                if_true: BlockTarget {
+                    block: no_component,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: array_component,
+                    args: vec![],
+                },
             },
         );
         let (array_component, component_value) =
@@ -9730,7 +10155,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         body.set_terminator(
             array_component,
             Terminator::Br {
-                target: BlockTarget { block: join, args: vec![component_value] },
+                target: BlockTarget {
+                    block: join,
+                    args: vec![component_value],
+                },
             },
         );
         for fallback_block in [fallback, no_component] {
@@ -9740,11 +10168,20 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             body.set_terminator(
                 fallback_block,
                 Terminator::Br {
-                    target: BlockTarget { block: join, args: vec![fallback_value] },
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![fallback_value],
+                    },
                 },
             );
         }
-        Ok((join, LowerValue::Wasm { value: result, kind: ValueKind::Reference }))
+        Ok((
+            join,
+            LowerValue::Wasm {
+                value: result,
+                kind: ValueKind::Reference,
+            },
+        ))
     }
 
     fn get_array_property(
@@ -9872,12 +10309,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     ) -> Result<Value, ConvertError> {
         let (key, kind) = key.wasm()?;
         Ok(match kind {
-            ValueKind::Number => body.add_op(
-                block,
-                Operator::I32TruncSatF64U,
-                &[key],
-                &[Type::I32],
-            ),
+            ValueKind::Number => {
+                body.add_op(block, Operator::I32TruncSatF64U, &[key], &[Type::I32])
+            }
             ValueKind::Integer | ValueKind::Boolean => key,
             _ => return Err(ConvertError::invalid("dynamic member key is not numeric")),
         })
@@ -10020,7 +10454,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         }
         let is_raw = body.add_op(
             block,
-            Operator::RefTest { ty: self.repr.arguments_ty() },
+            Operator::RefTest {
+                ty: self.repr.arguments_ty(),
+            },
             &[value],
             &[Type::I32],
         );
@@ -10032,13 +10468,21 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             block,
             Terminator::CondBr {
                 cond: is_raw,
-                if_true: BlockTarget { block: raw, args: vec![] },
-                if_false: BlockTarget { block: non_raw, args: vec![] },
+                if_true: BlockTarget {
+                    block: raw,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: non_raw,
+                    args: vec![],
+                },
             },
         );
         let raw_array = body.add_op(
             raw,
-            Operator::RefCast { ty: self.repr.arguments_ty() },
+            Operator::RefCast {
+                ty: self.repr.arguments_ty(),
+            },
             &[value],
             &[self.repr.arguments_ty()],
         );
@@ -10046,12 +10490,17 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         body.set_terminator(
             raw,
             Terminator::Br {
-                target: BlockTarget { block: join, args: vec![raw_value] },
+                target: BlockTarget {
+                    block: join,
+                    args: vec![raw_value],
+                },
             },
         );
         let is_object = body.add_op(
             non_raw,
-            Operator::RefTest { ty: self.repr.object_ty() },
+            Operator::RefTest {
+                ty: self.repr.object_ty(),
+            },
             &[value],
             &[Type::I32],
         );
@@ -10061,19 +10510,30 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             non_raw,
             Terminator::CondBr {
                 cond: is_object,
-                if_true: BlockTarget { block: array_object, args: vec![] },
-                if_false: BlockTarget { block: missing, args: vec![] },
+                if_true: BlockTarget {
+                    block: array_object,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: missing,
+                    args: vec![],
+                },
             },
         );
         let plain = body.add_op(
             array_object,
-            Operator::RefCast { ty: self.repr.object_ty() },
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
             &[value],
             &[self.repr.object_ty()],
         );
         let elements = body.add_op(
             array_object,
-            Operator::StructGet { sig: self.repr.object, idx: 1 },
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 1,
+            },
             &[plain],
             &[self.repr.arguments_ty()],
         );
@@ -10083,15 +10543,24 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             array_object,
             Terminator::CondBr {
                 cond: null,
-                if_true: BlockTarget { block: missing, args: vec![] },
-                if_false: BlockTarget { block: present, args: vec![] },
+                if_true: BlockTarget {
+                    block: missing,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: present,
+                    args: vec![],
+                },
             },
         );
         let (present, present_value) = self.get_array_index(body, present, elements, index)?;
         body.set_terminator(
             present,
             Terminator::Br {
-                target: BlockTarget { block: join, args: vec![present_value] },
+                target: BlockTarget {
+                    block: join,
+                    args: vec![present_value],
+                },
             },
         );
         let undef = self.undef(body, missing);
@@ -10099,10 +10568,19 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         body.set_terminator(
             missing,
             Terminator::Br {
-                target: BlockTarget { block: join, args: vec![undef] },
+                target: BlockTarget {
+                    block: join,
+                    args: vec![undef],
+                },
             },
         );
-        Ok((join, LowerValue::Wasm { value: result, kind: ValueKind::Reference }))
+        Ok((
+            join,
+            LowerValue::Wasm {
+                value: result,
+                kind: ValueKind::Reference,
+            },
+        ))
     }
 
     fn dynamic_string_key(
@@ -10117,7 +10595,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         }
         Ok(body.add_op(
             block,
-            Operator::RefCast { ty: self.repr.string_ty() },
+            Operator::RefCast {
+                ty: self.repr.string_ty(),
+            },
             &[key],
             &[self.repr.string_ty()],
         ))
@@ -10181,12 +10661,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[plain],
             &[self.repr.arguments_ty()],
         );
-        let no_elements = body.add_op(
-            array_object,
-            Operator::RefIsNull,
-            &[elements],
-            &[Type::I32],
-        );
+        let no_elements = body.add_op(array_object, Operator::RefIsNull, &[elements], &[Type::I32]);
         let array = body.add_block();
         body.set_terminator(
             array_object,
@@ -10436,12 +10911,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[plain],
             &[self.repr.arguments_ty()],
         );
-        let no_elements = body.add_op(
-            array_object,
-            Operator::RefIsNull,
-            &[elements],
-            &[Type::I32],
-        );
+        let no_elements = body.add_op(array_object, Operator::RefIsNull, &[elements], &[Type::I32]);
         let array = body.add_block();
         body.set_terminator(
             array_object,
@@ -10591,7 +11061,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let boxed_value = self.box_value(body, block, value)?;
         let is_object = body.add_op(
             block,
-            Operator::RefTest { ty: self.repr.object_ty() },
+            Operator::RefTest {
+                ty: self.repr.object_ty(),
+            },
             &[object],
             &[Type::I32],
         );
@@ -10601,19 +11073,30 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             block,
             Terminator::CondBr {
                 cond: is_object,
-                if_true: BlockTarget { block: array_object, args: vec![] },
-                if_false: BlockTarget { block: done, args: vec![] },
+                if_true: BlockTarget {
+                    block: array_object,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
             },
         );
         let plain = body.add_op(
             array_object,
-            Operator::RefCast { ty: self.repr.object_ty() },
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
             &[object],
             &[self.repr.object_ty()],
         );
         let elements = body.add_op(
             array_object,
-            Operator::StructGet { sig: self.repr.object, idx: 1 },
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 1,
+            },
             &[plain],
             &[self.repr.arguments_ty()],
         );
@@ -10623,8 +11106,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             array_object,
             Terminator::CondBr {
                 cond: no_elements,
-                if_true: BlockTarget { block: done, args: vec![] },
-                if_false: BlockTarget { block: write, args: vec![] },
+                if_true: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: write,
+                    args: vec![],
+                },
             },
         );
         let length = body.add_op(write, Operator::ArrayLen, &[elements], &[Type::I32]);
@@ -10635,53 +11124,77 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             write,
             Terminator::CondBr {
                 cond: in_bounds,
-                if_true: BlockTarget { block: set_existing, args: vec![] },
-                if_false: BlockTarget { block: grow, args: vec![] },
+                if_true: BlockTarget {
+                    block: set_existing,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: grow,
+                    args: vec![],
+                },
             },
         );
         body.add_op(
             set_existing,
-            Operator::ArraySet { sig: self.repr.arguments },
+            Operator::ArraySet {
+                sig: self.repr.arguments,
+            },
             &[elements, index, boxed_value],
             &[],
         );
         body.set_terminator(
             set_existing,
             Terminator::Br {
-                target: BlockTarget { block: done, args: vec![] },
+                target: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
             },
         );
         let one = body.add_op(grow, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
         let grown_length = body.add_op(grow, Operator::I32Add, &[index, one], &[Type::I32]);
         let grown = body.add_op(
             grow,
-            Operator::ArrayNewDefault { sig: self.repr.arguments },
+            Operator::ArrayNewDefault {
+                sig: self.repr.arguments,
+            },
             &[grown_length],
             &[self.repr.arguments_ty()],
         );
         let zero = body.add_op(grow, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
         body.add_op(
             grow,
-            Operator::ArrayCopy { dest: self.repr.arguments, src: self.repr.arguments },
+            Operator::ArrayCopy {
+                dest: self.repr.arguments,
+                src: self.repr.arguments,
+            },
             &[grown, zero, elements, zero, length],
             &[],
         );
         body.add_op(
             grow,
-            Operator::ArraySet { sig: self.repr.arguments },
+            Operator::ArraySet {
+                sig: self.repr.arguments,
+            },
             &[grown, index, boxed_value],
             &[],
         );
         body.add_op(
             grow,
-            Operator::StructSet { sig: self.repr.object, idx: 1 },
+            Operator::StructSet {
+                sig: self.repr.object,
+                idx: 1,
+            },
             &[plain, grown],
             &[],
         );
         body.set_terminator(
             grow,
             Terminator::Br {
-                target: BlockTarget { block: done, args: vec![] },
+                target: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
             },
         );
         Ok(done)
@@ -10796,9 +11309,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             .iter()
             .map(|key| match key {
                 PropKey::Lit(key) => Ok(key.sym.to_string()),
-                PropKey::Computed(value) => self.key_of(values.get(value).ok_or_else(|| {
-                    ConvertError::invalid("undefined static object-rest key")
-                })?),
+                PropKey::Computed(value) => self.key_of(
+                    values
+                        .get(value)
+                        .ok_or_else(|| ConvertError::invalid("undefined static object-rest key"))?,
+                ),
                 _ => Err(ConvertError::unsupported("object-rest property key", ())),
             })
             .collect::<Result<BTreeSet<_>, _>>()?;
@@ -10878,13 +11393,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         kind: ValueKind::Reference,
                     },
                 )?;
-                copied_block = self.set_static_property_value_raw(
-                    body,
-                    next,
-                    &object,
-                    name,
-                    &value,
-                )?;
+                copied_block =
+                    self.set_static_property_value_raw(body, next, &object, name, &value)?;
             }
             results.push((copied_block, object));
             current = next;
@@ -10929,19 +11439,30 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 current,
                 Terminator::CondBr {
                     cond: matches,
-                    if_true: BlockTarget { block: matched, args: vec![] },
-                    if_false: BlockTarget { block: next, args: vec![] },
+                    if_true: BlockTarget {
+                        block: matched,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: next,
+                        args: vec![],
+                    },
                 },
             );
             let instance = body.add_op(
                 matched,
-                Operator::RefCast { ty: ref_sig(shape.sig) },
+                Operator::RefCast {
+                    ty: ref_sig(shape.sig),
+                },
                 &[root],
                 &[ref_sig(shape.sig)],
             );
             let fallback = body.add_op(
                 matched,
-                Operator::StructGet { sig: shape.sig, idx: 0 },
+                Operator::StructGet {
+                    sig: shape.sig,
+                    idx: 0,
+                },
                 &[instance],
                 &[self.repr.trie_ty()],
             );
@@ -10963,7 +11484,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 // the target, regardless of the source's attributes.
                 let (next_block, value) = self.unwrap_slot(body, copied_block, source_slot);
                 copied_block = next_block;
-                let slot = self.new_slot_literal(body, copied_block, value, crate::repr::SLOT_FLAGS_DEFAULT);
+                let slot = self.new_slot_literal(
+                    body,
+                    copied_block,
+                    value,
+                    crate::repr::SLOT_FLAGS_DEFAULT,
+                );
                 let key = self.new_string(body, copied_block, name.as_bytes())?;
                 let zero = body.add_op(
                     copied_block,
@@ -11278,12 +11804,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[plain],
             &[self.repr.arguments_ty()],
         );
-        let no_elements = body.add_op(
-            array_object,
-            Operator::RefIsNull,
-            &[elements],
-            &[Type::I32],
-        );
+        let no_elements = body.add_op(array_object, Operator::RefIsNull, &[elements], &[Type::I32]);
         let array = body.add_block();
         body.set_terminator(
             array_object,
@@ -11382,12 +11903,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[plain],
             &[self.repr.arguments_ty()],
         );
-        let no_elements = body.add_op(
-            array_object,
-            Operator::RefIsNull,
-            &[elements],
-            &[Type::I32],
-        );
+        let no_elements = body.add_op(array_object, Operator::RefIsNull, &[elements], &[Type::I32]);
         let array = body.add_block();
         body.set_terminator(
             array_object,
@@ -11438,15 +11954,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             return Ok(block);
         }
         let requested = self.as_f64(body, block, value)?;
-        let requested = body.add_op(
-            block,
-            Operator::I32TruncSatF64U,
-            &[requested],
-            &[Type::I32],
-        );
+        let requested = body.add_op(block, Operator::I32TruncSatF64U, &[requested], &[Type::I32]);
         let is_object = body.add_op(
             block,
-            Operator::RefTest { ty: self.repr.object_ty() },
+            Operator::RefTest {
+                ty: self.repr.object_ty(),
+            },
             &[object],
             &[Type::I32],
         );
@@ -11456,19 +11969,30 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             block,
             Terminator::CondBr {
                 cond: is_object,
-                if_true: BlockTarget { block: array_object, args: vec![] },
-                if_false: BlockTarget { block: done, args: vec![] },
+                if_true: BlockTarget {
+                    block: array_object,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
             },
         );
         let plain = body.add_op(
             array_object,
-            Operator::RefCast { ty: self.repr.object_ty() },
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
             &[object],
             &[self.repr.object_ty()],
         );
         let elements = body.add_op(
             array_object,
-            Operator::StructGet { sig: self.repr.object, idx: 1 },
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 1,
+            },
             &[plain],
             &[self.repr.arguments_ty()],
         );
@@ -11478,13 +12002,23 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             array_object,
             Terminator::CondBr {
                 cond: absent,
-                if_true: BlockTarget { block: done, args: vec![] },
-                if_false: BlockTarget { block: resize, args: vec![] },
+                if_true: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: resize,
+                    args: vec![],
+                },
             },
         );
         let old_length = body.add_op(resize, Operator::ArrayLen, &[elements], &[Type::I32]);
-        let old_is_shorter =
-            body.add_op(resize, Operator::I32LtU, &[old_length, requested], &[Type::I32]);
+        let old_is_shorter = body.add_op(
+            resize,
+            Operator::I32LtU,
+            &[old_length, requested],
+            &[Type::I32],
+        );
         let copy_length = body.add_op(
             resize,
             Operator::TypedSelect { ty: Type::I32 },
@@ -11493,27 +12027,38 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         );
         let replacement = body.add_op(
             resize,
-            Operator::ArrayNewDefault { sig: self.repr.arguments },
+            Operator::ArrayNewDefault {
+                sig: self.repr.arguments,
+            },
             &[requested],
             &[self.repr.arguments_ty()],
         );
         let zero = body.add_op(resize, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
         body.add_op(
             resize,
-            Operator::ArrayCopy { dest: self.repr.arguments, src: self.repr.arguments },
+            Operator::ArrayCopy {
+                dest: self.repr.arguments,
+                src: self.repr.arguments,
+            },
             &[replacement, zero, elements, zero, copy_length],
             &[],
         );
         body.add_op(
             resize,
-            Operator::StructSet { sig: self.repr.object, idx: 1 },
+            Operator::StructSet {
+                sig: self.repr.object,
+                idx: 1,
+            },
             &[plain, replacement],
             &[],
         );
         body.set_terminator(
             resize,
             Terminator::Br {
-                target: BlockTarget { block: done, args: vec![] },
+                target: BlockTarget {
+                    block: done,
+                    args: vec![],
+                },
             },
         );
         Ok(done)
@@ -11657,7 +12202,13 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             return self.unpack_multi_return(body, block, result, info.returns);
         }
         let kind = info.returns.single().unwrap_or(ValueKind::Reference);
-        Ok(vec![(block, LowerValue::Wasm { value: result, kind })])
+        Ok(vec![(
+            block,
+            LowerValue::Wasm {
+                value: result,
+                kind,
+            },
+        )])
     }
 
     /// Build the arguments of a direct dispatch to a function literal's
@@ -11694,13 +12245,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             for i in 0..info.arity {
                 let index = body.add_op(
                     block,
-                    Operator::I32Const {
-                        value: i as u32,
-                    },
+                    Operator::I32Const { value: i as u32 },
                     &[],
                     &[Type::I32],
                 );
-                let in_bounds = body.add_op(block, Operator::I32LtU, &[index, length], &[Type::I32]);
+                let in_bounds =
+                    body.add_op(block, Operator::I32LtU, &[index, length], &[Type::I32]);
                 let present = body.add_block();
                 let missing = body.add_block();
                 let join = body.add_block();
@@ -11808,8 +12358,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         for (result_block, result) in
             self.direct_native_call(body, block, context, info, this, values, args)?
         {
-            let value = self
-                .convert_returned_value(body, result_block, &result, self.current_return_kinds)?;
+            let value = self.convert_returned_value(
+                body,
+                result_block,
+                &result,
+                self.current_return_kinds,
+            )?;
             body.set_terminator(
                 result_block,
                 Terminator::Return {
@@ -11891,8 +12445,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     self.try_provable_primordial_call(body, block, receiver, key, values, args)?
             {
                 for (block, value) in results {
-                    let converted =
-                        self.convert_returned_value(body, block, &value, self.current_return_kinds)?;
+                    let converted = self.convert_returned_value(
+                        body,
+                        block,
+                        &value,
+                        self.current_return_kinds,
+                    )?;
                     body.set_terminator(
                         block,
                         Terminator::Return {
@@ -12061,15 +12619,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 },
             );
         } else {
-            self.emit_direct_tail_downgrade(
-                body,
-                fast,
-                context,
-                info,
-                this.clone(),
-                values,
-                args,
-            )?;
+            self.emit_direct_tail_downgrade(body, fast, context, info, this.clone(), values, args)?;
         }
         // The slow arm handles an unknown runtime identity (the binding
         // may have been rebound). From a boxed caller it keeps the generic
@@ -12106,7 +12656,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 },
                 self.current_return_kinds,
             )?;
-            body.set_terminator(slow, Terminator::Return { values: vec![value] });
+            body.set_terminator(
+                slow,
+                Terminator::Return {
+                    values: vec![value],
+                },
+            );
         }
         Ok(Some(()))
     }
@@ -12204,7 +12759,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             },
         );
         let mut continuations = Vec::with_capacity(2);
-        continuations.extend(self.direct_native_call(body, fast, context, info, this, values, args)?);
+        continuations
+            .extend(self.direct_native_call(body, fast, context, info, this, values, args)?);
         for (slow_block, slow_value) in fallback(self, body, slow)? {
             let slow_value = self.box_value(body, slow_block, &slow_value)?;
             continuations.push((

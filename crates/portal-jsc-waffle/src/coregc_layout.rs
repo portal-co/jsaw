@@ -14,6 +14,17 @@ pub const COREGC_DESCRIPTOR_MAGIC: u32 = 0x4347_4431;
 pub const COREGC_DESCRIPTOR_VERSION: u32 = 1;
 const ARRAY_PAYLOAD_BYTES: u32 = u32::MAX;
 
+/// Descriptor `kind` tag for a struct payload (already emitted by v1).
+pub const COREGC_DESCRIPTOR_KIND_STRUCT: u32 = 1;
+/// Descriptor `kind` tag for an array payload (already emitted by v1).
+pub const COREGC_DESCRIPTOR_KIND_ARRAY: u32 = 2;
+/// Descriptor `kind` tag reserved for function objects
+/// (`docs/plan-coregc-atomic-collector-and-lowering.md` §6.7). No v1 code
+/// path emits or interprets this kind; it is reserved now so the v2
+/// function-reference/`call_ref` work never needs a second descriptor
+/// version bump.
+pub const COREGC_DESCRIPTOR_KIND_FUNCTION_OBJECT: u32 = 3;
+
 /// A byte-addressed field/element layout in a managed payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoreGcSlotLayout {
@@ -117,8 +128,8 @@ impl CoreGcDescriptorTable {
             push_u32(
                 &mut bytes,
                 match ty.kind {
-                    CoreGcTypeKind::Struct { .. } => 1,
-                    CoreGcTypeKind::Array { .. } => 2,
+                    CoreGcTypeKind::Struct { .. } => COREGC_DESCRIPTOR_KIND_STRUCT,
+                    CoreGcTypeKind::Array { .. } => COREGC_DESCRIPTOR_KIND_ARRAY,
                 },
             );
             push_u32(&mut bytes, layout.payload_alignment);

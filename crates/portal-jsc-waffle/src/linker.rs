@@ -10,8 +10,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use portal_jsc_swc_ssa::{
-    module::{ExportSpec, SModule},
     SFunc,
+    module::{ExportSpec, SModule},
 };
 use portal_jsc_swc_util::{ImportMap, ImportMapper};
 use swc_ecma_ast::Id as Ident;
@@ -161,7 +161,9 @@ pub(crate) fn module_export_names(
             ExportSpec::DefaultFunc { .. } | ExportSpec::DefaultExpr { .. } => {
                 names.insert("default".to_owned());
             }
-            ExportSpec::Reexport { names: reexported, .. } => {
+            ExportSpec::Reexport {
+                names: reexported, ..
+            } => {
                 for (_, exported) in reexported {
                     names.insert(exported.to_string());
                 }
@@ -202,7 +204,9 @@ pub(crate) fn resolve_export<'a>(
     // 1. Explicit exports of this module.
     for export in &module.exports {
         match export {
-            ExportSpec::Local { local, exported, .. } if exported.to_string() == name => {
+            ExportSpec::Local {
+                local, exported, ..
+            } if exported.to_string() == name => {
                 return match module.funcs.get(&local.0) {
                     Some(function) => Ok(Some(function)),
                     None => Err(ConvertError::invalid(format!(
@@ -225,15 +229,18 @@ pub(crate) fn resolve_export<'a>(
                      function` can be linked across modules"
                 )));
             }
-            ExportSpec::ReexportAll { ns: Some(ns_name), .. } if ns_name.to_string() == name => {
+            ExportSpec::ReexportAll {
+                ns: Some(ns_name), ..
+            } if ns_name.to_string() == name => {
                 return Err(ConvertError::invalid(format!(
                     "namespace object export {name:?} (export * as ns) in {path:?} is not \
                      supported yet"
                 )));
             }
             ExportSpec::Reexport { source, names, .. } => {
-                if let Some((original, _)) =
-                    names.iter().find(|(_, exported)| exported.to_string() == name)
+                if let Some((original, _)) = names
+                    .iter()
+                    .find(|(_, exported)| exported.to_string() == name)
                 {
                     let (target, _) = resolve_specifier_target(set, path, &source.to_string())?;
                     return resolve_export(set, target, &original.to_string(), visiting);
@@ -248,7 +255,10 @@ pub(crate) fn resolve_export<'a>(
     if name != "default" {
         let mut found: Option<(&'a SFunc, &str)> = None;
         for export in &module.exports {
-            if let ExportSpec::ReexportAll { source, ns: None, .. } = export {
+            if let ExportSpec::ReexportAll {
+                source, ns: None, ..
+            } = export
+            {
                 let (target, _) = resolve_specifier_target(set, path, &source.to_string())?;
                 if let Some(function) = resolve_export(set, target, name, visiting)? {
                     match found {
@@ -318,14 +328,13 @@ pub(crate) fn build_import_table<'a>(
                 )));
             }
         };
-        let function = resolve_export(set, target_path, &name, &mut BTreeSet::new())?.ok_or_else(
-            || {
+        let function =
+            resolve_export(set, target_path, &name, &mut BTreeSet::new())?.ok_or_else(|| {
                 ConvertError::invalid(format!(
                     "module {target_path:?} does not export {name:?} (imported by {path:?} from \
                      {specifier:?})"
                 ))
-            },
-        )?;
+            })?;
         table.insert(
             id,
             ImportTarget {
@@ -351,7 +360,11 @@ pub(crate) fn flatten_module_export_surface<'a>(
     let mut star_sources: Vec<String> = Vec::new();
     for export in &module.exports {
         match export {
-            ExportSpec::Local { local, exported: name, .. } => {
+            ExportSpec::Local {
+                local,
+                exported: name,
+                ..
+            } => {
                 declared_names.insert(name.to_string());
                 // Non-function local exports skip silently: the existing
                 // function-only ABI never exported them either.
@@ -380,11 +393,11 @@ pub(crate) fn flatten_module_export_surface<'a>(
                     let function =
                         resolve_export(set, target, &original.to_string(), &mut BTreeSet::new())?
                             .ok_or_else(|| {
-                                ConvertError::invalid(format!(
-                                    "module {target:?} does not export {original:?} (re-exported \
+                            ConvertError::invalid(format!(
+                                "module {target:?} does not export {original:?} (re-exported \
                                      by {entry:?} as {exported_name:?})"
-                                ))
-                            })?;
+                            ))
+                        })?;
                     declared_names.insert(exported_name.to_string());
                     exported.push((exported_name.to_string(), function));
                 }
@@ -395,7 +408,9 @@ pub(crate) fn flatten_module_export_surface<'a>(
                      yet"
                 )));
             }
-            ExportSpec::ReexportAll { source, ns: None, .. } => {
+            ExportSpec::ReexportAll {
+                source, ns: None, ..
+            } => {
                 let (target, _) = resolve_specifier_target(set, entry, &source.to_string())?;
                 star_sources.push(target.to_owned());
             }
@@ -417,13 +432,12 @@ pub(crate) fn flatten_module_export_surface<'a>(
             if name == "default" || local_names.contains(&name) {
                 continue;
             }
-            let function = resolve_export(set, source, &name, &mut BTreeSet::new())?.ok_or_else(
-                || {
+            let function =
+                resolve_export(set, source, &name, &mut BTreeSet::new())?.ok_or_else(|| {
                     ConvertError::invalid(format!(
                         "module {source:?} does not export {name:?} (star-exported by {entry:?})"
                     ))
-                },
-            )?;
+                })?;
             let key = function as *const SFunc as usize;
             match star_seen.insert(name.clone(), key) {
                 Some(previous) if previous != key => {

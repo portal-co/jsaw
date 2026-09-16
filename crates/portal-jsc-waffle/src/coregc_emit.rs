@@ -18,6 +18,7 @@ use crate::{
 /// Fixed header ABI reserved for later mark/sweep phases.
 pub const COREGC_HEADER_BYTES: u32 = 24;
 const COREGC_MAGIC_ALLOCATED: u32 = 0xC0DE_0001;
+const COREGC_FLAG_MARK: u32 = 1 << 1;
 
 /// Configuration for the phase-1 pure-Wasm runtime skeleton.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -370,6 +371,7 @@ pub fn emit_runtime_skeleton(
         body,
     ));
     let validator = add_ref_validator(&mut module, memory);
+    let marker = add_mark_ref(&mut module, memory, validator);
     let array_bounds = add_array_bounds_check(&mut module, memory, validator);
     let collect = add_empty_root_collect(
         &mut module,
@@ -385,6 +387,10 @@ pub fn emit_runtime_skeleton(
     module.exports.push(portal_pc_waffle::Export {
         name: "__coregc_validate_ref_phase1".to_owned(),
         kind: portal_pc_waffle::ExportKind::Func(validator),
+    });
+    module.exports.push(portal_pc_waffle::Export {
+        name: "__coregc_mark_phase2".to_owned(),
+        kind: portal_pc_waffle::ExportKind::Func(marker),
     });
     module.exports.push(portal_pc_waffle::Export {
         name: "__coregc_array_bounds_phase1".to_owned(),
@@ -635,6 +641,83 @@ fn add_array_bounds_check(
     module.funcs.push(FuncDecl::Body(
         signature,
         "__coregc_array_bounds_phase1".to_owned(),
+        body,
+    ))
+}
+
+/// Mark a validated reference without recursion. Descriptor-driven child
+/// traversal is added once reference-field lowering is enabled; this primitive
+/// already establishes the header-bit ownership protocol used by roots.
+fn add_mark_ref(
+    module: &mut Module<'static>,
+    memory: portal_pc_waffle::Memory,
+    validator: portal_pc_waffle::Func,
+) -> portal_pc_waffle::Func {
+    let signature = module.signatures.push(SignatureData::Func {
+        params: vec![Type::I32, Type::I32],
+        returns: vec![],
+        shared: false,
+    });
+    let mut body = FunctionBody::new(module, signature);
+    let entry = body.entry;
+    let address = body.blocks[entry].params[0].1;
+    let type_id = body.blocks[entry].params[1].1;
+    let checked = body.add_op(
+        entry,
+        Operator::Call {
+            function_index: validator,
+        },
+        &[address, type_id],
+        &[Type::I32],
+    );
+    let null = body.add_block();
+    let mark = body.add_block();
+    let address_is_null = body.add_op(entry, Operator::I32Eqz, &[checked], &[Type::I32]);
+    body.set_terminator(
+        entry,
+        Terminator::CondBr {
+            cond: address_is_null,
+            if_true: BlockTarget {
+                block: null,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: mark,
+                args: vec![],
+            },
+        },
+    );
+    body.set_terminator(null, Terminator::Return { values: vec![] });
+    let header_bytes = i32_const(&mut body, mark, COREGC_HEADER_BYTES);
+    let header = body.add_op(
+        mark,
+        Operator::I32Sub,
+        &[checked, header_bytes],
+        &[Type::I32],
+    );
+    let memory_arg = MemoryArg {
+        align: 2,
+        offset: 0,
+        memory,
+    };
+    let flags = body.add_op(
+        mark,
+        Operator::I32Load { memory: memory_arg },
+        &[header],
+        &[Type::I32],
+    );
+    let mark_bit = i32_const(&mut body, mark, COREGC_FLAG_MARK);
+    let marked = body.add_op(mark, Operator::I32Or, &[flags, mark_bit], &[Type::I32]);
+    body.add_op(
+        mark,
+        Operator::I32Store { memory: memory_arg },
+        &[header, marked],
+        &[],
+    );
+    body.set_terminator(mark, Terminator::Return { values: vec![] });
+    module.funcs.push(FuncDecl::Body(
+        signature,
+        "__coregc_mark_phase2".to_owned(),
         body,
     ))
 }
@@ -915,6 +998,42 @@ mod tests {
             0
         );
         assert!(bounds.call(&mut store, (address, 1, 1)).is_err());
+    }
+
+    #[test]
+    fn phase2_mark_sets_the_header_mark_bit_without_changing_type() {
+        let artifact = emit_runtime_skeleton(&Module::empty(), &CoreGcOptions::default())
+            .expect("runtime skeleton");
+        let engine = Engine::default();
+        let bytes = portal_pc_waffle::to_wasm_bytes(&artifact.module).expect("core wasm encodes");
+        let module = WasmtimeModule::new(&engine, bytes).expect("core engine compiles artifact");
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).expect("artifact instantiates");
+        let allocator = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "__coregc_alloc_phase1")
+            .expect("allocator export");
+        let marker = instance
+            .get_typed_func::<(i32, i32), ()>(&mut store, "__coregc_mark_phase2")
+            .expect("marker export");
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .expect("memory export");
+        let address = allocator.call(&mut store, (1, 8)).expect("allocation");
+        marker
+            .call(&mut store, (address, 1))
+            .expect("mark live pair");
+        let mut flags = [0; 4];
+        memory
+            .read(
+                &store,
+                usize::try_from(address).unwrap() - usize::try_from(COREGC_HEADER_BYTES).unwrap(),
+                &mut flags,
+            )
+            .expect("header flags read");
+        assert_eq!(
+            u32::from_le_bytes(flags),
+            COREGC_MAGIC_ALLOCATED | COREGC_FLAG_MARK
+        );
     }
 
     #[test]

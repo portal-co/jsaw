@@ -1,6 +1,7 @@
 pub mod conv;
 pub mod coregc;
 pub mod coregc_layout;
+pub mod coregc_lower;
 pub mod coregc_roots;
 pub mod coregc_runtime;
 pub mod ingest;

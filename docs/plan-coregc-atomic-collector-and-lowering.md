@@ -497,19 +497,23 @@ Per function, after CFG flattening but before emitting any runtime calls:
    - terminator: add every `FatRef` branch-target-argument / return value to
      `live`;
    - for each instruction, *in this order*:
-     a. if the instruction is a checkpoint instruction (`StructNew`,
-        `ArrayNewDefault`, `Call`): `checkpoint_live[instr] = live ∪
-        fatref_operands(instr)` — operands are included *before* removing
-        the instruction's own result, because they must survive exactly the
-        runtime call this instruction lowers to (they are consumed by
-        payload stores / passed as call arguments only *after* that call
-        returns; see the worked example below);
-     b. if the instruction has a `FatRef` result, remove it from `live`
-        (nothing before this point in program order needs to protect a
-        value that does not exist yet);
-     c. add every `FatRef` operand of the instruction to `live` (protect
-        values needed to construct this instruction's inputs, propagating
-        the requirement earlier in program order).
+     a. if the instruction has a `FatRef` result, remove it from `live`
+        *first* — the checkpoint this instruction may lower to (e.g. the
+        internal alloc call inside `struct.new`) runs before this result
+        exists, so it can never itself be something that checkpoint needs
+        already rooted, even though a *later* instruction's use of this same
+        result (processed earlier in this reverse walk) may have
+        provisionally added it to `live`;
+     b. add every `FatRef` operand of the instruction to `live` (they must
+        already be rooted to survive this instruction — for a checkpoint
+        instruction specifically, they are consumed by payload stores /
+        passed as call arguments only *after* its internal call returns, so
+        they must be protected across it; see the worked example below);
+     c. if the instruction is a checkpoint instruction (`StructNew`,
+        `ArrayNewDefault`, `Call`, `CallRef`, `CallIndirect`):
+        `checkpoint_live[instr] = live` (now correctly excluding the
+        instruction's own not-yet-existing result and including its
+        operands, from steps a and b above).
 4. `spilled = ⋃ checkpoint_live[instr]` over every checkpoint instruction in
    the function. This is the exact, permanent set of `FatRef` values that
    need a shadow-frame slot in this function.
@@ -574,13 +578,24 @@ The `checkpoint` happens *before* `%a`/`%b` are written into the new
 payload. If `%a`/`%b` were not in `checkpoint_live[struct.new]`, a collection
 inside `checkpoint` could reclaim whatever `%a`/`%b` point to (nothing else
 roots them at that exact instant), and the subsequent `store_pair` would
-write a dangling pair into `%r`. Because step 3a unions in `fatref_operands`
-before the def/use update, `%a` and `%b` are guaranteed to already have a
-`root_store` from their own definition sites (step 6), so they are valid
-roots at the moment `checkpoint` runs. The same reasoning is why `Call`
-arguments are included identically — a call's checkpoint precedes the actual
-`Operator::Call`, and the flattened fat-ref arguments must survive it to be
-passed once the callee is actually invoked.
+write a dangling pair into `%r`. Because step (b) unions in `fatref_operands`
+before step (c) captures `checkpoint_live`, and step (a) already removed `%r`
+itself, the captured set is exactly `{%a, %b}` (plus anything else still live
+from later in the block) — never `%r`. `%a` and `%b` are guaranteed to
+already have a `root_store` from their own definition sites (step 6), so they
+are valid roots at the moment `checkpoint` runs. The same reasoning is why
+`Call`/`CallRef`/`CallIndirect` arguments are included identically — such a
+checkpoint precedes the actual call operator, and the flattened fat-ref
+arguments must survive it to be passed once the callee is actually invoked.
+
+This exact ordering bug — capturing `checkpoint_live` before removing the
+instruction's own provisionally-live result — is what the first
+implementation attempt against this plan actually shipped and caught via the
+`array_built_and_summed_survives_a_forced_collection_at_every_allocation`
+test (a struct allocated then immediately stored into an array slot, so the
+struct's own result value was already `live` from the store when the
+struct.new checkpoint was reached): the corrected order above is what is
+implemented.
 
 ### 6.5 Runtime call surface used by lowering
 

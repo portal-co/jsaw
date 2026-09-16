@@ -1,6 +1,17 @@
 # Plan: typed, pure-Wasm mark-and-sweep fallback for WasmGC
 
-**Status:** design and research plan. This is a fallback backend for hosts that
+**Status:** superseded by
+[`plan-coregc-atomic-collector-and-lowering.md`](./plan-coregc-atomic-collector-and-lowering.md).
+This document remains as research/prior-art background (§1-§2, source notes)
+and as the origin of the collector-profile decisions in §2.4. Every normative
+ABI, header, descriptor, lowering, checkpoint, and acceptance-gate decision
+lives only in the superseding document now; do not implement against this
+file. It was originally written as a freestanding phased rollout plan, which
+is exactly the layering problem the superseding document's introduction
+explains: its phases were designed independently of the actual jsaw IR/runtime
+constraints and could not be safely composed once implementation started.
+
+**Original status:** design and research plan. This is a fallback backend for hosts that
 cannot validate or execute WasmGC. It ingests the same typed WasmGC module that
 jsaw already produces, inventories its GC types, and emits a **core Wasm**
 module containing direct code plus a generated, typed, non-moving mark-and-sweep

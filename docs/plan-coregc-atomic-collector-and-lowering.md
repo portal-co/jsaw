@@ -905,6 +905,23 @@ roadmap is smaller than a full `anyref` implementation would suggest.
 
 ## 12. Explicit non-goals / later work
 
+- **shadow-root stack on the managed heap instead of a fixed memory
+  region.** v1/v2 reserves a fixed-size root region below the heap
+  (configured by `root_stack_bytes`) that shares linear memory with the
+  descriptor table and worklist. That design has already bitten twice: the
+  frame-collision bound once pointed at the heap base instead of the
+  worklist start (so deep frames silently overwrote worklist entries until
+  the cross-test harness caught it), and the fixed default was too small
+  for real jsaw-compiled programs (the primordial-context builder nests
+  hundreds of frames). Moving the shadow stack onto the heap — frames
+  allocated as ordinary GC blocks, linked through a root-of-roots pin, with
+  `push_frame` calling the normal allocator/checkpoint machinery — removes
+  the fixed reservation, eliminates the collision boundary entirely, and
+  grows with the program instead of needing a tuned default. It needs care
+  around the chicken-and-egg case (allocating a frame may itself want a
+  collection, and the collection walks the frame chain being extended), so
+  it is a self-contained redesign stage, not an incidental tweak — deferred
+  until v2 stage 4 lands and the cross-test suite is the regression gate;
 - allocator splitting/coalescing, TLSF or size-class allocation, generated
   per-type scanners as a performance upgrade over the generic interpreter
   (§3.3), and shadow-frame slot-interval reuse (§6.4 item 5) — all

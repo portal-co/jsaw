@@ -377,3 +377,190 @@ fn add_root_clear(
         body,
     ))
 }
+
+/// Generate the Phase-3 root-aware collection checkpoint. It marks every
+/// exact root pair in the linked frame chain. Full descriptor scanning/sweep
+/// stays behind Phase-2's operation gate, so this function deliberately does
+/// not reclaim allocations yet: preserving a marked root is more important
+/// than unsafely freeing an object whose descriptor scanner is not generated.
+pub(crate) fn add_root_collect(
+    module: &mut Module<'static>,
+    memory: portal_pc_waffle::Memory,
+    _allocation_head: portal_pc_waffle::Global,
+    root_head: portal_pc_waffle::Global,
+    marker: portal_pc_waffle::Func,
+) -> portal_pc_waffle::Func {
+    let signature = module.signatures.push(SignatureData::Func {
+        params: vec![],
+        returns: vec![],
+        shared: false,
+    });
+    let mut body = FunctionBody::new(module, signature);
+    let entry = body.entry;
+    let loop_block = body.add_block();
+    let slot_loop = body.add_block();
+    let mark_slot = body.add_block();
+    let next_frame = body.add_block();
+    let done = body.add_block();
+    let head = body.add_op(
+        entry,
+        Operator::GlobalGet {
+            global_index: root_head,
+        },
+        &[],
+        &[Type::I32],
+    );
+    body.set_terminator(
+        entry,
+        Terminator::Br {
+            target: BlockTarget {
+                block: loop_block,
+                args: vec![head],
+            },
+        },
+    );
+    let frame = body.add_blockparam(loop_block, Type::I32);
+    let frame_is_null = body.add_op(loop_block, Operator::I32Eqz, &[frame], &[Type::I32]);
+    let first_slot = i32_const(&mut body, loop_block, 0);
+    body.set_terminator(
+        loop_block,
+        Terminator::CondBr {
+            cond: frame_is_null,
+            if_true: BlockTarget {
+                block: done,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: slot_loop,
+                args: vec![frame, first_slot],
+            },
+        },
+    );
+    let slot_frame = body.add_blockparam(slot_loop, Type::I32);
+    let slot = body.add_blockparam(slot_loop, Type::I32);
+    let count = body.add_op(
+        slot_loop,
+        Operator::I32Load {
+            memory: MemoryArg {
+                align: 2,
+                offset: 4,
+                memory,
+            },
+        },
+        &[slot_frame],
+        &[Type::I32],
+    );
+    let exhausted = body.add_op(slot_loop, Operator::I32Eq, &[slot, count], &[Type::I32]);
+    body.set_terminator(
+        slot_loop,
+        Terminator::CondBr {
+            cond: exhausted,
+            if_true: BlockTarget {
+                block: next_frame,
+                args: vec![slot_frame],
+            },
+            if_false: BlockTarget {
+                block: mark_slot,
+                args: vec![slot_frame, slot],
+            },
+        },
+    );
+    let mark_frame = body.add_blockparam(mark_slot, Type::I32);
+    let mark_index = body.add_blockparam(mark_slot, Type::I32);
+    let eight = i32_const(&mut body, mark_slot, 8);
+    let slot_offset = body.add_op(
+        mark_slot,
+        Operator::I32Mul,
+        &[mark_index, eight],
+        &[Type::I32],
+    );
+    let header = i32_const(&mut body, mark_slot, 8);
+    let slot_offset = body.add_op(
+        mark_slot,
+        Operator::I32Add,
+        &[slot_offset, header],
+        &[Type::I32],
+    );
+    let pointer = body.add_op(
+        mark_slot,
+        Operator::I32Add,
+        &[mark_frame, slot_offset],
+        &[Type::I32],
+    );
+    let address = body.add_op(
+        mark_slot,
+        Operator::I32Load {
+            memory: MemoryArg {
+                align: 2,
+                offset: 0,
+                memory,
+            },
+        },
+        &[pointer],
+        &[Type::I32],
+    );
+    let type_id = body.add_op(
+        mark_slot,
+        Operator::I32Load {
+            memory: MemoryArg {
+                align: 2,
+                offset: 4,
+                memory,
+            },
+        },
+        &[pointer],
+        &[Type::I32],
+    );
+    body.add_op(
+        mark_slot,
+        Operator::Call {
+            function_index: marker,
+        },
+        &[address, type_id],
+        &[],
+    );
+    let one = i32_const(&mut body, mark_slot, 1);
+    let next_slot = body.add_op(
+        mark_slot,
+        Operator::I32Add,
+        &[mark_index, one],
+        &[Type::I32],
+    );
+    body.set_terminator(
+        mark_slot,
+        Terminator::Br {
+            target: BlockTarget {
+                block: slot_loop,
+                args: vec![mark_frame, next_slot],
+            },
+        },
+    );
+    let next_input = body.add_blockparam(next_frame, Type::I32);
+    let previous = body.add_op(
+        next_frame,
+        Operator::I32Load {
+            memory: MemoryArg {
+                align: 2,
+                offset: 0,
+                memory,
+            },
+        },
+        &[next_input],
+        &[Type::I32],
+    );
+    body.set_terminator(
+        next_frame,
+        Terminator::Br {
+            target: BlockTarget {
+                block: loop_block,
+                args: vec![previous],
+            },
+        },
+    );
+    body.set_terminator(done, Terminator::Return { values: vec![] });
+    module.funcs.push(FuncDecl::Body(
+        signature,
+        "__coregc_collect".to_owned(),
+        body,
+    ))
+}

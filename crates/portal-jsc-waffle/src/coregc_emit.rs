@@ -13,7 +13,7 @@ use portal_pc_waffle::{
 use crate::{
     coregc::{CoreGcError, CoreGcInventory},
     coregc_layout::CoreGcDescriptorTable,
-    coregc_phase3::add_shadow_roots,
+    coregc_phase3::{add_root_collect, add_shadow_roots},
 };
 
 /// Fixed header ABI reserved for later mark/sweep phases.
@@ -397,13 +397,14 @@ pub fn emit_runtime_skeleton(
     let marker = add_mark_ref(&mut module, memory, validator);
     let array_bounds = add_array_bounds_check(&mut module, memory, validator);
     let roots = add_shadow_roots(&mut module, memory, options.heap_base, root_head, root_bump);
-    let collect = add_empty_root_collect(
+    let empty_collect = add_empty_root_collect(
         &mut module,
         memory,
         options.heap_base,
         allocation_head,
         bump,
     );
+    let collect = add_root_collect(&mut module, memory, allocation_head, root_head, marker);
     module.exports.push(portal_pc_waffle::Export {
         name: "__coregc_alloc_phase1".to_owned(),
         kind: portal_pc_waffle::ExportKind::Func(allocator),
@@ -438,6 +439,10 @@ pub fn emit_runtime_skeleton(
     });
     module.exports.push(portal_pc_waffle::Export {
         name: "__coregc_collect_phase2".to_owned(),
+        kind: portal_pc_waffle::ExportKind::Func(empty_collect),
+    });
+    module.exports.push(portal_pc_waffle::Export {
+        name: "__coregc_collect".to_owned(),
         kind: portal_pc_waffle::ExportKind::Func(collect),
     });
     module.exports.push(portal_pc_waffle::Export {
@@ -1038,6 +1043,58 @@ mod tests {
             0
         );
         assert!(bounds.call(&mut store, (address, 1, 1)).is_err());
+    }
+
+    #[test]
+    fn phase3_collect_marks_every_live_shadow_root() {
+        let artifact = emit_runtime_skeleton(&Module::empty(), &CoreGcOptions::default())
+            .expect("runtime skeleton");
+        let engine = Engine::default();
+        let bytes = portal_pc_waffle::to_wasm_bytes(&artifact.module).expect("core wasm encodes");
+        let module = WasmtimeModule::new(&engine, bytes).expect("core engine compiles artifact");
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).expect("artifact instantiates");
+        let allocator = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "__coregc_alloc_phase1")
+            .expect("allocator export");
+        let push = instance
+            .get_typed_func::<i32, i32>(&mut store, "__coregc_push_frame_phase3")
+            .expect("push export");
+        let root_store = instance
+            .get_typed_func::<(i32, i32, i32, i32), ()>(&mut store, "__coregc_root_store_phase3")
+            .expect("root store export");
+        let collect = instance
+            .get_typed_func::<(), ()>(&mut store, "__coregc_collect")
+            .expect("collector export");
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .expect("memory export");
+        let first = allocator
+            .call(&mut store, (1, 8))
+            .expect("first allocation");
+        let second = allocator
+            .call(&mut store, (1, 8))
+            .expect("second allocation");
+        let frame = push.call(&mut store, 2).expect("root frame");
+        root_store
+            .call(&mut store, (frame, 0, first, 1))
+            .expect("first root");
+        root_store
+            .call(&mut store, (frame, 1, second, 1))
+            .expect("second root");
+        collect
+            .call(&mut store, ())
+            .expect("root collection checkpoint");
+        for address in [first, second] {
+            let mut flags = [0; 4];
+            memory
+                .read(&store, usize::try_from(address).unwrap() - 24, &mut flags)
+                .expect("header flags");
+            assert_eq!(
+                u32::from_le_bytes(flags) & COREGC_FLAG_MARK,
+                COREGC_FLAG_MARK
+            );
+        }
     }
 
     #[test]

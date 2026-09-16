@@ -91,18 +91,26 @@ pub struct CoreGcOptions {
     /// Export `__coregc_collect` and `memory` for host-driven debugging.
     /// Production artifacts keep only the program's own exports.
     pub export_runtime_debug: bool,
+    /// Investigation-only: import `"coregc_debug" "trace"` (a
+    /// `(i32, i32, i32) -> ()` host function) and call it on every
+    /// allocation (`kind`=1 fresh bump, `kind`=2 free-list reuse, args
+    /// `(kind, address, type_id)`) and every sweep reclamation (`kind`=3,
+    /// args `(kind, address, type_id_before_clear)`). Never set outside
+    /// ad-hoc debugging; production artifacts must stay import-free.
+    pub debug_trace: bool,
 }
 
 impl Default for CoreGcOptions {
     fn default() -> Self {
         Self {
-            initial_pages: 2,
+            initial_pages: 24,
             maximum_pages: None,
-            heap_base: 0x1_0000,
-            root_stack_bytes: 4096,
-            worklist_bytes: 8192,
+            heap_base: 0x10_0000,
+            root_stack_bytes: 256 * 1024,
+            worklist_bytes: 64 * 1024,
             collect_threshold_bytes: 1 << 20,
             export_runtime_debug: false,
+            debug_trace: false,
         }
     }
 }
@@ -114,6 +122,11 @@ impl Default for CoreGcOptions {
 pub(crate) struct CoreGcRuntime {
     pub(crate) memory: portal_pc_waffle::Memory,
     pub(crate) trap_code: Global,
+    pub(crate) debug_addr: Global,
+    pub(crate) debug_type: Global,
+    pub(crate) root_head: Global,
+    pub(crate) block_list_head: Global,
+    pub(crate) root_bump: Global,
     /// `(type_id: i32, payload_bytes: i32) -> address: i32`
     pub(crate) alloc: Func,
     /// `(address: i32, byte_len: i32) -> ()`
@@ -131,6 +144,9 @@ pub(crate) struct CoreGcRuntime {
     /// optional debug export.
     pub(crate) collect: Func,
     pub(crate) roots: ShadowRootFunctions,
+    /// Investigation-only: `(kind: i32, address: i32, type_id: i32) -> ()`
+    /// host import; `Some` iff `CoreGcOptions::debug_trace` was set.
+    pub(crate) debug_trace_fn: Option<Func>,
 }
 
 /// Generate the complete coregc runtime described in
@@ -146,6 +162,24 @@ pub(crate) fn build(
             message: "coregc requires at least one initial memory page".to_owned(),
         });
     }
+    let debug_trace_fn = if options.debug_trace {
+        let sig = module.signatures.push(SignatureData::Func {
+            params: vec![Type::I32, Type::I32, Type::I32],
+            returns: vec![],
+            shared: false,
+        });
+        let func = module
+            .funcs
+            .push(FuncDecl::Import(sig, "trace".to_owned()));
+        module.imports.push(portal_pc_waffle::Import {
+            module: "coregc_debug".to_owned(),
+            name: "trace".to_owned(),
+            kind: portal_pc_waffle::ImportKind::Func(func),
+        });
+        Some(func)
+    } else {
+        None
+    };
     let root_stack_start = align8(
         u32::try_from(descriptors.bytes.len()).map_err(|_| CoreGcError {
             message: "coregc descriptor table exceeds u32 bytes".to_owned(),
@@ -207,8 +241,10 @@ pub(crate) fn build(
     let collecting = global_i32(module, 0);
     let bytes_since_collect = global_i32(module, 0);
     let trap_code = global_i32(module, 0);
+    let debug_addr = global_i32(module, 0);
+    let debug_type = global_i32(module, 0);
 
-    let validate_ref = add_validate_ref(module, memory, trap_code);
+    let validate_ref = add_validate_ref(module, memory, trap_code, debug_addr, debug_type);
     let array_bounds = add_array_bounds(module, memory, trap_code, validate_ref);
     let zero_bytes = add_zero_bytes(module, memory);
     let alloc = add_alloc(
@@ -220,16 +256,20 @@ pub(crate) fn build(
         free_list_head,
         bytes_since_collect,
         options.heap_base,
+        debug_trace_fn,
     );
     let mark_ref = add_mark_ref(module, memory, trap_code, validate_ref, worklist_start,
         options.worklist_bytes, worklist_count);
     let roots = coregc_roots::add_shadow_roots(
         module,
         memory,
+        worklist_start, // root stack must stop before the worklist region
         options.heap_base,
         root_head,
         root_bump,
         trap_code,
+        debug_addr,
+        debug_type,
     );
     let root_walk = coregc_roots::add_root_walk(module, memory, root_head, mark_ref);
     let collect = add_collect(
@@ -244,6 +284,7 @@ pub(crate) fn build(
         worklist_count,
         root_walk,
         mark_ref,
+        debug_trace_fn,
     );
     let checkpoint = add_checkpoint(
         module,
@@ -252,11 +293,17 @@ pub(crate) fn build(
         bytes_since_collect,
         options.collect_threshold_bytes,
         collect,
+        debug_trace_fn,
     );
 
     Ok(CoreGcRuntime {
         memory,
         trap_code,
+        debug_addr,
+        debug_type,
+        root_head,
+        block_list_head,
+        root_bump,
         alloc,
         zero_bytes,
         validate_ref,
@@ -264,6 +311,7 @@ pub(crate) fn build(
         checkpoint,
         collect,
         roots,
+        debug_trace_fn,
     })
 }
 
@@ -395,6 +443,8 @@ fn add_validate_ref(
     module: &mut Module<'static>,
     memory: portal_pc_waffle::Memory,
     trap_code: Global,
+    debug_addr: Global,
+    debug_type: Global,
 ) -> Func {
     let (placeholder, mut ctx) = push_func(
         module,
@@ -494,6 +544,8 @@ fn add_validate_ref(
             },
         },
     );
+    body.add_op(bad_flags_block, Operator::GlobalSet { global_index: debug_addr }, &[address], &[]);
+    body.add_op(bad_flags_block, Operator::GlobalSet { global_index: debug_type }, &[type_id], &[]);
     set_trap(body, bad_flags_block, trap_code, trap_code::BAD_FAT_REF);
     body.set_terminator(bad_flags_block, Terminator::Unreachable);
     let bad_type_p = body.add_blockparam(bad_type_check, Type::I32);
@@ -505,9 +557,13 @@ fn add_validate_ref(
             if_false: BlockTarget { block: success, args: vec![] },
         },
     );
+    body.add_op(bad_type_block, Operator::GlobalSet { global_index: debug_addr }, &[address], &[]);
+    body.add_op(bad_type_block, Operator::GlobalSet { global_index: debug_type }, &[type_id], &[]);
     set_trap(body, bad_type_block, trap_code, trap_code::BAD_TYPE_ID);
     body.set_terminator(bad_type_block, Terminator::Unreachable);
     body.set_terminator(success, Terminator::Return { values: vec![address] });
+    body.add_op(fail, Operator::GlobalSet { global_index: debug_addr }, &[address], &[]);
+    body.add_op(fail, Operator::GlobalSet { global_index: debug_type }, &[type_id], &[]);
     set_trap(body, fail, trap_code, trap_code::BAD_FAT_REF);
     body.set_terminator(fail, Terminator::Unreachable);
 
@@ -610,6 +666,7 @@ fn add_alloc(
     free_list_head: Global,
     bytes_since_collect: Global,
     heap_base: u32,
+    debug_trace_fn: Option<Func>,
 ) -> Func {
     let (placeholder, mut ctx) = push_func(
         module,
@@ -745,9 +802,10 @@ fn add_alloc(
     store32(body, unlinked, memory, re_header, 4, type_id);
     store32(body, unlinked, memory, re_header, 8, payload_bytes);
     let finish = body.add_block();
+    let reused_kind = i32_const(body, unlinked, 2);
     body.set_terminator(
         unlinked,
-        Terminator::Br { target: BlockTarget { block: finish, args: vec![re_cur, re_block_bytes] } },
+        Terminator::Br { target: BlockTarget { block: finish, args: vec![re_cur, re_block_bytes, reused_kind] } },
     );
 
     // Bump-allocation fallback (grows memory as needed).
@@ -834,13 +892,23 @@ fn add_alloc(
         &[payload],
         &[],
     );
+    let fresh_kind = i32_const(body, commit, 1);
     body.set_terminator(
         commit,
-        Terminator::Br { target: BlockTarget { block: finish, args: vec![payload, c_block_bytes] } },
+        Terminator::Br { target: BlockTarget { block: finish, args: vec![payload, c_block_bytes, fresh_kind] } },
     );
 
     let f_address = body.add_blockparam(finish, Type::I32);
     let f_block_bytes = body.add_blockparam(finish, Type::I32);
+    let f_kind = body.add_blockparam(finish, Type::I32);
+    if let Some(trace_fn) = debug_trace_fn {
+        body.add_op(
+            finish,
+            Operator::Call { function_index: trace_fn },
+            &[f_kind, f_address, type_id],
+            &[],
+        );
+    }
     let prior = body.add_op(
         finish,
         Operator::GlobalGet { global_index: bytes_since_collect },
@@ -978,6 +1046,7 @@ fn add_collect(
     worklist_count: Global,
     root_walk: Func,
     mark_ref: Func,
+    debug_trace_fn: Option<Func>,
 ) -> Func {
     let (placeholder, mut ctx) = push_func(module, vec![], vec![], "__coregc_collect");
     let body = &mut ctx.body;
@@ -1405,6 +1474,16 @@ fn add_collect(
     let rc2_cur = body.add_blockparam(reclaim, Type::I32);
     let rc2_header = body.add_blockparam(reclaim, Type::I32);
     let rc2_next = body.add_blockparam(reclaim, Type::I32);
+    if let Some(trace_fn) = debug_trace_fn {
+        let old_type_id = load32(body, reclaim, memory, rc2_header, 4);
+        let reclaim_kind = i32_const(body, reclaim, 3);
+        body.add_op(
+            reclaim,
+            Operator::Call { function_index: trace_fn },
+            &[reclaim_kind, rc2_cur, old_type_id],
+            &[],
+        );
+    }
     let free_flag = i32_const(body, reclaim, FLAG_FREE);
     store32(body, reclaim, memory, rc2_header, 0, free_flag);
     let zero_type = i32_const(body, reclaim, 0);
@@ -1447,6 +1526,7 @@ fn add_checkpoint(
     bytes_since_collect: Global,
     threshold: u32,
     collect: Func,
+    debug_trace_fn: Option<Func>,
 ) -> Func {
     let (placeholder, mut ctx) = push_func(module, vec![Type::I32], vec![], "__coregc_checkpoint");
     let body = &mut ctx.body;
@@ -1496,6 +1576,11 @@ fn add_checkpoint(
             if_false: BlockTarget { block: done, args: vec![] },
         },
     );
+    if let Some(trace_fn) = debug_trace_fn {
+        let kind = i32_const(body, do_collect, 6);
+        let zero = i32_const(body, do_collect, 0);
+        body.add_op(do_collect, Operator::Call { function_index: trace_fn }, &[kind, zero, zero], &[]);
+    }
     body.add_op(do_collect, Operator::Call { function_index: collect }, &[], &[]);
     body.set_terminator(do_collect, Terminator::Br { target: BlockTarget { block: done, args: vec![] } });
     body.set_terminator(done, Terminator::Return { values: vec![] });
@@ -1843,9 +1928,9 @@ mod tests {
     fn push_pop_store_clear_round_trip_in_lifo_order() {
         let mut rig = build_rig(CoreGcOptions::default());
         let outer = rig.push_frame(1);
-        rig.root_store(outer, 0, 123, rig.node_type_id);
+        rig.root_store(outer, 0, 0x200100, rig.node_type_id);
         let inner = rig.push_frame(1);
-        rig.root_store(inner, 0, 456, rig.node_type_id);
+        rig.root_store(inner, 0, 0x200200, rig.node_type_id);
         rig.pop_frame(inner).expect("pop inner");
         rig.pop_frame(outer).expect("pop outer");
         assert!(rig.pop_frame(outer).is_err(), "double pop traps");

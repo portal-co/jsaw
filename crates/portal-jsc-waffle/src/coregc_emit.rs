@@ -54,6 +54,30 @@ pub fn emit_coregc(
             kind: ExportKind::Func(runtime.collect),
         });
         module.exports.push(Export {
+            name: "__coregc_trap_code".to_owned(),
+            kind: ExportKind::Global(runtime.trap_code),
+        });
+        module.exports.push(Export {
+            name: "__coregc_debug_addr".to_owned(),
+            kind: ExportKind::Global(runtime.debug_addr),
+        });
+        module.exports.push(Export {
+            name: "__coregc_debug_type".to_owned(),
+            kind: ExportKind::Global(runtime.debug_type),
+        });
+        module.exports.push(Export {
+            name: "__coregc_root_head".to_owned(),
+            kind: ExportKind::Global(runtime.root_head),
+        });
+        module.exports.push(Export {
+            name: "__coregc_block_list_head".to_owned(),
+            kind: ExportKind::Global(runtime.block_list_head),
+        });
+        module.exports.push(Export {
+            name: "__coregc_root_bump".to_owned(),
+            kind: ExportKind::Global(runtime.root_bump),
+        });
+        module.exports.push(Export {
             name: "memory".to_owned(),
             kind: ExportKind::Memory(runtime.memory),
         });

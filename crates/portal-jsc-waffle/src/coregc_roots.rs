@@ -51,14 +51,24 @@ pub(crate) struct ShadowRootFunctions {
 pub(crate) fn add_shadow_roots(
     module: &mut Module<'static>,
     memory: portal_pc_waffle::Memory,
+    root_stack_end: u32,
     heap_base: u32,
     root_head: portal_pc_waffle::Global,
     root_bump: portal_pc_waffle::Global,
     trap_code_global: Global,
+    debug_addr: Global,
+    debug_type: Global,
 ) -> ShadowRootFunctions {
-    let push = add_root_push(module, memory, heap_base, root_head, root_bump, trap_code_global);
+    let push = add_root_push(module, memory, root_stack_end, root_head, root_bump, trap_code_global);
     let pop = add_root_pop(module, memory, root_head, root_bump, trap_code_global);
-    let store = add_root_store(module, memory, trap_code_global);
+    let store = add_root_store(
+        module,
+        memory,
+        heap_base,
+        trap_code_global,
+        debug_addr,
+        debug_type,
+    );
     let clear = add_root_clear(module, memory, trap_code_global);
     ShadowRootFunctions {
         push,
@@ -71,7 +81,7 @@ pub(crate) fn add_shadow_roots(
 fn add_root_push(
     module: &mut Module<'static>,
     memory: portal_pc_waffle::Memory,
-    heap_base: u32,
+    root_stack_end: u32,
     root_head: portal_pc_waffle::Global,
     root_bump: portal_pc_waffle::Global,
     trap_code_global: Global,
@@ -98,7 +108,7 @@ fn add_root_push(
     let total = body.add_op(entry, Operator::I32Add, &[bytes, header], &[Type::I32]);
     let next = body.add_op(entry, Operator::I32Add, &[frame, total], &[Type::I32]);
     let wrapped = body.add_op(entry, Operator::I32LtU, &[next, frame], &[Type::I32]);
-    let limit = i32_const(&mut body, entry, heap_base);
+    let limit = i32_const(&mut body, entry, root_stack_end);
     let collides = body.add_op(entry, Operator::I32GtU, &[next, limit], &[Type::I32]);
     let invalid = body.add_op(entry, Operator::I32Or, &[wrapped, collides], &[Type::I32]);
     let fail = body.add_block();
@@ -318,7 +328,10 @@ fn add_root_pop(
 fn add_root_store(
     module: &mut Module<'static>,
     memory: portal_pc_waffle::Memory,
+    heap_base: u32,
     trap_code_global: Global,
+    debug_addr: Global,
+    debug_type: Global,
 ) -> portal_pc_waffle::Func {
     let signature = module.signatures.push(SignatureData::Func {
         params: vec![Type::I32, Type::I32, Type::I32, Type::I32],
@@ -386,7 +399,29 @@ fn add_root_store(
         &[pointer, type_id],
         &[],
     );
-    body.set_terminator(commit, Terminator::Return { values: vec![] });
+    // Debug guard: a non-null address below heap_base can never be a valid
+    // reference (it's either a small integer or garbage).  Trapping here
+    // names the exact function whose root_store wrote garbage.
+    let heap_base_c = i32_const(&mut body, commit, heap_base);
+    let zero_c = i32_const(&mut body, commit, 0);
+    let non_null = body.add_op(commit, Operator::I32Ne, &[address, zero_c], &[Type::I32]);
+    let below_heap = body.add_op(commit, Operator::I32LtU, &[address, heap_base_c], &[Type::I32]);
+    let suspicious = body.add_op(commit, Operator::I32And, &[non_null, below_heap], &[Type::I32]);
+    let skip_guard = body.add_block();
+    let guard_fail = body.add_block();
+    body.set_terminator(
+        commit,
+        Terminator::CondBr {
+            cond: suspicious,
+            if_true: BlockTarget { block: guard_fail, args: vec![] },
+            if_false: BlockTarget { block: skip_guard, args: vec![] },
+        },
+    );
+    body.add_op(guard_fail, Operator::GlobalSet { global_index: debug_addr }, &[address], &[]);
+    body.add_op(guard_fail, Operator::GlobalSet { global_index: debug_type }, &[type_id], &[]);
+    set_trap(&mut body, guard_fail, trap_code_global, trap_code::BAD_FAT_REF);
+    body.set_terminator(guard_fail, Terminator::Unreachable);
+    body.set_terminator(skip_guard, Terminator::Return { values: vec![] });
     module
         .funcs
         .push(FuncDecl::Body(signature, "__coregc_root_store".to_owned(), body))

@@ -34,34 +34,53 @@ enum LowerValue {
         nullable: bool,
         concrete: crate::coregc::CoreGcTypeId,
     },
-    /// A dynamic value (`anyref`/`eqref`/`i31ref`/abstract
-    /// `structref`/`arrayref`): the same two-`i32` pair as a `FatRef`, but
-    /// without one fixed concrete type id — the type word may name any heap
-    /// type or the i31-immediate sentinel (`docs/plan-coregc-atomic-
-    /// collector-and-lowering.md` §13.2). It can still hold a heap pointer,
-    /// so liveness must root it exactly like a `FatRef`.
+    /// A dynamic value (`anyref`/`eqref`/`i31ref`): the same two-`i32`
+    /// pair as a `FatRef`, but without one fixed concrete type id — the
+    /// type word may name any heap type or the i31-immediate sentinel
+    /// (`docs/plan-coregc-atomic-collector-and-lowering.md` §13.2). It can
+    /// still hold a heap pointer, so liveness must root it exactly like a
+    /// `FatRef`.
     Dynamic,
+    /// An abstract `structref`: a heap pair guaranteed to name a struct
+    /// (descriptor kind 1), never an i31. `ref.test`/`ref.cast` against it
+    /// is a descriptor-kind shape check, not a concrete type-id compare.
+    AbstractStruct,
+    /// An abstract `arrayref`: a heap pair guaranteed to name an array
+    /// (descriptor kind 2), never an i31.
+    AbstractArray,
 }
 
 impl LowerValue {
     fn flat_len(self) -> usize {
         match self {
             LowerValue::Scalar(_) => 1,
-            LowerValue::FatRef { .. } | LowerValue::Dynamic => 2,
+            LowerValue::FatRef { .. }
+            | LowerValue::Dynamic
+            | LowerValue::AbstractStruct
+            | LowerValue::AbstractArray => 2,
         }
     }
 
     fn flat_types(self) -> Vec<Type> {
         match self {
             LowerValue::Scalar(ty) => vec![ty],
-            LowerValue::FatRef { .. } | LowerValue::Dynamic => vec![Type::I32, Type::I32],
+            LowerValue::FatRef { .. }
+            | LowerValue::Dynamic
+            | LowerValue::AbstractStruct
+            | LowerValue::AbstractArray => vec![Type::I32, Type::I32],
         }
     }
 
     /// Whether values of this plan can hold a heap pointer and therefore
     /// need a shadow-frame slot when live across a checkpoint.
     fn needs_root(self) -> bool {
-        matches!(self, LowerValue::FatRef { .. } | LowerValue::Dynamic)
+        matches!(
+            self,
+            LowerValue::FatRef { .. }
+                | LowerValue::Dynamic
+                | LowerValue::AbstractStruct
+                | LowerValue::AbstractArray
+        )
     }
 }
 
@@ -98,9 +117,15 @@ fn classify_type(
     match ty {
         Type::I32 | Type::I64 | Type::F32 | Type::F64 => Ok(LowerValue::Scalar(ty)),
         Type::Heap(reference) => match reference.value {
-            HeapType::Any | HeapType::Eq | HeapType::I31 | HeapType::Struct | HeapType::Array => {
-                Ok(LowerValue::Dynamic)
-            }
+            HeapType::Any | HeapType::Eq | HeapType::I31 => Ok(LowerValue::Dynamic),
+            // Abstract `structref`/`arrayref` are shape constraints (any
+            // struct / any array), not one concrete type: jsaw's property
+            // tries probe them with ref.test/cast to decide whether to walk
+            // a trie or jump straight to a concrete signature. Like a
+            // `FatRef`, the pair always names a *heap* allocation here (an
+            // i31 can never appear in a structref/arrayref-typed slot).
+            HeapType::Struct => Ok(LowerValue::AbstractStruct),
+            HeapType::Array => Ok(LowerValue::AbstractArray),
             HeapType::Sig { sig_index } => match &source.signatures[sig_index] {
                 SignatureData::Struct { .. } | SignatureData::Array { .. } => {
                     let concrete = inventory.id_for(sig_index).ok_or_else(|| CoreGcError {
@@ -1031,7 +1056,9 @@ fn validate_operator(
 // Codegen
 // ---------------------------------------------------------------------
 
-use crate::coregc_layout::CoreGcSlotLayout;
+use crate::coregc_layout::{
+    COREGC_DESCRIPTOR_KIND_ARRAY, COREGC_DESCRIPTOR_KIND_STRUCT, CoreGcSlotLayout,
+};
 use portal_pc_waffle::MemoryArg;
 
 /// A small cursor over "the block we are currently appending to" within one
@@ -1351,6 +1378,10 @@ impl<'a> FunctionLowering<'a> {
             &[frame, slot_c, addr, type_id],
             &[],
         );
+        if let Some(trace_fn) = self.runtime.debug_trace_fn {
+            let kind = emit.const_i32(4);
+            emit.op(Operator::Call { function_index: trace_fn }, &[kind, addr, type_id], &[]);
+        }
     }
 
     /// After lowering any instruction whose *source* value is spilled,
@@ -1409,6 +1440,21 @@ impl<'a> FunctionLowering<'a> {
                 let i31_c = emit.const_i32(crate::coregc_runtime::I31_TYPE_ID);
                 emit.op(Operator::I32Eq, &[type_id, i31_c], &[Type::I32])
             }
+            HeapType::Struct | HeapType::Array => {
+                // Abstract shape test: the pair must be a heap allocation
+                // (not an i31 — the sentinel is u32::MAX and never has a
+                // descriptor row, so the lookup traps BAD_TYPE_ID on one,
+                // which is the correct corruption failure) whose descriptor
+                // kind matches.
+                let kind = if matches!(reference.value, HeapType::Struct) {
+                    COREGC_DESCRIPTOR_KIND_STRUCT
+                } else {
+                    COREGC_DESCRIPTOR_KIND_ARRAY
+                };
+                let kind_c = emit.const_i32(kind);
+                let descriptor_kind = self.emit_descriptor_kind(emit, type_id);
+                emit.op(Operator::I32Eq, &[descriptor_kind, kind_c], &[Type::I32])
+            }
             HeapType::Any | HeapType::Eq => {
                 // Everything this backend produces (struct, array, i31) is in
                 // the eq hierarchy — the test is purely about null.
@@ -1428,6 +1474,253 @@ impl<'a> FunctionLowering<'a> {
         } else {
             Ok(type_matches)
         }
+    }
+
+    /// Look up a heap allocation's descriptor row and load its `kind`
+    /// field (offset 4). Used by abstract structref/arrayref shape tests
+    /// and by accessor arms operating on abstractly-typed receivers. An
+    /// i31 sentinel (u32::MAX) never has a descriptor row, so the lookup
+    /// traps BAD_TYPE_ID on it — the correct corruption failure.
+    fn emit_descriptor_kind(&self, emit: &mut Emit<'_>, type_id: Value) -> Value {
+        let row = self.emit_descriptor_row(emit, type_id);
+        emit.op(
+            Operator::I32Load {
+                memory: MemoryArg {
+                    align: 2,
+                    offset: 4,
+                    memory: self.runtime.memory,
+                },
+            },
+            &[row],
+            &[Type::I32],
+        )
+    }
+
+    /// Walk the descriptor table (base address 0, 12-byte header, then
+    /// 24-byte row headers plus 16-byte slot entries) linearly until the
+    /// row whose `type_id` field (offset 0) matches; traps BAD_TYPE_ID when
+    /// no row matches. Returns the row's base address. This mirrors
+    /// `coregc_runtime`'s scanner row lookup and shares its layout constants.
+    fn emit_descriptor_row(&self, emit: &mut Emit<'_>, type_id: Value) -> Value {
+        let memory = self.runtime.memory;
+        let table_base = emit.const_i32(0);
+        let count = emit.op(
+            Operator::I32Load {
+                memory: MemoryArg {
+                    align: 2,
+                    offset: 8,
+                    memory,
+                },
+            },
+            &[table_base],
+            &[Type::I32],
+        );
+        let first_row = emit.const_i32(12);
+        let zero_index = emit.const_i32(0);
+        let loop_head = emit.body.add_block();
+        let check = emit.body.add_block();
+        let step = emit.body.add_block();
+        let missing = emit.body.add_block();
+        let found = emit.body.add_block();
+        emit.body.set_terminator(
+            emit.current,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: loop_head,
+                    args: vec![first_row, zero_index],
+                },
+            },
+        );
+        let row = emit.body.add_blockparam(loop_head, Type::I32);
+        let index = emit.body.add_blockparam(loop_head, Type::I32);
+        let exhausted = emit.body.add_op(loop_head, Operator::I32GeU, &[index, count], &[Type::I32]);
+        emit.body.set_terminator(
+            loop_head,
+            Terminator::CondBr {
+                cond: exhausted,
+                if_true: BlockTarget {
+                    block: missing,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: check,
+                    args: vec![row, index],
+                },
+            },
+        );
+        let code = i32_const(emit.body, missing, trap_code::BAD_TYPE_ID);
+        emit.body.add_op(
+            missing,
+            Operator::GlobalSet {
+                global_index: self.runtime.trap_code,
+            },
+            &[code],
+            &[],
+        );
+        emit.body.set_terminator(missing, Terminator::Unreachable);
+
+        let c_row = emit.body.add_blockparam(check, Type::I32);
+        let c_index = emit.body.add_blockparam(check, Type::I32);
+        let row_type = emit.body.add_op(
+            check,
+            Operator::I32Load {
+                memory: MemoryArg {
+                    align: 2,
+                    offset: 0,
+                    memory,
+                },
+            },
+            &[c_row],
+            &[Type::I32],
+        );
+        let matches = emit.body.add_op(check, Operator::I32Eq, &[row_type, type_id], &[Type::I32]);
+        emit.body.set_terminator(
+            check,
+            Terminator::CondBr {
+                cond: matches,
+                if_true: BlockTarget {
+                    block: found,
+                    args: vec![c_row],
+                },
+                if_false: BlockTarget {
+                    block: step,
+                    args: vec![c_row, c_index],
+                },
+            },
+        );
+        let s_row = emit.body.add_blockparam(step, Type::I32);
+        let s_index = emit.body.add_blockparam(step, Type::I32);
+        let slot_count = emit.body.add_op(
+            step,
+            Operator::I32Load {
+                memory: MemoryArg {
+                    align: 2,
+                    offset: 16,
+                    memory,
+                },
+            },
+            &[s_row],
+            &[Type::I32],
+        );
+        let slot_bytes = i32_const(emit.body, step, 16);
+        let slots_size = emit.body.add_op(step, Operator::I32Mul, &[slot_count, slot_bytes], &[Type::I32]);
+        let row_header = i32_const(emit.body, step, 24);
+        let row_size = emit.body.add_op(step, Operator::I32Add, &[row_header, slots_size], &[Type::I32]);
+        let next_row = emit.body.add_op(step, Operator::I32Add, &[s_row, row_size], &[Type::I32]);
+        let one = i32_const(emit.body, step, 1);
+        let next_index = emit.body.add_op(step, Operator::I32Add, &[s_index, one], &[Type::I32]);
+        emit.body.set_terminator(
+            step,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: loop_head,
+                    args: vec![next_row, next_index],
+                },
+            },
+        );
+        let f_row = emit.body.add_blockparam(found, Type::I32);
+        emit.current = found;
+        f_row
+    }
+
+    /// Validate a receiver whose *source* type may be abstract (dynamic,
+    /// structref, arrayref) before a concrete `struct.*` access: the pair
+    /// must be a heap allocation whose descriptor kind is STRUCT, and its
+    /// payload must be at least the concrete layout's size (so a
+    /// larger-layout struct masquerading as this type cannot be read out of
+    /// bounds). Returns the validated payload address.
+    fn validate_struct_access(
+        &self,
+        emit: &mut Emit<'_>,
+        addr: Value,
+        type_id: Value,
+        layout: &crate::coregc_layout::CoreGcPayloadLayout,
+    ) -> Value {
+        self.validate_shape_access(
+            emit,
+            addr,
+            type_id,
+            COREGC_DESCRIPTOR_KIND_STRUCT,
+            layout.fixed_payload_bytes.expect("struct layouts are fixed"),
+        )
+    }
+
+    /// Dispatch accessor receiver validation on the receiver's *source*
+    /// type plan: a concrete `FatRef` keeps the cheap fixed-type-id check,
+    /// while abstract/dynamic receivers get the descriptor-kind shape check
+    /// plus a payload-size bound (`docs/plan-coregc-atomic-collector-and-
+    /// lowering.md` §13.2).
+    fn validate_accessor_receiver(
+        &self,
+        emit: &mut Emit<'_>,
+        source_value: Value,
+        addr: Value,
+        expected_kind: u32,
+        min_payload_bytes: u32,
+    ) -> Value {
+        let resolved = self.resolve(source_value);
+        match self.value_plan.get(&resolved) {
+            Some(LowerValue::FatRef { concrete, .. }) => {
+                let type_id_c = emit.const_i32(concrete.get());
+                emit.op(
+                    Operator::Call {
+                        function_index: self.runtime.validate_ref,
+                    },
+                    &[addr, type_id_c],
+                    &[Type::I32],
+                )
+            }
+            Some(LowerValue::Dynamic)
+            | Some(LowerValue::AbstractStruct)
+            | Some(LowerValue::AbstractArray) => {
+                let (_, type_id) = self.fat(source_value);
+                self.validate_shape_access(emit, addr, type_id, expected_kind, min_payload_bytes)
+            }
+            _ => panic!("coregc lowering internal error: accessor receiver is not a reference"),
+        }
+    }
+
+    /// Same shape check for `array.*` accesses (descriptor kind ARRAY); the
+    /// payload-size check is left to `array_bounds`.
+    fn validate_array_access(&self, emit: &mut Emit<'_>, addr: Value, type_id: Value) -> Value {
+        self.validate_shape_access(emit, addr, type_id, COREGC_DESCRIPTOR_KIND_ARRAY, 4)
+    }
+
+    fn validate_shape_access(
+        &self,
+        emit: &mut Emit<'_>,
+        addr: Value,
+        type_id: Value,
+        expected_kind: u32,
+        min_payload_bytes: u32,
+    ) -> Value {
+        let zero = emit.const_i32(0);
+        let is_null = emit.op(Operator::I32Eq, &[addr, zero], &[Type::I32]);
+        let i31_c = emit.const_i32(crate::coregc_runtime::I31_TYPE_ID);
+        let is_immediate = emit.op(Operator::I32Eq, &[type_id, i31_c], &[Type::I32]);
+        let bad = emit.op(Operator::I32Or, &[is_null, is_immediate], &[Type::I32]);
+        emit.trap_if(bad, self.runtime.trap_code, trap_code::BAD_CAST);
+        let descriptor_kind = self.emit_descriptor_kind(emit, type_id);
+        let kind_c = emit.const_i32(expected_kind);
+        let wrong_kind = emit.op(Operator::I32Ne, &[descriptor_kind, kind_c], &[Type::I32]);
+        emit.trap_if(wrong_kind, self.runtime.trap_code, trap_code::BAD_CAST);
+        let header_bytes = emit.const_i32(crate::coregc_runtime::COREGC_HEADER_BYTES);
+        let header = emit.op(Operator::I32Sub, &[addr, header_bytes], &[Type::I32]);
+        let payload_bytes = emit.op(
+            Operator::I32Load {
+                memory: MemoryArg {
+                    align: 2,
+                    offset: 8,
+                    memory: self.runtime.memory,
+                },
+            },
+            &[header],
+            &[Type::I32],
+        );
+        let min_c = emit.const_i32(min_payload_bytes);
+        let too_small = emit.op(Operator::I32LtU, &[payload_bytes, min_c], &[Type::I32]);
+        emit.trap_if(too_small, self.runtime.trap_code, trap_code::BAD_FAT_REF);
+        addr
     }
 
     fn lower_operator(
@@ -1469,14 +1762,13 @@ impl<'a> FunctionLowering<'a> {
                     ),
                 })?;
                 let (addr, recv_type) = self.fat(args[0]);
-                let type_id_c = emit.const_i32(type_id.get());
                 let _ = recv_type;
-                let checked = emit.op(
-                    Operator::Call {
-                        function_index: self.runtime.validate_ref,
-                    },
-                    &[addr, type_id_c],
-                    &[Type::I32],
+                let checked = self.validate_accessor_receiver(
+                    emit,
+                    args[0],
+                    addr,
+                    COREGC_DESCRIPTOR_KIND_STRUCT,
+                    layout.fixed_payload_bytes.expect("struct layout"),
                 );
                 Ok(Some(load_field(emit, memory, checked, slot)))
             }
@@ -1489,13 +1781,12 @@ impl<'a> FunctionLowering<'a> {
                     ),
                 })?;
                 let (addr, _) = self.fat(args[0]);
-                let type_id_c = emit.const_i32(type_id.get());
-                let checked = emit.op(
-                    Operator::Call {
-                        function_index: self.runtime.validate_ref,
-                    },
-                    &[addr, type_id_c],
-                    &[Type::I32],
+                let checked = self.validate_accessor_receiver(
+                    emit,
+                    args[0],
+                    addr,
+                    COREGC_DESCRIPTOR_KIND_STRUCT,
+                    layout.fixed_payload_bytes.expect("struct layout"),
                 );
                 let value = self.lowered(args[1]);
                 store_field(emit, memory, checked, slot, value)?;
@@ -1550,14 +1841,12 @@ impl<'a> FunctionLowering<'a> {
             }
             Operator::ArrayLen => {
                 let (addr, _) = self.fat(args[0]);
-                let type_id = self.array_type_id(args[0])?;
-                let type_id_c = emit.const_i32(type_id.get());
-                let checked = emit.op(
-                    Operator::Call {
-                        function_index: self.runtime.validate_ref,
-                    },
-                    &[addr, type_id_c],
-                    &[Type::I32],
+                let checked = self.validate_accessor_receiver(
+                    emit,
+                    args[0],
+                    addr,
+                    COREGC_DESCRIPTOR_KIND_ARRAY,
+                    4,
                 );
                 let length = emit.op(
                     Operator::I32Load {
@@ -1605,13 +1894,12 @@ impl<'a> FunctionLowering<'a> {
                     ),
                 })?;
                 let (addr, _) = self.fat(args[0]);
-                let type_id_c = emit.const_i32(type_id.get());
-                let checked = emit.op(
-                    Operator::Call {
-                        function_index: self.runtime.validate_ref,
-                    },
-                    &[addr, type_id_c],
-                    &[Type::I32],
+                let checked = self.validate_accessor_receiver(
+                    emit,
+                    args[0],
+                    addr,
+                    COREGC_DESCRIPTOR_KIND_STRUCT,
+                    layout.fixed_payload_bytes.expect("struct layout"),
                 );
                 let signed = matches!(op, Operator::StructGetS { .. });
                 Ok(Some(load_field_extended(
@@ -1689,12 +1977,19 @@ impl<'a> FunctionLowering<'a> {
                 let stride = layout.array_stride.expect("array descriptor has a stride");
                 let (addr, _) = self.fat(args[0]);
                 let index = self.scalar(args[1]);
-                let type_id_c = emit.const_i32(type_id.get());
+                let checked_addr = self.validate_accessor_receiver(
+                    emit,
+                    args[0],
+                    addr,
+                    COREGC_DESCRIPTOR_KIND_ARRAY,
+                    4,
+                );
+                let bounds_type = self.array_bounds_type_operand(emit, args[0], type_id);
                 let checked_index = emit.op(
                     Operator::Call {
                         function_index: self.runtime.array_bounds,
                     },
-                    &[addr, type_id_c, index],
+                    &[checked_addr, bounds_type, index],
                     &[Type::I32],
                 );
                 let stride_c = emit.const_i32(stride);
@@ -1722,13 +2017,12 @@ impl<'a> FunctionLowering<'a> {
                 let start = self.scalar(args[1]);
                 let value = self.lowered(args[2]);
                 let len = self.scalar(args[3]);
-                let type_id_c = emit.const_i32(type_id.get());
-                let checked_addr = emit.op(
-                    Operator::Call {
-                        function_index: self.runtime.validate_ref,
-                    },
-                    &[addr, type_id_c],
-                    &[Type::I32],
+                let checked_addr = self.validate_accessor_receiver(
+                    emit,
+                    args[0],
+                    addr,
+                    COREGC_DESCRIPTOR_KIND_ARRAY,
+                    4,
                 );
                 // Trap unless start + len <= array.len (computed in i64 to
                 // avoid u32 wrap).
@@ -1821,22 +2115,22 @@ impl<'a> FunctionLowering<'a> {
                 let (src_addr, _) = self.fat(args[2]);
                 let si = self.scalar(args[3]);
                 let len = self.scalar(args[4]);
-                let dst_type_c = emit.const_i32(dst_type.get());
-                let checked_dst = emit.op(
-                    Operator::Call {
-                        function_index: self.runtime.validate_ref,
-                    },
-                    &[dst_addr, dst_type_c],
-                    &[Type::I32],
+                let checked_dst = self.validate_accessor_receiver(
+                    emit,
+                    args[0],
+                    dst_addr,
+                    COREGC_DESCRIPTOR_KIND_ARRAY,
+                    4,
                 );
-                let src_type_c = emit.const_i32(src_type.get());
-                let checked_src = emit.op(
-                    Operator::Call {
-                        function_index: self.runtime.validate_ref,
-                    },
-                    &[src_addr, src_type_c],
-                    &[Type::I32],
+                let _ = dst_type;
+                let checked_src = self.validate_accessor_receiver(
+                    emit,
+                    args[2],
+                    src_addr,
+                    COREGC_DESCRIPTOR_KIND_ARRAY,
+                    4,
                 );
+                let _ = src_type;
                 let mem0 = MemoryArg {
                     align: 2,
                     offset: 0,
@@ -2044,12 +2338,19 @@ impl<'a> FunctionLowering<'a> {
                 let stride = layout.array_stride.expect("array descriptor has a stride");
                 let (addr, _) = self.fat(args[0]);
                 let index = self.scalar(args[1]);
-                let type_id_c = emit.const_i32(type_id.get());
+                let checked_addr = self.validate_accessor_receiver(
+                    emit,
+                    args[0],
+                    addr,
+                    COREGC_DESCRIPTOR_KIND_ARRAY,
+                    4,
+                );
+                let bounds_type = self.array_bounds_type_operand(emit, args[0], type_id);
                 let checked_index = emit.op(
                     Operator::Call {
                         function_index: self.runtime.array_bounds,
                     },
-                    &[addr, type_id_c, index],
+                    &[checked_addr, bounds_type, index],
                     &[Type::I32],
                 );
                 let stride_c = emit.const_i32(stride);
@@ -2069,7 +2370,7 @@ impl<'a> FunctionLowering<'a> {
                 let plan = classify_type(self.source, self.inventory, *ty)?;
                 match plan {
                     LowerValue::Scalar(_) => Ok(Some(Lowered::Scalar(emit.const_i32(0)))),
-                    LowerValue::FatRef { .. } | LowerValue::Dynamic => {
+                    LowerValue::FatRef { .. } | LowerValue::Dynamic | LowerValue::AbstractStruct | LowerValue::AbstractArray => {
                         let addr = emit.const_i32(0);
                         let type_id = emit.const_i32(0);
                         Ok(Some(Lowered::Fat(addr, type_id)))
@@ -2267,6 +2568,29 @@ impl<'a> FunctionLowering<'a> {
         }
     }
 
+    /// The type-id operand for an `array_bounds` call: concrete receivers
+    /// use their fixed compile-time id (the cheap path), abstract/dynamic
+    /// receivers pass their actual runtime type word (the shape check in
+    /// [`Self::validate_accessor_receiver`] already proved the array kind).
+    fn array_bounds_type_operand(
+        &self,
+        emit: &mut Emit<'_>,
+        array_value: Value,
+        compile_time_type_id: crate::coregc::CoreGcTypeId,
+    ) -> Value {
+        let resolved = self.resolve(array_value);
+        match self.value_plan.get(&resolved) {
+            Some(LowerValue::FatRef { .. }) => emit.const_i32(compile_time_type_id.get()),
+            Some(LowerValue::Dynamic)
+            | Some(LowerValue::AbstractStruct)
+            | Some(LowerValue::AbstractArray) => {
+                let (_, type_id) = self.fat(array_value);
+                type_id
+            }
+            _ => panic!("coregc lowering internal error: array receiver is not a reference"),
+        }
+    }
+
     fn array_type_id(&self, array_value: Value) -> Result<crate::coregc::CoreGcTypeId, CoreGcError> {
         let resolved = self.resolve(array_value);
         match self.value_plan.get(&resolved) {
@@ -2291,7 +2615,10 @@ impl<'a> FunctionLowering<'a> {
         match return_plan.first() {
             None => None,
             Some(LowerValue::Scalar(_)) => Some(Lowered::Scalar(result)),
-            Some(LowerValue::FatRef { .. }) | Some(LowerValue::Dynamic) => {
+            Some(LowerValue::FatRef { .. })
+            | Some(LowerValue::Dynamic)
+            | Some(LowerValue::AbstractStruct)
+            | Some(LowerValue::AbstractArray) => {
                 let addr = emit.pick(result, 0, Type::I32);
                 let type_id = emit.pick(result, 1, Type::I32);
                 Some(Lowered::Fat(addr, type_id))
@@ -2448,6 +2775,25 @@ fn lower_function(
         .map(|(index, &value)| (value, index as u32))
         .collect();
     verify_root_discipline(source_body, &computed, &slot_of, source_func)?;
+    // Debugging aid: `COREGC_SPILL_DUMP=<substring>` (or `=1` for every
+    // function) prints each function's shadow-frame slot assignments plus
+    // its checkpoint/tail-call liveness requirements, e.g. to diagnose an
+    // under-rooted value. Not read in production; safe to leave compiled in.
+    if let Ok(filter) = std::env::var("COREGC_SPILL_DUMP") {
+        if filter == "1" || name.contains(&filter) {
+            eprintln!("{name}: {} spilled values", spilled.len());
+            for (value, slot) in &slot_of {
+                let plan = value_plan.get(value);
+                eprintln!("  slot[{slot}] = value {value:?} plan {plan:?}");
+            }
+            for (checkpoint, required) in &computed.checkpoint_live {
+                eprintln!("  checkpoint {checkpoint:?}: required {required:?}");
+            }
+            for (block, required) in &computed.tail_call_live {
+                eprintln!("  tail_call in {block:?}: required {required:?}");
+            }
+        }
+    }
 
     // Create every block (and its flattened params) up front so any
     // instruction later can resolve a branch-target/use regardless of
@@ -2466,7 +2812,10 @@ fn lower_function(
                     cursor += 1;
                     Lowered::Scalar(value)
                 }
-                LowerValue::FatRef { .. } | LowerValue::Dynamic => {
+                LowerValue::FatRef { .. }
+                | LowerValue::Dynamic
+                | LowerValue::AbstractStruct
+                | LowerValue::AbstractArray => {
                     let addr = out_body.blocks[out_body.entry].params[cursor].1;
                     let type_id = out_body.blocks[out_body.entry].params[cursor + 1].1;
                     cursor += 2;
@@ -2490,7 +2839,10 @@ fn lower_function(
         for &(_, source_param) in params {
             let lowered = match value_plan[&source_param] {
                 LowerValue::Scalar(ty) => Lowered::Scalar(out_body.add_blockparam(out_block, ty)),
-                LowerValue::FatRef { .. } | LowerValue::Dynamic => {
+                LowerValue::FatRef { .. }
+                | LowerValue::Dynamic
+                | LowerValue::AbstractStruct
+                | LowerValue::AbstractArray => {
                     let addr = out_body.add_blockparam(out_block, Type::I32);
                     let type_id = out_body.add_blockparam(out_block, Type::I32);
                     Lowered::Fat(addr, type_id)
@@ -3284,6 +3636,402 @@ pub(crate) mod tests_fixtures {
         module
     }
 
+    /// A `call_ref` callee whose own body allocates (and therefore takes an
+    /// *internal* checkpoint) while a fat-ref argument passed in by the
+    /// caller is used *after* that internal allocation. `outer(x)`
+    /// allocates `Node { value: x, next: null }`, takes a `ref.func` to
+    /// `inner`, and calls it via `call_ref`. `inner(n, y)` allocates a
+    /// second, unrelated `Node` (an internal checkpoint) and only then
+    /// reads `n.value` — so `n` must survive a collection triggered from
+    /// *inside* the callee it was passed into, not just the call site's own
+    /// checkpoint.
+    pub(crate) fn call_ref_with_allocating_callee_source() -> Module<'static> {
+        let mut module = Module::empty();
+        let node = module.signatures.push(SignatureData::Struct {
+            fields: vec![],
+            shared: false,
+        });
+        module.signatures[node] = SignatureData::Struct {
+            fields: vec![
+                field(StorageType::Val(Type::I32)),
+                field(StorageType::Val(Type::Heap(WithNullable {
+                    nullable: true,
+                    value: HeapType::Sig { sig_index: node },
+                }))),
+            ],
+            shared: false,
+        };
+        let node_ref = Type::Heap(WithNullable {
+            nullable: true,
+            value: HeapType::Sig { sig_index: node },
+        });
+
+        let inner_sig = module.signatures.push(SignatureData::Func {
+            params: vec![node_ref, Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let inner_ref = Type::Heap(WithNullable {
+            nullable: true,
+            value: HeapType::Sig { sig_index: inner_sig },
+        });
+
+        let mut inner_body = FunctionBody::new(&module, inner_sig);
+        let inner_entry = inner_body.entry;
+        let n = inner_body.blocks[inner_entry].params[0].1;
+        let y = inner_body.blocks[inner_entry].params[1].1;
+        let inner_null = inner_body.add_op(inner_entry, Operator::RefNull { ty: node_ref }, &[], &[node_ref]);
+        // An unrelated allocation — a checkpoint entirely internal to the
+        // callee, after which `n` (the caller's argument) is still used.
+        let _scratch = inner_body.add_op(
+            inner_entry,
+            Operator::StructNew { sig: node },
+            &[y, inner_null],
+            &[node_ref],
+        );
+        let n_value = inner_body.add_op(inner_entry, Operator::StructGet { sig: node, idx: 0 }, &[n], &[Type::I32]);
+        let sum = inner_body.add_op(inner_entry, Operator::I32Add, &[n_value, y], &[Type::I32]);
+        inner_body.set_terminator(inner_entry, Terminator::Return { values: vec![sum] });
+        inner_body.recompute_edges();
+        inner_body.validate().expect("inner body validates");
+        let inner = module
+            .funcs
+            .push(FuncDecl::Body(inner_sig, "inner".to_owned(), inner_body));
+
+        let outer_sig = module.signatures.push(SignatureData::Func {
+            params: vec![Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut outer_body = FunctionBody::new(&module, outer_sig);
+        let outer_entry = outer_body.entry;
+        let x = outer_body.blocks[outer_entry].params[0].1;
+        let outer_null = outer_body.add_op(outer_entry, Operator::RefNull { ty: node_ref }, &[], &[node_ref]);
+        let node_val = outer_body.add_op(
+            outer_entry,
+            Operator::StructNew { sig: node },
+            &[x, outer_null],
+            &[node_ref],
+        );
+        let func_ref = outer_body.add_op(outer_entry, Operator::RefFunc { func_index: inner }, &[], &[inner_ref]);
+        let result = outer_body.add_op(
+            outer_entry,
+            Operator::CallRef { sig_index: inner_sig },
+            &[node_val, x, func_ref],
+            &[Type::I32],
+        );
+        outer_body.set_terminator(outer_entry, Terminator::Return { values: vec![result] });
+        outer_body.recompute_edges();
+        outer_body.validate().expect("outer body validates");
+        let outer = module
+            .funcs
+            .push(FuncDecl::Body(outer_sig, "outer".to_owned(), outer_body));
+        module.exports.push(Export {
+            name: "outer".to_owned(),
+            kind: ExportKind::Func(outer),
+        });
+        module
+    }
+
+    /// Same shape as `call_ref_with_allocating_callee_source`, but the
+    /// argument that must survive is a *zero-element* `array.new_fixed`
+    /// result (jsaw's empty-arguments-array idiom) rather than a struct.
+    pub(crate) fn call_ref_empty_array_survives_allocating_callee_source() -> Module<'static> {
+        let mut module = Module::empty();
+        let elem = module.signatures.push(SignatureData::Array {
+            ty: field(StorageType::Val(Type::Heap(WithNullable { nullable: true, value: HeapType::Any }))),
+            shared: false,
+        });
+        let elem_ref = Type::Heap(WithNullable { nullable: true, value: HeapType::Sig { sig_index: elem } });
+
+        let node = module.signatures.push(SignatureData::Struct {
+            fields: vec![],
+            shared: false,
+        });
+        module.signatures[node] = SignatureData::Struct {
+            fields: vec![field(StorageType::Val(Type::I32))],
+            shared: false,
+        };
+        let node_ref = Type::Heap(WithNullable { nullable: true, value: HeapType::Sig { sig_index: node } });
+
+        let inner_sig = module.signatures.push(SignatureData::Func {
+            params: vec![elem_ref, Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let inner_ref = Type::Heap(WithNullable { nullable: true, value: HeapType::Sig { sig_index: inner_sig } });
+
+        let mut inner_body = FunctionBody::new(&module, inner_sig);
+        let inner_entry = inner_body.entry;
+        let arr = inner_body.blocks[inner_entry].params[0].1;
+        let y = inner_body.blocks[inner_entry].params[1].1;
+        // An unrelated allocation — a checkpoint entirely internal to the
+        // callee, after which `arr` (the caller's argument) is still used.
+        let _scratch = inner_body.add_op(inner_entry, Operator::StructNew { sig: node }, &[y], &[node_ref]);
+        let len = inner_body.add_op(inner_entry, Operator::ArrayLen, &[arr], &[Type::I32]);
+        let sum = inner_body.add_op(inner_entry, Operator::I32Add, &[len, y], &[Type::I32]);
+        inner_body.set_terminator(inner_entry, Terminator::Return { values: vec![sum] });
+        inner_body.recompute_edges();
+        inner_body.validate().expect("inner body validates");
+        let inner = module
+            .funcs
+            .push(FuncDecl::Body(inner_sig, "inner".to_owned(), inner_body));
+
+        let outer_sig = module.signatures.push(SignatureData::Func {
+            params: vec![Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut outer_body = FunctionBody::new(&module, outer_sig);
+        let outer_entry = outer_body.entry;
+        let x = outer_body.blocks[outer_entry].params[0].1;
+        let empty_arr = outer_body.add_op(
+            outer_entry,
+            Operator::ArrayNewFixed { sig: elem, num: 0 },
+            &[],
+            &[elem_ref],
+        );
+        let func_ref = outer_body.add_op(outer_entry, Operator::RefFunc { func_index: inner }, &[], &[inner_ref]);
+        let result = outer_body.add_op(
+            outer_entry,
+            Operator::CallRef { sig_index: inner_sig },
+            &[empty_arr, x, func_ref],
+            &[Type::I32],
+        );
+        outer_body.set_terminator(outer_entry, Terminator::Return { values: vec![result] });
+        outer_body.recompute_edges();
+        outer_body.validate().expect("outer body validates");
+        let outer = module
+            .funcs
+            .push(FuncDecl::Body(outer_sig, "outer".to_owned(), outer_body));
+        module.exports.push(Export {
+            name: "outer".to_owned(),
+            kind: ExportKind::Func(outer),
+        });
+        module
+    }
+
+    /// Mirrors `js_adapter_14`'s exact shape: a fat-ref parameter (`arr`)
+    /// is used once *before* a branch (a non-checkpoint `array.len`), the
+    /// two branch arms merge at a join block via an unrelated block param,
+    /// and only *after* the join is `arr` used again at a checkpoint (a
+    /// direct `Call`). If liveness across the branch/join is computed
+    /// incorrectly, `arr` won't be rooted by the time the post-join
+    /// checkpoint collects.
+    pub(crate) fn call_survives_branch_then_join_source() -> Module<'static> {
+        let mut module = Module::empty();
+        let elem = module.signatures.push(SignatureData::Array {
+            ty: field(StorageType::Val(Type::Heap(WithNullable { nullable: true, value: HeapType::Any }))),
+            shared: false,
+        });
+        let elem_ref = Type::Heap(WithNullable { nullable: true, value: HeapType::Sig { sig_index: elem } });
+
+        let node = module.signatures.push(SignatureData::Struct {
+            fields: vec![],
+            shared: false,
+        });
+        module.signatures[node] = SignatureData::Struct {
+            fields: vec![field(StorageType::Val(Type::I32))],
+            shared: false,
+        };
+        let node_ref = Type::Heap(WithNullable { nullable: true, value: HeapType::Sig { sig_index: node } });
+
+        // callee(arr, y) allocates internally (checkpoint), then reads
+        // arr.len() — forcing arr to survive the checkpoint too.
+        let callee_sig = module.signatures.push(SignatureData::Func {
+            params: vec![elem_ref, Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut callee_body = FunctionBody::new(&module, callee_sig);
+        let callee_entry = callee_body.entry;
+        let c_arr = callee_body.blocks[callee_entry].params[0].1;
+        let c_y = callee_body.blocks[callee_entry].params[1].1;
+        let _scratch = callee_body.add_op(callee_entry, Operator::StructNew { sig: node }, &[c_y], &[node_ref]);
+        let c_len = callee_body.add_op(callee_entry, Operator::ArrayLen, &[c_arr], &[Type::I32]);
+        let c_sum = callee_body.add_op(callee_entry, Operator::I32Add, &[c_len, c_y], &[Type::I32]);
+        callee_body.set_terminator(callee_entry, Terminator::Return { values: vec![c_sum] });
+        callee_body.recompute_edges();
+        callee_body.validate().expect("callee body validates");
+        let callee = module
+            .funcs
+            .push(FuncDecl::Body(callee_sig, "callee".to_owned(), callee_body));
+
+        // outer(cond): arr = array.new_fixed 0 [checkpoint, like jsaw's
+        // empty-arguments-array]; len = arr.len() [non-checkpoint use
+        // before the branch]; branch on cond; each arm produces an
+        // unrelated i32 merged at the join block; after the join, call
+        // `callee(arr, y)` [checkpoint use of arr again, after the
+        // branch/join].
+        let outer_sig = module.signatures.push(SignatureData::Func {
+            params: vec![Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(&module, outer_sig);
+        let entry = body.entry;
+        let cond = body.blocks[entry].params[0].1;
+        let arr = body.add_op(entry, Operator::ArrayNewFixed { sig: elem, num: 0 }, &[], &[elem_ref]);
+        let _len = body.add_op(entry, Operator::ArrayLen, &[arr], &[Type::I32]);
+        let zero_c = body.add_op(entry, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let is_zero = body.add_op(entry, Operator::I32Eq, &[cond, zero_c], &[Type::I32]);
+        let arm_true = body.add_block();
+        let arm_false = body.add_block();
+        let join = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: is_zero,
+                if_true: BlockTarget { block: arm_true, args: vec![] },
+                if_false: BlockTarget { block: arm_false, args: vec![] },
+            },
+        );
+        let ten = body.add_op(arm_true, Operator::I32Const { value: 10 }, &[], &[Type::I32]);
+        body.set_terminator(arm_true, Terminator::Br { target: BlockTarget { block: join, args: vec![ten] } });
+        let twenty = body.add_op(arm_false, Operator::I32Const { value: 20 }, &[], &[Type::I32]);
+        body.set_terminator(arm_false, Terminator::Br { target: BlockTarget { block: join, args: vec![twenty] } });
+        let y = body.add_blockparam(join, Type::I32);
+        let result = body.add_op(
+            join,
+            Operator::Call { function_index: callee },
+            &[arr, y],
+            &[Type::I32],
+        );
+        body.set_terminator(join, Terminator::Return { values: vec![result] });
+        body.recompute_edges();
+        body.validate().expect("outer body validates");
+        let outer = module
+            .funcs
+            .push(FuncDecl::Body(outer_sig, "outer".to_owned(), body));
+        module.exports.push(Export {
+            name: "outer".to_owned(),
+            kind: ExportKind::Func(outer),
+        });
+        module
+    }
+
+    /// Exactly mirrors `js_body_2` → `js_adapter_14`: `outer` allocates an
+    /// empty array and passes it as a `call_ref` *argument*; the callee
+    /// (`adapter`) receives it as a *parameter*, uses it once before a
+    /// branch (non-checkpoint `array.len`), merges at a join block, and
+    /// only after the join calls a further function (a checkpoint) that
+    /// itself allocates — all while `adapter`'s own argument must stay
+    /// rooted the whole time.
+    pub(crate) fn call_ref_param_survives_branch_then_join_source() -> Module<'static> {
+        let mut module = Module::empty();
+        let elem = module.signatures.push(SignatureData::Array {
+            ty: field(StorageType::Val(Type::Heap(WithNullable { nullable: true, value: HeapType::Any }))),
+            shared: false,
+        });
+        let elem_ref = Type::Heap(WithNullable { nullable: true, value: HeapType::Sig { sig_index: elem } });
+
+        let node = module.signatures.push(SignatureData::Struct {
+            fields: vec![],
+            shared: false,
+        });
+        module.signatures[node] = SignatureData::Struct {
+            fields: vec![field(StorageType::Val(Type::I32))],
+            shared: false,
+        };
+        let node_ref = Type::Heap(WithNullable { nullable: true, value: HeapType::Sig { sig_index: node } });
+
+        // body(arr, y) allocates internally (checkpoint), then reads
+        // arr.len() again after that checkpoint.
+        let body_sig = module.signatures.push(SignatureData::Func {
+            params: vec![elem_ref, Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body_body = FunctionBody::new(&module, body_sig);
+        let body_entry = body_body.entry;
+        let b_arr = body_body.blocks[body_entry].params[0].1;
+        let b_y = body_body.blocks[body_entry].params[1].1;
+        let _scratch = body_body.add_op(body_entry, Operator::StructNew { sig: node }, &[b_y], &[node_ref]);
+        let b_len = body_body.add_op(body_entry, Operator::ArrayLen, &[b_arr], &[Type::I32]);
+        let b_sum = body_body.add_op(body_entry, Operator::I32Add, &[b_len, b_y], &[Type::I32]);
+        body_body.set_terminator(body_entry, Terminator::Return { values: vec![b_sum] });
+        body_body.recompute_edges();
+        body_body.validate().expect("body body validates");
+        let body_fn = module
+            .funcs
+            .push(FuncDecl::Body(body_sig, "body_fn".to_owned(), body_body));
+
+        // adapter(arr, cond): len = arr.len() [param used before the
+        // branch]; branch on cond; join; call body_fn(arr, y) [param used
+        // again, after the branch/join, at a checkpoint].
+        let adapter_sig = module.signatures.push(SignatureData::Func {
+            params: vec![elem_ref, Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let adapter_ref = Type::Heap(WithNullable { nullable: true, value: HeapType::Sig { sig_index: adapter_sig } });
+        let mut adapter_body = FunctionBody::new(&module, adapter_sig);
+        let a_entry = adapter_body.entry;
+        let a_arr = adapter_body.blocks[a_entry].params[0].1;
+        let a_cond = adapter_body.blocks[a_entry].params[1].1;
+        let _a_len = adapter_body.add_op(a_entry, Operator::ArrayLen, &[a_arr], &[Type::I32]);
+        let a_zero_c = adapter_body.add_op(a_entry, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let a_is_zero = adapter_body.add_op(a_entry, Operator::I32Eq, &[a_cond, a_zero_c], &[Type::I32]);
+        let a_arm_true = adapter_body.add_block();
+        let a_arm_false = adapter_body.add_block();
+        let a_join = adapter_body.add_block();
+        adapter_body.set_terminator(
+            a_entry,
+            Terminator::CondBr {
+                cond: a_is_zero,
+                if_true: BlockTarget { block: a_arm_true, args: vec![] },
+                if_false: BlockTarget { block: a_arm_false, args: vec![] },
+            },
+        );
+        let a_ten = adapter_body.add_op(a_arm_true, Operator::I32Const { value: 10 }, &[], &[Type::I32]);
+        adapter_body.set_terminator(a_arm_true, Terminator::Br { target: BlockTarget { block: a_join, args: vec![a_ten] } });
+        let a_twenty = adapter_body.add_op(a_arm_false, Operator::I32Const { value: 20 }, &[], &[Type::I32]);
+        adapter_body.set_terminator(a_arm_false, Terminator::Br { target: BlockTarget { block: a_join, args: vec![a_twenty] } });
+        let a_y = adapter_body.add_blockparam(a_join, Type::I32);
+        let a_result = adapter_body.add_op(
+            a_join,
+            Operator::Call { function_index: body_fn },
+            &[a_arr, a_y],
+            &[Type::I32],
+        );
+        adapter_body.set_terminator(a_join, Terminator::Return { values: vec![a_result] });
+        adapter_body.recompute_edges();
+        adapter_body.validate().expect("adapter body validates");
+        let adapter = module
+            .funcs
+            .push(FuncDecl::Body(adapter_sig, "adapter".to_owned(), adapter_body));
+
+        // outer(cond): arr = array.new_fixed 0; call adapter via call_ref,
+        // passing arr as the argument that must survive.
+        let outer_sig = module.signatures.push(SignatureData::Func {
+            params: vec![Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut outer_body = FunctionBody::new(&module, outer_sig);
+        let o_entry = outer_body.entry;
+        let o_cond = outer_body.blocks[o_entry].params[0].1;
+        let o_arr = outer_body.add_op(o_entry, Operator::ArrayNewFixed { sig: elem, num: 0 }, &[], &[elem_ref]);
+        let o_func_ref = outer_body.add_op(o_entry, Operator::RefFunc { func_index: adapter }, &[], &[adapter_ref]);
+        let o_result = outer_body.add_op(
+            o_entry,
+            Operator::CallRef { sig_index: adapter_sig },
+            &[o_arr, o_cond, o_func_ref],
+            &[Type::I32],
+        );
+        outer_body.set_terminator(o_entry, Terminator::Return { values: vec![o_result] });
+        outer_body.recompute_edges();
+        outer_body.validate().expect("outer body validates");
+        let outer = module
+            .funcs
+            .push(FuncDecl::Body(outer_sig, "outer".to_owned(), outer_body));
+        module.exports.push(Export {
+            name: "outer".to_owned(),
+            kind: ExportKind::Func(outer),
+        });
+        module
+    }
+
     /// A concrete-signature closure-table pattern: `add_one(x) -> x+1` and
     /// `double(x) -> x*2` are both taken by `ref.func` and invoked through
     /// `call_ref`. `apply(which, x)` picks one and calls through it; the
@@ -3990,6 +4738,72 @@ pub(crate) mod tests_fixtures {
         module
     }
 
+    /// Regression fixture for a real bug: a fat-ref value live *only* as a
+    /// `return_call_ref` argument (not used by any ordinary instruction
+    /// after its definition) must still be rooted across the tail call's
+    /// own checkpoint. `caller(x)` allocates `Node { value: x }`, takes a
+    /// `ref.func` to `callee`, and tail-calls it with the node as the sole
+    /// argument; `callee(n)` reads `n.value`. Under forced collection
+    /// (`collect_threshold_bytes: 0`), the tail call's own pre-dispatch
+    /// checkpoint must not reclaim `n` before the call ever runs.
+    pub(crate) fn tail_call_ref_carries_a_live_fat_ref_argument_source() -> Module<'static> {
+        let mut module = Module::empty();
+        let node = module.signatures.push(SignatureData::Struct {
+            fields: vec![],
+            shared: false,
+        });
+        module.signatures[node] = SignatureData::Struct {
+            fields: vec![field(StorageType::Val(Type::I32))],
+            shared: false,
+        };
+        let node_ref = Type::Heap(WithNullable { nullable: true, value: HeapType::Sig { sig_index: node } });
+
+        let callee_sig = module.signatures.push(SignatureData::Func {
+            params: vec![node_ref],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let callee_ref = Type::Heap(WithNullable { nullable: true, value: HeapType::Sig { sig_index: callee_sig } });
+        let mut callee_body = FunctionBody::new(&module, callee_sig);
+        let callee_entry = callee_body.entry;
+        let n = callee_body.blocks[callee_entry].params[0].1;
+        let value = callee_body.add_op(callee_entry, Operator::StructGet { sig: node, idx: 0 }, &[n], &[Type::I32]);
+        callee_body.set_terminator(callee_entry, Terminator::Return { values: vec![value] });
+        callee_body.recompute_edges();
+        callee_body.validate().expect("callee body validates");
+        let callee = module
+            .funcs
+            .push(FuncDecl::Body(callee_sig, "callee".to_owned(), callee_body));
+
+        let caller_sig = module.signatures.push(SignatureData::Func {
+            params: vec![Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut caller_body = FunctionBody::new(&module, caller_sig);
+        let caller_entry = caller_body.entry;
+        let x = caller_body.blocks[caller_entry].params[0].1;
+        let n = caller_body.add_op(caller_entry, Operator::StructNew { sig: node }, &[x], &[node_ref]);
+        let func_ref = caller_body.add_op(caller_entry, Operator::RefFunc { func_index: callee }, &[], &[callee_ref]);
+        caller_body.set_terminator(
+            caller_entry,
+            Terminator::ReturnCallRef {
+                sig: callee_sig,
+                args: vec![n, func_ref],
+            },
+        );
+        caller_body.recompute_edges();
+        caller_body.validate().expect("caller body validates");
+        let caller = module
+            .funcs
+            .push(FuncDecl::Body(caller_sig, "caller".to_owned(), caller_body));
+        module.exports.push(Export {
+            name: "caller".to_owned(),
+            kind: ExportKind::Func(caller),
+        });
+        module
+    }
+
     pub(crate) fn lower_and_instantiate(source: &Module<'_>, options: CoreGcOptions) -> (Store<()>, Instance) {
         let inventory = CoreGcInventory::build(source).expect("inventory");
         let descriptors = CoreGcDescriptorTable::build(&inventory).expect("descriptors");
@@ -4218,6 +5032,101 @@ mod tests {
             .get_typed_func::<(i32, i32), i32>(&mut store, "caller")
             .expect("caller export");
         assert_eq!(caller.call(&mut store, (10, 32)).expect("caller(10, 32)"), 42);
+    }
+
+    #[test]
+    fn a_call_ref_argument_survives_an_allocation_inside_the_callee() {
+        let source = call_ref_with_allocating_callee_source();
+        let (mut store, instance) = lower_and_instantiate(
+            &source,
+            CoreGcOptions {
+                collect_threshold_bytes: 0,
+                ..CoreGcOptions::default()
+            },
+        );
+        let outer = instance
+            .get_typed_func::<i32, i32>(&mut store, "outer")
+            .expect("outer export");
+        // inner(n, y) = n.value + y where n.value == x and y == x, so
+        // outer(x) == 2*x.
+        assert_eq!(outer.call(&mut store, 21).expect("outer(21)"), 42);
+    }
+
+    #[test]
+    fn a_zero_element_array_call_ref_argument_survives_an_allocation_inside_the_callee() {
+        let source = call_ref_empty_array_survives_allocating_callee_source();
+        let (mut store, instance) = lower_and_instantiate(
+            &source,
+            CoreGcOptions {
+                collect_threshold_bytes: 0,
+                ..CoreGcOptions::default()
+            },
+        );
+        let outer = instance
+            .get_typed_func::<i32, i32>(&mut store, "outer")
+            .expect("outer export");
+        // inner(arr, y) = arr.len + y = 0 + y = y.
+        assert_eq!(outer.call(&mut store, 21).expect("outer(21)"), 21);
+    }
+
+    #[test]
+    fn a_value_used_before_a_branch_and_again_after_the_join_survives_a_checkpoint() {
+        let source = call_survives_branch_then_join_source();
+        let (mut store, instance) = lower_and_instantiate(
+            &source,
+            CoreGcOptions {
+                collect_threshold_bytes: 0,
+                ..CoreGcOptions::default()
+            },
+        );
+        let outer = instance
+            .get_typed_func::<i32, i32>(&mut store, "outer")
+            .expect("outer export");
+        // cond==0 -> y=10, callee(arr,10) = 0+10 = 10.
+        assert_eq!(outer.call(&mut store, 0).expect("outer(0)"), 10);
+        // cond!=0 -> y=20, callee(arr,20) = 0+20 = 20.
+        assert_eq!(outer.call(&mut store, 1).expect("outer(1)"), 20);
+    }
+
+    #[test]
+    fn a_call_ref_parameter_used_before_a_branch_and_again_after_the_join_survives_a_checkpoint() {
+        let source = call_ref_param_survives_branch_then_join_source();
+        let (mut store, instance) = lower_and_instantiate(
+            &source,
+            CoreGcOptions {
+                collect_threshold_bytes: 0,
+                ..CoreGcOptions::default()
+            },
+        );
+        let outer = instance
+            .get_typed_func::<i32, i32>(&mut store, "outer")
+            .expect("outer export");
+        assert_eq!(outer.call(&mut store, 0).expect("outer(0)"), 10);
+        assert_eq!(outer.call(&mut store, 1).expect("outer(1)"), 20);
+    }
+
+    #[test]
+    fn a_return_call_ref_argument_survives_the_tail_calls_own_checkpoint() {
+        // Regression test for a real bug: `Terminator::visit_uses` in
+        // Waffle omitted `ReturnCallRef`'s `args` (present in every sibling
+        // arm and in `update_uses`), so this crate's liveness pass never
+        // saw a `return_call_ref` argument as "used" by its terminator.
+        // `tail_call_live` for the block came out empty, the argument never
+        // got a shadow-frame slot or a `root_store`, and a forced collection
+        // at the tail call's own checkpoint reclaimed it before the call
+        // ever dispatched. Fixed upstream in waffle-ir's `func.rs`.
+        let source = tail_call_ref_carries_a_live_fat_ref_argument_source();
+        let (mut store, instance) = lower_and_instantiate(
+            &source,
+            CoreGcOptions {
+                collect_threshold_bytes: 0,
+                ..CoreGcOptions::default()
+            },
+        );
+        let caller = instance
+            .get_typed_func::<i32, i32>(&mut store, "caller")
+            .expect("caller export");
+        assert_eq!(caller.call(&mut store, 42).expect("caller(42)"), 42);
     }
 
     #[test]

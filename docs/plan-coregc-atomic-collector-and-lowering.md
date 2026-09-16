@@ -83,24 +83,34 @@ collected by generated Wasm code — no host GC import.
 - **direct calls** (`Operator::Call`) between functions in the same module,
   with fully flattened, checkpoint-safe ABI, including managed
   parameters/returns;
-- `RefNull`, `RefIsNull` for the accepted concrete reference types.
+- **typed function references** (`Operator::RefFunc`, `Operator::CallRef`,
+  and `Operator::CallIndirect` against a source-declared table) for concrete
+  (non-`anyref`) call signatures — full design in §6.7, revised from the
+  originally-drafted heap-allocated "function object" design after checking
+  how `conv.rs` actually uses these operators (see §6.7's rationale);
+- `RefNull`, `RefIsNull` for the accepted concrete reference types, including
+  the concrete function-reference type.
 
 **Explicitly out of v1, with a named fail-closed diagnostic, and a committed
-non-conflicting design so v2 can add them without breaking v1** (see §6.6):
+non-conflicting design so v2 can add them without breaking v1**:
 
-- function references / `call_ref` / indirect calls through a table
-  (`CallIndirect`, `RefFunc`) — the function-object descriptor kind and table
-  layout are pinned in §6.6 now, but the lowering is not implemented in this
-  activation;
 - `anyref`/`eqref`/`i31ref`/dynamic JS value representation (jsaw's `Repr`
   closure) — needed for full dogfood compilation of jsaw's own compiler
-  output, tracked as a distinct, later plan once v1 is real and tested;
+  output, tracked as a distinct, later plan once v1 is real and tested. This
+  is why v1 function-reference support, while fully implemented, does not by
+  itself make jsaw's actual emitted closures lower: `conv.rs` closures carry
+  `anyref`-typed captured-environment/property-trie fields (confirmed by
+  reading its closure-construction code, §6.7) that need the deferred `Repr`
+  work regardless of call-mechanism support;
 - `externref`, exceptions, threads/shared memory, `memory64`, SIMD-managed
-  layouts, tail calls.
+  layouts, tail calls (including `ReturnCallRef`/`ReturnCall`/
+  `ReturnCallIndirect`, which `conv.rs` also emits for proven-tail JS calls —
+  rejected by name in v1's preflight, not silently miscompiled).
 
 The dogfood goal (compiling jsaw's own compiler with coregc) needs the
-deferred items too. This plan does not claim v1 reaches that goal by itself;
-it claims v1 is the correct, non-throwaway foundation for it — see §11.
+deferred `Repr`/`anyref` items too. This plan does not claim v1 reaches that
+goal by itself; it claims v1 is the correct, non-throwaway foundation for it
+— see §11.
 
 ## 2. Prior art and design rationale (inherited, condensed)
 
@@ -376,23 +386,35 @@ Before any output is generated, `coregc_lower`:
 
 1. builds `CoreGcInventory` and `CoreGcDescriptorTable` (fails closed on any
    `DynamicRef`/shared/unsupported storage per the existing inventory rules);
+   `CoreGcStorage::FuncRef { nullable, target: Signature }` (§6.7) is treated
+   as scalar-classified, not fat-ref, and never generates a descriptor scan
+   entry;
 2. for every function, classifies every value's `LowerValue` plan (§6.2) from
-   its Waffle `Type`, rejecting `Type::Heap` shapes that are not a concrete
-   `HeapType::Sig` reference into the inventory (this is where `anyref`,
-   `i31ref`, `externref`, `eqref` are rejected by name);
+   its Waffle `Type`: a concrete `HeapType::Sig` reference into a
+   `Struct`/`Array` signature is `FatRef`; a concrete `HeapType::Sig`
+   reference into a `Func` signature is `Scalar(I32)` (§6.7); any other
+   `Type::Heap` shape (`anyref`, `i31ref`, `externref`, `eqref`, `structref`,
+   `arrayref`) is rejected by name;
 3. walks every operator in every function against a **total** matcher: the
    v1 accepted set is exactly `StructNew`, `StructGet`, `StructSet`,
    `ArrayNewDefault`, `ArrayGet`, `ArraySet`, `ArrayLen`, `RefNull`,
-   `RefIsNull`, `Call`, ordinary scalar/comparison/conversion operators, and
-   the terminators `Br`/`CondBr`/`Return`. Anything else (including
-   `CallIndirect`/`CallRef`/`RefFunc`/`Select`/`ReturnCall*`/`Unreachable`
-   used as a real path/`UB`) is rejected with the operator name, function
-   index, and value index;
-4. for every `Call` target, confirms the callee is in the same source module
-   and its own signature passes the same classification — a call to an
-   unsupported/unclassifiable callee is rejected before any output exists,
-   not discovered mid-lowering;
-5. only after all functions pass steps 2-4 does lowering emit anything.
+   `RefIsNull`, `Call`, `CallRef`, `CallIndirect` (against a source table
+   whose element type is a plain `funcref`, §6.7), `RefFunc`, ordinary
+   scalar/comparison/conversion operators, and the terminators
+   `Br`/`CondBr`/`Return`. Anything else (including `Select`, tail-call
+   terminators `ReturnCall`/`ReturnCallIndirect`/`ReturnCallRef`, and
+   `Unreachable`/`UB` used as a real reachable path) is rejected with the
+   operator name, function index, and value index;
+4. for every `Call`/`CallRef`/`CallIndirect` target (a specific callee for
+   `Call`, a source `Signature` for `CallRef`, a source `Table` for
+   `CallIndirect`), confirms the callee(s)/signature/table pass the same
+   classification as every other function — an unsupported/unclassifiable
+   callee is rejected before any output exists, not discovered mid-lowering;
+5. collects the **function-reference table inventory** (§6.7): every `Func`
+   ever taken by a `RefFunc` operator, plus every source `Table`/`func_elements`
+   entry ever addressed by a `CallIndirect`, each assigned a deterministic
+   output table slot;
+6. only after all functions pass steps 2-5 does lowering emit anything.
 
 ### 6.2 Value plan
 
@@ -577,57 +599,124 @@ __coregc_root_store(frame: i32, slot: i32, addr: i32, type_id: i32)
 __coregc_root_clear(frame: i32, slot: i32)
 ```
 
-### 6.6 Struct/array operator lowering (unchanged in substance from the prior draft, now grounded in the above)
+### 6.6 Struct/array operator lowering
 
 | Source op | Core lowering |
 | --- | --- |
-| `struct.new $T(...)` | checkpoint(frame); `alloc(type_id(T), fixed_bytes(T))`; typed store per field at its descriptor offset (`ManagedRef` fields store both words); result is the fat pair |
+| `struct.new $T(...)` | checkpoint(frame); `alloc(type_id(T), fixed_bytes(T))`; typed store per field at its descriptor offset (`ManagedRef` fields store both words, `FuncRef` fields store one word, §6.7); result is the fat pair |
 | `struct.get $T.i` | `addr = validate_ref(recv.addr, recv.type)`; typed load at the field's offset; a `ManagedRef` field loads both words and the loaded pair is *not* re-validated at load time (validated lazily the next time it is dereferenced/scanned — validating on every load as well as every dereference would be redundant, not incorrect; the plan chooses load-time-cheap/dereference-time-checked) |
-| `struct.set $T.i` | `validate_ref(recv)`; typed store (both words for `ManagedRef`) |
+| `struct.set $T.i` | `validate_ref(recv)`; typed store (both words for `ManagedRef`, one word for `FuncRef`) |
 | `array.new_default $A(len)` | checkpoint(frame); checked `4 + len*stride` (traps on overflow); `alloc`; store length at offset 0; `zero_bytes(addr+4, len*stride)` |
 | `array.len` | `validate_ref`; load offset 0 |
 | `array.get $A[i]` | `validate_ref`; `array_bounds(addr, type, i)`; typed load at `4 + i*stride` |
 | `array.set $A[i] = v` | `validate_ref`; `array_bounds`; typed store at `4 + i*stride` |
-| `ref.null $T` | constant fat pair `(0, 0)` — no runtime call |
-| `ref.is_null` | `addr == 0` (the invariant guarantees `type_id == 0` iff `addr == 0` for any value that ever passed validation; constructing a value that violates this outside generated code is impossible in the accepted surface) |
+| `ref.null $T` (struct/array `T`) | constant fat pair `(0, 0)` — no runtime call |
+| `ref.null $T` (func `T`) | constant scalar `0` (§6.7) — no runtime call |
+| `ref.is_null` | struct/array receiver: `addr == 0` (the invariant guarantees `type_id == 0` iff `addr == 0` for any value that ever passed validation); func receiver: `value == 0` |
 | `call f(...)` | checkpoint(frame) with `checkpoint_live` per §6.4; flatten args; `Operator::Call { function_index: <lowered f> }`; flatten/re-pair the (possibly multi-value) result |
+| `ref.func $f` | compile-time-constant scalar `table_slot_of(f)` — no runtime call, no allocation (§6.7) |
+| `call_ref $sig(args..., callee)` | checkpoint(frame) with `checkpoint_live` (callee scalar plus flattened fat-ref args, §6.7); `Operator::CallIndirect { sig_index: <flattened sig>, table_index: <function-ref table> }` using the callee scalar as the index operand — no explicit null/arity check emitted; core Wasm's own `call_indirect` semantics (uninitialized-element trap, type-mismatch trap) already cover both |
+| `call_indirect $sig $table(args..., index)` | same as `call_ref`, against the corresponding copied source table instead of the generated function-ref table |
 
 No generic opcode interpreter exists; each row is a fixed generator, matching
-the existing `coregc_array.rs`/`coregc_lower.rs` style but generalized to
-work inside the CFG/liveness machinery instead of one hand-matched function
-shape.
+the prior `coregc_array.rs`/`coregc_lower.rs` style but generalized to work
+inside the CFG/liveness machinery instead of one hand-matched function shape.
 
-### 6.7 Function objects and `call_ref` — pinned design, deferred implementation
+### 6.7 Function references: `RefFunc`/`CallRef`/`CallIndirect`
 
-This is the one v1-target item not implemented in this pass (§0, §1). The
-design is pinned now so implementing it later cannot require reopening the
-descriptor or header format:
+This section was originally drafted (previous revision of this plan) as a
+heap-allocated "function object" with its own descriptor kind, deferred to a
+later activation. Before implementing that, `crates/portal-jsc-waffle/src/conv.rs`
+was checked directly for how jsaw's own WasmGC backend actually uses these
+operators (searched for `RefFunc`/`CallRef`/`CallIndirect`/`TableData`):
 
-- add descriptor `kind == 3` (`FunctionObject`) with a fixed payload layout
-  `{ table_index: i32, arity: i32, tag: i32, env: GcRef }` (16 bytes, 8-byte
-  aligned) — this fits the existing struct-descriptor encoding with `kind`
-  extended from 2 values to 3 and needs no header/descriptor byte-format
-  change, only a new `CoreGcTypeKind::FunctionObject` inventory variant and
-  one more descriptor `kind` tag value;
-- the module gets one generated `funcref` table (ordinary core Wasm — no
-  reference-types-beyond-MVP feature is required for a `funcref`
-  table + `call_indirect`, confirmed against `portal_pc_waffle`'s
-  `TableData`/`Operator::CallIndirect`) whose entries are generated
-  call-adapters with a single normalized flattened signature per arity class;
-- `RefFunc` lowers to allocating a function object (checkpointed like any
-  other allocation) whose `table_index` is a compile-time constant, capturing
-  the closure environment as a `GcRef` through the same field-store lowering
-  as `struct.new`;
-- `CallRef`/indirect calls lower to: `validate_ref`; arity/tag check against
-  the function object's descriptor fields; `Operator::CallIndirect` through
-  the generated table; identical checkpoint/liveness treatment to `Call`
-  (§6.4 already generalizes to "any instruction that may call into code that
-  may allocate," which a `call_indirect` through a validated function object
-  is, structurally, so no new liveness rule is needed — only the operator
-  lowering itself).
+- `conv.rs` never emits `CallIndirect`; it uses typed `RefFunc`/`CallRef`
+  exclusively for its own dispatch, and separately builds one ordinary
+  `TableData { ty: Type::Heap(WithNullable { value: HeapType::FuncRef, .. }) }`
+  (`declare_function_reference`) purely to expose function references to a
+  host/import boundary — i.e. jsaw's own compiler already treats "a callable
+  function" as a plain core-Wasm `funcref` table entry, not a heap object;
+- a jsaw closure (e.g. around `conv.rs`'s `js_export_*`/adapter-construction
+  code) is an ordinary `struct.new` whose fields are: a `RefFunc`-typed code
+  pointer (`ref $adapter_sig`), an `i32` arrow flag, a boxed/`anyref`
+  `captured_this`, an `anyref` property trie, and an `i32` tag. **The closure
+  itself is already just a struct** — already fully covered by §6.6's struct
+  lowering — whose "function object" nature comes entirely from one field
+  being function-reference-typed, not from any special allocation shape.
 
-No code for this section is written in this pass. It is here so v2 is an
-addition, not a redesign.
+This means the originally-drafted heap-allocated function-object design was
+unnecessary complexity: a typed function reference never needs GC identity,
+marking, or scanning, because the code it names is static module content
+that is always alive, never collected. The corrected v1 design:
+
+**Representation.** A concrete function-reference-typed value
+(`Type::Heap(HeapType::Sig { sig_index })` where `sig_index` resolves to a
+`SignatureData::Func`, not `Struct`/`Array`) is `LowerValue::Scalar(Type::I32)`
+— a **1-based output table slot index**, not a fat pair. `0` is reserved as
+the null function reference. No new `LowerValue` variant, no header, no
+descriptor scan entry, and no runtime validator function are needed; a
+function-reference-typed struct/array field costs exactly 4 bytes (one
+scalar word), not 8.
+
+**Inventory (§6.1 step 5).** `coregc.rs` gains
+`CoreGcStorage::FuncRef { nullable: bool, target: Signature }` (the `target`
+is the callee's *source* `Func` signature) as a sibling of `ManagedRef`,
+chosen instead of `ManagedRef` whenever `storage()`'s `HeapType::Sig` case
+resolves to a `SignatureData::Func`/`Import` rather than `Struct`/`Array` —
+this requires threading `&Module` into `storage()`, which it does not
+currently take. `coregc_layout.rs` assigns `FuncRef` slots 4-byte
+alignment/size and a new `storage_tag` value (`9`, distinct from
+`ManagedRef`'s `7` and `DynamicRef`'s `8`); `coregc_runtime`'s generic scanner
+(§3.3/§3.6) simply has no case for tag `9`, so it is skipped during scanning
+automatically, with no runtime change required beyond the new tag constant
+being unrecognized-and-ignored (not unrecognized-and-erroring — the scanner's
+"unknown storage tag" default is "not scannable," matching pointer-free
+scalar fields; only an unknown descriptor *kind*, not an unknown *slot tag*,
+is a corruption error).
+
+**Function-reference table.** `coregc_lower` builds exactly one generated
+core `TableData { ty: funcref, func_elements: Some([Func::invalid(), ...]) }`
+whose slot `0` is deliberately left `Func::invalid()` (the null sentinel) and
+whose slots `1..N` hold the *lowered* `Func` handles for every distinct
+source `Func` ever named by a `RefFunc` operator anywhere in the module,
+assigned in ascending source-`Func`-index order (deterministic). Any source
+`Table`s actually addressed by a `CallIndirect` are copied over similarly
+(their `func_elements` remapped from source to lowered `Func` handles) rather
+than merged into the generated table, preserving the source's own table
+identity/indices for that call site.
+
+**Operator lowering** (added to §6.6's table): `RefFunc { func_index }`
+lowers to a compile-time-constant scalar (the callee's assigned table slot;
+no instruction is generated at all beyond the constant). `CallRef { sig_index }`
+and `CallIndirect { sig_index, table_index }` both lower to
+`Operator::CallIndirect` against the corresponding table, using the already-
+lowered scalar index value with **no explicit null or arity check emitted by
+coregc** — core Wasm's own `call_indirect` already traps deterministically on
+an out-of-bounds index, an uninitialized (`Func::invalid()`) slot, or a
+signature mismatch, which exactly covers "called a null function reference,"
+"stale/corrupt index," and "mismatched signature" without any new runtime
+helper or trap code.
+
+**Liveness/checkpoints.** `CallRef`/`CallIndirect` join `Call` in §6.4's
+checkpoint-instruction set with identical treatment: the callee's scalar
+index is `LowerValue::Scalar`, so it is never spilled (scalars never need
+root slots), while its flattened fat-ref *arguments* are captured into
+`checkpoint_live` exactly like any other call's arguments. No new liveness
+rule is needed — §6.4 already generalizes to "any instruction that may call
+into code that may allocate," which a validated `call_indirect` is,
+structurally, identically to a direct `Call`.
+
+**What this does and does not unlock.** This makes `RefFunc`/`CallRef`/
+`CallIndirect` over concrete (non-`anyref`) signatures a real, tested part of
+the v1 activation — e.g. a function-pointer-table pattern over concrete
+struct/array/scalar types works end-to-end. It does **not**, by itself, make
+jsaw's actual emitted closures lower under coregc: those closures' other
+fields (`captured_this`, the property trie) are `anyref`-typed, which §1/§11
+already scope to the deferred `Repr`/`anyref` plan. The call *mechanism* is
+nonetheless exactly what that later work will reuse unchanged — this section
+exists so that v2 (`anyref`) is an addition on top of this call mechanism,
+not a second redesign of it, matching this plan's §0 structural fix applied
+one level down.
 
 ## 7. Legacy removal (done before any new code lands)
 
@@ -665,35 +754,58 @@ Unlike the prior three-phase scaffolding, every stage below commits code
 whose data contract is the frozen §3 contract from the start. A later stage
 adds a capability; it never changes what an earlier stage already committed.
 Each stage ends in a real, green `cargo test` state; `emit_coregc` is not
-exported/wired until Stage 5 passes its full acceptance suite (§9) — earlier
+exported/wired until Stage 6 passes its full acceptance suite (§9) — earlier
 stages export their pieces only as `pub(crate)` building blocks, so there is
 no window where a partially-capable `emit_coregc` is reachable by a caller.
 
 1. **Legacy removal + descriptor `FunctionObject` reservation** (§7). Compiles,
-   existing `coregc`/`coregc_layout` unit tests still pass.
+   existing `coregc`/`coregc_layout` unit tests still pass. *(Done.)*
 2. **`coregc_runtime.rs`**: header v2 semantics (§3.2), first-fit allocator
    with free-list reuse (§3.4), validator, array-bounds check, worklist
    (§3.5), generic descriptor-driven `mark_ref`/scan dispatch, `sweep`,
    `collect` (§3.6), `zero_bytes`. Tested standalone by direct Waffle
-   fixtures that call these `Func`s exactly like the existing
-   `coregc_emit.rs` tests do (hand-built modules calling `__coregc_alloc`,
-   `__coregc_root_store`, `__coregc_collect` etc. through Wasmtime) — this
-   proves retention/reclamation/reuse/worklist-exhaustion *before* the
-   general lowerer exists, isolating runtime bugs from lowering bugs.
+   fixtures that call these `Func`s directly through Wasmtime, with no
+   lowering involved — this proves retention/reclamation/reuse/worklist-
+   exhaustion *before* the general lowerer exists, isolating runtime bugs
+   from lowering bugs. *(Done: 9 tests in `coregc_runtime.rs`.)*
 3. **`coregc_roots.rs`**: moved from `coregc_phase3.rs`, renamed exports,
-   otherwise unchanged (already tested).
-4. **`coregc_lower.rs`**: value plan, CFG/value flattening (§6.2-6.3),
-   liveness/checkpoint algorithm (§6.4), operator lowering (§6.6) for
-   straight-line and branching single functions with no calls. Tested with
-   hand-built multi-block fixtures (loops constructing/traversing a linked
-   list, wide/deep graphs, cycles, self-cycles) under forced collection
-   (`collect_threshold_bytes = 0`), asserting both retention of reachable
-   graphs and reclamation of unreachable ones.
-5. **Direct calls**: extend Stage 4's liveness (already generalized to treat
-   `Call` as a checkpoint instruction, §6.4) to actually lower `Operator::Call`
-   with the flattened multi-function ABI (§6.3 item 1, §6.4 item 4 of §6.1).
-   Tested with a caller/callee pair where the callee allocates and the caller
-   holds a live reference across the call under forced collection.
+   trap codes wired in. *(Done, folded into Stage 2's commit.)*
+4. **`coregc_lower.rs`, part A — struct/array/branches, no calls**: value
+   plan (§6.2), preflight (§6.1 steps 1-3 only), CFG/value flattening
+   (§6.3), the full liveness/checkpoint algorithm (§6.4) restricted to
+   `StructNew`/`ArrayNewDefault` as the only checkpoint instructions, and
+   struct/array operator lowering (§6.6, excluding the call rows). Concrete
+   deliverables:
+   - a `LiveSet`/liveness module computing `defs`/`uses` per block, the
+     block-level fixed-point dataflow, and the per-instruction backward
+     sweep producing `checkpoint_live` (§6.4 items 1-4), independently unit
+     tested against hand-built multi-block CFGs (including an irreducible
+     back-edge loop) with obviously-correct expected live sets, *before*
+     wiring it into codegen;
+   - the function/block/value translation context (source `Value`/`Block` ->
+     lowered `LowerValue`/`Block` maps) and the two-pass block-creation order
+     from §6.3;
+   - root-slot assignment and codegen (§6.4 items 5-6) plus the debug
+     verifier (§6.4 item 7);
+   - struct/array operator lowering table rows that do not involve a call.
+   Tested with hand-built multi-block fixtures (loops constructing/
+   traversing a linked list, wide/deep graphs, cycles, self-cycles) under
+   forced collection (`collect_threshold_bytes = 0`), asserting both
+   retention of reachable graphs and reclamation of unreachable ones, plus
+   the root-verifier negative fixture from §9.
+5. **`coregc_lower.rs`, part B — direct calls, function references**: extend
+   part A's liveness (already generalized to a `is_checkpoint_instruction`
+   predicate, §6.4) to also cover `Call`/`CallRef`/`CallIndirect`; add the
+   two-pass whole-module lowering needed for (mutually) recursive/forward
+   calls (preflight allocates every accepted function's lowered `Func`
+   placeholder and flattened signature *before* any body is translated, §6.1
+   step 4); add the function-reference table inventory and construction
+   (§6.1 step 5, §6.7); add the `Call`/`RefFunc`/`CallRef`/`CallIndirect`
+   lowering rows (§6.6, §6.7). Tested with: a caller/callee pair where the
+   callee allocates and the caller holds a live reference across the call
+   under forced collection; a `RefFunc`/`CallRef` fixture over a concrete
+   signature exercising a null-function-reference trap and a successful
+   indirect call; a `CallIndirect` fixture against a copied source table.
 6. **`coregc_emit.rs` orchestrator + `emit_coregc` activation**: wires
    Stages 1-5 together behind the single public entry point (§5), runs the
    full acceptance suite (§9), and is the only stage that changes `lib.rs`'s
@@ -720,10 +832,12 @@ into the next one, which is the specific mistake §0 diagnoses.
   deterministically (no partial sweep); nested frame push/pop/clear LIFO
   discipline (existing tests already cover push/pop/store/clear — kept).
 - **Lowering** (through `emit_coregc` end to end): struct/array
-  new/get/set/len and direct calls, branches carrying fat refs, forced
-  collection at every checkpoint (`collect_threshold_bytes = 0`) proves a
-  local managed value used after later allocations/calls is still correct;
-  the debug root-verifier (§6.4 item 7) runs and passes on every fixture; a
+  new/get/set/len, direct calls, and `RefFunc`/`CallRef`/`CallIndirect` over
+  concrete signatures (including a null-function-reference trap and a
+  mismatched-table-slot trap), branches carrying fat refs, forced collection
+  at every checkpoint (`collect_threshold_bytes = 0`) proves a local managed
+  value used after later allocations/calls is still correct; the debug
+  root-verifier (§6.4 item 7) runs and passes on every fixture; a
   deliberately hand-corrupted lowering (omitted `root_store` before a
   checkpoint, added directly to a test-only unchecked builder, never through
   the real lowerer) is asserted to be caught by the verifier, proving the
@@ -753,14 +867,16 @@ state.
 `docs/plan-dogfood-self-hosting-java.md` (and the broader ambition of running
 jsaw's own compiler through coregc) needs, beyond this plan: the full jsaw
 `Repr` closure (boxed Number/Boolean/BigInt/String, property tries, dynamic
-arrays, typed arrays, DataView, module contexts), `anyref`/dynamic dispatch,
-and the function-object/`call_ref` work pinned in §6.7. This plan
-deliberately stops short of those so that v1 is small enough to build
-correctly and prove correct in one pass. The module boundaries in §4 and the
-descriptor `kind` reservation in §6.7 exist specifically so that work is
-additive on top of this plan rather than a second rewrite of it — the same
-property §0 demanded of this plan's own internal stages, applied one level up
-to the plan-of-plans.
+arrays, typed arrays, DataView, module contexts) and `anyref`/dynamic
+dispatch. The call *mechanism* (direct calls and typed function references,
+§6.7) is in v1's scope and is not one of the deferred items — confirmed
+against `conv.rs`'s actual closure representation, whose only blocking fields
+are `anyref`-typed, not its `RefFunc`-typed code pointer. This plan
+deliberately stops short of the `Repr`/`anyref` closure so that v1 is small
+enough to build correctly and prove correct in one pass. The module
+boundaries in §4 exist specifically so that work is additive on top of this
+plan rather than a second rewrite of it — the same property §0 demanded of
+this plan's own internal stages, applied one level up to the plan-of-plans.
 
 ## 12. Explicit non-goals / later work
 

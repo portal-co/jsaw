@@ -4,6 +4,7 @@ pub mod coregc_array;
 pub mod coregc_emit;
 pub mod coregc_layout;
 pub mod coregc_lower;
+pub mod coregc_phase3;
 pub mod ingest;
 pub mod linker;
 pub mod repr;

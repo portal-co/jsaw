@@ -13,12 +13,13 @@ use portal_pc_waffle::{
 use crate::{
     coregc::{CoreGcError, CoreGcInventory},
     coregc_layout::CoreGcDescriptorTable,
+    coregc_phase3::add_shadow_roots,
 };
 
 /// Fixed header ABI reserved for later mark/sweep phases.
 pub const COREGC_HEADER_BYTES: u32 = 24;
 const COREGC_MAGIC_ALLOCATED: u32 = 0xC0DE_0001;
-const COREGC_FLAG_MARK: u32 = 1 << 1;
+pub(crate) const COREGC_FLAG_MARK: u32 = 1 << 1;
 
 /// Configuration for the phase-1 pure-Wasm runtime skeleton.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,6 +134,28 @@ pub fn emit_runtime_skeleton(
     let allocation_head = module.globals.push(GlobalData {
         ty: Type::I32,
         value: Some(0),
+        mutable: true,
+    });
+    let root_stack_start = u32::try_from((descriptors.bytes.len() + 7) & !7)
+        .map_err(|_| CoreGcError {
+            message: "coregc descriptor length exceeds u32".to_owned(),
+        })?
+        .max(8);
+    if root_stack_start >= options.heap_base {
+        return Err(CoreGcError {
+            message: "coregc descriptor table leaves no room for the shadow-root stack".to_owned(),
+        });
+    }
+    // Shadow frames live below the managed heap and grow upward. They cannot
+    // alias the bump heap, and a push checks the heap-base boundary.
+    let root_head = module.globals.push(GlobalData {
+        ty: Type::I32,
+        value: Some(0),
+        mutable: true,
+    });
+    let root_bump = module.globals.push(GlobalData {
+        ty: Type::I32,
+        value: Some(u64::from(root_stack_start)),
         mutable: true,
     });
     let signature = module.signatures.push(SignatureData::Func {
@@ -373,6 +396,7 @@ pub fn emit_runtime_skeleton(
     let validator = add_ref_validator(&mut module, memory);
     let marker = add_mark_ref(&mut module, memory, validator);
     let array_bounds = add_array_bounds_check(&mut module, memory, validator);
+    let roots = add_shadow_roots(&mut module, memory, options.heap_base, root_head, root_bump);
     let collect = add_empty_root_collect(
         &mut module,
         memory,
@@ -395,6 +419,22 @@ pub fn emit_runtime_skeleton(
     module.exports.push(portal_pc_waffle::Export {
         name: "__coregc_array_bounds_phase1".to_owned(),
         kind: portal_pc_waffle::ExportKind::Func(array_bounds),
+    });
+    module.exports.push(portal_pc_waffle::Export {
+        name: "__coregc_push_frame_phase3".to_owned(),
+        kind: portal_pc_waffle::ExportKind::Func(roots.push),
+    });
+    module.exports.push(portal_pc_waffle::Export {
+        name: "__coregc_pop_frame_phase3".to_owned(),
+        kind: portal_pc_waffle::ExportKind::Func(roots.pop),
+    });
+    module.exports.push(portal_pc_waffle::Export {
+        name: "__coregc_root_store_phase3".to_owned(),
+        kind: portal_pc_waffle::ExportKind::Func(roots.store),
+    });
+    module.exports.push(portal_pc_waffle::Export {
+        name: "__coregc_root_clear_phase3".to_owned(),
+        kind: portal_pc_waffle::ExportKind::Func(roots.clear),
     });
     module.exports.push(portal_pc_waffle::Export {
         name: "__coregc_collect_phase2".to_owned(),
@@ -998,6 +1038,51 @@ mod tests {
             0
         );
         assert!(bounds.call(&mut store, (address, 1, 1)).is_err());
+    }
+
+    #[test]
+    fn phase3_shadow_frames_store_clear_and_pop_in_lifo_order() {
+        let artifact = emit_runtime_skeleton(&Module::empty(), &CoreGcOptions::default())
+            .expect("runtime skeleton");
+        let engine = Engine::default();
+        let bytes = portal_pc_waffle::to_wasm_bytes(&artifact.module).expect("core wasm encodes");
+        let module = WasmtimeModule::new(&engine, bytes).expect("core engine compiles artifact");
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).expect("artifact instantiates");
+        let push = instance
+            .get_typed_func::<i32, i32>(&mut store, "__coregc_push_frame_phase3")
+            .expect("push export");
+        let pop = instance
+            .get_typed_func::<i32, ()>(&mut store, "__coregc_pop_frame_phase3")
+            .expect("pop export");
+        let root_store = instance
+            .get_typed_func::<(i32, i32, i32, i32), ()>(&mut store, "__coregc_root_store_phase3")
+            .expect("root store export");
+        let root_clear = instance
+            .get_typed_func::<(i32, i32), ()>(&mut store, "__coregc_root_clear_phase3")
+            .expect("root clear export");
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .expect("memory export");
+        let first = push.call(&mut store, 1).expect("first frame");
+        root_store
+            .call(&mut store, (first, 0, 123, 7))
+            .expect("store root pair");
+        let second = push.call(&mut store, 1).expect("nested frame");
+        root_store
+            .call(&mut store, (second, 0, 456, 8))
+            .expect("nested root pair");
+        pop.call(&mut store, second).expect("pop nested frame");
+        root_clear
+            .call(&mut store, (first, 0))
+            .expect("clear parent root");
+        pop.call(&mut store, first).expect("pop parent frame");
+        let mut slot = [0; 8];
+        memory
+            .read(&store, usize::try_from(first).unwrap() + 8, &mut slot)
+            .expect("frame slot read");
+        assert_eq!(slot, [0; 8], "clear zeros both words of the fat root pair");
+        assert!(pop.call(&mut store, first).is_err(), "double pop traps");
     }
 
     #[test]

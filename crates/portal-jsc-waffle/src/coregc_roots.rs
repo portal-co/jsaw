@@ -7,9 +7,11 @@
 //! calls [`add_root_walk`] as one step of its collection algorithm.
 
 use portal_pc_waffle::{
-    BlockTarget, FuncDecl, FunctionBody, MemoryArg, Module, Operator, SignatureData, Terminator,
-    Type,
+    BlockTarget, FuncDecl, FunctionBody, Global, MemoryArg, Module, Operator, SignatureData,
+    Terminator, Type,
 };
+
+use crate::coregc_runtime::trap_code;
 
 fn i32_const(
     body: &mut FunctionBody,
@@ -19,7 +21,20 @@ fn i32_const(
     body.add_op(block, Operator::I32Const { value }, &[], &[Type::I32])
 }
 
+fn set_trap(body: &mut FunctionBody, block: portal_pc_waffle::Block, trap_code_global: Global, code: u32) {
+    let value = i32_const(body, block, code);
+    body.add_op(
+        block,
+        Operator::GlobalSet {
+            global_index: trap_code_global,
+        },
+        &[value],
+        &[],
+    );
+}
+
 /// Functions that form the shadow-root ABI (`docs/plan-coregc-atomic-collector-and-lowering.md` §3.7).
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct ShadowRootFunctions {
     pub(crate) push: portal_pc_waffle::Func,
     pub(crate) pop: portal_pc_waffle::Func,
@@ -39,11 +54,12 @@ pub(crate) fn add_shadow_roots(
     heap_base: u32,
     root_head: portal_pc_waffle::Global,
     root_bump: portal_pc_waffle::Global,
+    trap_code_global: Global,
 ) -> ShadowRootFunctions {
-    let push = add_root_push(module, memory, heap_base, root_head, root_bump);
-    let pop = add_root_pop(module, memory, root_head, root_bump);
-    let store = add_root_store(module, memory);
-    let clear = add_root_clear(module, memory);
+    let push = add_root_push(module, memory, heap_base, root_head, root_bump, trap_code_global);
+    let pop = add_root_pop(module, memory, root_head, root_bump, trap_code_global);
+    let store = add_root_store(module, memory, trap_code_global);
+    let clear = add_root_clear(module, memory, trap_code_global);
     ShadowRootFunctions {
         push,
         pop,
@@ -58,6 +74,7 @@ fn add_root_push(
     heap_base: u32,
     root_head: portal_pc_waffle::Global,
     root_bump: portal_pc_waffle::Global,
+    trap_code_global: Global,
 ) -> portal_pc_waffle::Func {
     let signature = module.signatures.push(SignatureData::Func {
         params: vec![Type::I32],
@@ -100,6 +117,7 @@ fn add_root_push(
             },
         },
     );
+    set_trap(&mut body, fail, trap_code_global, trap_code::ROOT_STACK_OVERFLOW);
     body.set_terminator(fail, Terminator::Unreachable);
     let previous = body.add_op(
         commit,
@@ -160,6 +178,7 @@ fn add_root_pop(
     memory: portal_pc_waffle::Memory,
     root_head: portal_pc_waffle::Global,
     root_bump: portal_pc_waffle::Global,
+    trap_code_global: Global,
 ) -> portal_pc_waffle::Func {
     let signature = module.signatures.push(SignatureData::Func {
         params: vec![Type::I32],
@@ -194,6 +213,7 @@ fn add_root_pop(
             },
         },
     );
+    set_trap(&mut body, fail, trap_code_global, trap_code::ROOT_STACK_OVERFLOW);
     body.set_terminator(fail, Terminator::Unreachable);
     // Restore the linked-list head before rewinding the reserved frame region.
     let previous = body.add_op(
@@ -233,6 +253,7 @@ fn add_root_pop(
 fn add_root_store(
     module: &mut Module<'static>,
     memory: portal_pc_waffle::Memory,
+    trap_code_global: Global,
 ) -> portal_pc_waffle::Func {
     let signature = module.signatures.push(SignatureData::Func {
         params: vec![Type::I32, Type::I32, Type::I32, Type::I32],
@@ -274,6 +295,7 @@ fn add_root_store(
             },
         },
     );
+    set_trap(&mut body, fail, trap_code_global, trap_code::OUT_OF_BOUNDS);
     body.set_terminator(fail, Terminator::Unreachable);
     let eight = i32_const(&mut body, commit, 8);
     let offset = body.add_op(commit, Operator::I32Mul, &[slot, eight], &[Type::I32]);
@@ -308,6 +330,7 @@ fn add_root_store(
 fn add_root_clear(
     module: &mut Module<'static>,
     memory: portal_pc_waffle::Memory,
+    trap_code_global: Global,
 ) -> portal_pc_waffle::Func {
     let signature = module.signatures.push(SignatureData::Func {
         params: vec![Type::I32, Type::I32],
@@ -347,6 +370,7 @@ fn add_root_clear(
             },
         },
     );
+    set_trap(&mut body, fail, trap_code_global, trap_code::OUT_OF_BOUNDS);
     body.set_terminator(fail, Terminator::Unreachable);
     let eight = i32_const(&mut body, commit, 8);
     let offset = body.add_op(commit, Operator::I32Mul, &[slot, eight], &[Type::I32]);

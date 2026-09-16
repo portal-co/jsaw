@@ -39,6 +39,18 @@ const DESCRIPTOR_SLOT_BYTES: u32 = 16;
 /// `storage_tag` value that marks a scannable managed-reference slot
 /// (`coregc_layout::storage_tag`'s `CoreGcStorage::ManagedRef` case).
 const STORAGE_TAG_MANAGED_REF: u32 = 7;
+/// `storage_tag` value that marks a scannable *dynamic* reference slot
+/// (`coregc_layout::storage_tag`'s `CoreGcStorage::DynamicRef` case). The
+/// pair may hold an i31 immediate instead of a heap address, which the
+/// immediate rule in `mark_ref`/`validate_ref` skips.
+const STORAGE_TAG_DYNAMIC_REF: u32 = 8;
+
+/// The reserved type-id of an i31 immediate (`docs/plan-coregc-atomic-
+/// collector-and-lowering.md` §13.2): `(payload, I31_TYPE_ID)` is the
+/// dynamic-value form of `ref i31`. `u32::MAX` is unreachable by the dense
+/// from-1 heap type-id assignment (exhaustion is rejected long before), so
+/// no descriptor-table change is needed.
+pub(crate) const I31_TYPE_ID: u32 = u32::MAX;
 
 /// Distinct trap identities (`docs/...` §10). Stored into `trap_code` as the
 /// last action before every `Terminator::Unreachable` this module emits, so a
@@ -53,6 +65,7 @@ pub mod trap_code {
     pub const HEAP_OOM: u32 = 5;
     pub const WORKLIST_OOM: u32 = 6;
     pub const ALLOCATOR_CORRUPTION: u32 = 7;
+    pub const BAD_CAST: u32 = 8;
 }
 
 /// Configuration for the generated coregc runtime and heap.
@@ -398,9 +411,25 @@ fn add_validate_ref(
     let null_ok = body.add_block();
     let live = body.add_block();
     let fail = body.add_block();
-    let address_is_null = body.add_op(entry, Operator::I32Eqz, &[address], &[Type::I32]);
+    let immediate_ok = body.add_block();
+    // The i31 immediate rule comes first: an immediate has no header and
+    // its payload word may legitimately be zero, which the null-pair check
+    // below would misread as a partial-null trap.
+    let i31_type = i32_const(body, entry, I31_TYPE_ID);
+    let is_immediate = body.add_op(entry, Operator::I32Eq, &[type_id, i31_type], &[Type::I32]);
+    let check_null = body.add_block();
     body.set_terminator(
         entry,
+        Terminator::CondBr {
+            cond: is_immediate,
+            if_true: BlockTarget { block: immediate_ok, args: vec![] },
+            if_false: BlockTarget { block: check_null, args: vec![] },
+        },
+    );
+    body.set_terminator(immediate_ok, Terminator::Return { values: vec![address] });
+    let address_is_null = body.add_op(check_null, Operator::I32Eqz, &[address], &[Type::I32]);
+    body.set_terminator(
+        check_null,
         Terminator::CondBr {
             cond: address_is_null,
             if_true: BlockTarget { block: null_case, args: vec![] },
@@ -847,17 +876,32 @@ fn add_mark_ref(
     let entry = body.entry;
     let address = body.blocks[entry].params[0].1;
     let type_id = body.blocks[entry].params[1].1;
-    let checked = body.add_op(
+    let done = body.add_block();
+    // Immediates have no header and are never in the block list, so there
+    // is nothing to mark — this must be checked *before* validate_ref (and
+    // certainly before reading a header), not subsumed by the null check
+    // below (a payload of zero is not the null pair).
+    let i31_type = i32_const(body, entry, I31_TYPE_ID);
+    let is_immediate = body.add_op(entry, Operator::I32Eq, &[type_id, i31_type], &[Type::I32]);
+    let heap_case = body.add_block();
+    body.set_terminator(
         entry,
+        Terminator::CondBr {
+            cond: is_immediate,
+            if_true: BlockTarget { block: done, args: vec![] },
+            if_false: BlockTarget { block: heap_case, args: vec![] },
+        },
+    );
+    let checked = body.add_op(
+        heap_case,
         Operator::Call { function_index: validate_ref },
         &[address, type_id],
         &[Type::I32],
     );
-    let is_null = body.add_op(entry, Operator::I32Eqz, &[checked], &[Type::I32]);
+    let is_null = body.add_op(heap_case, Operator::I32Eqz, &[checked], &[Type::I32]);
     let non_null = body.add_block();
-    let done = body.add_block();
     body.set_terminator(
-        entry,
+        heap_case,
         Terminator::CondBr {
             cond: is_null,
             if_true: BlockTarget { block: done, args: vec![] },
@@ -1131,10 +1175,23 @@ fn add_collect(
     let field_offset = load32(body, struct_slot_body, memory, slot_addr, 0);
     let storage_tag = load32(body, struct_slot_body, memory, slot_addr, 4);
     let managed_ref_tag = i32_const(body, struct_slot_body, STORAGE_TAG_MANAGED_REF);
-    let is_ref = body.add_op(
+    let dynamic_ref_tag = i32_const(body, struct_slot_body, STORAGE_TAG_DYNAMIC_REF);
+    let is_dynamic_ref = body.add_op(
+        struct_slot_body,
+        Operator::I32Eq,
+        &[storage_tag, dynamic_ref_tag],
+        &[Type::I32],
+    );
+    let is_managed = body.add_op(
         struct_slot_body,
         Operator::I32Eq,
         &[storage_tag, managed_ref_tag],
+        &[Type::I32],
+    );
+    let is_ref = body.add_op(
+        struct_slot_body,
+        Operator::I32Or,
+        &[is_managed, is_dynamic_ref],
         &[Type::I32],
     );
     let mark_struct_field = body.add_block();
@@ -1183,10 +1240,23 @@ fn add_collect(
     let elem_slot_addr = body.add_op(array_scan_init, Operator::I32Add, &[as_row, row_header_c2], &[Type::I32]);
     let elem_storage_tag = load32(body, array_scan_init, memory, elem_slot_addr, 4);
     let elem_managed_ref_tag = i32_const(body, array_scan_init, STORAGE_TAG_MANAGED_REF);
-    let elem_is_ref = body.add_op(
+    let elem_dynamic_ref_tag = i32_const(body, array_scan_init, STORAGE_TAG_DYNAMIC_REF);
+    let elem_is_dynamic = body.add_op(
+        array_scan_init,
+        Operator::I32Eq,
+        &[elem_storage_tag, elem_dynamic_ref_tag],
+        &[Type::I32],
+    );
+    let elem_is_managed = body.add_op(
         array_scan_init,
         Operator::I32Eq,
         &[elem_storage_tag, elem_managed_ref_tag],
+        &[Type::I32],
+    );
+    let elem_is_ref = body.add_op(
+        array_scan_init,
+        Operator::I32Or,
+        &[elem_is_managed, elem_is_dynamic],
         &[Type::I32],
     );
     let array_scan_body_init = body.add_block();

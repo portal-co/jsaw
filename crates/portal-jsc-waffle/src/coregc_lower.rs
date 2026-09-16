@@ -11,14 +11,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use portal_pc_waffle::{
-    Block, BlockTarget, EntityRef, Func, FuncDecl, FunctionBody, HeapType, Module, Operator,
-    Signature, SignatureData, Table, TableData, Terminator, Type, Value, ValueDef, WithNullable,
+    Block, BlockTarget, EntityRef, Func, FuncDecl, FunctionBody, Global, HeapType, Module,
+    Operator, Signature, SignatureData, Table, TableData, Terminator, Type, Value, ValueDef,
+    WithNullable,
 };
 
 use crate::{
     coregc::{CoreGcError, CoreGcInventory, CoreGcStorage},
     coregc_layout::CoreGcDescriptorTable,
-    coregc_runtime::CoreGcRuntime,
+    coregc_runtime::{trap_code, CoreGcRuntime},
 };
 
 /// How one source SSA value (or function parameter/return/block parameter)
@@ -33,25 +34,34 @@ enum LowerValue {
         nullable: bool,
         concrete: crate::coregc::CoreGcTypeId,
     },
+    /// A dynamic value (`anyref`/`eqref`/`i31ref`/abstract
+    /// `structref`/`arrayref`): the same two-`i32` pair as a `FatRef`, but
+    /// without one fixed concrete type id — the type word may name any heap
+    /// type or the i31-immediate sentinel (`docs/plan-coregc-atomic-
+    /// collector-and-lowering.md` §13.2). It can still hold a heap pointer,
+    /// so liveness must root it exactly like a `FatRef`.
+    Dynamic,
 }
 
 impl LowerValue {
     fn flat_len(self) -> usize {
         match self {
             LowerValue::Scalar(_) => 1,
-            LowerValue::FatRef { .. } => 2,
+            LowerValue::FatRef { .. } | LowerValue::Dynamic => 2,
         }
     }
 
     fn flat_types(self) -> Vec<Type> {
         match self {
             LowerValue::Scalar(ty) => vec![ty],
-            LowerValue::FatRef { .. } => vec![Type::I32, Type::I32],
+            LowerValue::FatRef { .. } | LowerValue::Dynamic => vec![Type::I32, Type::I32],
         }
     }
 
-    fn is_fatref(self) -> bool {
-        matches!(self, LowerValue::FatRef { .. })
+    /// Whether values of this plan can hold a heap pointer and therefore
+    /// need a shadow-frame slot when live across a checkpoint.
+    fn needs_root(self) -> bool {
+        matches!(self, LowerValue::FatRef { .. } | LowerValue::Dynamic)
     }
 }
 
@@ -88,6 +98,9 @@ fn classify_type(
     match ty {
         Type::I32 | Type::I64 | Type::F32 | Type::F64 => Ok(LowerValue::Scalar(ty)),
         Type::Heap(reference) => match reference.value {
+            HeapType::Any | HeapType::Eq | HeapType::I31 | HeapType::Struct | HeapType::Array => {
+                Ok(LowerValue::Dynamic)
+            }
             HeapType::Sig { sig_index } => match &source.signatures[sig_index] {
                 SignatureData::Struct { .. } | SignatureData::Array { .. } => {
                     let concrete = inventory.id_for(sig_index).ok_or_else(|| CoreGcError {
@@ -986,6 +999,10 @@ fn validate_operator(
         | Operator::RefNull { .. }
         | Operator::RefIsNull
         | Operator::RefFunc { .. }
+        | Operator::RefI31
+        | Operator::RefTest { .. }
+        | Operator::RefCast { .. }
+        | Operator::RefEq
         | Operator::Select
         | Operator::TypedSelect { .. } => true,
         Operator::Call { function_index } => {
@@ -1053,7 +1070,9 @@ impl<'b> Emit<'b> {
         value
     }
 
-    fn trap_if(&mut self, cond: Value) {
+    /// The trap identity is recorded in the runtime's `trap_code` global
+    /// first (see `coregc_runtime::trap_code`).
+    fn trap_if(&mut self, cond: Value, trap_global: Global, code: u32) {
         let trap_block = self.body.add_block();
         let continue_block = self.body.add_block();
         self.body.set_terminator(
@@ -1069,6 +1088,15 @@ impl<'b> Emit<'b> {
                     args: vec![],
                 },
             },
+        );
+        let code_value = i32_const(self.body, trap_block, code);
+        self.body.add_op(
+            trap_block,
+            Operator::GlobalSet {
+                global_index: trap_global,
+            },
+            &[code_value],
+            &[],
         );
         self.body.set_terminator(trap_block, Terminator::Unreachable);
         self.current = continue_block;
@@ -1165,7 +1193,7 @@ fn store_field(
     value: Lowered,
 ) -> Result<(), CoreGcError> {
     match (&slot.storage, value) {
-        (CoreGcStorage::ManagedRef { .. }, Lowered::Fat(addr, type_id)) => {
+        (CoreGcStorage::ManagedRef { .. } | CoreGcStorage::DynamicRef { .. }, Lowered::Fat(addr, type_id)) => {
             // Each word of the fat pair is an ordinary i32 access; the
             // slot's own (8-byte) alignment governs its *offset*, not the
             // natural alignment of each individual i32 load/store.
@@ -1205,7 +1233,7 @@ fn load_field(
     slot: &CoreGcSlotLayout,
 ) -> Lowered {
     match &slot.storage {
-        CoreGcStorage::ManagedRef { .. } => {
+        CoreGcStorage::ManagedRef { .. } | CoreGcStorage::DynamicRef { .. } => {
             let mem0 = MemoryArg {
                 align: 2,
                 offset: u64::from(slot.offset),
@@ -1339,6 +1367,69 @@ impl<'a> FunctionLowering<'a> {
         }
     }
 
+    /// `ref.test ty` on the pair `(addr, type_id)` (docs plan §13.2).
+    /// Returns an i32 predicate value.
+    fn lower_ref_test(
+        &self,
+        emit: &mut Emit<'_>,
+        addr: Value,
+        type_id: Value,
+        ty: Type,
+    ) -> Result<Value, CoreGcError> {
+        let Type::Heap(reference) = ty else {
+            return Err(CoreGcError {
+                message: format!("coregc lowering: ref.test against non-reference type {ty:?}"),
+            });
+        };
+        // Validate the pair once (header coherence, immediate rule).
+        emit.op(
+            Operator::Call {
+                function_index: self.runtime.validate_ref,
+            },
+            &[addr, type_id],
+            &[Type::I32],
+        );
+        let zero = emit.const_i32(0);
+        let addr_zero = emit.op(Operator::I32Eq, &[addr, zero], &[Type::I32]);
+        let type_zero = emit.op(Operator::I32Eq, &[type_id, zero], &[Type::I32]);
+        let is_null = emit.op(Operator::I32And, &[addr_zero, type_zero], &[Type::I32]);
+        let not_null = emit.op(Operator::I32Eqz, &[is_null], &[Type::I32]);
+        let type_matches = match reference.value {
+            HeapType::Sig { sig_index } => {
+                let id = self.inventory.id_for(sig_index).ok_or_else(|| CoreGcError {
+                    message: format!(
+                        "coregc lowering: ref.test against unmanaged signature {}",
+                        sig_index.index()
+                    ),
+                })?;
+                let id_c = emit.const_i32(id.get());
+                emit.op(Operator::I32Eq, &[type_id, id_c], &[Type::I32])
+            }
+            HeapType::I31 => {
+                let i31_c = emit.const_i32(crate::coregc_runtime::I31_TYPE_ID);
+                emit.op(Operator::I32Eq, &[type_id, i31_c], &[Type::I32])
+            }
+            HeapType::Any | HeapType::Eq => {
+                // Everything this backend produces (struct, array, i31) is in
+                // the eq hierarchy — the test is purely about null.
+                not_null
+            }
+            unsupported => {
+                return Err(CoreGcError {
+                    message: format!(
+                        "coregc lowering does not support ref.test against {unsupported:?}"
+                    ),
+                });
+            }
+        };
+        if reference.nullable {
+            // ref.test (ref null T) also matches null.
+            Ok(emit.op(Operator::I32Or, &[is_null, type_matches], &[Type::I32]))
+        } else {
+            Ok(type_matches)
+        }
+    }
+
     fn lower_operator(
         &self,
         emit: &mut Emit<'_>,
@@ -1424,7 +1515,7 @@ impl<'a> FunctionLowering<'a> {
                 let total64 = emit.op(Operator::I64Add, &[mul64, four64], &[Type::I64]);
                 let max64 = emit.const_i64(u64::from(u32::MAX));
                 let overflow = emit.op(Operator::I64GtU, &[total64, max64], &[Type::I32]);
-                emit.trap_if(overflow);
+                emit.trap_if(overflow, self.runtime.trap_code, trap_code::OUT_OF_BOUNDS);
                 let payload_bytes = emit.op(Operator::I32WrapI64, &[total64], &[Type::I32]);
                 let type_id_c = emit.const_i32(type_id.get());
                 let addr = emit.op(
@@ -1657,7 +1748,7 @@ impl<'a> FunctionLowering<'a> {
                 let end64 = emit.op(Operator::I64Add, &[start64, len64], &[Type::I64]);
                 let array_len64 = emit.op(Operator::I64ExtendI32U, &[array_len], &[Type::I64]);
                 let out_of_range = emit.op(Operator::I64GtU, &[end64, array_len64], &[Type::I32]);
-                emit.trap_if(out_of_range);
+                emit.trap_if(out_of_range, self.runtime.trap_code, trap_code::OUT_OF_BOUNDS);
                 // Loop: for k in 0..len, store element at start + k.
                 let loop_head = emit.body.add_block();
                 let loop_body = emit.body.add_block();
@@ -1759,7 +1850,7 @@ impl<'a> FunctionLowering<'a> {
                     let end64 = emit.op(Operator::I64Add, &[index64, len64], &[Type::I64]);
                     let array_len64 = emit.op(Operator::I64ExtendI32U, &[array_len], &[Type::I64]);
                     let out_of_range = emit.op(Operator::I64GtU, &[end64, array_len64], &[Type::I32]);
-                    emit.trap_if(out_of_range);
+                    emit.trap_if(out_of_range, self.runtime.trap_code, trap_code::OUT_OF_BOUNDS);
                 }
                 // Byte-wise memmove over the element region: copy backward
                 // when dst > src (same-array overlap), forward otherwise.
@@ -1978,7 +2069,7 @@ impl<'a> FunctionLowering<'a> {
                 let plan = classify_type(self.source, self.inventory, *ty)?;
                 match plan {
                     LowerValue::Scalar(_) => Ok(Some(Lowered::Scalar(emit.const_i32(0)))),
-                    LowerValue::FatRef { .. } => {
+                    LowerValue::FatRef { .. } | LowerValue::Dynamic => {
                         let addr = emit.const_i32(0);
                         let type_id = emit.const_i32(0);
                         Ok(Some(Lowered::Fat(addr, type_id)))
@@ -1986,14 +2077,83 @@ impl<'a> FunctionLowering<'a> {
                 }
             }
             Operator::RefIsNull => {
-                let value = self.lowered(args[0]);
-                let addr = match value {
-                    Lowered::Scalar(v) => v,
-                    Lowered::Fat(addr, _) => addr,
-                };
                 let zero = emit.const_i32(0);
-                let result = emit.op(Operator::I32Eq, &[addr, zero], &[Type::I32]);
+                let result = match self.lowered(args[0]) {
+                    Lowered::Scalar(v) => emit.op(Operator::I32Eq, &[v, zero], &[Type::I32]),
+                    // Null is exactly the pair (0, 0): an i31 immediate with
+                    // payload zero must NOT read as null (its type word is
+                    // the sentinel, not 0).
+                    Lowered::Fat(addr, type_id) => {
+                        let addr_zero = emit.op(Operator::I32Eq, &[addr, zero], &[Type::I32]);
+                        let type_zero = emit.op(Operator::I32Eq, &[type_id, zero], &[Type::I32]);
+                        emit.op(Operator::I32And, &[addr_zero, type_zero], &[Type::I32])
+                    }
+                };
                 Ok(Some(Lowered::Scalar(result)))
+            }
+            Operator::RefI31 => {
+                let payload = self.scalar(args[0]);
+                let i31_type = emit.const_i32(crate::coregc_runtime::I31_TYPE_ID);
+                Ok(Some(Lowered::Fat(payload, i31_type)))
+            }
+            Operator::RefTest { ty } => {
+                let (addr, type_id) = self.fat(args[0]);
+                let result = self.lower_ref_test(emit, addr, type_id, *ty)?;
+                Ok(Some(Lowered::Scalar(result)))
+            }
+            Operator::RefCast { ty } => {
+                let (addr, type_id) = self.fat(args[0]);
+                let tested = self.lower_ref_test(emit, addr, type_id, *ty)?;
+                let not_tested = emit.op(Operator::I32Eqz, &[tested], &[Type::I32]);
+                emit.trap_if(not_tested, self.runtime.trap_code, trap_code::BAD_CAST);
+                // A cast never rewrites the pair: the actual type id is
+                // preserved (the next test/cast/dereference re-checks it).
+                Ok(Some(Lowered::Fat(addr, type_id)))
+            }
+            Operator::RefEq => {
+                let (a_addr, a_type) = self.fat(args[0]);
+                let (b_addr, b_type) = self.fat(args[1]);
+                // Both pairs get validated (header coherence, immediate
+                // rule), then compared per docs plan §13.2.
+                for (addr, ty) in [(a_addr, a_type), (b_addr, b_type)] {
+                    emit.op(
+                        Operator::Call {
+                            function_index: self.runtime.validate_ref,
+                        },
+                        &[addr, ty],
+                        &[Type::I32],
+                    );
+                }
+                let zero = emit.const_i32(0);
+                let i31_type = emit.const_i32(crate::coregc_runtime::I31_TYPE_ID);
+                let a_addr_zero = emit.op(Operator::I32Eq, &[a_addr, zero], &[Type::I32]);
+                let a_type_zero = emit.op(Operator::I32Eq, &[a_type, zero], &[Type::I32]);
+                let a_null = emit.op(Operator::I32And, &[a_addr_zero, a_type_zero], &[Type::I32]);
+                let b_addr_zero = emit.op(Operator::I32Eq, &[b_addr, zero], &[Type::I32]);
+                let b_type_zero = emit.op(Operator::I32Eq, &[b_type, zero], &[Type::I32]);
+                let b_null = emit.op(Operator::I32And, &[b_addr_zero, b_type_zero], &[Type::I32]);
+                let a_i31 = emit.op(Operator::I32Eq, &[a_type, i31_type], &[Type::I32]);
+                let b_i31 = emit.op(Operator::I32Eq, &[b_type, i31_type], &[Type::I32]);
+                let a_not_null = emit.op(Operator::I32Eqz, &[a_null], &[Type::I32]);
+                let b_not_null = emit.op(Operator::I32Eqz, &[b_null], &[Type::I32]);
+                let a_not_i31 = emit.op(Operator::I32Eqz, &[a_i31], &[Type::I32]);
+                let a_heap = emit.op(Operator::I32And, &[a_not_null, a_not_i31], &[Type::I32]);
+                let b_not_i31 = emit.op(Operator::I32Eqz, &[b_i31], &[Type::I32]);
+                let b_heap = emit.op(Operator::I32And, &[b_not_null, b_not_i31], &[Type::I32]);
+                let addr_eq = emit.op(Operator::I32Eq, &[a_addr, b_addr], &[Type::I32]);
+                let type_ne = emit.op(Operator::I32Ne, &[a_type, b_type], &[Type::I32]);
+                // Corruption: one address with two different heap types.
+                let both_heap = emit.op(Operator::I32And, &[a_heap, b_heap], &[Type::I32]);
+                let same_addr = emit.op(Operator::I32And, &[both_heap, addr_eq], &[Type::I32]);
+                let corrupt = emit.op(Operator::I32And, &[same_addr, type_ne], &[Type::I32]);
+                emit.trap_if(corrupt, self.runtime.trap_code, trap_code::ALLOCATOR_CORRUPTION);
+                let both_null = emit.op(Operator::I32And, &[a_null, b_null], &[Type::I32]);
+                let both_i31 = emit.op(Operator::I32And, &[a_i31, b_i31], &[Type::I32]);
+                let i31_eq = emit.op(Operator::I32And, &[both_i31, addr_eq], &[Type::I32]);
+                let heap_eq = emit.op(Operator::I32And, &[both_heap, addr_eq], &[Type::I32]);
+                let eq = emit.op(Operator::I32Or, &[both_null, i31_eq], &[Type::I32]);
+                let eq = emit.op(Operator::I32Or, &[eq, heap_eq], &[Type::I32]);
+                Ok(Some(Lowered::Scalar(eq)))
             }
             Operator::Select => {
                 // Untyped select only validates for numeric operand types, so
@@ -2131,7 +2291,7 @@ impl<'a> FunctionLowering<'a> {
         match return_plan.first() {
             None => None,
             Some(LowerValue::Scalar(_)) => Some(Lowered::Scalar(result)),
-            Some(LowerValue::FatRef { .. }) => {
+            Some(LowerValue::FatRef { .. }) | Some(LowerValue::Dynamic) => {
                 let addr = emit.pick(result, 0, Type::I32);
                 let type_id = emit.pick(result, 1, Type::I32);
                 Some(Lowered::Fat(addr, type_id))
@@ -2273,7 +2433,7 @@ fn lower_function(
 
     let value_plan = classify_function_body(source, inventory, source_body)?;
 
-    let is_fatref = |v: Value| value_plan.get(&v).is_some_and(|p| p.is_fatref());
+    let is_fatref = |v: Value| value_plan.get(&v).is_some_and(|p| p.needs_root());
     let computed = liveness::compute(source_body, is_fatref, is_checkpoint_operator)?;
     let spilled: BTreeSet<Value> = computed
         .checkpoint_live
@@ -2306,7 +2466,7 @@ fn lower_function(
                     cursor += 1;
                     Lowered::Scalar(value)
                 }
-                LowerValue::FatRef { .. } => {
+                LowerValue::FatRef { .. } | LowerValue::Dynamic => {
                     let addr = out_body.blocks[out_body.entry].params[cursor].1;
                     let type_id = out_body.blocks[out_body.entry].params[cursor + 1].1;
                     cursor += 2;
@@ -2330,7 +2490,7 @@ fn lower_function(
         for &(_, source_param) in params {
             let lowered = match value_plan[&source_param] {
                 LowerValue::Scalar(ty) => Lowered::Scalar(out_body.add_blockparam(out_block, ty)),
-                LowerValue::FatRef { .. } => {
+                LowerValue::FatRef { .. } | LowerValue::Dynamic => {
                     let addr = out_body.add_blockparam(out_block, Type::I32);
                     let type_id = out_body.add_blockparam(out_block, Type::I32);
                     Lowered::Fat(addr, type_id)
@@ -3243,6 +3403,209 @@ pub(crate) mod tests_fixtures {
 
     /// A fixture whose only unusual feature is a `Terminator::Select`
     /// (br_table) — still rejected with a named diagnostic.
+    /// A dynamic-value scenario mirroring jsaw's repr: `Box { value:
+    /// anyref }` holds either an i31 sentinel (jsaw's JS-null idiom) or a
+    /// boxed `Number`, and exported functions exercise `RefI31`, `RefTest`
+    /// (i31/concrete/nullable-any/non-null-any), `RefCast` (success and a
+    /// trapping failure), and `RefEq` — all under forced collection so the
+    /// `anyref` fields must keep their referents alive (descriptor tag 8
+    /// scanning).
+    pub(crate) fn dynamic_box_source() -> Module<'static> {
+        let mut module = Module::empty();
+        let anyref = Type::Heap(WithNullable {
+            nullable: true,
+            value: HeapType::Any,
+        });
+        let i31ref = Type::Heap(WithNullable {
+            nullable: false,
+            value: HeapType::I31,
+        });
+        let eqref = Type::Heap(WithNullable {
+            nullable: true,
+            value: HeapType::Eq,
+        });
+        let number = module.signatures.push(SignatureData::Struct {
+            fields: vec![field(StorageType::Val(Type::I32))],
+            shared: false,
+        });
+        let number_ref = Type::Heap(WithNullable {
+            nullable: true,
+            value: HeapType::Sig { sig_index: number },
+        });
+        let boxed = module.signatures.push(SignatureData::Struct {
+            fields: vec![field(StorageType::Val(anyref))],
+            shared: false,
+        });
+        let box_ref = Type::Heap(WithNullable {
+            nullable: true,
+            value: HeapType::Sig { sig_index: boxed },
+        });
+
+        let mut builders = DynamicBoxBuilders {
+            number,
+            number_ref,
+            boxed,
+            box_ref,
+            anyref,
+        };
+
+        // is_null_sentinel(): Box(ref.i31(0)); ref.test (ref i31) -> 1
+        builders.push_fn(&mut module, "is_null_sentinel", |body, entry, m| {
+            let zero = m.c(body, entry, 0);
+            let sentinel = body.add_op(entry, Operator::RefI31, &[zero], &[i31ref]);
+            let b = body.add_op(entry, Operator::StructNew { sig: boxed }, &[sentinel], &[box_ref]);
+            let v = body.add_op(entry, Operator::StructGet { sig: boxed, idx: 0 }, &[b], &[anyref]);
+            let t = body.add_op(
+                entry,
+                Operator::RefTest {
+                    ty: Type::Heap(WithNullable {
+                        nullable: false,
+                        value: HeapType::I31,
+                    }),
+                },
+                &[v],
+                &[Type::I32],
+            );
+            body.set_terminator(entry, Terminator::Return { values: vec![t] });
+        });
+
+        // unbox_number(): Box(Number(42)); get; test i31 (0); test $Number
+        // (1); cast $Number; read .v -> 42 + t1*1000 + t2*100 = 142
+        builders.push_fn(&mut module, "unbox_number", |body, entry, m| {
+            let forty_two = m.c(body, entry, 42);
+            let n = body.add_op(entry, Operator::StructNew { sig: number }, &[forty_two], &[number_ref]);
+            let b = body.add_op(entry, Operator::StructNew { sig: boxed }, &[n], &[box_ref]);
+            let v = body.add_op(entry, Operator::StructGet { sig: boxed, idx: 0 }, &[b], &[anyref]);
+            let t1 = body.add_op(
+                entry,
+                Operator::RefTest {
+                    ty: Type::Heap(WithNullable {
+                        nullable: false,
+                        value: HeapType::I31,
+                    }),
+                },
+                &[v],
+                &[Type::I32],
+            );
+            let t2 = body.add_op(
+                entry,
+                Operator::RefTest { ty: number_ref },
+                &[v],
+                &[Type::I32],
+            );
+            let casted = body.add_op(entry, Operator::RefCast { ty: number_ref }, &[v], &[number_ref]);
+            let num_v = body.add_op(entry, Operator::StructGet { sig: number, idx: 0 }, &[casted], &[Type::I32]);
+            let k1000 = m.c(body, entry, 1000);
+            let t1_scaled = body.add_op(entry, Operator::I32Mul, &[t1, k1000], &[Type::I32]);
+            let k100 = m.c(body, entry, 100);
+            let t2_scaled = body.add_op(entry, Operator::I32Mul, &[t2, k100], &[Type::I32]);
+            let s1 = body.add_op(entry, Operator::I32Add, &[num_v, t1_scaled], &[Type::I32]);
+            let s2 = body.add_op(entry, Operator::I32Add, &[s1, t2_scaled], &[Type::I32]);
+            body.set_terminator(entry, Terminator::Return { values: vec![s2] });
+        });
+
+        // bad_cast(): Box(ref.i31(7)); get; ref.cast $Number -> traps BAD_CAST
+        builders.push_fn(&mut module, "bad_cast", |body, entry, m| {
+            let seven = m.c(body, entry, 7);
+            let sentinel = body.add_op(entry, Operator::RefI31, &[seven], &[i31ref]);
+            let b = body.add_op(entry, Operator::StructNew { sig: boxed }, &[sentinel], &[box_ref]);
+            let v = body.add_op(entry, Operator::StructGet { sig: boxed, idx: 0 }, &[b], &[anyref]);
+            let casted = body.add_op(entry, Operator::RefCast { ty: number_ref }, &[v], &[number_ref]);
+            let num_v = body.add_op(entry, Operator::StructGet { sig: number, idx: 0 }, &[casted], &[Type::I32]);
+            body.set_terminator(entry, Terminator::Return { values: vec![num_v] });
+        });
+
+        // eq_checks(): 1 (same heap ref) + 1 (i31 same payload) + 0 (i31 vs
+        // heap) + 1 (null vs null) + 0 (heap vs null) = 3
+        builders.push_fn(&mut module, "eq_checks", |body, entry, m| {
+            let five = m.c(body, entry, 5);
+            let n = body.add_op(entry, Operator::StructNew { sig: number }, &[five], &[number_ref]);
+            let same_heap = body.add_op(entry, Operator::RefEq, &[n, n], &[Type::I32]);
+            let nine_a = m.c(body, entry, 9);
+            let i31_a = body.add_op(entry, Operator::RefI31, &[nine_a], &[i31ref]);
+            let nine_b = m.c(body, entry, 9);
+            let i31_b = body.add_op(entry, Operator::RefI31, &[nine_b], &[i31ref]);
+            let same_i31 = body.add_op(entry, Operator::RefEq, &[i31_a, i31_b], &[Type::I32]);
+            let i31_vs_heap = body.add_op(entry, Operator::RefEq, &[i31_a, n], &[Type::I32]);
+            let null_a = body.add_op(entry, Operator::RefNull { ty: eqref }, &[], &[eqref]);
+            let null_b = body.add_op(entry, Operator::RefNull { ty: eqref }, &[], &[eqref]);
+            let null_eq = body.add_op(entry, Operator::RefEq, &[null_a, null_b], &[Type::I32]);
+            let heap_vs_null = body.add_op(entry, Operator::RefEq, &[n, null_a], &[Type::I32]);
+            let s1 = body.add_op(entry, Operator::I32Add, &[same_heap, same_i31], &[Type::I32]);
+            let s2 = body.add_op(entry, Operator::I32Add, &[s1, i31_vs_heap], &[Type::I32]);
+            let s3 = body.add_op(entry, Operator::I32Add, &[s2, null_eq], &[Type::I32]);
+            let s4 = body.add_op(entry, Operator::I32Add, &[s3, heap_vs_null], &[Type::I32]);
+            body.set_terminator(entry, Terminator::Return { values: vec![s4] });
+        });
+
+        // null_tests(): test (ref null any) null (1) + 2*test (ref any)
+        // null (0) + 4*test (ref any) Number (4) = 5
+        builders.push_fn(&mut module, "null_tests", |body, entry, m| {
+            let any_nullable = Type::Heap(WithNullable {
+                nullable: true,
+                value: HeapType::Any,
+            });
+            let any_non_null = Type::Heap(WithNullable {
+                nullable: false,
+                value: HeapType::Any,
+            });
+            let null_v = body.add_op(entry, Operator::RefNull { ty: anyref }, &[], &[anyref]);
+            let t1 = body.add_op(entry, Operator::RefTest { ty: any_nullable }, &[null_v], &[Type::I32]);
+            let t2 = body.add_op(entry, Operator::RefTest { ty: any_non_null }, &[null_v], &[Type::I32]);
+            let eight = m.c(body, entry, 8);
+            let n = body.add_op(entry, Operator::StructNew { sig: number }, &[eight], &[number_ref]);
+            let t3 = body.add_op(entry, Operator::RefTest { ty: any_non_null }, &[n], &[Type::I32]);
+            let two = m.c(body, entry, 2);
+            let t2_scaled = body.add_op(entry, Operator::I32Mul, &[t2, two], &[Type::I32]);
+            let four = m.c(body, entry, 4);
+            let t3_scaled = body.add_op(entry, Operator::I32Mul, &[t3, four], &[Type::I32]);
+            let s1 = body.add_op(entry, Operator::I32Add, &[t1, t2_scaled], &[Type::I32]);
+            let s2 = body.add_op(entry, Operator::I32Add, &[s1, t3_scaled], &[Type::I32]);
+            body.set_terminator(entry, Terminator::Return { values: vec![s2] });
+        });
+
+        module
+    }
+
+    struct DynamicBoxBuilders {
+        number: Signature,
+        number_ref: Type,
+        boxed: Signature,
+        box_ref: Type,
+        anyref: Type,
+    }
+
+    impl DynamicBoxBuilders {
+        fn c(&self, body: &mut FunctionBody, block: Block, value: u32) -> Value {
+            body.add_op(block, Operator::I32Const { value }, &[], &[Type::I32])
+        }
+
+        fn push_fn(
+            &mut self,
+            module: &mut Module<'static>,
+            name: &str,
+            build: impl FnOnce(&mut FunctionBody, Block, &mut Self),
+        ) {
+            let signature = module.signatures.push(SignatureData::Func {
+                params: vec![],
+                returns: vec![Type::I32],
+                shared: false,
+            });
+            let mut body = FunctionBody::new(module, signature);
+            let entry = body.entry;
+            build(&mut body, entry, self);
+            body.recompute_edges();
+            body.validate().expect("dynamic-box body validates");
+            let func = module
+                .funcs
+                .push(FuncDecl::Body(signature, name.to_owned(), body));
+            module.exports.push(Export {
+                name: name.to_owned(),
+                kind: ExportKind::Func(func),
+            });
+        }
+    }
+
     pub(crate) fn select_terminator_source() -> Module<'static> {
         let mut module = Module::empty();
         let unary_sig = module.signatures.push(SignatureData::Func {
@@ -3708,7 +4071,7 @@ mod tests {
         };
         let inventory = CoreGcInventory::build(&source).expect("inventory");
         let value_plan = classify_function_body(&source, &inventory, body).expect("classification");
-        let is_fatref = |v: Value| value_plan.get(&v).is_some_and(|p| p.is_fatref());
+        let is_fatref = |v: Value| value_plan.get(&v).is_some_and(|p| p.needs_root());
         let mut liveness = super::liveness::compute(body, is_fatref, is_checkpoint_operator)
             .expect("liveness");
         let slot_of: BTreeMap<Value, u32> = BTreeMap::new();
@@ -3735,6 +4098,38 @@ mod tests {
             .or_default()
             .push(fake);
         assert!(verify_root_discipline(body, &liveness, &honest, Func::new(0)).is_err());
+    }
+
+    #[test]
+    fn dynamic_values_support_i31_tests_casts_and_equality_under_forced_collection() {
+        let source = dynamic_box_source();
+        let (mut store, instance) = lower_and_instantiate(
+            &source,
+            CoreGcOptions {
+                collect_threshold_bytes: 0,
+                ..CoreGcOptions::default()
+            },
+        );
+        let is_null_sentinel = instance
+            .get_typed_func::<(), i32>(&mut store, "is_null_sentinel")
+            .expect("is_null_sentinel export");
+        assert_eq!(is_null_sentinel.call(&mut store, ()).expect("is_null_sentinel"), 1);
+        let unbox_number = instance
+            .get_typed_func::<(), i32>(&mut store, "unbox_number")
+            .expect("unbox_number export");
+        assert_eq!(unbox_number.call(&mut store, ()).expect("unbox_number"), 142);
+        let bad_cast = instance
+            .get_typed_func::<(), i32>(&mut store, "bad_cast")
+            .expect("bad_cast export");
+        assert!(bad_cast.call(&mut store, ()).is_err(), "BAD_CAST must trap");
+        let eq_checks = instance
+            .get_typed_func::<(), i32>(&mut store, "eq_checks")
+            .expect("eq_checks export");
+        assert_eq!(eq_checks.call(&mut store, ()).expect("eq_checks"), 3);
+        let null_tests = instance
+            .get_typed_func::<(), i32>(&mut store, "null_tests")
+            .expect("null_tests export");
+        assert_eq!(null_tests.call(&mut store, ()).expect("null_tests"), 5);
     }
 
     #[test]

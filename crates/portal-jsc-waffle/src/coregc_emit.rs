@@ -371,6 +371,13 @@ pub fn emit_runtime_skeleton(
     ));
     let validator = add_ref_validator(&mut module, memory);
     let array_bounds = add_array_bounds_check(&mut module, memory, validator);
+    let collect = add_empty_root_collect(
+        &mut module,
+        memory,
+        options.heap_base,
+        allocation_head,
+        bump,
+    );
     module.exports.push(portal_pc_waffle::Export {
         name: "__coregc_alloc_phase1".to_owned(),
         kind: portal_pc_waffle::ExportKind::Func(allocator),
@@ -382,6 +389,10 @@ pub fn emit_runtime_skeleton(
     module.exports.push(portal_pc_waffle::Export {
         name: "__coregc_array_bounds_phase1".to_owned(),
         kind: portal_pc_waffle::ExportKind::Func(array_bounds),
+    });
+    module.exports.push(portal_pc_waffle::Export {
+        name: "__coregc_collect_phase2".to_owned(),
+        kind: portal_pc_waffle::ExportKind::Func(collect),
     });
     module.exports.push(portal_pc_waffle::Export {
         name: "memory".to_owned(),
@@ -628,6 +639,131 @@ fn add_array_bounds_check(
     ))
 }
 
+/// Generate the Phase-2 empty-root collector. Until shadow frames exist, the
+/// only sound collection point has an empty root set: walk every allocation,
+/// clear its header, and reset the bump frontier. Stale fat references then
+/// fail the existing header validator instead of becoming use-after-free.
+fn add_empty_root_collect(
+    module: &mut Module<'static>,
+    memory: portal_pc_waffle::Memory,
+    heap_base: u32,
+    allocation_head: portal_pc_waffle::Global,
+    bump: portal_pc_waffle::Global,
+) -> portal_pc_waffle::Func {
+    let signature = module.signatures.push(SignatureData::Func {
+        params: vec![],
+        returns: vec![],
+        shared: false,
+    });
+    let mut body = FunctionBody::new(module, signature);
+    let entry = body.entry;
+    let loop_block = body.add_block();
+    let clear_block = body.add_block();
+    let done = body.add_block();
+    let head = body.add_op(
+        entry,
+        Operator::GlobalGet {
+            global_index: allocation_head,
+        },
+        &[],
+        &[Type::I32],
+    );
+    body.set_terminator(
+        entry,
+        Terminator::Br {
+            target: BlockTarget {
+                block: loop_block,
+                args: vec![head],
+            },
+        },
+    );
+    let current = body.add_blockparam(loop_block, Type::I32);
+    let is_empty = body.add_op(loop_block, Operator::I32Eqz, &[current], &[Type::I32]);
+    body.set_terminator(
+        loop_block,
+        Terminator::CondBr {
+            cond: is_empty,
+            if_true: BlockTarget {
+                block: done,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: clear_block,
+                args: vec![],
+            },
+        },
+    );
+    let memory_arg = MemoryArg {
+        align: 2,
+        offset: 0,
+        memory,
+    };
+    let header_bytes = i32_const(&mut body, clear_block, COREGC_HEADER_BYTES);
+    let header = body.add_op(
+        clear_block,
+        Operator::I32Sub,
+        &[current, header_bytes],
+        &[Type::I32],
+    );
+    // Read the next allocation before invalidating this header.
+    let next = body.add_op(
+        clear_block,
+        Operator::I32Load {
+            memory: MemoryArg {
+                offset: 12,
+                ..memory_arg
+            },
+        },
+        &[header],
+        &[Type::I32],
+    );
+    let zero = i32_const(&mut body, clear_block, 0);
+    for offset in [0_u64, 4, 8, 12, 16, 20] {
+        body.add_op(
+            clear_block,
+            Operator::I32Store {
+                memory: MemoryArg {
+                    offset,
+                    ..memory_arg
+                },
+            },
+            &[header, zero],
+            &[],
+        );
+    }
+    body.set_terminator(
+        clear_block,
+        Terminator::Br {
+            target: BlockTarget {
+                block: loop_block,
+                args: vec![next],
+            },
+        },
+    );
+    let reset = i32_const(&mut body, done, heap_base);
+    let done_zero = i32_const(&mut body, done, 0);
+    body.add_op(
+        done,
+        Operator::GlobalSet {
+            global_index: allocation_head,
+        },
+        &[done_zero],
+        &[],
+    );
+    body.add_op(
+        done,
+        Operator::GlobalSet { global_index: bump },
+        &[reset],
+        &[],
+    );
+    body.set_terminator(done, Terminator::Return { values: vec![] });
+    module.funcs.push(FuncDecl::Body(
+        signature,
+        "__coregc_collect_phase2".to_owned(),
+        body,
+    ))
+}
+
 fn i32_const(
     body: &mut FunctionBody,
     block: portal_pc_waffle::Block,
@@ -779,6 +915,36 @@ mod tests {
             0
         );
         assert!(bounds.call(&mut store, (address, 1, 1)).is_err());
+    }
+
+    #[test]
+    fn phase2_empty_root_collect_reclaims_and_invalidates_allocations() {
+        let artifact = emit_runtime_skeleton(&Module::empty(), &CoreGcOptions::default())
+            .expect("runtime skeleton");
+        let engine = Engine::default();
+        let bytes = portal_pc_waffle::to_wasm_bytes(&artifact.module).expect("core wasm encodes");
+        let module = WasmtimeModule::new(&engine, bytes).expect("core engine compiles artifact");
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).expect("artifact instantiates");
+        let allocator = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "__coregc_alloc_phase1")
+            .expect("allocator export");
+        let validator = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "__coregc_validate_ref_phase1")
+            .expect("validator export");
+        let collect = instance
+            .get_typed_func::<(), ()>(&mut store, "__coregc_collect_phase2")
+            .expect("collector export");
+        let first = allocator.call(&mut store, (1, 8)).expect("allocation");
+        validator
+            .call(&mut store, (first, 1))
+            .expect("live before collection");
+        collect.call(&mut store, ()).expect("empty-root collection");
+        assert!(validator.call(&mut store, (first, 1)).is_err());
+        let replacement = allocator
+            .call(&mut store, (1, 8))
+            .expect("reused allocation");
+        assert_eq!(replacement, first, "collector resets the empty-root heap");
     }
 
     #[test]

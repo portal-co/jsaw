@@ -229,10 +229,25 @@ mod tests {
 
     #[test]
     fn unsupported_operators_fail_closed_with_a_named_diagnostic() {
-        let source = tests_fixtures::tail_call_source();
+        let source = tests_fixtures::select_terminator_source();
         let error = emit_coregc(&source, &CoreGcOptions::default())
-            .expect_err("tail calls must be rejected");
-        assert!(error.message.contains("ReturnCallRef"), "{error}");
+            .expect_err("br_table (Terminator::Select) must be rejected");
+        assert!(error.message.contains("Select"), "{error}");
+    }
+
+    #[test]
+    fn return_call_ref_through_a_null_reference_traps_at_runtime() {
+        let source = tests_fixtures::tail_call_source();
+        let artifact = emit_coregc(&source, &CoreGcOptions::default())
+            .expect("tail calls are supported since stage 2");
+        let (mut store, instance) = instantiate(&artifact);
+        let tail_caller: TypedFunc<i32, i32> = instance
+            .get_typed_func(&mut store, "tail_caller")
+            .expect("tail_caller export");
+        assert!(
+            tail_caller.call(&mut store, 41).is_err(),
+            "a null callee must trap, not silently succeed"
+        );
     }
 
     /// Differential check: the same fixture runs under native WasmGC

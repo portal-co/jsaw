@@ -128,7 +128,9 @@ fn is_checkpoint_operator(op: &Operator) -> bool {
     matches!(
         op,
         Operator::StructNew { .. }
+            | Operator::StructNewDefault { .. }
             | Operator::ArrayNewDefault { .. }
+            | Operator::ArrayNewFixed { .. }
             | Operator::Call { .. }
             | Operator::CallRef { .. }
             | Operator::CallIndirect { .. }
@@ -145,6 +147,11 @@ mod liveness {
         /// For each checkpoint instruction's own `Value`, the sorted set of
         /// fat-ref values that must already be rooted before it executes.
         pub(super) checkpoint_live: BTreeMap<Value, Vec<Value>>,
+        /// For each block whose terminator is a tail call, the fat-ref values
+        /// that must be rooted at the tail call's own checkpoint (before the
+        /// caller's frame is popped and the callee takes ownership of the
+        /// arguments).
+        pub(super) tail_call_live: BTreeMap<Block, Vec<Value>>,
     }
 
     fn block_defs_uses(
@@ -239,6 +246,7 @@ mod liveness {
         }
 
         let mut checkpoint_live = BTreeMap::new();
+        let mut tail_call_live = BTreeMap::new();
         for &block in &blocks {
             let mut live = live_out[&block].clone();
             let mut terminator_uses = Vec::new();
@@ -251,6 +259,17 @@ mod liveness {
                     }
                 });
             live.extend(terminator_uses);
+
+            if matches!(
+                &body.blocks[block].terminator.terminator,
+                Terminator::ReturnCall { .. }
+                    | Terminator::ReturnCallIndirect { .. }
+                    | Terminator::ReturnCallRef { .. }
+            ) {
+                let mut required: Vec<Value> = live.iter().copied().collect();
+                required.sort_by_key(|v| v.index());
+                tail_call_live.insert(block, required);
+            }
 
             for record in body.blocks[block].insts.iter().rev() {
                 let value = record.value;
@@ -306,7 +325,10 @@ mod liveness {
             );
         }
 
-        Ok(Liveness { checkpoint_live })
+        Ok(Liveness {
+            checkpoint_live,
+            tail_call_live,
+        })
     }
 
     #[cfg(test)]
@@ -570,6 +592,90 @@ fn flatten_plan(plan: &[LowerValue]) -> Vec<Type> {
     plan.iter().flat_map(|value| value.flat_types()).collect()
 }
 
+fn intern_call_site_signature(
+    source: &Module<'_>,
+    inventory: &CoreGcInventory,
+    out: &mut Module<'static>,
+    sig_index: Signature,
+    interned: &mut BTreeMap<Signature, Signature>,
+) -> Result<(), CoreGcError> {
+    if interned.contains_key(&sig_index) {
+        return Ok(());
+    }
+    let (params, returns) = function_signature(source, sig_index)?;
+    // The signature used by `CallIndirect` is the callee's own flattened
+    // signature; the selector is a separate operand popped by
+    // `call_indirect` itself, NOT a parameter in this signature (getting
+    // this wrong makes the validator pop one more i32 than the call site
+    // provides).
+    let flat_params = flatten_plan(&classify_all(source, inventory, params)?);
+    let flat_returns = flatten_plan(&classify_all(source, inventory, returns)?);
+    let lowered_signature = out.signatures.push(SignatureData::Func {
+        params: flat_params,
+        returns: flat_returns,
+        shared: false,
+    });
+    interned.insert(sig_index, lowered_signature);
+    Ok(())
+}
+
+fn copy_source_table(
+    source: &Module<'_>,
+    out: &mut Module<'static>,
+    table_index: Table,
+    functions: &BTreeMap<Func, FunctionPlan>,
+    copied_tables: &mut BTreeMap<Table, Table>,
+) -> Result<(), CoreGcError> {
+    if copied_tables.contains_key(&table_index) {
+        return Ok(());
+    }
+    let source_table = &source.tables[table_index];
+    if !matches!(
+        source_table.ty,
+        Type::Heap(WithNullable {
+            value: HeapType::FuncRef,
+            ..
+        })
+    ) {
+        return Err(CoreGcError {
+            message: format!(
+                "coregc lowering only supports call_indirect against a funcref table (table {})",
+                table_index.index()
+            ),
+        });
+    }
+    let remapped_elements = match &source_table.func_elements {
+        Some(elements) => {
+            let mut remapped = Vec::with_capacity(elements.len());
+            for &element in elements {
+                if element.is_invalid() {
+                    remapped.push(Func::invalid());
+                    continue;
+                }
+                let lowered = functions.get(&element).ok_or_else(|| CoreGcError {
+                    message: format!(
+                        "coregc lowering: table {} element names unsupported function {}",
+                        table_index.index(),
+                        element.index()
+                    ),
+                })?;
+                remapped.push(lowered.lowered_func);
+            }
+            Some(remapped)
+        }
+        None => None,
+    };
+    let lowered_table = out.tables.push(TableData {
+        ty: source_table.ty.clone(),
+        initial: source_table.initial,
+        max: source_table.max,
+        func_elements: remapped_elements,
+        table64: source_table.table64,
+    });
+    copied_tables.insert(table_index, lowered_table);
+    Ok(())
+}
+
 /// Preflight: build `CoreGcInventory`/`CoreGcDescriptorTable` are the
 /// caller's job (they already exist by the time this runs); this function
 /// classifies every function's flattened ABI, validates every function body
@@ -615,6 +721,7 @@ pub(crate) fn preflight(
     let mut func_ref_slots: BTreeMap<Func, u32> = BTreeMap::new();
     let mut copied_tables: BTreeMap<Table, Table> = BTreeMap::new();
     let mut call_site_signatures: BTreeMap<Signature, Signature> = BTreeMap::new();
+    let mut needs_func_ref_table = false;
 
     for (func, decl) in source.funcs.entries() {
         let FuncDecl::Body(_, _, body) = decl else {
@@ -626,6 +733,31 @@ pub(crate) fn preflight(
             });
         }
         validate_function_body(source, inventory, &functions, body, func)?;
+        for (_, block_def) in body.blocks.entries() {
+            match &block_def.terminator.terminator {
+                Terminator::ReturnCallRef { sig, .. } => {
+                    intern_call_site_signature(
+                        source,
+                        inventory,
+                        out,
+                        *sig,
+                        &mut call_site_signatures,
+                    )?;
+                    needs_func_ref_table = true;
+                }
+                Terminator::ReturnCallIndirect { sig, table, .. } => {
+                    intern_call_site_signature(
+                        source,
+                        inventory,
+                        out,
+                        *sig,
+                        &mut call_site_signatures,
+                    )?;
+                    copy_source_table(source, out, *table, &functions, &mut copied_tables)?;
+                }
+                _ => {}
+            }
+        }
         for (_, def) in body.values.entries() {
             if let ValueDef::Operator(Operator::RefFunc { func_index }, _, _) = def {
                 if !functions.contains_key(func_index) {
@@ -647,70 +779,25 @@ pub(crate) fn preflight(
                 _,
             ) = def
             {
-                if !call_site_signatures.contains_key(sig_index) {
-                    let (params, returns) = function_signature(source, *sig_index)?;
-                    // The signature used by `CallIndirect` is the callee's
-                    // own flattened signature; the selector is a separate
-                    // operand popped by `call_indirect` itself, NOT a
-                    // parameter in this signature (getting this wrong makes
-                    // the validator pop one more i32 than the call site
-                    // provides).
-                    let flat_params = flatten_plan(&classify_all(source, inventory, params)?);
-                    let flat_returns = flatten_plan(&classify_all(source, inventory, returns)?);
-                    let lowered_signature = out.signatures.push(SignatureData::Func {
-                        params: flat_params,
-                        returns: flat_returns,
-                        shared: false,
-                    });
-                    call_site_signatures.insert(*sig_index, lowered_signature);
-                }
+                intern_call_site_signature(
+                    source,
+                    inventory,
+                    out,
+                    *sig_index,
+                    &mut call_site_signatures,
+                )?;
+                needs_func_ref_table |= matches!(
+                    def,
+                    ValueDef::Operator(Operator::CallRef { .. }, _, _)
+                );
             }
             if let ValueDef::Operator(Operator::CallIndirect { table_index, .. }, _, _) = def {
-                if !copied_tables.contains_key(table_index) {
-                    let source_table = &source.tables[*table_index];
-                    if !matches!(source_table.ty, Type::Heap(WithNullable { value: HeapType::FuncRef, .. })) {
-                        return Err(CoreGcError {
-                            message: format!(
-                                "coregc lowering only supports call_indirect against a funcref table (table {})",
-                                table_index.index()
-                            ),
-                        });
-                    }
-                    let remapped_elements = match &source_table.func_elements {
-                        Some(elements) => {
-                            let mut remapped = Vec::with_capacity(elements.len());
-                            for &element in elements {
-                                if element.is_invalid() {
-                                    remapped.push(Func::invalid());
-                                    continue;
-                                }
-                                let lowered = functions.get(&element).ok_or_else(|| CoreGcError {
-                                    message: format!(
-                                        "coregc lowering: table {} element names unsupported function {}",
-                                        table_index.index(),
-                                        element.index()
-                                    ),
-                                })?;
-                                remapped.push(lowered.lowered_func);
-                            }
-                            Some(remapped)
-                        }
-                        None => None,
-                    };
-                    let lowered_table = out.tables.push(TableData {
-                        ty: source_table.ty.clone(),
-                        initial: source_table.initial,
-                        max: source_table.max,
-                        func_elements: remapped_elements,
-                        table64: source_table.table64,
-                    });
-                    copied_tables.insert(*table_index, lowered_table);
-                }
+                copy_source_table(source, out, *table_index, &functions, &mut copied_tables)?;
             }
         }
     }
 
-    let func_ref_table = if func_ref_slots.is_empty() {
+    let func_ref_table = if func_ref_slots.is_empty() && !needs_func_ref_table {
         None
     } else {
         let mut elements = vec![Func::invalid(); func_ref_slots.len() + 1];
@@ -793,6 +880,9 @@ fn validate_function_body(
             Terminator::Br { .. }
             | Terminator::CondBr { .. }
             | Terminator::Return { .. }
+            | Terminator::ReturnCall { .. }
+            | Terminator::ReturnCallIndirect { .. }
+            | Terminator::ReturnCallRef { .. }
             | Terminator::Unreachable => {}
             other => {
                 return Err(CoreGcError {
@@ -806,6 +896,57 @@ fn validate_function_body(
         }
     }
     Ok(())
+}
+
+/// Pure scalar numeric/comparison/conversion operators that lower to
+/// themselves unchanged (their operands and results are all core scalars).
+/// This is deliberately the *comprehensive* non-SIMD scalar set from
+/// waffle's `Operator` enum, not just the subset jsaw's `conv.rs` currently
+/// emits, so a future jsaw change that starts emitting e.g. `I32Rotl` does
+/// not silently become a lowering rejection.
+fn is_scalar_passthrough(op: &Operator) -> bool {
+    use Operator as O;
+    matches!(
+        op,
+        // Constants
+        O::I32Const { .. } | O::I64Const { .. } | O::F32Const { .. } | O::F64Const { .. }
+        // i32 comparisons
+        | O::I32Eqz | O::I32Eq | O::I32Ne | O::I32LtS | O::I32LtU | O::I32GtS | O::I32GtU
+        | O::I32LeS | O::I32LeU | O::I32GeS | O::I32GeU
+        // i64 comparisons
+        | O::I64Eqz | O::I64Eq | O::I64Ne | O::I64LtS | O::I64LtU | O::I64GtS | O::I64GtU
+        | O::I64LeS | O::I64LeU | O::I64GeS | O::I64GeU
+        // f32/f64 comparisons
+        | O::F32Eq | O::F32Ne | O::F32Lt | O::F32Gt | O::F32Le | O::F32Ge
+        | O::F64Eq | O::F64Ne | O::F64Lt | O::F64Gt | O::F64Le | O::F64Ge
+        // i32 arithmetic/bitwise
+        | O::I32Clz | O::I32Ctz | O::I32Popcnt | O::I32Add | O::I32Sub | O::I32Mul
+        | O::I32DivS | O::I32DivU | O::I32RemS | O::I32RemU | O::I32And | O::I32Or
+        | O::I32Xor | O::I32Shl | O::I32ShrS | O::I32ShrU | O::I32Rotl | O::I32Rotr
+        // i64 arithmetic/bitwise
+        | O::I64Clz | O::I64Ctz | O::I64Popcnt | O::I64Add | O::I64Sub | O::I64Mul
+        | O::I64DivS | O::I64DivU | O::I64RemS | O::I64RemU | O::I64And | O::I64Or
+        | O::I64Xor | O::I64Shl | O::I64ShrS | O::I64ShrU | O::I64Rotl | O::I64Rotr
+        // f32 arithmetic
+        | O::F32Abs | O::F32Neg | O::F32Ceil | O::F32Floor | O::F32Trunc | O::F32Nearest
+        | O::F32Sqrt | O::F32Add | O::F32Sub | O::F32Mul | O::F32Div | O::F32Min
+        | O::F32Max | O::F32Copysign
+        // f64 arithmetic
+        | O::F64Abs | O::F64Neg | O::F64Ceil | O::F64Floor | O::F64Trunc | O::F64Nearest
+        | O::F64Sqrt | O::F64Add | O::F64Sub | O::F64Mul | O::F64Div | O::F64Min
+        | O::F64Max | O::F64Copysign
+        // Conversions
+        | O::I32WrapI64 | O::I32TruncF32S | O::I32TruncF32U | O::I32TruncF64S | O::I32TruncF64U
+        | O::I64ExtendI32S | O::I64ExtendI32U | O::I64TruncF32S | O::I64TruncF32U
+        | O::I64TruncF64S | O::I64TruncF64U | O::F32ConvertI32S | O::F32ConvertI32U
+        | O::F32ConvertI64S | O::F32ConvertI64U | O::F32DemoteF64 | O::F64ConvertI32S
+        | O::F64ConvertI32U | O::F64ConvertI64S | O::F64ConvertI64U | O::F64PromoteF32
+        | O::I32Extend8S | O::I32Extend16S | O::I64Extend8S | O::I64Extend16S | O::I64Extend32S
+        | O::I32TruncSatF32S | O::I32TruncSatF32U | O::I32TruncSatF64S | O::I32TruncSatF64U
+        | O::I64TruncSatF32S | O::I64TruncSatF32U | O::I64TruncSatF64S | O::I64TruncSatF64U
+        // Reinterpretations
+        | O::F32ReinterpretI32 | O::F64ReinterpretI64 | O::I32ReinterpretF32 | O::I64ReinterpretF64
+    )
 }
 
 fn reject(func: Func, value: Value, what: &str) -> CoreGcError {
@@ -830,65 +971,23 @@ fn validate_operator(
         Operator::StructNew { .. }
         | Operator::StructGet { .. }
         | Operator::StructSet { .. }
+        | Operator::StructNewDefault { .. }
+        | Operator::StructGetS { .. }
+        | Operator::StructGetU { .. }
         | Operator::ArrayNewDefault { .. }
+        | Operator::ArrayNewFixed { .. }
         | Operator::ArrayGet { .. }
+        | Operator::ArrayGetS { .. }
+        | Operator::ArrayGetU { .. }
         | Operator::ArraySet { .. }
+        | Operator::ArrayFill { .. }
+        | Operator::ArrayCopy { .. }
         | Operator::ArrayLen
         | Operator::RefNull { .. }
         | Operator::RefIsNull
         | Operator::RefFunc { .. }
-        | Operator::I32Const { .. }
-        | Operator::I64Const { .. }
-        | Operator::F32Const { .. }
-        | Operator::F64Const { .. }
-        | Operator::I32Add
-        | Operator::I32Sub
-        | Operator::I32Mul
-        | Operator::I32And
-        | Operator::I32Or
-        | Operator::I32Xor
-        | Operator::I32Shl
-        | Operator::I32ShrS
-        | Operator::I32ShrU
-        | Operator::I32Eq
-        | Operator::I32Ne
-        | Operator::I32Eqz
-        | Operator::I32LtS
-        | Operator::I32LtU
-        | Operator::I32LeS
-        | Operator::I32LeU
-        | Operator::I32GtS
-        | Operator::I32GtU
-        | Operator::I32GeS
-        | Operator::I32GeU
-        | Operator::I64Add
-        | Operator::I64Sub
-        | Operator::I64Mul
-        | Operator::I64And
-        | Operator::I64Or
-        | Operator::I64Xor
-        | Operator::I64Eq
-        | Operator::I64Ne
-        | Operator::I64Eqz
-        | Operator::I64LtS
-        | Operator::I64LtU
-        | Operator::I64LeS
-        | Operator::I64LeU
-        | Operator::I64GtS
-        | Operator::I64GtU
-        | Operator::I64GeS
-        | Operator::I64GeU
-        | Operator::F32Add
-        | Operator::F32Sub
-        | Operator::F32Mul
-        | Operator::F32Div
-        | Operator::F64Add
-        | Operator::F64Sub
-        | Operator::F64Mul
-        | Operator::F64Div
-        | Operator::I32WrapI64
-        | Operator::I64ExtendI32S
-        | Operator::I64ExtendI32U => true,
+        | Operator::Select
+        | Operator::TypedSelect { .. } => true,
         Operator::Call { function_index } => {
             if !functions.contains_key(function_index) {
                 return Err(reject(func, value, "a call to an unsupported/unclassified function"));
@@ -899,7 +998,10 @@ fn validate_operator(
             function_signature(source, *sig_index)?;
             true
         }
-        _ => false,
+        // Scalar operators lower to themselves; the comprehensive set lives
+        // in `is_scalar_passthrough` so this accept list cannot drift from it
+        // (jsaw's compiler output exercises most of these).
+        _ => is_scalar_passthrough(op),
     };
     if accepted {
         Ok(())
@@ -1023,6 +1125,36 @@ fn scalar_store_operator(storage: &CoreGcStorage, memory: MemoryArg) -> Operator
             unreachable!("handled as a fat pair, not a scalar")
         }
     }
+}
+
+/// Like [`load_field`], but for the packed sign/zero-extending reads
+/// (`struct.get_s/u`, `array.get_s/u`). Only 1/2-byte scalar storage is
+/// packed; everything else (and managed refs, which are never packed) goes
+/// through the ordinary path.
+fn load_field_extended(
+    emit: &mut Emit<'_>,
+    memory: portal_pc_waffle::Memory,
+    base_addr: Value,
+    slot: &CoreGcSlotLayout,
+    signed: bool,
+) -> Result<Lowered, CoreGcError> {
+    let packed = matches!(slot.storage, CoreGcStorage::I8 | CoreGcStorage::I16);
+    if !packed {
+        return Ok(load_field(emit, memory, base_addr, slot));
+    }
+    let mem = MemoryArg {
+        align: alignment_exponent(&slot.storage),
+        offset: u64::from(slot.offset),
+        memory,
+    };
+    let op = match (&slot.storage, signed) {
+        (CoreGcStorage::I8, true) => Operator::I32Load8S { memory: mem },
+        (CoreGcStorage::I8, false) => Operator::I32Load8U { memory: mem },
+        (CoreGcStorage::I16, true) => Operator::I32Load16S { memory: mem },
+        (CoreGcStorage::I16, false) => Operator::I32Load16U { memory: mem },
+        _ => unreachable!("packed checked above"),
+    };
+    Ok(Lowered::Scalar(emit.op(op, &[base_addr], &[Type::I32])))
 }
 
 fn store_field(
@@ -1349,6 +1481,461 @@ impl<'a> FunctionLowering<'a> {
                 );
                 Ok(Some(Lowered::Scalar(length)))
             }
+            Operator::StructNewDefault { sig } => {
+                let (type_id, layout) = self.descriptor(*sig)?;
+                let payload_bytes = layout
+                    .fixed_payload_bytes
+                    .expect("struct descriptors always have a fixed payload size");
+                self.checkpoint(emit);
+                let type_id_c = emit.const_i32(type_id.get());
+                let bytes_c = emit.const_i32(payload_bytes);
+                let addr = emit.op(
+                    Operator::Call {
+                        function_index: self.runtime.alloc,
+                    },
+                    &[type_id_c, bytes_c],
+                    &[Type::I32],
+                );
+                emit.op(
+                    Operator::Call {
+                        function_index: self.runtime.zero_bytes,
+                    },
+                    &[addr, bytes_c],
+                    &[],
+                );
+                Ok(Some(Lowered::Fat(addr, type_id_c)))
+            }
+            Operator::StructGetS { sig, idx } | Operator::StructGetU { sig, idx } => {
+                let (type_id, layout) = self.descriptor(*sig)?;
+                let slot = layout.slots.get(*idx as usize).ok_or_else(|| CoreGcError {
+                    message: format!(
+                        "coregc lowering: struct.get_s/u field {idx} is outside descriptor type {}",
+                        type_id.get()
+                    ),
+                })?;
+                let (addr, _) = self.fat(args[0]);
+                let type_id_c = emit.const_i32(type_id.get());
+                let checked = emit.op(
+                    Operator::Call {
+                        function_index: self.runtime.validate_ref,
+                    },
+                    &[addr, type_id_c],
+                    &[Type::I32],
+                );
+                let signed = matches!(op, Operator::StructGetS { .. });
+                Ok(Some(load_field_extended(
+                    emit,
+                    memory,
+                    checked,
+                    slot,
+                    signed,
+                )?))
+            }
+            Operator::ArrayNewFixed { sig, num } => {
+                let (type_id, layout) = self.descriptor(*sig)?;
+                let stride = layout.array_stride.expect("array descriptor has a stride");
+                let element_slot = CoreGcSlotLayout {
+                    offset: 0,
+                    storage: layout.slots[0].storage.clone(),
+                };
+                if args.len() != *num {
+                    return Err(CoreGcError {
+                        message: format!(
+                            "coregc lowering: array.new_fixed with {} elements for a {}-element constructor",
+                            args.len(),
+                            num
+                        ),
+                    });
+                }
+                self.checkpoint(emit);
+                // payload_bytes = 4 + num*stride is a compile-time constant;
+                // it still goes through the allocator's own overflow checks.
+                let payload_bytes = 4u32
+                    .checked_add((*num as u32).checked_mul(stride).ok_or_else(|| CoreGcError {
+                        message: "coregc lowering: array.new_fixed payload size overflows u32"
+                            .to_owned(),
+                    })?)
+                    .ok_or_else(|| CoreGcError {
+                        message: "coregc lowering: array.new_fixed payload size overflows u32"
+                            .to_owned(),
+                    })?;
+                let type_id_c = emit.const_i32(type_id.get());
+                let bytes_c = emit.const_i32(payload_bytes);
+                let addr = emit.op(
+                    Operator::Call {
+                        function_index: self.runtime.alloc,
+                    },
+                    &[type_id_c, bytes_c],
+                    &[Type::I32],
+                );
+                let len_c = emit.const_i32(*num as u32);
+                emit.op(
+                    Operator::I32Store {
+                        memory: MemoryArg {
+                            align: 2,
+                            offset: 0,
+                            memory,
+                        },
+                    },
+                    &[addr, len_c],
+                    &[],
+                );
+                for (index, arg) in args.iter().enumerate() {
+                    let offset = 4 + (index as u32) * stride;
+                    let offset_c = emit.const_i32(offset);
+                    let element_addr = emit.op(Operator::I32Add, &[addr, offset_c], &[Type::I32]);
+                    let value = self.lowered(*arg);
+                    store_field(emit, memory, element_addr, &element_slot, value)?;
+                }
+                Ok(Some(Lowered::Fat(addr, type_id_c)))
+            }
+            Operator::ArrayGetS { sig } | Operator::ArrayGetU { sig } => {
+                let (type_id, layout) = self.descriptor(*sig)?;
+                let element_slot = CoreGcSlotLayout {
+                    offset: 0,
+                    storage: layout.slots[0].storage.clone(),
+                };
+                let stride = layout.array_stride.expect("array descriptor has a stride");
+                let (addr, _) = self.fat(args[0]);
+                let index = self.scalar(args[1]);
+                let type_id_c = emit.const_i32(type_id.get());
+                let checked_index = emit.op(
+                    Operator::Call {
+                        function_index: self.runtime.array_bounds,
+                    },
+                    &[addr, type_id_c, index],
+                    &[Type::I32],
+                );
+                let stride_c = emit.const_i32(stride);
+                let offset = emit.op(Operator::I32Mul, &[checked_index, stride_c], &[Type::I32]);
+                let four = emit.const_i32(4);
+                let offset = emit.op(Operator::I32Add, &[offset, four], &[Type::I32]);
+                let element_addr = emit.op(Operator::I32Add, &[addr, offset], &[Type::I32]);
+                let signed = matches!(op, Operator::ArrayGetS { .. });
+                Ok(Some(load_field_extended(
+                    emit,
+                    memory,
+                    element_addr,
+                    &element_slot,
+                    signed,
+                )?))
+            }
+            Operator::ArrayFill { sig } => {
+                let (type_id, layout) = self.descriptor(*sig)?;
+                let stride = layout.array_stride.expect("array descriptor has a stride");
+                let element_slot = CoreGcSlotLayout {
+                    offset: 0,
+                    storage: layout.slots[0].storage.clone(),
+                };
+                let (addr, _) = self.fat(args[0]);
+                let start = self.scalar(args[1]);
+                let value = self.lowered(args[2]);
+                let len = self.scalar(args[3]);
+                let type_id_c = emit.const_i32(type_id.get());
+                let checked_addr = emit.op(
+                    Operator::Call {
+                        function_index: self.runtime.validate_ref,
+                    },
+                    &[addr, type_id_c],
+                    &[Type::I32],
+                );
+                // Trap unless start + len <= array.len (computed in i64 to
+                // avoid u32 wrap).
+                let array_len = emit.op(
+                    Operator::I32Load {
+                        memory: MemoryArg {
+                            align: 2,
+                            offset: 0,
+                            memory,
+                        },
+                    },
+                    &[checked_addr],
+                    &[Type::I32],
+                );
+                let start64 = emit.op(Operator::I64ExtendI32U, &[start], &[Type::I64]);
+                let len64 = emit.op(Operator::I64ExtendI32U, &[len], &[Type::I64]);
+                let end64 = emit.op(Operator::I64Add, &[start64, len64], &[Type::I64]);
+                let array_len64 = emit.op(Operator::I64ExtendI32U, &[array_len], &[Type::I64]);
+                let out_of_range = emit.op(Operator::I64GtU, &[end64, array_len64], &[Type::I32]);
+                emit.trap_if(out_of_range);
+                // Loop: for k in 0..len, store element at start + k.
+                let loop_head = emit.body.add_block();
+                let loop_body = emit.body.add_block();
+                let zero_k = emit.const_i32(0);
+                emit.body.set_terminator(
+                    emit.current,
+                    Terminator::Br {
+                        target: BlockTarget {
+                            block: loop_head,
+                            args: vec![zero_k],
+                        },
+                    },
+                );
+                let k = emit.body.add_blockparam(loop_head, Type::I32);
+                let done = emit.body.add_op(loop_head, Operator::I32GeU, &[k, len], &[Type::I32]);
+                let after = emit.body.add_block();
+                emit.body.set_terminator(
+                    loop_head,
+                    Terminator::CondBr {
+                        cond: done,
+                        if_true: BlockTarget {
+                            block: after,
+                            args: vec![],
+                        },
+                        if_false: BlockTarget {
+                            block: loop_body,
+                            args: vec![k],
+                        },
+                    },
+                );
+                let bk = emit.body.add_blockparam(loop_body, Type::I32);
+                let idx = emit.body.add_op(loop_body, Operator::I32Add, &[start, bk], &[Type::I32]);
+                let stride_c = emit.body.add_op(
+                    loop_body,
+                    Operator::I32Const { value: stride },
+                    &[],
+                    &[Type::I32],
+                );
+                let offset = emit.body.add_op(loop_body, Operator::I32Mul, &[idx, stride_c], &[Type::I32]);
+                let four = emit.body.add_op(loop_body, Operator::I32Const { value: 4 }, &[], &[Type::I32]);
+                let offset = emit.body.add_op(loop_body, Operator::I32Add, &[offset, four], &[Type::I32]);
+                let element_addr =
+                    emit.body.add_op(loop_body, Operator::I32Add, &[checked_addr, offset], &[Type::I32]);
+                let mut fill_emit = Emit {
+                    body: emit.body,
+                    current: loop_body,
+                };
+                store_field(&mut fill_emit, memory, element_addr, &element_slot, value)?;
+                let one = fill_emit.const_i32(1);
+                let next_k = fill_emit.body.add_op(loop_body, Operator::I32Add, &[bk, one], &[Type::I32]);
+                fill_emit.body.set_terminator(
+                    loop_body,
+                    Terminator::Br {
+                        target: BlockTarget {
+                            block: loop_head,
+                            args: vec![next_k],
+                        },
+                    },
+                );
+                emit.current = after;
+                Ok(None)
+            }
+            Operator::ArrayCopy { dest, src } => {
+                let (dst_type, dst_layout) = self.descriptor(*dest)?;
+                let (src_type, src_layout) = self.descriptor(*src)?;
+                let dst_stride = dst_layout.array_stride.expect("array descriptor has a stride");
+                let src_stride = src_layout.array_stride.expect("array descriptor has a stride");
+                let (dst_addr, _) = self.fat(args[0]);
+                let di = self.scalar(args[1]);
+                let (src_addr, _) = self.fat(args[2]);
+                let si = self.scalar(args[3]);
+                let len = self.scalar(args[4]);
+                let dst_type_c = emit.const_i32(dst_type.get());
+                let checked_dst = emit.op(
+                    Operator::Call {
+                        function_index: self.runtime.validate_ref,
+                    },
+                    &[dst_addr, dst_type_c],
+                    &[Type::I32],
+                );
+                let src_type_c = emit.const_i32(src_type.get());
+                let checked_src = emit.op(
+                    Operator::Call {
+                        function_index: self.runtime.validate_ref,
+                    },
+                    &[src_addr, src_type_c],
+                    &[Type::I32],
+                );
+                let mem0 = MemoryArg {
+                    align: 2,
+                    offset: 0,
+                    memory,
+                };
+                let dst_len = emit.op(Operator::I32Load { memory: mem0 }, &[checked_dst], &[Type::I32]);
+                let src_len = emit.op(Operator::I32Load { memory: mem0 }, &[checked_src], &[Type::I32]);
+                for (index_arg, array_len) in [(di, dst_len), (si, src_len)] {
+                    let index64 = emit.op(Operator::I64ExtendI32U, &[index_arg], &[Type::I64]);
+                    let len64 = emit.op(Operator::I64ExtendI32U, &[len], &[Type::I64]);
+                    let end64 = emit.op(Operator::I64Add, &[index64, len64], &[Type::I64]);
+                    let array_len64 = emit.op(Operator::I64ExtendI32U, &[array_len], &[Type::I64]);
+                    let out_of_range = emit.op(Operator::I64GtU, &[end64, array_len64], &[Type::I32]);
+                    emit.trap_if(out_of_range);
+                }
+                // Byte-wise memmove over the element region: copy backward
+                // when dst > src (same-array overlap), forward otherwise.
+                let di_bytes = {
+                    let stride_c = emit.const_i32(dst_stride);
+                    let offset = emit.op(Operator::I32Mul, &[di, stride_c], &[Type::I32]);
+                    let four = emit.const_i32(4);
+                    let offset = emit.op(Operator::I32Add, &[offset, four], &[Type::I32]);
+                    emit.op(Operator::I32Add, &[checked_dst, offset], &[Type::I32])
+                };
+                let si_bytes = {
+                    let stride_c = emit.const_i32(src_stride);
+                    let offset = emit.op(Operator::I32Mul, &[si, stride_c], &[Type::I32]);
+                    let four = emit.const_i32(4);
+                    let offset = emit.op(Operator::I32Add, &[offset, four], &[Type::I32]);
+                    emit.op(Operator::I32Add, &[checked_src, offset], &[Type::I32])
+                };
+                let byte_len = {
+                    let stride_c = emit.const_i32(dst_stride);
+                    emit.op(Operator::I32Mul, &[len, stride_c], &[Type::I32])
+                };
+                let backward = emit.op(Operator::I32GtU, &[di_bytes, si_bytes], &[Type::I32]);
+                let down_loop = emit.body.add_block();
+                let up_loop = emit.body.add_block();
+                let after = emit.body.add_block();
+                emit.body.set_terminator(
+                    emit.current,
+                    Terminator::CondBr {
+                        cond: backward,
+                        // dst > src: copy high addresses first (count down)
+                        // so overlapping source bytes are read before being
+                        // overwritten.
+                        if_true: BlockTarget {
+                            block: down_loop,
+                            args: vec![byte_len],
+                        },
+                        if_false: BlockTarget {
+                            block: up_loop,
+                            args: vec![],
+                        },
+                    },
+                );
+                // Down: i counts down from byte_len to 0, copying i-1.
+                let forward_loop = down_loop;
+                let fi = emit.body.add_blockparam(forward_loop, Type::I32);
+                let f_done = emit.body.add_op(forward_loop, Operator::I32Eqz, &[fi], &[Type::I32]);
+                let f_body = emit.body.add_block();
+                emit.body.set_terminator(
+                    forward_loop,
+                    Terminator::CondBr {
+                        cond: f_done,
+                        if_true: BlockTarget {
+                            block: after,
+                            args: vec![],
+                        },
+                        if_false: BlockTarget {
+                            block: f_body,
+                            args: vec![fi],
+                        },
+                    },
+                );
+                let fbi = emit.body.add_blockparam(f_body, Type::I32);
+                let one_f = emit.body.add_op(f_body, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+                let prev = emit.body.add_op(f_body, Operator::I32Sub, &[fbi, one_f], &[Type::I32]);
+                let src_p = emit.body.add_op(f_body, Operator::I32Add, &[si_bytes, prev], &[Type::I32]);
+                let dst_p = emit.body.add_op(f_body, Operator::I32Add, &[di_bytes, prev], &[Type::I32]);
+                let byte_v = emit.body.add_op(
+                    f_body,
+                    Operator::I32Load8U {
+                        memory: MemoryArg {
+                            align: 0,
+                            offset: 0,
+                            memory,
+                        },
+                    },
+                    &[src_p],
+                    &[Type::I32],
+                );
+                emit.body.add_op(
+                    f_body,
+                    Operator::I32Store8 {
+                        memory: MemoryArg {
+                            align: 0,
+                            offset: 0,
+                            memory,
+                        },
+                    },
+                    &[dst_p, byte_v],
+                    &[],
+                );
+                emit.body.set_terminator(
+                    f_body,
+                    Terminator::Br {
+                        target: BlockTarget {
+                            block: forward_loop,
+                            args: vec![prev],
+                        },
+                    },
+                );
+                // Up: i counts up from 0 to byte_len (dst <= src, so reading
+                // low addresses first cannot clobber unread source bytes).
+                let backward_loop = up_loop;
+                let zero_b = emit.body.add_op(
+                    backward_loop,
+                    Operator::I32Const { value: 0 },
+                    &[],
+                    &[Type::I32],
+                );
+                let b_loop_head = emit.body.add_block();
+                emit.body.set_terminator(
+                    backward_loop,
+                    Terminator::Br {
+                        target: BlockTarget {
+                            block: b_loop_head,
+                            args: vec![zero_b],
+                        },
+                    },
+                );
+                let bi = emit.body.add_blockparam(b_loop_head, Type::I32);
+                let b_done = emit.body.add_op(b_loop_head, Operator::I32GeU, &[bi, byte_len], &[Type::I32]);
+                let b_body = emit.body.add_block();
+                emit.body.set_terminator(
+                    b_loop_head,
+                    Terminator::CondBr {
+                        cond: b_done,
+                        if_true: BlockTarget {
+                            block: after,
+                            args: vec![],
+                        },
+                        if_false: BlockTarget {
+                            block: b_body,
+                            args: vec![bi],
+                        },
+                    },
+                );
+                let bbi = emit.body.add_blockparam(b_body, Type::I32);
+                let src_q = emit.body.add_op(b_body, Operator::I32Add, &[si_bytes, bbi], &[Type::I32]);
+                let dst_q = emit.body.add_op(b_body, Operator::I32Add, &[di_bytes, bbi], &[Type::I32]);
+                let byte_w = emit.body.add_op(
+                    b_body,
+                    Operator::I32Load8U {
+                        memory: MemoryArg {
+                            align: 0,
+                            offset: 0,
+                            memory,
+                        },
+                    },
+                    &[src_q],
+                    &[Type::I32],
+                );
+                emit.body.add_op(
+                    b_body,
+                    Operator::I32Store8 {
+                        memory: MemoryArg {
+                            align: 0,
+                            offset: 0,
+                            memory,
+                        },
+                    },
+                    &[dst_q, byte_w],
+                    &[],
+                );
+                let one_b = emit.body.add_op(b_body, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+                let next_b = emit.body.add_op(b_body, Operator::I32Add, &[bbi, one_b], &[Type::I32]);
+                emit.body.set_terminator(
+                    b_body,
+                    Terminator::Br {
+                        target: BlockTarget {
+                            block: b_loop_head,
+                            args: vec![next_b],
+                        },
+                    },
+                );
+                emit.current = after;
+                Ok(None)
+            }
             Operator::ArrayGet { sig } | Operator::ArraySet { sig } => {
                 let (type_id, layout) = self.descriptor(*sig)?;
                 // The descriptor's element "slot" already carries offset `4`
@@ -1407,6 +1994,41 @@ impl<'a> FunctionLowering<'a> {
                 let zero = emit.const_i32(0);
                 let result = emit.op(Operator::I32Eq, &[addr, zero], &[Type::I32]);
                 Ok(Some(Lowered::Scalar(result)))
+            }
+            Operator::Select => {
+                // Untyped select only validates for numeric operand types, so
+                // this is always scalar here.
+                let a = self.scalar(args[0]);
+                let b = self.scalar(args[1]);
+                let cond = self.scalar(args[2]);
+                let value = emit.op(Operator::Select, &[a, b, cond], &result_ty.into_iter().collect::<Vec<_>>());
+                Ok(Some(Lowered::Scalar(value)))
+            }
+            Operator::TypedSelect { ty } => {
+                let cond = self.scalar(args[2]);
+                match (self.lowered(args[0]), self.lowered(args[1])) {
+                    (Lowered::Scalar(a), Lowered::Scalar(b)) => {
+                        let value = emit.op(Operator::TypedSelect { ty: *ty }, &[a, b, cond], &[*ty]);
+                        Ok(Some(Lowered::Scalar(value)))
+                    }
+                    (Lowered::Fat(a_addr, a_ty), Lowered::Fat(b_addr, b_ty)) => {
+                        // A select over a fat reference is two scalar selects.
+                        let addr = emit.op(
+                            Operator::TypedSelect { ty: Type::I32 },
+                            &[a_addr, b_addr, cond],
+                            &[Type::I32],
+                        );
+                        let type_id = emit.op(
+                            Operator::TypedSelect { ty: Type::I32 },
+                            &[a_ty, b_ty, cond],
+                            &[Type::I32],
+                        );
+                        Ok(Some(Lowered::Fat(addr, type_id)))
+                    }
+                    _ => Err(CoreGcError {
+                        message: "coregc lowering: select over mismatched value shapes".to_owned(),
+                    }),
+                }
             }
             Operator::RefFunc { func_index } => {
                 let slot = *self
@@ -1531,6 +2153,29 @@ impl<'a> FunctionLowering<'a> {
 /// definition site necessarily dominates every checkpoint that needs it.
 ///
 /// A violation is an internal lowering bug, not a source-level diagnostic.
+/// Collect the flattened results of a call/call_indirect op result into
+/// individual `Value`s (zero results → empty, one → itself, more →
+/// `PickOutput` projections), for use by tail-call lowering which must
+/// forward them to a `Return` terminator.
+fn collect_flat_result(
+    body: &mut FunctionBody,
+    block: Block,
+    result: Value,
+    flat_returns: &[Type],
+) -> Vec<Value> {
+    match flat_returns.len() {
+        0 => vec![],
+        1 => vec![result],
+        n => (0..n)
+            .map(|index| {
+                let value = body.add_value(ValueDef::PickOutput(result, index as u32, flat_returns[index]));
+                body.append_to_block(block, value);
+                value
+            })
+            .collect(),
+    }
+}
+
 fn verify_root_discipline(
     body: &FunctionBody,
     liveness: &Liveness,
@@ -1546,6 +2191,21 @@ fn verify_root_discipline(
                          value {} to be rooted, but no shadow-frame slot was assigned to it",
                         func.index(),
                         checkpoint.index(),
+                        value.index()
+                    ),
+                });
+            }
+        }
+    }
+    for (block, required) in &liveness.tail_call_live {
+        for &value in required {
+            if !slot_of.contains_key(&value) {
+                return Err(CoreGcError {
+                    message: format!(
+                        "coregc root verifier: function {} tail call in block {} requires \
+                         value {} to be rooted, but no shadow-frame slot was assigned to it",
+                        func.index(),
+                        block.index(),
                         value.index()
                     ),
                 });
@@ -1618,6 +2278,7 @@ fn lower_function(
     let spilled: BTreeSet<Value> = computed
         .checkpoint_live
         .values()
+        .chain(computed.tail_call_live.values())
         .flatten()
         .copied()
         .collect();
@@ -1796,6 +2457,144 @@ fn lower_function(
                         values: flat_values,
                     },
                 );
+            }
+            Terminator::ReturnCall { func: callee_func, args } => {
+                // Tail-call discipline (docs plan §13.3): checkpoint while
+                // the caller's frame still roots the live arguments, then
+                // pop it, then a normal call whose results are returned
+                // immediately (no allocation can occur between pop and the
+                // callee's own push_frame).
+                let callee = &plan.functions[callee_func];
+                lowering.checkpoint(&mut Emit {
+                    body: &mut out_body,
+                    current,
+                });
+                let mut flat_args = Vec::new();
+                for &arg in args {
+                    lowering.lowered(arg).flatten_into(&mut flat_args);
+                }
+                if let Some(frame) = lowering.frame {
+                    out_body.add_op(
+                        current,
+                        Operator::Call {
+                            function_index: runtime.roots.pop,
+                        },
+                        &[frame],
+                        &[],
+                    );
+                }
+                let flat_returns = flatten_plan(&callee.return_plan);
+                let result = out_body.add_op(
+                    current,
+                    Operator::Call {
+                        function_index: callee.lowered_func,
+                    },
+                    &flat_args,
+                    &flat_returns,
+                );
+                let return_values = collect_flat_result(
+                    &mut out_body,
+                    current,
+                    result,
+                    &flat_returns,
+                );
+                out_body.set_terminator(current, Terminator::Return { values: return_values });
+            }
+            Terminator::ReturnCallRef { sig, args } => {
+                let (params, returns) = function_signature(source, *sig)?;
+                let param_plan = classify_all(source, inventory, params)?;
+                let return_plan = classify_all(source, inventory, returns)?;
+                let flat_returns = flatten_plan(&return_plan);
+                let lowered_signature = plan.call_site_signatures[sig];
+                let call_args = &args[..args.len() - 1];
+                let selector = args[args.len() - 1];
+                let _ = param_plan;
+                lowering.checkpoint(&mut Emit {
+                    body: &mut out_body,
+                    current,
+                });
+                let mut flat_args = Vec::new();
+                for &arg in call_args {
+                    lowering.lowered(arg).flatten_into(&mut flat_args);
+                }
+                let selector_value = lowering.scalar(selector);
+                flat_args.push(selector_value);
+                if let Some(frame) = lowering.frame {
+                    out_body.add_op(
+                        current,
+                        Operator::Call {
+                            function_index: runtime.roots.pop,
+                        },
+                        &[frame],
+                        &[],
+                    );
+                }
+                let table = plan
+                    .func_ref_table
+                    .expect("preflight built a function-reference table for every RefFunc target");
+                let result = out_body.add_op(
+                    current,
+                    Operator::CallIndirect {
+                        sig_index: lowered_signature,
+                        table_index: table,
+                    },
+                    &flat_args,
+                    &flat_returns,
+                );
+                let return_values = collect_flat_result(
+                    &mut out_body,
+                    current,
+                    result,
+                    &flat_returns,
+                );
+                out_body.set_terminator(current, Terminator::Return { values: return_values });
+            }
+            Terminator::ReturnCallIndirect { sig, table, args } => {
+                let (params, returns) = function_signature(source, *sig)?;
+                let param_plan = classify_all(source, inventory, params)?;
+                let return_plan = classify_all(source, inventory, returns)?;
+                let flat_returns = flatten_plan(&return_plan);
+                let lowered_signature = plan.call_site_signatures[sig];
+                let call_args = &args[..args.len() - 1];
+                let selector = args[args.len() - 1];
+                let _ = param_plan;
+                lowering.checkpoint(&mut Emit {
+                    body: &mut out_body,
+                    current,
+                });
+                let mut flat_args = Vec::new();
+                for &arg in call_args {
+                    lowering.lowered(arg).flatten_into(&mut flat_args);
+                }
+                let selector_value = lowering.scalar(selector);
+                flat_args.push(selector_value);
+                if let Some(frame) = lowering.frame {
+                    out_body.add_op(
+                        current,
+                        Operator::Call {
+                            function_index: runtime.roots.pop,
+                        },
+                        &[frame],
+                        &[],
+                    );
+                }
+                let lowered_table = plan.copied_tables[table];
+                let result = out_body.add_op(
+                    current,
+                    Operator::CallIndirect {
+                        sig_index: lowered_signature,
+                        table_index: lowered_table,
+                    },
+                    &flat_args,
+                    &flat_returns,
+                );
+                let return_values = collect_flat_result(
+                    &mut out_body,
+                    current,
+                    result,
+                    &flat_returns,
+                );
+                out_body.set_terminator(current, Terminator::Return { values: return_values });
             }
             Terminator::Unreachable => {
                 out_body.set_terminator(current, Terminator::Unreachable);
@@ -2442,8 +3241,346 @@ pub(crate) mod tests_fixtures {
     }
 
 
-    /// A fixture whose only unusual feature is a `ReturnCallRef` tail-call
-    /// terminator — rejected by v1 preflight with a named diagnostic.
+    /// A fixture whose only unusual feature is a `Terminator::Select`
+    /// (br_table) — still rejected with a named diagnostic.
+    pub(crate) fn select_terminator_source() -> Module<'static> {
+        let mut module = Module::empty();
+        let unary_sig = module.signatures.push(SignatureData::Func {
+            params: vec![Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(&module, unary_sig);
+        let entry = body.entry;
+        let x = body.blocks[entry].params[0].1;
+        let arm = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::Select {
+                value: x,
+                targets: vec![BlockTarget {
+                    block: arm,
+                    args: vec![],
+                }],
+                default: BlockTarget {
+                    block: arm,
+                    args: vec![],
+                },
+            },
+        );
+        body.set_terminator(arm, Terminator::Return { values: vec![x] });
+        body.recompute_edges();
+        body.validate().unwrap();
+        let f = module
+            .funcs
+            .push(FuncDecl::Body(unary_sig, "branchy".to_owned(), body));
+        module.exports.push(Export {
+            name: "branchy".to_owned(),
+            kind: ExportKind::Func(f),
+        });
+        module
+    }
+
+    /// An `i8` array scenario exercising `ArrayNewFixed`, `ArrayGetU`,
+    /// `ArrayFill`, and `ArrayCopy` (including an overlapping same-array
+    /// copy), plus a second i32-element array to prove element widths do not
+    /// cross-contaminate. `byte_ops()` returns the combined sum.
+    pub(crate) fn byte_array_source() -> Module<'static> {
+        let mut module = Module::empty();
+        let i8_array = module.signatures.push(SignatureData::Array {
+            ty: field(StorageType::I8),
+            shared: false,
+        });
+        let i8_ref = Type::Heap(WithNullable {
+            nullable: true,
+            value: HeapType::Sig {
+                sig_index: i8_array,
+            },
+        });
+        let signature = module.signatures.push(SignatureData::Func {
+            params: vec![],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(&module, signature);
+        let entry = body.entry;
+        let c = |body: &mut FunctionBody, value: u32| {
+            body.add_op(entry, Operator::I32Const { value }, &[], &[Type::I32])
+        };
+        let e0 = c(&mut body, 10);
+        let e1 = c(&mut body, 20);
+        let e2 = c(&mut body, 30);
+        let arr1 = body.add_op(
+            entry,
+            Operator::ArrayNewFixed {
+                sig: i8_array,
+                num: 3,
+            },
+            &[e0, e1, e2],
+            &[i8_ref],
+        );
+        let len3 = c(&mut body, 3);
+        let arr2 = body.add_op(
+            entry,
+            Operator::ArrayNewDefault { sig: i8_array },
+            &[len3],
+            &[i8_ref],
+        );
+        let zero = c(&mut body, 0);
+        let forty = c(&mut body, 40);
+        let two = c(&mut body, 2);
+        body.add_op(
+            entry,
+            Operator::ArrayFill { sig: i8_array },
+            &[arr2, zero, forty, two],
+            &[],
+        );
+        let one = c(&mut body, 1);
+        // arr2 = [40, 40, 0]; copy arr1[0..2] into arr2[1..3] -> [40, 10, 20]
+        body.add_op(
+            entry,
+            Operator::ArrayCopy {
+                dest: i8_array,
+                src: i8_array,
+            },
+            &[arr2, one, arr1, zero, two],
+            &[],
+        );
+        // Overlapping same-array copy within arr1 (dst > src):
+        // arr1 = [10, 20, 30] -> copy arr1[0..2] into arr1[1..3] -> [10, 10, 20]
+        body.add_op(
+            entry,
+            Operator::ArrayCopy {
+                dest: i8_array,
+                src: i8_array,
+            },
+            &[arr1, one, arr1, zero, two],
+            &[],
+        );
+        let reads2: Vec<Value> = (0..3)
+            .map(|i| {
+                let index = c(&mut body, i);
+                body.add_op(
+                    entry,
+                    Operator::ArrayGetU { sig: i8_array },
+                    &[arr2, index],
+                    &[Type::I32],
+                )
+            })
+            .collect();
+        let s2a = body.add_op(entry, Operator::I32Add, &[reads2[0], reads2[1]], &[Type::I32]);
+        let sum2 = body.add_op(entry, Operator::I32Add, &[s2a, reads2[2]], &[Type::I32]);
+        let reads1: Vec<Value> = (0..3)
+            .map(|i| {
+                let index = c(&mut body, i);
+                body.add_op(
+                    entry,
+                    Operator::ArrayGetU { sig: i8_array },
+                    &[arr1, index],
+                    &[Type::I32],
+                )
+            })
+            .collect();
+        let s1a = body.add_op(entry, Operator::I32Add, &[reads1[0], reads1[1]], &[Type::I32]);
+        let sum1 = body.add_op(entry, Operator::I32Add, &[s1a, reads1[2]], &[Type::I32]);
+        let total = body.add_op(entry, Operator::I32Add, &[sum2, sum1], &[Type::I32]);
+        body.set_terminator(entry, Terminator::Return { values: vec![total] });
+        body.recompute_edges();
+        body.validate().expect("byte_ops body validates");
+        let func = module
+            .funcs
+            .push(FuncDecl::Body(signature, "byte_ops".to_owned(), body));
+        module.exports.push(Export {
+            name: "byte_ops".to_owned(),
+            kind: ExportKind::Func(func),
+        });
+        module
+    }
+
+    /// A `count(n, cur) -> i32` function that recurses *to itself* with a
+    /// tail call: `if n == 0 { cur.value } else { count(n-1, struct.new(n,
+    /// cur)) }`. The freshly allocated node and the incoming `cur` must both
+    /// survive the tail call's checkpoint under forced collection, and the
+    /// final `.value` read returns the very first `n`.
+    pub(crate) fn tail_call_count_source() -> Module<'static> {
+        let mut module = Module::empty();
+        let node = module.signatures.push(SignatureData::Struct {
+            fields: vec![],
+            shared: false,
+        });
+        module.signatures[node] = SignatureData::Struct {
+            fields: vec![
+                field(StorageType::Val(Type::I32)),
+                field(StorageType::Val(Type::Heap(WithNullable {
+                    nullable: true,
+                    value: HeapType::Sig { sig_index: node },
+                }))),
+            ],
+            shared: false,
+        };
+        let node_ref = Type::Heap(WithNullable {
+            nullable: true,
+            value: HeapType::Sig { sig_index: node },
+        });
+        let count_sig = module.signatures.push(SignatureData::Func {
+            params: vec![Type::I32, node_ref],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+
+        let mut body = FunctionBody::new(&module, count_sig);
+        let entry = body.entry;
+        let n = body.blocks[entry].params[0].1;
+        let cur = body.blocks[entry].params[1].1;
+        let zero = body.add_op(entry, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let done = body.add_op(entry, Operator::I32Eq, &[n, zero], &[Type::I32]);
+        let base = body.add_block();
+        let step = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: done,
+                if_true: BlockTarget {
+                    block: base,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: step,
+                    args: vec![],
+                },
+            },
+        );
+        let value = body.add_op(
+            base,
+            Operator::StructGet { sig: node, idx: 0 },
+            &[cur],
+            &[Type::I32],
+        );
+        body.set_terminator(base, Terminator::Return { values: vec![value] });
+        let next_node = body.add_op(
+            step,
+            Operator::StructNew { sig: node },
+            &[n, cur],
+            &[node_ref],
+        );
+        let one = body.add_op(step, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        let next_n = body.add_op(step, Operator::I32Sub, &[n, one], &[Type::I32]);
+        let placeholder = module.funcs.push(FuncDecl::None(std::marker::PhantomData));
+        body.set_terminator(
+            step,
+            Terminator::ReturnCall {
+                func: placeholder,
+                args: vec![next_n, next_node],
+            },
+        );
+        body.recompute_edges();
+        body.validate().expect("count body validates");
+        module.funcs[placeholder] = FuncDecl::Body(count_sig, "count".to_owned(), body);
+
+        // start(n): seed the recursion with a leaf node holding value 999
+        // (never observed unless the chain is broken).
+        let start_sig = module.signatures.push(SignatureData::Func {
+            params: vec![Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut start_body = FunctionBody::new(&module, start_sig);
+        let s_entry = start_body.entry;
+        let s_n = start_body.blocks[s_entry].params[0].1;
+        let sentinel = start_body.add_op(s_entry, Operator::I32Const { value: 999 }, &[], &[Type::I32]);
+        let null_ref = start_body.add_op(s_entry, Operator::RefNull { ty: node_ref }, &[], &[node_ref]);
+        let leaf = start_body.add_op(
+            s_entry,
+            Operator::StructNew { sig: node },
+            &[sentinel, null_ref],
+            &[node_ref],
+        );
+        let result = start_body.add_op(
+            s_entry,
+            Operator::Call {
+                function_index: placeholder,
+            },
+            &[s_n, leaf],
+            &[Type::I32],
+        );
+        start_body.set_terminator(s_entry, Terminator::Return { values: vec![result] });
+        start_body.recompute_edges();
+        start_body.validate().expect("start body validates");
+        let start = module
+            .funcs
+            .push(FuncDecl::Body(start_sig, "start".to_owned(), start_body));
+        module.exports.push(Export {
+            name: "start".to_owned(),
+            kind: ExportKind::Func(start),
+        });
+        module
+    }
+
+    /// Pick one of two freshly allocated nodes with `TypedSelect` over the
+    /// reference type, then read the chosen `.value`. Both candidates must
+    /// survive the second allocation's checkpoint.
+    pub(crate) fn select_ref_source() -> Module<'static> {
+        let mut module = Module::empty();
+        let node = module.signatures.push(SignatureData::Struct {
+            fields: vec![],
+            shared: false,
+        });
+        module.signatures[node] = SignatureData::Struct {
+            fields: vec![
+                field(StorageType::Val(Type::I32)),
+                field(StorageType::Val(Type::Heap(WithNullable {
+                    nullable: true,
+                    value: HeapType::Sig { sig_index: node },
+                }))),
+            ],
+            shared: false,
+        };
+        let node_ref = Type::Heap(WithNullable {
+            nullable: true,
+            value: HeapType::Sig { sig_index: node },
+        });
+        let signature = module.signatures.push(SignatureData::Func {
+            params: vec![Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(&module, signature);
+        let entry = body.entry;
+        let cond = body.blocks[entry].params[0].1;
+        let null_ref = body.add_op(entry, Operator::RefNull { ty: node_ref }, &[], &[node_ref]);
+        let forty = body.add_op(entry, Operator::I32Const { value: 40 }, &[], &[Type::I32]);
+        let a = body.add_op(entry, Operator::StructNew { sig: node }, &[forty, null_ref], &[node_ref]);
+        let null_ref2 = body.add_op(entry, Operator::RefNull { ty: node_ref }, &[], &[node_ref]);
+        let two = body.add_op(entry, Operator::I32Const { value: 2 }, &[], &[Type::I32]);
+        let b = body.add_op(entry, Operator::StructNew { sig: node }, &[two, null_ref2], &[node_ref]);
+        let chosen = body.add_op(
+            entry,
+            Operator::TypedSelect { ty: node_ref },
+            &[a, b, cond],
+            &[node_ref],
+        );
+        let value = body.add_op(
+            entry,
+            Operator::StructGet { sig: node, idx: 0 },
+            &[chosen],
+            &[Type::I32],
+        );
+        body.set_terminator(entry, Terminator::Return { values: vec![value] });
+        body.recompute_edges();
+        body.validate().expect("select body validates");
+        let func = module
+            .funcs
+            .push(FuncDecl::Body(signature, "pick".to_owned(), body));
+        module.exports.push(Export {
+            name: "pick".to_owned(),
+            kind: ExportKind::Func(func),
+        });
+        module
+    }
+
+    /// A fixture exercising `ReturnCallRef` through a deliberately-null
+    /// function reference: accepted since stage 2 (tail-call support), and
+    /// traps at runtime on the null call.
     pub(crate) fn tail_call_source() -> Module<'static> {
         let mut module = Module::empty();
         let unary_sig = module.signatures.push(SignatureData::Func {
@@ -2598,6 +3735,59 @@ mod tests {
             .or_default()
             .push(fake);
         assert!(verify_root_discipline(body, &liveness, &honest, Func::new(0)).is_err());
+    }
+
+    #[test]
+    fn packed_byte_arrays_support_fixed_fill_copy_and_unsigned_reads() {
+        let source = byte_array_source();
+        let (mut store, instance) = lower_and_instantiate(
+            &source,
+            CoreGcOptions {
+                collect_threshold_bytes: 0,
+                ..CoreGcOptions::default()
+            },
+        );
+        let byte_ops = instance
+            .get_typed_func::<(), i32>(&mut store, "byte_ops")
+            .expect("byte_ops export");
+        // arr2 = [40, 10, 20] -> 70; arr1 = [10, 10, 20] -> 40.
+        assert_eq!(byte_ops.call(&mut store, ()).expect("byte_ops()"), 110);
+    }
+
+    #[test]
+    fn tail_call_recursion_survives_a_forced_collection_at_every_allocation() {
+        let source = tail_call_count_source();
+        let (mut store, instance) = lower_and_instantiate(
+            &source,
+            CoreGcOptions {
+                collect_threshold_bytes: 0,
+                ..CoreGcOptions::default()
+            },
+        );
+        let start = instance
+            .get_typed_func::<i32, i32>(&mut store, "start")
+            .expect("start export");
+        // count(3, leaf) -> count(2, node(3)) -> count(1, node(2)) ->
+        // count(0, node(1)) -> node(1).value = 1
+        assert_eq!(start.call(&mut store, 3).expect("start(3)"), 1);
+        assert_eq!(start.call(&mut store, 7).expect("start(7)"), 1);
+    }
+
+    #[test]
+    fn typed_select_over_fat_references_survives_forced_collection() {
+        let source = select_ref_source();
+        let (mut store, instance) = lower_and_instantiate(
+            &source,
+            CoreGcOptions {
+                collect_threshold_bytes: 0,
+                ..CoreGcOptions::default()
+            },
+        );
+        let pick = instance
+            .get_typed_func::<i32, i32>(&mut store, "pick")
+            .expect("pick export");
+        assert_eq!(pick.call(&mut store, 1).expect("pick(1)"), 40);
+        assert_eq!(pick.call(&mut store, 0).expect("pick(0)"), 2);
     }
 
     #[test]

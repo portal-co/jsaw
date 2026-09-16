@@ -47,6 +47,15 @@ pub enum CoreGcStorage {
         nullable: bool,
         target: Signature,
     },
+    /// A concrete typed function reference, stored as one scalar table-slot
+    /// index (`0` = null). Never a GC-heap pointer: the code it names is
+    /// static module content that is always alive, so it needs no fat pair,
+    /// no header, and no descriptor scan entry
+    /// (`docs/plan-coregc-atomic-collector-and-lowering.md` §6.7).
+    FuncRef {
+        nullable: bool,
+        target: Signature,
+    },
     /// A dynamic/reference-union value; phase 0 inventories it but does not
     /// claim that direct core lowering exists yet.
     DynamicRef {
@@ -112,12 +121,12 @@ impl CoreGcInventory {
                 SignatureData::Struct { fields, shared } => {
                     let fields = fields
                         .iter()
-                        .map(|field| storage(field.value))
+                        .map(|field| storage(module, field.value))
                         .collect::<Result<Vec<_>, _>>()?;
                     Some((CoreGcTypeKind::Struct { fields }, *shared))
                 }
                 SignatureData::Array { ty, shared } => {
-                    let element = storage(ty.value)?;
+                    let element = storage(module, ty.value)?;
                     Some((CoreGcTypeKind::Array { element }, *shared))
                 }
                 SignatureData::Func { .. } | SignatureData::Import { .. } | SignatureData::None => {
@@ -221,7 +230,7 @@ fn gc_operator_name(operator: &Operator) -> Option<&'static str> {
     })
 }
 
-fn storage(storage: StorageType) -> Result<CoreGcStorage, CoreGcError> {
+fn storage(module: &Module<'_>, storage: StorageType) -> Result<CoreGcStorage, CoreGcError> {
     Ok(match storage {
         StorageType::I8 => CoreGcStorage::I8,
         StorageType::I16 => CoreGcStorage::I16,
@@ -230,9 +239,26 @@ fn storage(storage: StorageType) -> Result<CoreGcStorage, CoreGcError> {
         StorageType::Val(Type::F32) => CoreGcStorage::F32,
         StorageType::Val(Type::F64) => CoreGcStorage::F64,
         StorageType::Val(Type::Heap(reference)) => match reference.value {
-            HeapType::Sig { sig_index } => CoreGcStorage::ManagedRef {
-                nullable: reference.nullable,
-                target: sig_index,
+            HeapType::Sig { sig_index } => match &module.signatures[sig_index] {
+                SignatureData::Struct { .. } | SignatureData::Array { .. } => {
+                    CoreGcStorage::ManagedRef {
+                        nullable: reference.nullable,
+                        target: sig_index,
+                    }
+                }
+                SignatureData::Func { .. } | SignatureData::Import { .. } => {
+                    CoreGcStorage::FuncRef {
+                        nullable: reference.nullable,
+                        target: sig_index,
+                    }
+                }
+                unsupported => {
+                    return Err(CoreGcError {
+                        message: format!(
+                            "coregc does not support a reference to signature kind {unsupported:?}"
+                        ),
+                    });
+                }
             },
             HeapType::Any | HeapType::Eq | HeapType::I31 | HeapType::Struct | HeapType::Array => {
                 CoreGcStorage::DynamicRef {
@@ -278,6 +304,9 @@ fn canonical_storage(storage: &CoreGcStorage) -> String {
         CoreGcStorage::F64 => "f64".to_owned(),
         CoreGcStorage::ManagedRef { nullable, target } => {
             format!("ref:{}:{}", u8::from(*nullable), target.index())
+        }
+        CoreGcStorage::FuncRef { nullable, target } => {
+            format!("funcref:{}:{}", u8::from(*nullable), target.index())
         }
         CoreGcStorage::DynamicRef { nullable, heap } => {
             format!("dynamic:{}:{heap:?}", u8::from(*nullable))

@@ -162,7 +162,7 @@ fn storage_alignment(storage: &CoreGcStorage) -> u32 {
     match storage {
         CoreGcStorage::I8 => 1,
         CoreGcStorage::I16 => 2,
-        CoreGcStorage::I32 | CoreGcStorage::F32 => 4,
+        CoreGcStorage::I32 | CoreGcStorage::F32 | CoreGcStorage::FuncRef { .. } => 4,
         CoreGcStorage::I64
         | CoreGcStorage::F64
         | CoreGcStorage::ManagedRef { .. }
@@ -174,7 +174,9 @@ fn storage_size(storage: &CoreGcStorage) -> u32 {
     match storage {
         CoreGcStorage::I8 => 1,
         CoreGcStorage::I16 => 2,
-        CoreGcStorage::I32 | CoreGcStorage::F32 => 4,
+        // A function reference is one scalar table-slot index, never a fat
+        // pair: the code it names is static module content, always alive.
+        CoreGcStorage::I32 | CoreGcStorage::F32 | CoreGcStorage::FuncRef { .. } => 4,
         CoreGcStorage::I64 | CoreGcStorage::F64 => 8,
         // Every managed reference has an address and its concrete runtime type.
         CoreGcStorage::ManagedRef { .. } | CoreGcStorage::DynamicRef { .. } => 8,
@@ -191,6 +193,10 @@ fn storage_tag(storage: &CoreGcStorage) -> u32 {
         CoreGcStorage::F64 => 6,
         CoreGcStorage::ManagedRef { .. } => 7,
         CoreGcStorage::DynamicRef { .. } => 8,
+        // Not a scannable reference: the generic runtime scanner
+        // (`coregc_runtime`) only recognizes tag 7 and treats every other
+        // tag, including this one, as pointer-free.
+        CoreGcStorage::FuncRef { .. } => 9,
     }
 }
 
@@ -208,7 +214,10 @@ fn storage_target_id(
                     target.index()
                 ),
             }),
-        CoreGcStorage::DynamicRef { .. } => Ok(None),
+        // A `FuncRef` target names a `Func` signature, which the inventory
+        // never assigns a `CoreGcTypeId` to (only struct/array signatures
+        // are managed heap types); there is nothing to cross-reference.
+        CoreGcStorage::DynamicRef { .. } | CoreGcStorage::FuncRef { .. } => Ok(None),
         _ => Ok(None),
     }
 }

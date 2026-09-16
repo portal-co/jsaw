@@ -1,12 +1,19 @@
 # Plan: coregc — a pure-core-Wasm backend for jsaw's typed WasmGC IR
 
-**Status:** approved for implementation (this revision). Supersedes and
-absorbs the prior `docs/plan-wasmgc-linear-memory-fallback.md` design (its
-research/prior-art sections remain cited from here) and the prior
+**Status:** v1 **implemented and activated** (stages 1-6 complete: legacy
+removal, generated runtime with free-list mark/sweep, general struct/array/
+branch lowering with liveness-derived shadow-frame checkpoints, direct calls,
+typed function references via `call_indirect`, and the public `emit_coregc`
+orchestrator with its acceptance suite including a native-WasmGC-vs-coregc
+differential test). §13 details the remaining v2 roadmap toward the dogfood
+goal and §14 the cross-testing strategy.
+
+Supersedes and absorbs the prior `docs/plan-wasmgc-linear-memory-fallback.md`
+design (its research/prior-art sections remain cited from here) and the prior
 `docs/plan-coregc-atomic-collector-and-lowering.md` "atomic activation" draft.
 This revision exists because the first implementation attempt against the
 prior draft failed for a specific, diagnosable reason (see §0) — this plan
-fixes that reason structurally, not just by re-describing the same seam.
+fixed that reason structurally, not just by re-describing the same seam.
 
 **Implementation rule:** the *public* activation (`emit_coregc` returning a
 runnable artifact for real source programs) is one all-or-nothing gate — see
@@ -774,7 +781,10 @@ stages export their pieces only as `pub(crate)` building blocks, so there is
 no window where a partially-capable `emit_coregc` is reachable by a caller.
 
 1. **Legacy removal + descriptor `FunctionObject` reservation** (§7). Compiles,
-   existing `coregc`/`coregc_layout` unit tests still pass. *(Done.)*
+   existing `coregc`/`coregc_layout` unit tests still pass. *(Done. The
+   function-object reservation was later superseded by §6.7's simpler
+   table-slot design — no `kind == 3` is ever emitted; the reservation
+   remains harmless.)*
 2. **`coregc_runtime.rs`**: header v2 semantics (§3.2), first-fit allocator
    with free-list reuse (§3.4), validator, array-bounds check, worklist
    (§3.5), generic descriptor-driven `mark_ref`/scan dispatch, `sweep`,
@@ -816,15 +826,19 @@ no window where a partially-capable `emit_coregc` is reachable by a caller.
    placeholder and flattened signature *before* any body is translated, §6.1
    step 4); add the function-reference table inventory and construction
    (§6.1 step 5, §6.7); add the `Call`/`RefFunc`/`CallRef`/`CallIndirect`
-   lowering rows (§6.6, §6.7). Tested with: a caller/callee pair where the
-   callee allocates and the caller holds a live reference across the call
-   under forced collection; a `RefFunc`/`CallRef` fixture over a concrete
-   signature exercising a null-function-reference trap and a successful
-   indirect call; a `CallIndirect` fixture against a copied source table.
+   lowering rows (§6.6, §6.7). *(Done, with three real bugs found by the
+   tests: the call-site signature must be the callee's flattened signature
+   without the selector operand folded in; waffle-backend stored multi-result
+   operator values to locals in swapped order (fixed upstream in waffle-);
+   and push_frame needed to zero its slots against stale memory reuse after
+   pop.)* Tested with: a caller/callee pair where the callee allocates and
+   the caller holds a live reference across the call under forced collection;
+   a `RefFunc`/`CallRef` fixture over a concrete signature exercising a
+   null-function-reference trap and successful indirect calls.
 6. **`coregc_emit.rs` orchestrator + `emit_coregc` activation**: wires
    Stages 1-5 together behind the single public entry point (§5), runs the
    full acceptance suite (§9), and is the only stage that changes `lib.rs`'s
-   public exports.
+   public exports. *(Done — `emit_coregc` is public in `lib.rs`.)*
 
 Stage boundaries are commit boundaries. A stage that cannot be completed
 safely is reverted to the end of the previous stage — never left half-wired
@@ -880,18 +894,14 @@ state.
 ## 11. Relationship to the dogfood goal
 
 `docs/plan-dogfood-self-hosting-java.md` (and the broader ambition of running
-jsaw's own compiler through coregc) needs, beyond this plan: the full jsaw
-`Repr` closure (boxed Number/Boolean/BigInt/String, property tries, dynamic
-arrays, typed arrays, DataView, module contexts) and `anyref`/dynamic
-dispatch. The call *mechanism* (direct calls and typed function references,
-§6.7) is in v1's scope and is not one of the deferred items — confirmed
-against `conv.rs`'s actual closure representation, whose only blocking fields
-are `anyref`-typed, not its `RefFunc`-typed code pointer. This plan
-deliberately stops short of the `Repr`/`anyref` closure so that v1 is small
-enough to build correctly and prove correct in one pass. The module
-boundaries in §4 exist specifically so that work is additive on top of this
-plan rather than a second rewrite of it — the same property §0 demanded of
-this plan's own internal stages, applied one level up to the plan-of-plans.
+jsaw's own compiler through coregc) needs, beyond v1: the dynamic value model
+(§13.2 — jsaw's `anyref` boundary), the remaining aggregate/control operators
+(§13.3), and program-level activation with cross-testing (§13.4, §14). v1's
+call mechanism (direct calls and typed function references, §6.7) is complete
+and is not a blocker. §13 is grounded in the actual operator inventory of
+`conv.rs`/`repr.rs`, and notably jsaw never uses `i31.get`, extern/any
+conversion operators, or multi-value function returns — which is why the v2
+roadmap is smaller than a full `anyref` implementation would suggest.
 
 ## 12. Explicit non-goals / later work
 
@@ -905,3 +915,202 @@ this plan's own internal stages, applied one level up to the plan-of-plans.
 - publishing a stable cross-version ABI for fat references outside one
   module instance (they are process/instance-local addresses, never durable
   IDs — unchanged from the superseded plan's §13).
+
+## 13. v2 roadmap: closing jsaw's `Repr` and remaining operator surface
+
+v1 (stages 1-6) is complete and activated. This section details what remains
+between v1 and compiling jsaw's own compiler output (the dogfood goal), with
+each item grounded in the operators `conv.rs` actually emits (counts from a
+direct read of `conv.rs`/`repr.rs`, September 2026).
+
+### 13.1 What jsaw's compiled output actually uses
+
+From a full inventory of `Operator::`/`Terminator::` sites in `conv.rs`,
+`repr.rs`, and `repr/trie.rs`:
+
+- **Already covered by v1:** `StructNew/Get/Set`, `ArrayNewDefault/Get/Set/
+  Len`, `RefNull`, `RefIsNull`, `RefFunc`, `Call`, `CallRef`, `Br`,
+  `CondBr`, `Return`, `Unreachable`, and most scalar ops.
+- **Dynamic-value operations** (the dominant gap): `RefCast` (69 sites),
+  `RefTest` (49), `RefEq`, `RefI31` — all operating on jsaw's `anyref`-typed
+  `value` boundary.
+- **Aggregate bulk/packed operations:** `ArrayNewFixed` (14), `ArrayGetU`
+  (14), `ArrayCopy` (5), `StructNewDefault` (2), plus `ArrayGetS`/`ArrayFill`
+  reachable through string/typed-array helpers.
+- **Control flow:** `TypedSelect` (13), `ReturnCall` (11), `ReturnCallRef`
+  (2).
+- **Scalar ops v1's accept-list is missing** (all pure pass-throughs, no
+  design needed — extend `validate_operator`'s whitelist): the remaining
+  `I32`/`I64`/`F64` arithmetic/comparison/conversion operators jsaw emits,
+  including `I32ShrS`, `I32DivS/RemS`, `I64Shl/ShrS/DivS/RemS`, `F64Neg/
+  Trunc/Lt/Le/Gt/Ge/Eq/Ne`, `F64ConvertI32S/I64S`, `I32TruncF64S`,
+  `I32TruncSatF64U`, and friends.
+- **Never used by jsaw** (confirmed by the same inventory, so v2 need not
+  support them): `i31.get_s`/`i31.get_u` (jsaw only *creates* the JS-null
+  sentinel and *tests* for it; it never reads the payload back),
+  `any.convert_extern`/`extern.convert_any`, and multi-value function
+  returns (every function returns 0 or 1 values; jsaw's tagged-union
+  `multi_*` types are ordinary structs returned as a single reference).
+
+### 13.2 The dynamic value model (`anyref`/`eqref`/`i31ref`)
+
+This is the one semantically deep addition; everything else in this section
+is mechanical. The design constraint is to keep the existing two-word fat
+reference instead of introducing a wider `GcValue` triple (the superseded
+fallback plan's §4.5 sketch), so that shadow frames, field slots, block
+parameters, and call ABIs do not change width.
+
+**Representation.** A dynamic value is the same `(addr: i32, type_id: i32)`
+pair as a v1 `FatRef`, with the type-id space extended by one sentinel:
+
+- `(0, 0)` — null. At jsaw's `anyref` boundary this is JS `undefined`;
+  against a nullable concrete type it is that type's null. The pair alone
+  does not distinguish the two — the *source-level* static type does, and
+  every v2 operator carries enough static type information to interpret it.
+- `(payload, 0xFFFF_FFFF)` — an i31 immediate (`I31_TYPE_ID`). `payload` is
+  the raw i31 bits. Used by jsaw exactly once: `JS_NULL_SENTINEL`. The
+  sentinel id is `u32::MAX`, which the dense-from-1 heap type-id assignment
+  can never reach (exhaustion is rejected long before), so no descriptor
+  table change is needed.
+- `(addr, heap_type_id)` — an ordinary managed allocation, unchanged from v1.
+
+**Runtime changes** (small, additive, in `coregc_runtime.rs`):
+`validate_ref` and `mark_ref` learn one rule — `type_id == I31_TYPE_ID`
+accepts without touching the header (immediates have no header and nothing
+to mark). The sweep never sees immediates (they are never in the block
+list). `array_bounds`/`struct.get` callers never pass an immediate as a
+receiver because the source `ref.cast`/`ref.test` discipline guards those
+paths — and if a lowering bug ever let one through, the receiver's concrete
+expected type id would mismatch `I31_TYPE_ID` and trap `BAD_TYPE_ID`, which
+is the correct failure.
+
+**Inventory/lowering changes:** `CoreGcStorage::DynamicRef { heap: Any | Eq }`
+stops being a rejection and becomes a lowerable 8-byte slot kind (a fat pair,
+exactly the `ManagedRef` layout) with descriptor `storage_tag` `8`; the
+runtime scanner treats tag `8` as scannable, identically to tag `7` (the
+only difference is that the pair may hold an immediate, which `mark_ref`
+skips via the rule above). `DynamicRef { heap: I31 | Struct | Array | .. }`
+arising from operator results (`RefI31`, tests) is a value-plan classification
+in `coregc_lower`: `Type::Heap(HeapType::Any | Eq)` lowers to the dynamic fat
+pair, `Type::Heap(HeapType::I31)` lowers to the same pair constrained to the
+immediate form.
+
+**Operator lowering:**
+
+| Source op | Core lowering |
+| --- | --- |
+| `ref.i31` | `(payload, I31_TYPE_ID)` — two constants/values, no allocation |
+| `ref.test (ref null? $concrete)` | `type_id == id(T)` after validating the pair; for the nullable form, `\|\| addr == 0` per the source type's nullability semantics (a nullable test accepts null, a non-null test rejects it) |
+| `ref.test i31` / `ref.test (ref i31)` | `type_id == I31_TYPE_ID` (plus the null rule) |
+| `ref.test any`/`eq` | constant true — everything this backend produces is in the `eq` hierarchy (matching jsaw's own comment that its eqref cast "cannot trap in practice") |
+| `ref.cast` | the corresponding test, then trap `BAD_CAST` on failure and pass the pair through *unchanged* on success (the actual type id is preserved — a cast never rewrites it) |
+| `ref.eq` | validate both; if both are null pairs → true; if both i31 → payload equality; if both heap → address equality, with `addr` equal but `type_id` unequal trapping as corruption (one address has exactly one type); heap-vs-immediate → false |
+
+New trap code: `BAD_CAST = 8`.
+
+### 13.3 Remaining aggregate/control operators
+
+- `ArrayNewFixed(sig, n)`: checkpoint; checked `4 + n*stride`; `alloc`;
+  store length; store each of the `n` flattened element arguments at
+  `4 + i*stride`. (`ArrayNewFixed` is a checkpoint instruction with all `n`
+  fat-ref element arguments in its spill set — the liveness algorithm already
+  generalizes; the instruction walker just iterates all operands.)
+- `ArrayGetS`/`ArrayGetU`: same address path as `ArrayGet`, loading with the
+  signed/unsigned 8/16-bit variants from the element's storage tag.
+- `ArrayCopy(dst, di, src, si, len)`: validate both arrays, bounds-check
+  `di+len` and `si+len`, then a byte-wise copy loop using `array_stride` —
+  handle overlap by copying backward when `dst > src` within the same array
+  (the WasmGC semantics are `memmove`, not `memcpy`).
+- `ArrayFill(arr, i, v, len)`: validate, bounds-check `i+len`, loop storing
+  the (possibly fat) element value.
+- `StructNewDefault(sig)`: checkpoint; `alloc`; `zero_bytes(addr,
+  fixed_payload_bytes)`. (Struct payloads are fully covered by zeroing:
+  scalar fields read as 0, reference slots read as the null pair.)
+- `TypedSelect(cond, a, b)`: scalar-only in v1's accept set; extend to
+  fat-pair select via two core `select`s (addr, type_id) once dynamic values
+  exist. Plain `Select` (untyped) is scalar-only and can be accepted now.
+- `ReturnCall`/`ReturnCallRef` (tail calls): lower as *checkpoint;
+  root_store all live fat-ref arguments (already in the checkpoint's spill
+  set); `pop_frame`; call; return the flattened results*. The
+  safety argument: the checkpoint collects while the caller's frame (holding
+  the spilled arguments) is still live; between `pop_frame` and the callee's
+  own `push_frame` no allocation can occur (a call is not an allocation);
+  the callee roots its own parameters on entry. The returned fat refs are
+  never exposed to a collection before the caller returns them (no
+  intervening checkpoint). This is the exact discipline the superseded plan
+  §7.4 specified, restated against the v1 machinery.
+
+### 13.4 Staging
+
+v2 lands in the same stage discipline as v1 (each stage permanently valid,
+public surface unchanged until the acceptance suite passes):
+
+1. **Scalar/whitelist completion** — extend `validate_operator` with every
+   pure scalar op jsaw emits (§13.1). Purely mechanical; verified by the
+   preflight tests gaining one accepted-operator fixture per family.
+2. **Aggregate completion** — §13.3's array/struct operators plus
+   `Select`/`TypedSelect` and tail calls. Each gets a forced-collection
+   end-to-end test in the style of the v1 fixtures.
+3. **Dynamic values** — §13.2 (sentinel type id, runtime immediate rule,
+   descriptor tag 8 scanning, ref.test/cast/eq lowering). This is the stage
+   after which jsaw's `Repr` module itself becomes lowerable; it has its own
+   acceptance battery (boxed values, null vs undefined, equality, casts).
+4. **Program-level activation** — `conv.rs` output accepted by `emit_coregc`
+   for a growing allowlist of e2e fixtures, gated by the cross-testing
+   harness in §14.
+
+## 14. Cross-testing: differential execution of jsaw-compiled programs
+
+The goal is to run the *same* jsaw-compiled programs through both backends
+and compare observable behavior:
+
+```
+JS source -> conv.rs -> portal_pc_waffle::Module (WasmGC IR)
+  -> [native] to_wasm_bytes -> wasmtime (wasm_gc=true)      -> results
+  -> [coregc] emit_coregc   -> wasmtime (default features)  -> results
+```
+
+### 14.1 Harness shape
+
+A `#[cfg(test)]` harness (in `portal-jsc-waffle/tests/`) that, for each
+fixture, compiles JS to the native module once, then:
+
+- **native path:** execute exported functions under wasmtime with
+  `wasm_gc(true)` + `wasm_function_references(true)` (the configuration the
+  existing e2e suite already uses);
+- **coregc path:** `emit_coregc` the same module, execute under default
+  wasmtime — twice, once with `collect_threshold_bytes = 0` (forced
+  collection at every checkpoint) and once with the default threshold
+  (catches schedule-dependent rooting bugs the forced run alone would mask);
+- compare every exported function's numeric results and trap behavior across
+  all three runs;
+- if `emit_coregc` returns an error, the fixture is *expected-rejected*:
+  the harness asserts the diagnostic names a known-deferred feature (so the
+  allowlist of unlowerable features is itself under test, and shrinks as v2
+  stages land).
+
+### 14.2 Speed discipline
+
+The existing e2e suite runs every fixture in Node.js, the JVM, and Swift in
+addition to wasmtime (~135 s per fixture on this host — that was the
+"hang" observed during stage 5 validation; it is external-compiler latency,
+not a deadlock). Cross-testing deliberately runs **wasmtime-only** (both
+paths above) as the fast inner loop, so the differential suite scales with
+fixture count rather than toolchain latency. Node/JVM/Swift remain the
+native backend's own parity gate and are unchanged; coregc artifacts are
+pure core Wasm, so any engine running the native suite's core subset (or
+wasmtime alone) suffices to host them.
+
+### 14.3 Rollout
+
+- v1: the harness exists and runs the v1 hand-built fixtures (already
+  covered by `coregc_emit::tests::differential_native_wasmgc_vs_coregc`),
+  plus asserts every real `conv.rs` fixture fails closed with a named
+  diagnostic (proving the rejection surface is honest, not silently partial).
+- v2 stage 4: flip fixtures onto the accepted list as their required
+  operators land, in increasing Repr complexity order: numeric cores →
+  booleans/comparisons → strings → objects/properties → closures → typed
+  arrays → the compiler itself (dogfood).
+- The suite fails if a fixture is *silently* omitted: the harness enumerates
+  the e2e fixture list, so adding a fixture without a cross-test entry is a
+  test failure, matching the inventory-exhaustiveness stance elsewhere.

@@ -24,6 +24,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aho-corasick"
+version = "1.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c982642fa9e8606056828ee9a8505737230110bb1099153c79efe865c59d12ba"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -67,6 +76,12 @@ name = "array-init"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d62b7694a562cdf5a74227903507c56ab2cc8bdd1f781ed5cb4cf9c9f810bfc"
+
+[[package]]
+name = "ascii"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d92bec98840b8f03a5ff5413de5293bfcd8bf96467cf5452609f939ec6f5de16"
 
 [[package]]
 name = "ast_node"
@@ -207,6 +222,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "castaway"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dec551ab6e7578819132c713a93c022a05d60159dc86e7a7050223577484c55a"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "cc"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -225,6 +249,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 [[package]]
 name = "cfg-traits"
 version = "0.2.3"
+source = "git+https://github.com/portal-co/codegen-utils.git?branch=master#148b07d923ca586162e27ed8f7578dd10fa924a8"
 dependencies = [
  "arena-traits",
  "either",
@@ -248,6 +273,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
 dependencies = [
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "compact_str"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f86b9c4c00838774a6d902ef931eff7470720c51d90c2e32cfe15dc304737b3f"
+dependencies = [
+ "castaway",
+ "cfg-if",
+ "itoa",
+ "ryu",
+ "static_assertions",
 ]
 
 [[package]]
@@ -1576,11 +1614,14 @@ dependencies = [
  "portal-jsc-swc-tac",
  "portal-jsc-swc-util",
  "portal-solutions-swibb",
+ "sha3",
  "ssa-impls",
  "ssa-traits",
  "swc_atoms",
  "swc_common",
  "swc_ecma_ast",
+ "swc_ecma_codegen",
+ "swc_ecma_parser",
  "swc_ecma_utils",
  "swc_ecma_visit",
  "thiserror 2.0.20",
@@ -1664,8 +1705,11 @@ dependencies = [
  "portal-jsc-swift-emit",
  "portal-pc-waffle",
  "ryu-js",
+ "sha3",
+ "swc_atoms",
  "swc_common",
  "swc_ecma_ast",
+ "swc_ecma_codegen",
  "swc_ecma_parser",
  "wasmparser 0.240.0",
  "wasmtime",
@@ -1726,7 +1770,7 @@ dependencies = [
  "smallvec",
  "wasm-encoder 0.240.0",
  "wasmparser 0.240.0",
- "wax-core",
+ "wax-core 0.1.0 (git+https://github.com/portal-co/wax.git)",
 ]
 
 [[package]]
@@ -1748,7 +1792,7 @@ dependencies = [
  "portal-pc-waffle-ir",
  "wasm-encoder 0.240.0",
  "wasmparser 0.240.0",
- "wax-core",
+ "wax-core 0.1.0 (git+https://github.com/portal-co/wax.git)",
 ]
 
 [[package]]
@@ -1802,6 +1846,7 @@ dependencies = [
 [[package]]
 name = "portal-solutions-asm-regalloc"
 version = "0.1.0"
+source = "git+https://github.com/portal-co/asm-arch.git#7fabce2a10f33d62065646f4f5c57e4bd44ab849"
 dependencies = [
  "portal-pc-asm-common 0.1.1",
  "typeid",
@@ -1823,7 +1868,7 @@ dependencies = [
  "typeid",
  "wasm-encoder 0.240.0",
  "wasmparser 0.240.0",
- "wax-core",
+ "wax-core 0.1.0 (git+https://github.com/portal-co/wax.git?branch=main)",
 ]
 
 [[package]]
@@ -1851,6 +1896,7 @@ checksum = "bd561b504f0baa18b1b44c277bb216367ce6176900117aa0041d6a22f9c8f67a"
 [[package]]
 name = "portal-solutions-swibb"
 version = "0.6.0-alpha.1"
+source = "git+https://github.com/portal-co/swibb.git#f97a7a661d9e2207fcc826247cd95518840bdbba"
 dependencies = [
  "impl-trait-for-tuples",
  "swc_atoms",
@@ -2018,6 +2064,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
+name = "regex-automata"
+version = "0.4.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-syntax",
+]
+
+[[package]]
+name = "regex-syntax"
+version = "0.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
 name = "relooper"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2073,6 +2148,12 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "ryu-js"
@@ -2244,6 +2325,7 @@ dependencies = [
 [[package]]
 name = "ssa-impls"
 version = "0.2.3"
+source = "git+https://github.com/portal-co/codegen-utils.git?branch=master#148b07d923ca586162e27ed8f7578dd10fa924a8"
 dependencies = [
  "arena-traits",
  "cfg-traits",
@@ -2253,6 +2335,7 @@ dependencies = [
 [[package]]
 name = "ssa-reloop"
 version = "0.2.3"
+source = "git+https://github.com/portal-co/codegen-utils.git?branch=master#148b07d923ca586162e27ed8f7578dd10fa924a8"
 dependencies = [
  "arena-traits",
  "cfg-traits",
@@ -2264,6 +2347,7 @@ dependencies = [
 [[package]]
 name = "ssa-reloop2"
 version = "0.2.3"
+source = "git+https://github.com/portal-co/codegen-utils.git?branch=master#148b07d923ca586162e27ed8f7578dd10fa924a8"
 dependencies = [
  "arena-traits",
  "cfg-traits",
@@ -2273,6 +2357,7 @@ dependencies = [
 [[package]]
 name = "ssa-traits"
 version = "0.2.3"
+source = "git+https://github.com/portal-co/codegen-utils.git?branch=master#148b07d923ca586162e27ed8f7578dd10fa924a8"
 dependencies = [
  "anyhow",
  "arena-traits",
@@ -2314,6 +2399,18 @@ dependencies = [
  "quote",
  "swc_macros_common",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "swc_allocator"
+version = "4.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d7eefd2c8b228a8c73056482b2ae4b3a1071fbe07638e3b55ceca8570cc48bb"
+dependencies = [
+ "allocator-api2",
+ "bumpalo",
+ "hashbrown 0.14.5",
+ "rustc-hash",
 ]
 
 [[package]]
@@ -2369,6 +2466,40 @@ dependencies = [
  "swc_common",
  "swc_visit",
  "unicode-id-start",
+]
+
+[[package]]
+name = "swc_ecma_codegen"
+version = "24.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50b8dbdc2be434883934cda8c3f6638130390032c44e1952e543252fcafd67e0"
+dependencies = [
+ "ascii",
+ "compact_str",
+ "dragonbox_ecma",
+ "memchr",
+ "num-bigint",
+ "once_cell",
+ "regex",
+ "rustc-hash",
+ "serde",
+ "swc_allocator",
+ "swc_atoms",
+ "swc_common",
+ "swc_ecma_ast",
+ "swc_ecma_codegen_macros",
+ "tracing",
+]
+
+[[package]]
+name = "swc_ecma_codegen_macros"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e276dc62c0a2625a560397827989c82a93fd545fcf6f7faec0935a82cc4ddbb8"
+dependencies = [
+ "proc-macro2",
+ "swc_macros_common",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -3061,6 +3192,17 @@ dependencies = [
 [[package]]
 name = "wax-core"
 version = "0.1.0"
+source = "git+https://github.com/portal-co/wax.git?branch=main#249323b6cb2c7ff3f4700dd3ed27f0145fb5c352"
+dependencies = [
+ "impl-trait-for-tuples",
+ "wasm-encoder 0.240.0",
+ "wasmparser 0.240.0",
+]
+
+[[package]]
+name = "wax-core"
+version = "0.1.0"
+source = "git+https://github.com/portal-co/wax.git#249323b6cb2c7ff3f4700dd3ed27f0145fb5c352"
 dependencies = [
  "impl-trait-for-tuples",
  "wasm-encoder 0.240.0",
@@ -3070,6 +3212,7 @@ dependencies = [
 [[package]]
 name = "wax-meta"
 version = "0.1.0"
+source = "git+https://github.com/portal-co/portal-container.git#b3d2fce46407e8b7102ed5a385f8ff951259b7b4"
 dependencies = [
  "sha3",
 ]
@@ -3445,116 +3588,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[patch.unused]]
-name = "portal-jsc-generator"
-version = "0.8.0-pre.10"
-
-[[patch.unused]]
-name = "portal-jsc-simpl-js"
-version = "0.8.0-pre.11"
-
-[[patch.unused]]
-name = "portal-jsc-swc-opt-ssa"
-version = "0.8.0-pre.11"
-
-[[patch.unused]]
-name = "portal-container-core"
+name = "lazy-repo"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-container-select"
+name = "lazy-repo-crypto"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-container-wasm"
+name = "lazy-repo-std"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "dreamcomp-ir-plugin-host"
+name = "portal-jit-host-names"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "dreamcomp-plugin-common"
+name = "volar-circuit-exec-core"
 version = "0.1.0"
-
-[[patch.unused]]
-name = "dreamcompiler-arena"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "dreamcompiler-codegen"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "dreamcompiler-core"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "dreamcompiler-cps"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "dreamcompiler-cps-c-backend"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "dreamcompiler-e2e-tests"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "dreamcompiler-edu"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "dreamcompiler-fast-ir"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "dreamcompiler-lower"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "dreamcompiler-mini-target"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "dreamcompiler-minibc"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "dreamcompiler-minibc-c-interp"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "dreamcompiler-minibc-interp"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "px-wsdom"
-version = "0.0.6"
-
-[[patch.unused]]
-name = "px-wsdom-axum"
-version = "0.0.6"
-
-[[patch.unused]]
-name = "px-wsdom-core"
-version = "0.0.6"
-
-[[patch.unused]]
-name = "px-wsdom-dom"
-version = "0.0.6"
-
-[[patch.unused]]
-name = "px-wsdom-javascript"
-version = "0.0.6"
-
-[[patch.unused]]
-name = "px-wsdom-macros"
-version = "0.0.6"
-
-[[patch.unused]]
-name = "px-wsdom-macros-decl"
-version = "0.0.6"
 
 [[patch.unused]]
 name = "volar-llvm-constchain"
@@ -3565,227 +3616,27 @@ name = "volar-llvm-import-core"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "wax-tags"
+name = "volar-llvm-pass-build"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "ast-traits"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "register-machine-traits"
-version = "0.2.3"
-
-[[patch.unused]]
-name = "sift-trait"
-version = "0.2.3"
-
-[[patch.unused]]
-name = "siftify"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "ssa-canon"
-version = "0.2.3"
-
-[[patch.unused]]
-name = "ssa-cc"
-version = "0.2.3"
-
-[[patch.unused]]
-name = "ssa-pliron-compat"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "ssa-rust"
-version = "0.2.3"
-
-[[patch.unused]]
-name = "ssa-trace"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "ssa-translation"
-version = "0.2.3"
-
-[[patch.unused]]
-name = "tac-traits"
-version = "0.2.3"
-
-[[patch.unused]]
-name = "type-onion"
-version = "0.2.3"
-
-[[patch.unused]]
-name = "pit-core"
-version = "0.5.0-alpha.1"
-
-[[patch.unused]]
-name = "portal-solutions-asm-aarch64"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-solutions-asm-jvm"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-solutions-asm-riscv64"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-solutions-asm-semantics"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-solutions-asm-x86-64"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-solutions-asm-x86-64-shim"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-lazy-transform"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-progress"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-progress-core"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-progress-lazy-transform"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-progress-protocol"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-progress-tui"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-progress-wasm"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-progress-web"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-pc-waffle-copying"
-version = "0.6.0-alpha.1"
-
-[[patch.unused]]
-name = "portal-pc-waffle-copying-passes"
-version = "0.6.0-alpha.1"
-
-[[patch.unused]]
-name = "portal-pc-waffle-fuzzing"
-version = "0.6.0-alpha.1"
-
-[[patch.unused]]
-name = "portal-pc-waffle-hooking"
-version = "0.6.0-alpha.1"
-
-[[patch.unused]]
-name = "portal-pc-waffle-lowering"
-version = "0.6.0-alpha.1"
-
-[[patch.unused]]
-name = "lazy-repo"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "vaffle"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-c-backend"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-fuzz"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-ir"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-ir-build"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-ir-common"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-ir-config"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-ir-opt"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-ir-passes"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-ir-text"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-ir-virt"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-lir"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-lir-saved"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-lir-test-corpus"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-lir-text"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-llvm-backend"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-provenance"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-riscv-test-programs"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-side"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-vaffle-target"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-wasm-backend"
+name = "volar-llvm-pass-support"
 version = "0.1.0"
 
 [[patch.unused]]
 name = "ephemera"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-build"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-c-backend-spec-tests"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-channel"
 version = "0.1.0"
 
 [[patch.unused]]
@@ -3805,7 +3656,19 @@ name = "volar-compiler-passes"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "volar-discipline"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "volar-dyn"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-fold"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-iop"
 version = "0.1.0"
 
 [[patch.unused]]
@@ -3813,11 +3676,39 @@ name = "volar-ir-lir-target"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "volar-ir-tester"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "volar-lir-codegen"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "volar-log"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-macros"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-net"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-oram"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-oram-core"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "volar-primitives"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-riscv-e2e"
 version = "0.1.0"
 
 [[patch.unused]]
@@ -3829,7 +3720,43 @@ name = "volar-spec-dyn"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "volar-verifier-fold"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-verifier-iop-runtime"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "volar-weaver"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "xtask"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "lazy-repo"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "lazy-repo-crypto"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "lazy-repo-std"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-asm-arm"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-asm-riscv32"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-asm-x86"
 version = "0.1.0"
 
 [[patch.unused]]
@@ -3873,11 +3800,23 @@ name = "os-daemon-protocol"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "os-daemon-shim"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "os-darwin-wasi"
 version = "0.1.0"
 
 [[patch.unused]]
 name = "os-host-api"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "os-interposer"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "os-jit-core"
 version = "0.1.0"
 
 [[patch.unused]]
@@ -3898,6 +3837,14 @@ version = "0.1.0"
 
 [[patch.unused]]
 name = "os-rewrite-macho"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "os-shim-core"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "os-shim-handler"
 version = "0.1.0"
 
 [[patch.unused]]
@@ -3929,21 +3876,101 @@ name = "os-unix-wasi"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-solutions-sdk"
-version = "0.0.2"
-
-[[patch.unused]]
-name = "pit-gen"
+name = "volar-ir"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "pit-lang-generic"
+name = "volar-ir-build"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "pit-rust-generic"
+name = "volar-ir-common"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "rv-asm"
-version = "0.2.1"
+name = "volar-lir-test-corpus"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-llvm-ir-import"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-llvm-vaffle-import"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-wasm-circuit-import"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "vane-aarch64"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "vane-riscv"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-jsc-swc-opt-ssa"
+version = "0.8.0-pre.11"
+
+[[patch.unused]]
+name = "volar-circuit-exec-core"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-llvm-constchain"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-llvm-import-core"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-llvm-pass-build"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-llvm-pass-support"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-jit-host-names"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "thin-mcp"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-blitz-aarch64"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-blitz-arm"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-blitz-c"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-blitz-common"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-blitz-i686"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-blitz-js"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-blitz-riscv32"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-blitz-x86-64"
+version = "0.1.0"

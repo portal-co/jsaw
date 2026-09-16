@@ -649,8 +649,13 @@ pub(crate) fn preflight(
             {
                 if !call_site_signatures.contains_key(sig_index) {
                     let (params, returns) = function_signature(source, *sig_index)?;
-                    let mut flat_params = flatten_plan(&classify_all(source, inventory, params)?);
-                    flat_params.push(Type::I32);
+                    // The signature used by `CallIndirect` is the callee's
+                    // own flattened signature; the selector is a separate
+                    // operand popped by `call_indirect` itself, NOT a
+                    // parameter in this signature (getting this wrong makes
+                    // the validator pop one more i32 than the call site
+                    // provides).
+                    let flat_params = flatten_plan(&classify_all(source, inventory, params)?);
                     let flat_returns = flatten_plan(&classify_all(source, inventory, returns)?);
                     let lowered_signature = out.signatures.push(SignatureData::Func {
                         params: flat_params,
@@ -2163,6 +2168,222 @@ mod tests {
         module
     }
 
+    /// `Node { value: i32, next: ref null Node }`, a helper `make_node(v) ->
+    /// ref null Node` (`struct.new(v, null)`), and `caller(a, b) -> i32`
+    /// which allocates one node directly, **then** calls `make_node` (a real
+    /// `Operator::Call`) to allocate a second, and finally reads both
+    /// `.value` fields. The directly-allocated node is only used *after*
+    /// the call, so it must survive the call's own checkpoint.
+    fn direct_call_source() -> Module<'static> {
+        let mut module = Module::empty();
+        let node = module.signatures.push(SignatureData::Struct {
+            fields: vec![],
+            shared: false,
+        });
+        module.signatures[node] = SignatureData::Struct {
+            fields: vec![
+                field(StorageType::Val(Type::I32)),
+                field(StorageType::Val(Type::Heap(WithNullable {
+                    nullable: true,
+                    value: HeapType::Sig { sig_index: node },
+                }))),
+            ],
+            shared: false,
+        };
+        let node_ref = Type::Heap(WithNullable {
+            nullable: true,
+            value: HeapType::Sig { sig_index: node },
+        });
+
+        let make_node_sig = module.signatures.push(SignatureData::Func {
+            params: vec![Type::I32],
+            returns: vec![node_ref],
+            shared: false,
+        });
+        let mut make_node_body = FunctionBody::new(&module, make_node_sig);
+        let mn_entry = make_node_body.entry;
+        let v = make_node_body.blocks[mn_entry].params[0].1;
+        let null_ref = make_node_body.add_op(mn_entry, Operator::RefNull { ty: node_ref }, &[], &[node_ref]);
+        let result = make_node_body.add_op(
+            mn_entry,
+            Operator::StructNew { sig: node },
+            &[v, null_ref],
+            &[node_ref],
+        );
+        make_node_body.set_terminator(mn_entry, Terminator::Return { values: vec![result] });
+        make_node_body.recompute_edges();
+        make_node_body.validate().expect("make_node body validates");
+        let make_node = module
+            .funcs
+            .push(FuncDecl::Body(make_node_sig, "make_node".to_owned(), make_node_body));
+
+        let caller_sig = module.signatures.push(SignatureData::Func {
+            params: vec![Type::I32, Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut caller_body = FunctionBody::new(&module, caller_sig);
+        let entry = caller_body.entry;
+        let a = caller_body.blocks[entry].params[0].1;
+        let b = caller_body.blocks[entry].params[1].1;
+        let null_ref2 = caller_body.add_op(entry, Operator::RefNull { ty: node_ref }, &[], &[node_ref]);
+        let n1 = caller_body.add_op(
+            entry,
+            Operator::StructNew { sig: node },
+            &[a, null_ref2],
+            &[node_ref],
+        );
+        let n2 = caller_body.add_op(
+            entry,
+            Operator::Call {
+                function_index: make_node,
+            },
+            &[b],
+            &[node_ref],
+        );
+        let v1 = caller_body.add_op(
+            entry,
+            Operator::StructGet { sig: node, idx: 0 },
+            &[n1],
+            &[Type::I32],
+        );
+        let v2 = caller_body.add_op(
+            entry,
+            Operator::StructGet { sig: node, idx: 0 },
+            &[n2],
+            &[Type::I32],
+        );
+        let sum = caller_body.add_op(entry, Operator::I32Add, &[v1, v2], &[Type::I32]);
+        caller_body.set_terminator(entry, Terminator::Return { values: vec![sum] });
+        caller_body.recompute_edges();
+        caller_body.validate().expect("caller body validates");
+        let caller = module
+            .funcs
+            .push(FuncDecl::Body(caller_sig, "caller".to_owned(), caller_body));
+        module.exports.push(Export {
+            name: "caller".to_owned(),
+            kind: ExportKind::Func(caller),
+        });
+        module
+    }
+
+    /// A concrete-signature closure-table pattern: `add_one(x) -> x+1` and
+    /// `double(x) -> x*2` are both taken by `ref.func` and invoked through
+    /// `call_ref`. `apply(which, x)` picks one and calls through it; the
+    /// `else` arm calls through a deliberate null function reference to
+    /// prove that traps deterministically with no coregc-specific runtime
+    /// support (core Wasm's own `call_indirect` semantics).
+    fn call_ref_source() -> Module<'static> {
+        let mut module = Module::empty();
+        let unary_sig = module.signatures.push(SignatureData::Func {
+            params: vec![Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let unary_ref = Type::Heap(WithNullable {
+            nullable: true,
+            value: HeapType::Sig { sig_index: unary_sig },
+        });
+
+        let mut add_one_body = FunctionBody::new(&module, unary_sig);
+        let add_one_entry = add_one_body.entry;
+        let x0 = add_one_body.blocks[add_one_entry].params[0].1;
+        let one = add_one_body.add_op(add_one_entry, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        let result0 = add_one_body.add_op(add_one_entry, Operator::I32Add, &[x0, one], &[Type::I32]);
+        add_one_body.set_terminator(add_one_entry, Terminator::Return { values: vec![result0] });
+        add_one_body.recompute_edges();
+        add_one_body.validate().unwrap();
+        let add_one = module
+            .funcs
+            .push(FuncDecl::Body(unary_sig, "add_one".to_owned(), add_one_body));
+
+        let mut double_body = FunctionBody::new(&module, unary_sig);
+        let double_entry = double_body.entry;
+        let x1 = double_body.blocks[double_entry].params[0].1;
+        let two = double_body.add_op(double_entry, Operator::I32Const { value: 2 }, &[], &[Type::I32]);
+        let result1 = double_body.add_op(double_entry, Operator::I32Mul, &[x1, two], &[Type::I32]);
+        double_body.set_terminator(double_entry, Terminator::Return { values: vec![result1] });
+        double_body.recompute_edges();
+        double_body.validate().unwrap();
+        let double = module
+            .funcs
+            .push(FuncDecl::Body(unary_sig, "double".to_owned(), double_body));
+
+        // apply(which, x): which==0 -> add_one(x); which==1 -> double(x); else -> call through null (traps)
+        let apply_sig = module.signatures.push(SignatureData::Func {
+            params: vec![Type::I32, Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(&module, apply_sig);
+        let entry = body.entry;
+        let which = body.blocks[entry].params[0].1;
+        let x = body.blocks[entry].params[1].1;
+
+        let zero_c = body.add_op(entry, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let is_add_one = body.add_op(entry, Operator::I32Eq, &[which, zero_c], &[Type::I32]);
+        let add_one_block = body.add_block();
+        let check_double = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: is_add_one,
+                if_true: BlockTarget { block: add_one_block, args: vec![] },
+                if_false: BlockTarget { block: check_double, args: vec![] },
+            },
+        );
+        let add_one_ref = body.add_op(add_one_block, Operator::RefFunc { func_index: add_one }, &[], &[unary_ref]);
+        let add_one_result = body.add_op(
+            add_one_block,
+            Operator::CallRef { sig_index: unary_sig },
+            &[x, add_one_ref],
+            &[Type::I32],
+        );
+        body.set_terminator(add_one_block, Terminator::Return { values: vec![add_one_result] });
+
+        let one_c = body.add_op(check_double, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        let is_double = body.add_op(check_double, Operator::I32Eq, &[which, one_c], &[Type::I32]);
+        let double_block = body.add_block();
+        let null_block = body.add_block();
+        body.set_terminator(
+            check_double,
+            Terminator::CondBr {
+                cond: is_double,
+                if_true: BlockTarget { block: double_block, args: vec![] },
+                if_false: BlockTarget { block: null_block, args: vec![] },
+            },
+        );
+        let double_ref = body.add_op(double_block, Operator::RefFunc { func_index: double }, &[], &[unary_ref]);
+        let double_result = body.add_op(
+            double_block,
+            Operator::CallRef { sig_index: unary_sig },
+            &[x, double_ref],
+            &[Type::I32],
+        );
+        body.set_terminator(double_block, Terminator::Return { values: vec![double_result] });
+
+        let null_ref = body.add_op(null_block, Operator::RefNull { ty: unary_ref }, &[], &[unary_ref]);
+        let null_result = body.add_op(
+            null_block,
+            Operator::CallRef { sig_index: unary_sig },
+            &[x, null_ref],
+            &[Type::I32],
+        );
+        body.set_terminator(null_block, Terminator::Return { values: vec![null_result] });
+
+        body.recompute_edges();
+        body.validate().expect("apply body validates");
+        let apply = module
+            .funcs
+            .push(FuncDecl::Body(apply_sig, "apply".to_owned(), body));
+        module.exports.push(Export {
+            name: "apply".to_owned(),
+            kind: ExportKind::Func(apply),
+        });
+        module
+    }
+
+
     fn lower_and_instantiate(source: &Module<'_>, options: CoreGcOptions) -> (Store<()>, Instance) {
         let inventory = CoreGcInventory::build(source).expect("inventory");
         let descriptors = CoreGcDescriptorTable::build(&inventory).expect("descriptors");
@@ -2239,6 +2460,78 @@ mod tests {
     }
 
     #[test]
+    fn a_directly_allocated_value_survives_a_call_that_also_allocates() {
+        let source = direct_call_source();
+        let (mut store, instance) = lower_and_instantiate(
+            &source,
+            CoreGcOptions {
+                collect_threshold_bytes: 0,
+                ..CoreGcOptions::default()
+            },
+        );
+        let caller = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "caller")
+            .expect("caller export");
+        assert_eq!(caller.call(&mut store, (10, 32)).expect("caller(10, 32)"), 42);
+    }
+
+    #[test]
+    fn debug_minimal_call_ref() {
+        let mut module = Module::empty();
+        let unary_sig = module.signatures.push(SignatureData::Func {
+            params: vec![Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let unary_ref = Type::Heap(WithNullable {
+            nullable: true,
+            value: HeapType::Sig { sig_index: unary_sig },
+        });
+        let mut add_one_body = FunctionBody::new(&module, unary_sig);
+        let e = add_one_body.entry;
+        let x0 = add_one_body.blocks[e].params[0].1;
+        let one = add_one_body.add_op(e, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        let r0 = add_one_body.add_op(e, Operator::I32Add, &[x0, one], &[Type::I32]);
+        add_one_body.set_terminator(e, Terminator::Return { values: vec![r0] });
+        add_one_body.recompute_edges();
+        let add_one = module.funcs.push(FuncDecl::Body(unary_sig, "add_one".into(), add_one_body));
+
+        let apply_sig = module.signatures.push(SignatureData::Func {
+            params: vec![Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(&module, apply_sig);
+        let entry = body.entry;
+        let x = body.blocks[entry].params[0].1;
+        let r = body.add_op(entry, Operator::RefFunc { func_index: add_one }, &[], &[unary_ref]);
+        let result = body.add_op(entry, Operator::CallRef { sig_index: unary_sig }, &[x, r], &[Type::I32]);
+        body.set_terminator(entry, Terminator::Return { values: vec![result] });
+        body.recompute_edges();
+        let apply = module.funcs.push(FuncDecl::Body(apply_sig, "apply".into(), body));
+        module.exports.push(Export { name: "apply".into(), kind: ExportKind::Func(apply) });
+
+        let (mut store, instance) = lower_and_instantiate(&module, CoreGcOptions::default());
+        let apply = instance.get_typed_func::<i32, i32>(&mut store, "apply").unwrap();
+        assert_eq!(apply.call(&mut store, 41).unwrap(), 42);
+    }
+
+    #[test]
+    fn ref_func_and_call_ref_dispatch_over_concrete_signatures() {
+        let source = call_ref_source();
+        let (mut store, instance) = lower_and_instantiate(&source, CoreGcOptions::default());
+        let apply = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "apply")
+            .expect("apply export");
+        assert_eq!(apply.call(&mut store, (0, 41)).expect("add_one via call_ref"), 42);
+        assert_eq!(apply.call(&mut store, (1, 21)).expect("double via call_ref"), 42);
+        assert!(
+            apply.call(&mut store, (2, 0)).is_err(),
+            "calling through a null function reference must trap, not silently succeed"
+        );
+    }
+
+    #[test]
     fn list_built_and_summed_matches_with_a_normal_collection_threshold() {
         let (source, _) = list_sum_source();
         let (mut store, instance) = lower_and_instantiate(&source, CoreGcOptions::default());
@@ -2272,5 +2565,113 @@ mod tests {
             .get_typed_func::<(), ()>(&mut store, "collect")
             .expect("collect export");
         collect.call(&mut store, ()).expect("forced collection after both calls");
+    }
+}
+
+#[cfg(test)]
+mod call_indirect_regressions {
+    use portal_pc_waffle::{
+        EntityRef, Export, ExportKind, FuncDecl, FunctionBody, HeapType, Module, Operator,
+        SignatureData, TableData, Terminator, Type, WithNullable,
+    };
+
+    /// Regression guard for the call-site-signature ABI: `call_indirect`'s
+    /// signature is the *callee's* signature; the selector is a separate
+    /// operand popped by the instruction itself, not a signature parameter.
+    /// coregc once interned the signature with a spurious trailing i32,
+    /// which made the validator underflow ("expected i32 but nothing on
+    /// stack") at every indirect call.
+    #[test]
+    fn call_indirect_with_operands_validates() {
+        let mut module = Module::empty();
+        let unary_sig = module.signatures.push(SignatureData::Func {
+            params: vec![Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut add_one_body = FunctionBody::new(&module, unary_sig);
+        let entry = add_one_body.entry;
+        let x = add_one_body.blocks[entry].params[0].1;
+        let one = add_one_body.add_op(entry, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        let sum = add_one_body.add_op(entry, Operator::I32Add, &[x, one], &[Type::I32]);
+        add_one_body.set_terminator(entry, Terminator::Return { values: vec![sum] });
+        add_one_body.recompute_edges();
+        let add_one = module
+            .funcs
+            .push(FuncDecl::Body(unary_sig, "add_one".to_owned(), add_one_body));
+
+        let table = module.tables.push(TableData {
+            ty: Type::Heap(WithNullable {
+                value: HeapType::FuncRef,
+                nullable: true,
+            }),
+            initial: 2,
+            max: Some(2),
+            func_elements: Some(vec![EntityRef::invalid(), add_one]),
+            table64: false,
+        });
+
+        let mut apply_body = FunctionBody::new(&module, unary_sig);
+        let entry = apply_body.entry;
+        let x = apply_body.blocks[entry].params[0].1;
+        let slot = apply_body.add_op(entry, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        let result = apply_body.add_op(
+            entry,
+            Operator::CallIndirect {
+                sig_index: unary_sig,
+                table_index: table,
+            },
+            &[x, slot],
+            &[Type::I32],
+        );
+        apply_body.set_terminator(entry, Terminator::Return { values: vec![result] });
+        apply_body.recompute_edges();
+        let apply = module
+            .funcs
+            .push(FuncDecl::Body(unary_sig, "apply".to_owned(), apply_body));
+        module.exports.push(Export {
+            name: "apply".to_owned(),
+            kind: ExportKind::Func(apply),
+        });
+
+        let bytes = portal_pc_waffle::to_wasm_bytes(&module).expect("compiles");
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("validates with default core features");
+
+        // Both operands (the argument local and the selector constant) must
+        // actually be emitted before `call_indirect`.
+        let mut apply_ops = None;
+        for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+            if let Ok(wasmparser::Payload::CodeSectionEntry(body)) = payload {
+                let ops = body
+                    .get_operators_reader()
+                    .expect("operators")
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("decode");
+                if ops
+                    .iter()
+                    .any(|op| matches!(op, wasmparser::Operator::CallIndirect { .. }))
+                {
+                    apply_ops = Some(ops);
+                }
+            }
+        }
+        let apply_ops = apply_ops.expect("a function with call_indirect exists");
+        let call_pos = apply_ops
+            .iter()
+            .position(|op| matches!(op, wasmparser::Operator::CallIndirect { .. }))
+            .unwrap();
+        let has_arg = apply_ops[..call_pos]
+            .iter()
+            .any(|op| matches!(op, wasmparser::Operator::LocalGet { local_index: 0 }));
+        let has_selector = apply_ops[..call_pos]
+            .iter()
+            .any(|op| matches!(op, wasmparser::Operator::I32Const { value: 1 }));
+        assert!(
+            has_arg && has_selector,
+            "call_indirect operands must be emitted: {apply_ops:?}"
+        );
     }
 }

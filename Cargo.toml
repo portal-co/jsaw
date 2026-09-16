@@ -99,7 +99,22 @@ portal-jsc-swc-util =    { path = "../jsaw-core/crates/swc-util" }
 # Development-only: build against the local waffle- checkout, which has a
 # fix for a treeify bug that inlined values across block boundaries (see
 # call_then_prop_read_combined_in_one_expression in
-# crates/portal-jsc-waffle/tests/e2e.rs). Remove once the fix is pushed
-# upstream and the version pin is bumped.
+# crates/portal-jsc-waffle/tests/e2e.rs) and a fix for multi-result operator
+# values being stored to locals in the wrong (swapped) stack order
+# (waffle-backend lower_inst; surfaced by coregc's two-value fat-reference
+# call returns). Remove once the fixes are pushed upstream and the version
+# pin is bumped.
+#
+# Every crate in the waffle workspace must be patched, not just the facade:
+# the facade's own workspace members are declared as git dependencies, so
+# patching only `portal-pc-waffle` would silently mix the local facade with
+# stale git copies of its sub-crates (the parent .cargo/config.toml warns
+# about exactly this for other repos).
 [patch."https://github.com/portal-co/waffle-.git"]
 portal-pc-waffle = { path = "../waffle-" }
+portal-pc-waffle-backend = { path = "../waffle-/crates/waffle-backend" }
+portal-pc-waffle-entity = { path = "../waffle-/crates/waffle-entity" }
+portal-pc-waffle-frontend = { path = "../waffle-/crates/waffle-frontend" }
+portal-pc-waffle-ir = { path = "../waffle-/crates/waffle-ir" }
+portal-pc-waffle-passes = { path = "../waffle-/crates/waffle-passes" }
+portal-pc-waffle-passes-shared = { path = "../waffle-/crates/waffle-passes-shared" }

@@ -162,8 +162,73 @@ fn add_root_push(
         &[next],
         &[],
     );
+    // Zero every slot: pop rewinds the root bump without clearing memory, so
+    // a later push can reuse memory that still holds stale non-null pairs
+    // from a dead frame. Until the lowering's own root_store runs, a slot
+    // must read as the null pair (0, 0), not as garbage or a stale root.
+    let zero_loop = body.add_block();
+    let zero_step = body.add_block();
+    let finish = body.add_block();
+    let zero_index = i32_const(&mut body, commit, 0);
     body.set_terminator(
         commit,
+        Terminator::Br {
+            target: BlockTarget {
+                block: zero_loop,
+                args: vec![zero_index],
+            },
+        },
+    );
+    let i = body.add_blockparam(zero_loop, Type::I32);
+    let done = body.add_op(zero_loop, Operator::I32GeU, &[i, slots], &[Type::I32]);
+    body.set_terminator(
+        zero_loop,
+        Terminator::CondBr {
+            cond: done,
+            if_true: BlockTarget {
+                block: finish,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: zero_step,
+                args: vec![i],
+            },
+        },
+    );
+    let step_i = body.add_blockparam(zero_step, Type::I32);
+    let eight = i32_const(&mut body, zero_step, 8);
+    let slot_offset = body.add_op(zero_step, Operator::I32Mul, &[step_i, eight], &[Type::I32]);
+    let slot_base = body.add_op(zero_step, Operator::I32Add, &[frame, slot_offset], &[Type::I32]);
+    let prefix = i32_const(&mut body, zero_step, 8);
+    let slot_addr = body.add_op(zero_step, Operator::I32Add, &[slot_base, prefix], &[Type::I32]);
+    let zero = i32_const(&mut body, zero_step, 0);
+    body.add_op(
+        zero_step,
+        Operator::I32Store { memory: mem },
+        &[slot_addr, zero],
+        &[],
+    );
+    body.add_op(
+        zero_step,
+        Operator::I32Store {
+            memory: MemoryArg { offset: 4, ..mem },
+        },
+        &[slot_addr, zero],
+        &[],
+    );
+    let one = i32_const(&mut body, zero_step, 1);
+    let next_i = body.add_op(zero_step, Operator::I32Add, &[step_i, one], &[Type::I32]);
+    body.set_terminator(
+        zero_step,
+        Terminator::Br {
+            target: BlockTarget {
+                block: zero_loop,
+                args: vec![next_i],
+            },
+        },
+    );
+    body.set_terminator(
+        finish,
         Terminator::Return {
             values: vec![frame],
         },

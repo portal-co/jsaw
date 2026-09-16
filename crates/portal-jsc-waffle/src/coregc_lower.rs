@@ -87,6 +87,17 @@ pub fn emit_scalar_struct_subset(
     // Start from the well-tested runtime artifact, then append the lowered
     // export. This keeps every allocation/header/descriptor invariant shared.
     let mut runtime = emit_runtime_skeleton(&Module::empty(), options)?;
+    // The runtime skeleton is constructed from an empty source; replace its
+    // placeholder descriptor segment with the descriptors for the program we
+    // are lowering. Runtime type IDs and descriptor bytes must always travel
+    // as one immutable artifact.
+    let runtime_memory = runtime
+        .module
+        .memories
+        .iter()
+        .next()
+        .expect("runtime memory");
+    runtime.module.memories[runtime_memory].segments[0].data = descriptors.bytes.clone();
     let memory = runtime
         .module
         .memories

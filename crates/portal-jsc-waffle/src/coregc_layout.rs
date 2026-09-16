@@ -82,10 +82,13 @@ impl CoreGcDescriptorTable {
                     let stride = align_up(storage_size(element), payload_alignment)?;
                     CoreGcPayloadLayout {
                         id: ty.id,
-                        payload_alignment,
+                        payload_alignment: payload_alignment.max(4),
                         fixed_payload_bytes: None,
+                        // Payload layout reserves a 4-byte length word before
+                        // the element data, matching the generated array
+                        // bounds check's `I32Load` at offset 0.
                         slots: vec![CoreGcSlotLayout {
-                            offset: 0,
+                            offset: 4,
                             storage: element.clone(),
                         }],
                         array_stride: Some(stride),

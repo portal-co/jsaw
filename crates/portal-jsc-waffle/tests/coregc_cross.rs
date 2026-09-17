@@ -318,10 +318,11 @@ fn dump_descriptor_layouts(module: &Module<'_>) {
     }
 }
 
-/// Compile `source`, then run `name(args)` under (a) native WasmGC and
+/// Compile `source`, then run each named export under (a) native WasmGC and
 /// (b/c) coregc at both collection thresholds, requiring all observable
-/// outcomes to match.
-fn cross_test(source: &str, name: &str, args: &[f64]) {
+/// outcomes to match. Keeping several exports in one artifact catches
+/// cross-component effects without recompiling the module per call.
+fn cross_test_cases(source: &str, cases: &[(&str, &[f64])]) {
     let module = compile_module(source);
     let native_bytes = portal_pc_waffle::to_wasm_bytes(&module).expect("native encodes");
     if std::env::var("COREGC_CROSS_LAYOUTS").is_ok() {
@@ -335,7 +336,7 @@ fn cross_test(source: &str, name: &str, args: &[f64]) {
         export_runtime_debug: true,
         ..portal_jsc_waffle::CoreGcOptions::default()
     })
-    .expect("fixture must lower under coregc; if it needs a deferred feature, list it in KNOWN_REJECTIONS instead");
+    .expect("fixture must lower under coregc");
     let core_bytes_forced = portal_pc_waffle::to_wasm_bytes(&artifact.module).expect("coregc encodes");
     let artifact_normal = portal_jsc_waffle::emit_coregc(
         &module,
@@ -360,32 +361,28 @@ fn cross_test(source: &str, name: &str, args: &[f64]) {
         })
         .expect("traced lowering");
         let traced_bytes = portal_pc_waffle::to_wasm_bytes(&traced_artifact.module).expect("coregc encodes");
-        execute_with_trace(&traced_bytes, name, args, watch_addr);
+        for &(name, args) in cases {
+            execute_with_trace(&traced_bytes, name, args, watch_addr);
+        }
     }
-    let native = execute(&native_bytes, name, args, true);
-    let forced = execute(&core_bytes_forced, name, args, false);
-    let normal = execute(&core_bytes_normal, name, args, false);
-    assert_eq!(
-        native, forced,
-        "forced-threshold coregc diverges from native for {name:?}"
-    );
-    assert_eq!(
-        native, normal,
-        "normal-threshold coregc diverges from native for {name:?}"
-    );
+    for &(name, args) in cases {
+        let native = execute(&native_bytes, name, args, true);
+        let forced = execute(&core_bytes_forced, name, args, false);
+        let normal = execute(&core_bytes_normal, name, args, false);
+        assert_eq!(
+            native, forced,
+            "forced-threshold coregc diverges from native for {name:?}"
+        );
+        assert_eq!(
+            native, normal,
+            "normal-threshold coregc diverges from native for {name:?}"
+        );
+    }
 }
 
-/// A fixture that is expected to fail `emit_coregc` with a diagnostic naming
-/// a known-deferred feature. As v2/v3 stages land this list must shrink; a
-/// fixture that starts lowering belongs in `cross_test`.
-fn expect_rejection(source: &str, expected_fragment: &str) {
-    let module = compile_module(source);
-    let error = portal_jsc_waffle::emit_coregc(&module, &portal_jsc_waffle::CoreGcOptions::default())
-        .expect_err("fixture is expected to be rejected by coregc for a named reason");
-    assert!(
-        error.message.contains(expected_fragment),
-        "expected a diagnostic containing {expected_fragment:?}, got: {error}"
-    );
+/// Convenience wrapper for the common one-export fixture shape.
+fn cross_test(source: &str, name: &str, args: &[f64]) {
+    cross_test_cases(source, &[(name, args)]);
 }
 
 // ---------------------------------------------------------------------
@@ -469,11 +466,194 @@ fn strings_and_length() {
     );
 }
 
+
+/// Source-level `throw` becomes a core-Wasm trap in jsaw, not a Wasm
+/// exception terminator; its non-throwing path is therefore already part of
+/// the supported core surface and must retain parity.
 #[test]
-fn typed_arrays() {
+fn non_throwing_path_of_a_source_throw() {
     cross_test(
-        "export function run() { let a = new Uint8Array(3); a[0] = 5; a[1] = 37; return a[0] + a[1]; }",
+        "export function run(n) { if (n > 0) throw new Error('boom'); return 42; }",
         "run",
-        &[],
+        &[0.0],
+    );
+}
+
+/// Representative object paths from the native e2e corpus. They exercise
+/// dynamic property names, shape transitions, ref.test/ref.cast, and the
+/// shape-trie tail-call fallback in one module.
+#[test]
+fn object_mutation_shape_changes_and_dynamic_fields() {
+    cross_test_cases(
+        "
+            export function mutate() {
+                let object = {};
+                object.count = 1;
+                object.count = object.count + 2;
+                object.extra = 4;
+                return object.count + object.extra;
+            }
+            export function reshape() {
+                let object = { slot: 1 };
+                object.slot = {};
+                object.slot.count = 4;
+                object.slot.extra = 6;
+                return object.slot.count + object.slot.extra;
+            }
+            export function shaped_dynamic() {
+                let object = { left: 2, right: 3 };
+                let key = 'left';
+                object[key] = 5;
+                object.extra = 7;
+                return object.left * 100 + object.right * 10 + object.extra;
+            }
+        ",
+        &[("mutate", &[]), ("reshape", &[]), ("shaped_dynamic", &[])],
+    );
+}
+
+/// Array literals, the arguments object, and rest destructuring use the same
+/// dynamic-array representation in jsaw's real compiler output.
+#[test]
+fn arrays_arguments_and_object_rest() {
+    cross_test_cases(
+        "
+            export function array_literal() {
+                let values = [3, 4, 5];
+                return values[0] * 100 + values[1] * 10 + values[2] + values.length;
+            }
+            export function arguments_visible(first, second) {
+                return arguments[0] * 100 + arguments[1] * 10 + arguments.length;
+            }
+            export function object_rest() {
+                let source = { hidden: 4, kept: 2, other: 3 };
+                let { hidden, ...rest } = source;
+                rest.kept = 7;
+                return source.kept * 100 + rest.kept * 10 + rest.other;
+            }
+        ",
+        &[
+            ("array_literal", &[]),
+            ("arguments_visible", &[2.0, 3.0]),
+            ("object_rest", &[]),
+        ],
+    );
+}
+
+/// Accessor dispatch crosses the function-reference bridge; accessor_tail
+/// reaches ReturnCallRef and must keep its arguments rooted at its checkpoint.
+#[test]
+fn object_accessors_and_tail_dispatch() {
+    cross_test_cases(
+        "
+            export function paired() {
+                let object = {
+                    value: 2,
+                    get doubled() { return this.value * 2; },
+                    set doubled(next) { this.value = next / 2; },
+                };
+                object.doubled = 10;
+                let result = object.doubled;
+                object.extra = 3;
+                return result * 100 + object.value + object.extra;
+            }
+            export function accessor_call() {
+                let object = {
+                    factor: 3,
+                    get method() {
+                        return function(value) { return this.factor * value; };
+                    },
+                };
+                return object.method(4);
+            }
+            export function accessor_tail(value) {
+                let object = {
+                    get invoke() {
+                        return function(input) { return input + 1; };
+                    },
+                };
+                return object.invoke(value);
+            }
+        ",
+        &[("paired", &[]), ("accessor_call", &[]), ("accessor_tail", &[4.0])],
+    );
+}
+
+/// Computed writes and length changes exercise grow/copy paths and dynamic
+/// array-to-object casts.
+#[test]
+fn computed_array_writes_growth_and_length_resize() {
+    cross_test_cases(
+        "
+            export function grow() {
+                let values = [3];
+                let index = 3;
+                values[index] = 7;
+                return values.length * 100 + values[3];
+            }
+            export function resize() {
+                let values = [3, 4, 5];
+                values.length = 1;
+                return values.length * 10 + values[0];
+            }
+            export function static_index() {
+                let values = [3];
+                values[2] = 6;
+                return values.length * 10 + values[2];
+            }
+        ",
+        &[("grow", &[]), ("resize", &[]), ("static_index", &[])],
+    );
+}
+
+/// Compact direct probes of the mechanical idioms blitz-js emits for the
+/// self-hosted compiler: an operand stack, rest/spread dispatch, function
+/// metadata, typed-array bulk writes, and DataView access.
+#[test]
+fn blitz_js_stack_machine_idioms() {
+    cross_test_cases(
+        "
+            export function stack() {
+                let stack = [], tmp;
+                stack.length++;
+                stack[1] = 40;
+                stack.length++;
+                stack[2] = 2;
+                tmp = stack[2];
+                stack.length--;
+                return stack[1] + tmp;
+            }
+            export function rest_spread() {
+                let f = function(...locals) {
+                    let t = function(...inner) { return inner.length; };
+                    return locals.length * 100 + t(...locals);
+                };
+                return f(40, 2);
+            }
+            export function function_metadata() {
+                let f = function(x) { return x + 1; };
+                f.__sig = { params: 1, rets: 1 };
+                return f.__sig.params + f(40);
+            }
+            export function typed_array_set() {
+                let mem = new Uint8Array(16);
+                mem.set([1, 2, 3], 4);
+                return mem[4] + mem[5] + mem[6] + mem.length;
+            }
+            export function dataview() {
+                let mem = new Uint8Array(16);
+                let dv = new DataView(mem.buffer);
+                dv.setUint32(4, 40, true);
+                dv.setUint8(8, 2);
+                return dv.getUint32(4, true) + dv.getUint8(8);
+            }
+        ",
+        &[
+            ("stack", &[]),
+            ("rest_spread", &[]),
+            ("function_metadata", &[]),
+            ("typed_array_set", &[]),
+            ("dataview", &[]),
+        ],
     );
 }

@@ -1072,9 +1072,14 @@ public surface unchanged until the acceptance suite passes):
    descriptor tag 8 scanning, ref.test/cast/eq lowering). This is the stage
    after which jsaw's `Repr` module itself becomes lowerable; it has its own
    acceptance battery (boxed values, null vs undefined, equality, casts).
-4. **Program-level activation** — `conv.rs` output accepted by `emit_coregc`
-   for a growing allowlist of e2e fixtures, gated by the cross-testing
-   harness in §14.
+4. **Program-level activation** — **in progress.** `conv.rs` output is
+   accepted by `emit_coregc` for a growing allowlist of e2e fixtures, gated
+   by the cross-testing harness in §14. The current accepted set covers
+   numeric/control flow, BigInt, strings, concrete and dynamic arrays,
+   objects/shape transitions, closures, accessors (including tail dispatch),
+   typed arrays, and representative blitz-js stack-machine idioms. The real
+   167 MiB Stage-B compiler remains the explicit M19 stress gate; it must not
+   be represented as covered until its complete artifact lowers and executes.
 
 ## 14. Cross-testing: differential execution of jsaw-compiled programs
 
@@ -1118,16 +1123,42 @@ native backend's own parity gate and are unchanged; coregc artifacts are
 pure core Wasm, so any engine running the native suite's core subset (or
 wasmtime alone) suffices to host them.
 
-### 14.3 Rollout
+### 14.3 Current activation coverage
 
-- v1: the harness exists and runs the v1 hand-built fixtures (already
-  covered by `coregc_emit::tests::differential_native_wasmgc_vs_coregc`),
-  plus asserts every real `conv.rs` fixture fails closed with a named
-  diagnostic (proving the rejection surface is honest, not silently partial).
-- v2 stage 4: flip fixtures onto the accepted list as their required
-  operators land, in increasing Repr complexity order: numeric cores →
-  booleans/comparisons → strings → objects/properties → closures → typed
-  arrays → the compiler itself (dogfood).
-- The suite fails if a fixture is *silently* omitted: the harness enumerates
-  the e2e fixture list, so adding a fixture without a cross-test entry is a
-  test failure, matching the inventory-exhaustiveness stance elsewhere.
+`crates/portal-jsc-waffle/tests/coregc_cross.rs` is the active Wasmtime-only
+parity gate. Each accepted fixture executes as native WasmGC plus CoreGC at
+both a collection-at-every-checkpoint schedule and the normal schedule.
+Beyond the baseline arithmetic/call/string/closure/array/typed-array cases,
+it includes representative native e2e programs for:
+
+- dynamic object keys, shape changes, and shape-trie fallback;
+- arguments arrays and object-rest copying;
+- getters/setters and accessor tail dispatch (the `ReturnCallRef` rooting
+  regression path);
+- computed array growth and length resizing;
+- the blitz-js mechanical operand-stack, rest/spread, function-metadata,
+  `Uint8Array.set`, and `DataView` idioms; and
+- a source-level `throw`'s non-throwing path (jsaw emits core `unreachable`,
+  not a Wasm exception terminator).
+
+This is intentionally an allowlist rather than a claim of whole-program
+self-hosting. The full `wasi.js`/Stage-B artifact is substantially larger
+than an ordinary parity fixture and remains covered by its explicit M19
+bounded-stack ingestion/lowering test. It becomes CoreGC-covered only when a
+bounded full-artifact CoreGC lowering and execution gate is added.
+
+
+### 14.4 Rollout
+
+- v1: the harness begins with hand-built fixtures (also covered by
+  `coregc_emit::tests::differential_native_wasmgc_vs_coregc`) and validates
+  the CoreGC rejection surface explicitly where a deferred native feature is
+  encountered.
+- v2 stage 4: grow the accepted fixture list in increasing `Repr`
+  complexity—numeric cores → booleans/comparisons → strings →
+  objects/properties → closures → typed arrays → the compiler itself
+  (dogfood). Each promotion requires native/forced/normal parity.
+- Keep the list explicit and reviewed: adding an e2e capability should add
+  a corresponding cross-test case or document why it is outside CoreGC's
+  supported pure-core surface. The complete Stage-B compiler is the final
+  promotion gate, not an implied consequence of the smaller fixtures.

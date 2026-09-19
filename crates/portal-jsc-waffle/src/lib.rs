@@ -9,6 +9,7 @@ pub mod ingest;
 pub mod linker;
 pub mod repr;
 pub mod revision;
+mod wasm_boundary;
 
 pub use conv::{
     ComponentFunctions, ComponentHandle, ConvertOptions, IncrementalConverter, convert,

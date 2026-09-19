@@ -197,16 +197,17 @@ pub fn convert_modules<'a, 'wasm>(
     declared_names.extend(module.exports.iter().map(|export| export.name.clone()));
     let mut generated_names = BTreeSet::new();
     for export in &exported {
-        if !generated_names.insert(export.0.clone()) {
+        let name = boundary_export_name(&export.0)?;
+        if !generated_names.insert(name.clone()) {
             return Err(ConvertError::invalid(format!(
-                "duplicate Wasm export name {:?}",
-                export.0
+                "duplicate Wasm export name {name:?}"
             )));
         }
     }
     if let Some(suffix) = &options.gc_export_suffix {
         for export in &exported {
-            let name = format!("{}{suffix}", export.0);
+            let base = boundary_export_name(&export.0)?;
+            let name = format!("{base}{suffix}");
             if declared_names.contains(&name) || !generated_names.insert(name.clone()) {
                 return Err(ConvertError::invalid(format!(
                     "internal GC export name {:?} collides with an existing export",
@@ -247,6 +248,10 @@ pub fn convert_modules<'a, 'wasm>(
     }
     let mut exports = Vec::with_capacity(exported.len());
     for (name, function) in exported {
+        // Validate and strip the declarative raw-host ABI suffix before any
+        // code generation. Phase 2 will use the preserved signature to emit
+        // the wrapper; Phase 1 reserves its external name now.
+        let name = boundary_export_name(&name)?;
         converter.collect_shapes(function)?;
         converter.shadowed_names.clear();
         converter.function_literal_locals.clear();
@@ -268,6 +273,16 @@ pub fn convert_modules<'a, 'wasm>(
         }
     }
     Ok(())
+}
+
+/// Parse a source export boundary name if it opts into the `$wasm$` ABI;
+/// ordinary ESM export names retain their existing spelling.
+fn boundary_export_name(name: &str) -> Result<String, ConvertError> {
+    if name.contains("$wasm$") {
+        Ok(crate::wasm_boundary::wasm_export_spec(name)?.field)
+    } else {
+        Ok(name.to_owned())
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1350,12 +1365,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     self.lowering_function
                 } else if let Some(literal) = self.function_literal_locals.get(id).copied() {
                     Some(literal)
-                } else if let Some(target) = self
+                } else if let Some(ImportTarget::InternalFunction { function, .. }) = self
                     .import_tables
                     .get(&self.current_module)
                     .and_then(|table| table.get(id))
                 {
-                    Some(target.function)
+                    Some(*function)
                 } else {
                     None
                 };
@@ -2664,17 +2679,27 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     .and_then(|table| table.get(id))
                     .cloned()
                 {
-                    let info = self.ensure_function(target.function, &target.module)?;
-                    let value = self.function_object_from_info(
-                        body,
-                        block,
-                        context,
-                        this.clone(),
-                        info,
-                        false, // a hoisted declaration is never an arrow
-                        true,  // an import binding cannot be rebound
-                    )?;
-                    return Ok(vec![(block, value)]);
+                    match target {
+                        ImportTarget::InternalFunction { module, function } => {
+                            let info = self.ensure_function(function, &module)?;
+                            let value = self.function_object_from_info(
+                                body,
+                                block,
+                                context,
+                                this.clone(),
+                                info,
+                                false, // a hoisted declaration is never an arrow
+                                true,  // an import binding cannot be rebound
+                            )?;
+                            return Ok(vec![(block, value)]);
+                        }
+                        ImportTarget::WasmHost(spec) => {
+                            return Err(ConvertError::invalid(format!(
+                                "Wasm host import {}.{} is parsed but native host-import lowering is not enabled yet",
+                                spec.module, spec.field
+                            )));
+                        }
+                    }
                 }
 
                 let mut results = Vec::new();

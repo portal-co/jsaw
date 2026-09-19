@@ -14,9 +14,12 @@ use portal_jsc_swc_ssa::{
     module::{ExportSpec, SModule},
 };
 use portal_jsc_swc_util::{ImportMap, ImportMapper};
-use swc_ecma_ast::Id as Ident;
+use swc_ecma_ast::{Id as Ident, ImportSpecifier};
 
-use crate::repr::ConvertError;
+use crate::{
+    repr::ConvertError,
+    wasm_boundary::{WasmImportSpec, parse_wasm_import_specifier, wasm_import_spec},
+};
 
 /// A closed set of ES modules that [`convert_modules`](crate::convert_modules)
 /// can link together into one WasmGC module.
@@ -282,12 +285,20 @@ pub(crate) fn resolve_export<'a>(
     Ok(None)
 }
 
-/// A statically resolved cross-module import binding.
+/// A statically resolved imported binding.
+///
+/// Relative ESM imports link to a source function in this closed module set;
+/// the reserved `wasm:` namespace names an external, typed Wasm function.
 #[derive(Clone)]
-pub(crate) struct ImportTarget<'a> {
-    /// Module key of the module that declares the target function.
-    pub(crate) module: String,
-    pub(crate) function: &'a SFunc,
+pub(crate) enum ImportTarget<'a> {
+    /// A normal relative ESM import resolved within [`ModuleSet`].
+    InternalFunction {
+        /// Module key of the module that declares the target function.
+        module: String,
+        function: &'a SFunc,
+    },
+    /// A named import from `wasm:<module>` with an explicitly declared ABI.
+    WasmHost(WasmImportSpec),
 }
 
 /// Build one module's import table: every referenced imported binding →
@@ -302,6 +313,7 @@ pub(crate) fn build_import_table<'a>(
     path: &str,
     module: &'a SModule,
 ) -> Result<BTreeMap<Ident, ImportTarget<'a>>, ConvertError> {
+    validate_wasm_host_import_declarations(path, module)?;
     let mut table = BTreeMap::new();
     let mapper = module.import_mapper();
     // Referenced bindings only. Imported bindings are recorded in each
@@ -317,6 +329,26 @@ pub(crate) fn build_import_table<'a>(
             continue;
         };
         let specifier = specifier.to_atom_lossy().to_string();
+        if let Some(host_module) = parse_wasm_import_specifier(&specifier) {
+            let host_module = host_module?;
+            let name = match kind {
+                ImportMap::Named { name } => name.to_string(),
+                ImportMap::Default => {
+                    return Err(ConvertError::invalid(format!(
+                        "Wasm host import from {specifier:?} in module {path:?} must be a named \
+                         import, not a default import"
+                    )));
+                }
+                ImportMap::Star => {
+                    return Err(ConvertError::invalid(format!(
+                        "Wasm host import from {specifier:?} in module {path:?} must be a named \
+                         import, not a namespace import"
+                    )));
+                }
+            };
+            table.insert(id, ImportTarget::WasmHost(wasm_import_spec(host_module, &name)?));
+            continue;
+        }
         let (target_path, _) = resolve_specifier_target(set, path, &specifier)?;
         let name = match kind {
             ImportMap::Named { name } => name.to_string(),
@@ -337,13 +369,57 @@ pub(crate) fn build_import_table<'a>(
             })?;
         table.insert(
             id,
-            ImportTarget {
+            ImportTarget::InternalFunction {
                 module: target_path.to_owned(),
                 function,
             },
         );
     }
     Ok(table)
+}
+
+/// Validate every declared host import, including imports not presently
+/// referenced by a lowered function. A malformed ABI declaration must not be
+/// hidden merely because dead source did not create a `LoadId`.
+fn validate_wasm_host_import_declarations(path: &str, module: &SModule) -> Result<(), ConvertError> {
+    let mut signatures = BTreeMap::new();
+    for declaration in &module.imports {
+        let specifier = declaration.src.value.to_atom_lossy().to_string();
+        let Some(host_module) = parse_wasm_import_specifier(&specifier) else {
+            continue;
+        };
+        let host_module = host_module?;
+        for import in &declaration.specifiers {
+            let ImportSpecifier::Named(named) = import else {
+                let kind = match import {
+                    ImportSpecifier::Default(_) => "default",
+                    ImportSpecifier::Namespace(_) => "namespace",
+                    ImportSpecifier::Named(_) => unreachable!("matched above"),
+                };
+                return Err(ConvertError::invalid(format!(
+                    "Wasm host import from {specifier:?} in module {path:?} must be a named \
+                     import, not a {kind} import"
+                )));
+            };
+            let imported_name = named
+                .imported
+                .as_ref()
+                .map(|name| name.atom().to_string())
+                .unwrap_or_else(|| named.local.sym.to_string());
+            let import = wasm_import_spec(host_module, &imported_name)?;
+            let key = (import.module.clone(), import.field.clone());
+            if let Some(previous) = signatures.insert(key.clone(), import.signature.clone())
+                && previous != import.signature
+            {
+                return Err(ConvertError::invalid(format!(
+                    "Wasm host imports in module {path:?} declare incompatible signatures for \
+                     {}.{}",
+                    key.0, key.1
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The main module's complete export surface, flattened.

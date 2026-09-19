@@ -2245,6 +2245,74 @@ fn star_exports_do_not_shadow_local_declarations() {
 }
 
 #[test]
+fn reserves_wasm_host_import_syntax_without_module_set_resolution() {
+    let fixtures: Fixture<'_> = &[(
+        "main.mjs",
+        "import { add$wasm$i32_i32$i32 as add } from 'wasm:env'; export function run(x) { return add(x, 1); }",
+    )];
+    let error = lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect_err("phase 1 reserves the host binding but does not lower it yet");
+    assert!(
+        !error.to_string().contains("only relative"),
+        "wasm: must not be treated as an ESM bare specifier: {error}"
+    );
+
+    for (source, needle) in [
+        (
+            "import add from 'wasm:env'; export function run() { return add(); }",
+            "named import",
+        ),
+        (
+            "import * as env from 'wasm:env'; export function run() { return env.add(); }",
+            "named import",
+        ),
+        (
+            "import { add } from 'wasm:env'; export function run() { return add(); }",
+            "$wasm$",
+        ),
+        (
+            "import { add$wasm$i32_i32$i64 } from 'wasm:' ; export function run() { return add$wasm$i32_i32$i64(); }",
+            "empty module",
+        ),
+    ] {
+        let fixtures: Fixture<'_> = &[("main.mjs", source)];
+        let error = lower_modules(fixtures, "main.mjs", &Default::default())
+            .expect_err("malformed host import must fail before lowering");
+        assert!(error.to_string().contains(needle), "{error}");
+    }
+}
+
+#[test]
+fn validates_wasm_host_imports_even_when_unused() {
+    let fixtures: Fixture<'_> = &[(
+        "main.mjs",
+        "import { malformed } from 'wasm:env'; export function run() { return 1; }",
+    )];
+    let error = lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect_err("unreferenced malformed host imports must still fail");
+    assert!(error.to_string().contains("$wasm$"), "{error}");
+}
+
+#[test]
+fn reserves_stripped_wasm_export_names_and_detects_collisions() {
+    let fixtures: Fixture<'_> = &[(
+        "main.mjs",
+        "export function run$wasm$i32$i32(x) { return x; } export function run() { return 0; }",
+    )];
+    let error = lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect_err("raw Wasm export names must be collision checked before lowering");
+    assert!(error.to_string().contains("duplicate Wasm export name"), "{error}");
+
+    let fixtures: Fixture<'_> = &[(
+        "main.mjs",
+        "export function bad$wasm$i32() { return 0; }",
+    )];
+    let error = lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect_err("malformed raw Wasm export suffix must fail before lowering");
+    assert!(error.to_string().contains("$wasm$<params>$<result>"), "{error}");
+}
+
+#[test]
 fn rejects_missing_and_bare_module_specifiers() {
     let missing: Fixture<'_> = &[("main.mjs", "import { x } from './nope.js'; export function run() { return x(); }")];
     let error = lower_modules(missing, "main.mjs", &Default::default())

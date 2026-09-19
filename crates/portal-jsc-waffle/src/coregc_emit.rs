@@ -7,7 +7,9 @@
 //! fully validated, fully rooted, fully scanned-and-swept core-Wasm module,
 //! or a `CoreGcError` naming the first unsupported source construct.
 
-use portal_pc_waffle::{Export, ExportKind, FuncDecl, Module};
+use portal_pc_waffle::{
+    EntityRef, Export, ExportKind, FuncDecl, Import, ImportKind, Module, SignatureData, Type,
+};
 
 use crate::{
     coregc::{CoreGcError, CoreGcInventory},
@@ -40,8 +42,18 @@ pub fn emit_coregc(
     let inventory = CoreGcInventory::build(source)?;
     let descriptors = CoreGcDescriptorTable::build(&inventory)?;
     let mut module = Module::empty();
+    // Core Wasm requires imports before defined functions. Reference ABI
+    // positions become i32 handles at this boundary.
+    let raw_imports = declare_coregc_function_imports(source, &inventory, &mut module)?;
     let runtime = coregc_runtime::build(&mut module, options, &descriptors)?;
-    let lowered = coregc_lower::lower(source, &inventory, &descriptors, &runtime, &mut module)?;
+    let lowered = coregc_lower::lower_with_imports(
+        source,
+        &inventory,
+        &descriptors,
+        &runtime,
+        &raw_imports,
+        &mut module,
+    )?;
     for (name, func) in lowered.exports {
         module.exports.push(Export {
             name,
@@ -105,6 +117,77 @@ pub fn emit_coregc(
     })
 }
 
+/// Predeclare every source function import as a pure-core function import.
+/// The lowered adapter retains the source's flattened ABI and owns all handle
+/// conversion, leaving the raw host function ABI scalar-only.
+fn declare_coregc_function_imports(
+    source: &Module<'_>,
+    inventory: &CoreGcInventory,
+    out: &mut Module<'static>,
+) -> Result<coregc_lower::RawImports, CoreGcError> {
+    let mut imports = std::collections::BTreeMap::new();
+    for (func, decl) in source.funcs.entries() {
+        let FuncDecl::Import(signature, field) = decl else {
+            continue;
+        };
+        let import = source
+            .imports
+            .iter()
+            .find(|import| matches!(import.kind, ImportKind::Func(imported) if imported == func))
+            .ok_or_else(|| CoreGcError {
+                message: format!(
+                    "coregc import function {} has no import record",
+                    func.index()
+                ),
+            })?;
+        let SignatureData::Func {
+            params,
+            returns,
+            shared,
+        } = &source.signatures[*signature]
+        else {
+            return Err(CoreGcError {
+                message: format!(
+                    "coregc import function {} has a non-function signature",
+                    func.index()
+                ),
+            });
+        };
+        if *shared || returns.len() > 1 {
+            return Err(CoreGcError {
+                message: format!(
+                    "coregc import function {} has an unsupported signature",
+                    func.index()
+                ),
+            });
+        }
+        let map = |ty: Type| -> Result<Type, CoreGcError> {
+            if coregc_lower::boundary_uses_handle(source, inventory, ty)? {
+                Ok(Type::I32)
+            } else {
+                Ok(ty)
+            }
+        };
+        let signature = out.signatures.push(SignatureData::Func {
+            params: params.iter().copied().map(&map).collect::<Result<_, _>>()?,
+            returns: returns
+                .iter()
+                .copied()
+                .map(&map)
+                .collect::<Result<_, _>>()?,
+            shared: false,
+        });
+        let raw = out.funcs.push(FuncDecl::Import(signature, field.clone()));
+        out.imports.push(Import {
+            module: import.module.clone(),
+            name: import.name.clone(),
+            kind: ImportKind::Func(raw),
+        });
+        imports.insert(func, raw);
+    }
+    Ok(imports)
+}
+
 /// Prove the encoded artifact uses only default core-Wasm features: the
 /// validator's default feature set already rejects GC/reference-types/
 /// function-references constructs; the explicit scan below additionally
@@ -113,7 +196,9 @@ fn verify_core_only(bytes: &[u8]) -> Result<(), CoreGcError> {
     wasmparser::Validator::new()
         .validate_all(bytes)
         .map_err(|error| CoreGcError {
-            message: format!("coregc artifact does not validate with default core features: {error}"),
+            message: format!(
+                "coregc artifact does not validate with default core features: {error}"
+            ),
         })?;
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         match payload {
@@ -146,9 +231,22 @@ fn verify_core_only(bytes: &[u8]) -> Result<(), CoreGcError> {
                     })?;
                     let name = format!("{op:?}");
                     for gc in [
-                        "StructNew", "StructGet", "StructSet", "ArrayNew", "ArrayGet", "ArraySet",
-                        "ArrayLen", "RefCast", "RefTest", "RefI31", "I31Get", "AnyConvert",
-                        "ExternConvert", "RefFunc", "CallRef", "ReturnCallRef",
+                        "StructNew",
+                        "StructGet",
+                        "StructSet",
+                        "ArrayNew",
+                        "ArrayGet",
+                        "ArraySet",
+                        "ArrayLen",
+                        "RefCast",
+                        "RefTest",
+                        "RefI31",
+                        "I31Get",
+                        "AnyConvert",
+                        "ExternConvert",
+                        "RefFunc",
+                        "CallRef",
+                        "ReturnCallRef",
                     ] {
                         if name.starts_with(gc) {
                             return Err(CoreGcError {
@@ -196,7 +294,10 @@ mod tests {
         let build: TypedFunc<i32, i32> = instance
             .get_typed_func(&mut store, "build")
             .expect("build export");
-        assert_eq!(build.call(&mut store, 20).expect("build(20)"), (0..20).sum::<i32>());
+        assert_eq!(
+            build.call(&mut store, 20).expect("build(20)"),
+            (0..20).sum::<i32>()
+        );
     }
 
     #[test]
@@ -248,7 +349,171 @@ mod tests {
             .expect("apply export");
         assert_eq!(apply.call(&mut store, (0, 41)).expect("add_one"), 42);
         assert_eq!(apply.call(&mut store, (1, 21)).expect("double"), 42);
-        assert!(apply.call(&mut store, (2, 0)).is_err(), "null funcref traps");
+        assert!(
+            apply.call(&mut store, (2, 0)).is_err(),
+            "null funcref traps"
+        );
+    }
+
+    #[test]
+    fn scalar_function_imports_lower_to_core_wasm_imports() {
+        let mut source = Module::empty();
+        let import_sig = source.signatures.push(SignatureData::Func {
+            params: vec![Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let imported = source
+            .funcs
+            .push(FuncDecl::Import(import_sig, "increment".to_owned()));
+        source.imports.push(Import {
+            module: "host".to_owned(),
+            name: "increment".to_owned(),
+            kind: ImportKind::Func(imported),
+        });
+        let caller_sig = source.signatures.push(SignatureData::Func {
+            params: vec![Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = portal_pc_waffle::FunctionBody::new(&source, caller_sig);
+        let entry = body.entry;
+        let input = body.blocks[entry].params[0].1;
+        let result = body.add_op(
+            entry,
+            portal_pc_waffle::Operator::Call {
+                function_index: imported,
+            },
+            &[input],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            entry,
+            portal_pc_waffle::Terminator::Return {
+                values: vec![result],
+            },
+        );
+        body.recompute_edges();
+        body.validate().expect("source body validates");
+        let caller = source
+            .funcs
+            .push(FuncDecl::Body(caller_sig, "caller".to_owned(), body));
+        source.exports.push(Export {
+            name: "caller".to_owned(),
+            kind: ExportKind::Func(caller),
+        });
+
+        let artifact =
+            emit_coregc(&source, &CoreGcOptions::default()).expect("scalar import should lower");
+        assert_eq!(artifact.module.imports.len(), 1);
+        assert_eq!(artifact.module.imports[0].module, "host");
+        assert_eq!(artifact.module.imports[0].name, "increment");
+        let bytes = portal_pc_waffle::to_wasm_bytes(&artifact.module).expect("encodes");
+        let engine = Engine::default();
+        let module = WasmtimeModule::new(&engine, bytes).expect("compiles");
+        let mut store = Store::new(&engine, ());
+        let host = wasmtime::Func::wrap(&mut store, |value: i32| value + 1);
+        let instance = Instance::new(&mut store, &module, &[host.into()]).expect("instantiates");
+        let caller: TypedFunc<i32, i32> = instance
+            .get_typed_func(&mut store, "caller")
+            .expect("caller export");
+        assert_eq!(caller.call(&mut store, 41).unwrap(), 42);
+    }
+
+    #[test]
+    fn reference_imports_exchange_temporary_handles_under_forced_collection() {
+        use portal_pc_waffle::{StorageType, WithMutablility, WithNullable};
+
+        let mut source = Module::empty();
+        let node = source.signatures.push(SignatureData::Struct {
+            fields: vec![WithMutablility {
+                value: StorageType::Val(Type::I32),
+                mutable: true,
+            }],
+            shared: false,
+        });
+        let node_ref = Type::Heap(WithNullable {
+            value: portal_pc_waffle::HeapType::Sig { sig_index: node },
+            nullable: true,
+        });
+        let echo_sig = source.signatures.push(SignatureData::Func {
+            params: vec![node_ref],
+            returns: vec![node_ref],
+            shared: false,
+        });
+        let echo = source
+            .funcs
+            .push(FuncDecl::Import(echo_sig, "echo".to_owned()));
+        source.imports.push(Import {
+            module: "host".to_owned(),
+            name: "echo".to_owned(),
+            kind: ImportKind::Func(echo),
+        });
+        let caller_sig = source.signatures.push(SignatureData::Func {
+            params: vec![Type::I32],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = portal_pc_waffle::FunctionBody::new(&source, caller_sig);
+        let entry = body.entry;
+        let value = body.blocks[entry].params[0].1;
+        let allocated = body.add_op(
+            entry,
+            portal_pc_waffle::Operator::StructNew { sig: node },
+            &[value],
+            &[node_ref],
+        );
+        let echoed = body.add_op(
+            entry,
+            portal_pc_waffle::Operator::Call {
+                function_index: echo,
+            },
+            &[allocated],
+            &[node_ref],
+        );
+        let result = body.add_op(
+            entry,
+            portal_pc_waffle::Operator::StructGet { sig: node, idx: 0 },
+            &[echoed],
+            &[Type::I32],
+        );
+        body.set_terminator(
+            entry,
+            portal_pc_waffle::Terminator::Return {
+                values: vec![result],
+            },
+        );
+        body.recompute_edges();
+        body.validate().expect("source body validates");
+        let caller = source
+            .funcs
+            .push(FuncDecl::Body(caller_sig, "caller".to_owned(), body));
+        source.exports.push(Export {
+            name: "caller".to_owned(),
+            kind: ExportKind::Func(caller),
+        });
+
+        let artifact = emit_coregc(
+            &source,
+            &CoreGcOptions {
+                collect_threshold_bytes: 0,
+                ..CoreGcOptions::default()
+            },
+        )
+        .expect("reference import should lower through handles");
+        let bytes = portal_pc_waffle::to_wasm_bytes(&artifact.module).expect("encodes");
+        let engine = Engine::default();
+        let module = WasmtimeModule::new(&engine, bytes).expect("compiles");
+        let mut store = Store::new(&engine, ());
+        // The host treats an import result as borrowed: it returns precisely
+        // the temporary handle received for this invocation and never saves it.
+        let echo_host = wasmtime::Func::wrap(&mut store, |handle: i32| handle);
+        let instance =
+            Instance::new(&mut store, &module, &[echo_host.into()]).expect("instantiates");
+        let caller: TypedFunc<i32, i32> = instance
+            .get_typed_func(&mut store, "caller")
+            .expect("caller export");
+        assert_eq!(caller.call(&mut store, 42).unwrap(), 42);
     }
 
     #[test]
@@ -285,10 +550,11 @@ mod tests {
         config.wasm_gc(true);
         config.wasm_function_references(true);
         let native_engine = Engine::new(&config).expect("GC engine");
-        let native_module = WasmtimeModule::new(&native_engine, native_bytes).expect("native GC module");
+        let native_module =
+            WasmtimeModule::new(&native_engine, native_bytes).expect("native GC module");
         let mut native_store = Store::new(&native_engine, ());
-        let native_instance = Instance::new(&mut native_store, &native_module, &[])
-            .expect("native instance");
+        let native_instance =
+            Instance::new(&mut native_store, &native_module, &[]).expect("native instance");
         let native_build: TypedFunc<i32, i32> = native_instance
             .get_typed_func(&mut native_store, "build")
             .expect("native build");
@@ -307,7 +573,9 @@ mod tests {
             .expect("coregc build");
 
         for n in [0, 1, 2, 5, 20] {
-            let native = native_build.call(&mut native_store, n).expect("native call");
+            let native = native_build
+                .call(&mut native_store, n)
+                .expect("native call");
             let core = core_build.call(&mut core_store, n).expect("coregc call");
             assert_eq!(native, core, "differential mismatch at n={n}");
         }

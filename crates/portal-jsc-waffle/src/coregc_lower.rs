@@ -3480,6 +3480,84 @@ pub(crate) fn lower(
     )
 }
 
+fn lower_export_wrapper(
+    runtime: &CoreGcRuntime,
+    function: &FunctionPlan,
+    out: &mut Module<'static>,
+    export_name: &str,
+) -> Result<Func, CoreGcError> {
+    let mut params = Vec::new();
+    for plan in &function.param_plan {
+        if plan.needs_root() {
+            params.push(Type::I32);
+        } else {
+            params.extend(plan.flat_types());
+        }
+    }
+    let returns = function
+        .return_plan
+        .iter()
+        .map(|plan| if plan.needs_root() { Type::I32 } else { plan.flat_types()[0] })
+        .collect::<Vec<_>>();
+    let signature = out.signatures.push(SignatureData::Func {
+        params,
+        returns,
+        shared: false,
+    });
+    let wrapper = out.funcs.push(FuncDecl::Body(
+        signature,
+        format!("coregc_export_{export_name}"),
+        FunctionBody::new(out, signature),
+    ));
+    let FuncDecl::Body(_, _, body) = &mut out.funcs[wrapper] else {
+        unreachable!();
+    };
+    let entry = body.entry;
+    let flat_params = body.blocks[entry]
+        .params
+        .iter()
+        .map(|(_, value)| *value)
+        .collect::<Vec<_>>();
+    let mut cursor = 0usize;
+    let mut args = Vec::new();
+    for plan in &function.param_plan {
+        if plan.needs_root() {
+            let handle = flat_params[cursor];
+            let address = body.add_op(entry, Operator::Call { function_index: runtime.handle_address }, &[handle], &[Type::I32]);
+            let type_id = body.add_op(entry, Operator::Call { function_index: runtime.handle_type }, &[handle], &[Type::I32]);
+            args.extend([address, type_id]);
+            cursor += 1;
+        } else {
+            let count = plan.flat_len();
+            args.extend_from_slice(&flat_params[cursor..cursor + count]);
+            cursor += count;
+        }
+    }
+    let raw_returns = function.return_plan.iter().flat_map(|plan| plan.flat_types()).collect::<Vec<_>>();
+    let result = body.add_op(entry, Operator::Call { function_index: function.lowered_func }, &args, &raw_returns);
+    let mut outputs = Vec::new();
+    let mut result_index = 0u32;
+    for plan in &function.return_plan {
+        if plan.needs_root() {
+            let address = body.add_value(ValueDef::PickOutput(result, result_index, Type::I32));
+            body.append_to_block(entry, address);
+            let type_id = body.add_value(ValueDef::PickOutput(result, result_index + 1, Type::I32));
+            body.append_to_block(entry, type_id);
+            let handle = body.add_op(entry, Operator::Call { function_index: runtime.handle_new }, &[address, type_id], &[Type::I32]);
+            outputs.push(handle);
+            result_index += 2;
+        } else {
+            outputs.push(body.add_value(ValueDef::PickOutput(result, result_index, plan.flat_types()[0])));
+            body.append_to_block(entry, *outputs.last().unwrap());
+            result_index += 1;
+        }
+    }
+    body.set_terminator(entry, Terminator::Return { values: outputs });
+    body.recompute_edges();
+    body.validate().map_err(|error| CoreGcError { message: format!("coregc export wrapper {export_name} is invalid: {error}") })?;
+    Ok(wrapper)
+}
+
 pub(crate) fn lower_with_imports(
     source: &Module<'_>,
     inventory: &CoreGcInventory,
@@ -3520,7 +3598,14 @@ pub(crate) fn lower_with_imports(
                     export.name
                 ),
             })?;
-            exports.push((export.name.clone(), lowered.lowered_func));
+            if lowered.return_plan.iter().any(|plan| plan.needs_root())
+                || lowered.param_plan.iter().any(|plan| plan.needs_root())
+            {
+                let wrapper = lower_export_wrapper(runtime, lowered, out, &export.name)?;
+                exports.push((export.name.clone(), wrapper));
+            } else {
+                exports.push((export.name.clone(), lowered.lowered_func));
+            }
         }
     }
     Ok(LoweredModule { exports })

@@ -673,9 +673,13 @@ struct ValueSidecar {
 
 impl ValueSidecar {
     fn empty() -> Arc<Self> {
+        Self::root(BTreeMap::new())
+    }
+
+    fn root(bindings: BTreeMap<SValueId, LowerValue>) -> Arc<Self> {
         Arc::new(Self {
             parent: None,
-            bindings: BTreeMap::new(),
+            bindings,
             depth: 0,
         })
     }
@@ -784,13 +788,10 @@ impl ContinuationValues {
 /// Keeping a separate value map for each path lets subsequent source
 /// statements be emitted with the representation refined by that split.
 ///
-/// This remains the legacy map only while Phase 1 proves
-/// [`ContinuationValues`] in isolation. Phase 2 changes it to the private
-/// move-oriented environment and removes this `Clone` implementation.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Continuation {
     block: Block,
-    values: BTreeMap<SValueId, LowerValue>,
+    values: ContinuationValues,
 }
 
 impl LowerValue {
@@ -2170,20 +2171,22 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         // jsaw's entry shim parameters may be referenced directly from later
         // blocks without being explicit jump arguments. Keep them available
         // while lowering every source block.
-        let entry_values = sfunc.cfg.blocks[sfunc.entry]
-            .params
-            .iter()
-            .zip(body.blocks[body.entry].params.iter().skip(3))
-            .map(|((source, _), (_, value))| {
-                (
-                    *source,
-                    LowerValue::Wasm {
-                        value: *value,
-                        kind: ValueKind::Reference,
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
+        let entry_values = ValueSidecar::root(
+            sfunc.cfg.blocks[sfunc.entry]
+                .params
+                .iter()
+                .zip(body.blocks[body.entry].params.iter().skip(3))
+                .map(|((source, _), (_, value))| {
+                    (
+                        *source,
+                        LowerValue::Wasm {
+                            value: *value,
+                            kind: ValueKind::Reference,
+                        },
+                    )
+                })
+                .collect(),
+        );
 
         while let Some(state) = pending.pop_front() {
             if !lowered.insert(state.clone()) {
@@ -2198,7 +2201,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             let original_block = *blocks
                 .get(&state)
                 .ok_or_else(|| ConvertError::invalid("missing source block mapping"))?;
-            let mut values = entry_values.clone();
+            let mut values = ContinuationValues::new(entry_values.clone());
             // Native bodies prepend the captured lexical context, effective
             // receiver, and original argument array. Source SSA parameters
             // begin after those ABI-only parameters in the entry shim.
@@ -2224,8 +2227,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
 
             for stmt in sfunc.cfg.blocks[sblock].stmts.iter().copied() {
                 let mut next = Vec::new();
-                for continuation in continuations {
-                    for (block, value) in self.lower_statement(
+                for mut continuation in continuations {
+                    let results = self.lower_statement(
                         body,
                         continuation.block,
                         context,
@@ -2233,10 +2236,25 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         arguments.clone(),
                         &continuation.values,
                         &sfunc.cfg.values[stmt].value,
-                    )? {
-                        let mut values = continuation.values.clone();
-                        values.insert(stmt, value);
-                        next.push(Continuation { block, values });
+                    )?;
+                    match results.len() {
+                        0 => {}
+                        1 => {
+                            let (block, value) = results
+                                .into_iter()
+                                .next()
+                                .expect("single continuation result must exist");
+                            continuation.block = block;
+                            continuation.values.insert(stmt, value);
+                            next.push(continuation);
+                        }
+                        _ => {
+                            let base = continuation.values.freeze();
+                            next.extend(results.into_iter().map(|(block, value)| Continuation {
+                                block,
+                                values: ContinuationValues::child(base.clone(), stmt, value),
+                            }));
+                        }
                     }
                 }
                 continuations = next;
@@ -2565,7 +2583,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         context: Value,
         this: LowerValue,
         arguments: LowerValue,
-        values: &BTreeMap<SValueId, LowerValue>,
+        values: &ContinuationValues,
         source: &'a SValue,
     ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
         match source {
@@ -2716,7 +2734,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         context: Value,
         this: LowerValue,
         arguments: LowerValue,
-        values: &BTreeMap<SValueId, LowerValue>,
+        values: &ContinuationValues,
         item: &'a Item<SValueId, SFunc>,
         span: &impl std::fmt::Debug,
     ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
@@ -3369,7 +3387,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         &mut self,
         body: &mut FunctionBody,
         block: Block,
-        values: &BTreeMap<SValueId, LowerValue>,
+        values: &ContinuationValues,
         quasis: &[swc_atoms::Atom],
         exprs: &[SValueId],
     ) -> Result<LowerValue, ConvertError> {
@@ -9184,7 +9202,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         block: &mut Block,
         context: Value,
         this: LowerValue,
-        values: &BTreeMap<SValueId, LowerValue>,
+        values: &ContinuationValues,
         members: &'a [(PropKey<SValueId>, PropVal<SValueId, SFunc>)],
         span: &impl std::fmt::Debug,
     ) -> Result<LowerValue, ConvertError> {
@@ -11432,7 +11450,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         &mut self,
         body: &mut FunctionBody,
         block: Block,
-        values: &BTreeMap<SValueId, LowerValue>,
+        values: &ContinuationValues,
         wrapped: &LowerValue,
         keys: &[PropKey<SValueId>],
     ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
@@ -12203,7 +12221,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         &mut self,
         body: &mut FunctionBody,
         block: Block,
-        values: &BTreeMap<SValueId, LowerValue>,
+        values: &ContinuationValues,
         args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
     ) -> Result<Value, ConvertError> {
         if args.iter().any(|arg| arg.is_spread) {
@@ -12275,7 +12293,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         &self,
         body: &mut FunctionBody,
         block: Block,
-        values: &BTreeMap<SValueId, LowerValue>,
+        values: &ContinuationValues,
         args: &[SValueId],
     ) -> Result<Value, ConvertError> {
         let values = args
@@ -12310,7 +12328,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         context: Value,
         info: FunctionInfo,
         this: LowerValue,
-        values: &BTreeMap<SValueId, LowerValue>,
+        values: &ContinuationValues,
         args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
     ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
         // Spread calls are supported: `build_native_call_args` folds them
@@ -12359,7 +12377,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         block: Block,
         info: FunctionInfo,
         this: LowerValue,
-        values: &BTreeMap<SValueId, LowerValue>,
+        values: &ContinuationValues,
         args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
     ) -> Result<(Value, Value, Vec<Value>), ConvertError> {
         #[allow(unused_mut)]
@@ -12487,7 +12505,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         context: Value,
         info: FunctionInfo,
         this: LowerValue,
-        values: &BTreeMap<SValueId, LowerValue>,
+        values: &ContinuationValues,
         args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
     ) -> Result<(), ConvertError> {
         for (result_block, result) in
@@ -12555,7 +12573,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         block: Block,
         context: Value,
         this: LowerValue,
-        values: &BTreeMap<SValueId, LowerValue>,
+        values: &ContinuationValues,
         callee: &TCallee<SValueId>,
         args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
     ) -> Result<Option<()>, ConvertError> {
@@ -12813,7 +12831,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         info: FunctionInfo,
         context: Value,
         this: LowerValue,
-        values: &BTreeMap<SValueId, LowerValue>,
+        values: &ContinuationValues,
         args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
         fallback: F,
     ) -> Result<Vec<(Block, LowerValue)>, ConvertError>
@@ -12915,7 +12933,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         block: Block,
         context: Value,
         this: LowerValue,
-        values: &BTreeMap<SValueId, LowerValue>,
+        values: &ContinuationValues,
         callee: &TCallee<SValueId>,
         args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
     ) -> Result<Vec<(Block, Value, Value, Value, Value)>, ConvertError> {

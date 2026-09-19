@@ -3130,7 +3130,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         body: &mut FunctionBody,
         block: Block,
         key: &Ident,
-        values: &BTreeMap<SValueId, LowerValue>,
+        values: &ContinuationValues,
         args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
     ) -> Result<Option<Vec<(Block, LowerValue)>>, ConvertError> {
         // Only `Number`/`BigInt` are conversion intrinsics, and only when the
@@ -3516,7 +3516,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         block: Block,
         receiver: &LowerValue,
         key: &LowerValue,
-        values: &BTreeMap<SValueId, LowerValue>,
+        values: &ContinuationValues,
         args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
     ) -> Result<Option<Vec<(Block, LowerValue)>>, ConvertError> {
         // 1. Receiver must be the unshadowed identifier read.
@@ -3678,7 +3678,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         body: &mut FunctionBody,
         block: Block,
         callee: &LowerValue,
-        values: &BTreeMap<SValueId, LowerValue>,
+        values: &ContinuationValues,
         args: &[SValueId],
     ) -> Result<Option<(Block, LowerValue)>, ConvertError> {
         let LowerValue::ReferenceKey { key: name, .. } = callee else {

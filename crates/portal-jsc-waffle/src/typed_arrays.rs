@@ -1743,7 +1743,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         body: &mut FunctionBody,
         block: Block,
         callee: &LowerValue,
-        values: &BTreeMap<SValueId, LowerValue>,
+        values: &ContinuationValues,
         args: &[SValueId],
     ) -> Result<Option<(Block, LowerValue)>, ConvertError> {
         let LowerValue::ReferenceKey { key: name, .. } = callee else {

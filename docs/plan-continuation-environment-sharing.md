@@ -1,6 +1,6 @@
 # Plan: move-oriented continuation environments
 
-**Status:** planned.
+**Status:** implemented (2026-09-19).
 
 ## 1. Purpose
 
@@ -407,3 +407,33 @@ The redesign is complete only when all of the following are true:
 - No public converter interface or JavaScript/Wasm semantic contract changes.
 - Existing unit/e2e/CoreGC tests pass, and the bounded M19 stress run records
   its actual next-stage outcome with elapsed time and peak memory.
+
+## 8. As-built result (2026-09-19)
+
+Implemented in these commits:
+
+1. `f250a85` — introduced `ValueSidecar` / `ContinuationValues`, bounded
+   compaction, and five focused environment tests before changing the driver.
+2. `7554c36` — migrated `lower_function` and all read-only expression/call
+   helper seams to the move-oriented environment. A singleton result mutates
+   and moves its continuation; a fan-out freezes the old writable overlay once
+   and gives each child a private one-binding overlay.
+3. `31bf36c` — added opt-in `JSAW_CONTINUATION_STATS` accounting for path
+   shapes, freezes, depth, and compaction.
+
+The real 168,968,420-byte Stage-B M19 artifact was run with the statistics
+flag. Lazy ingestion completed in **640.35 s**. During Stage C, the large
+straight-line function recorded **202,454 statements, 202,454 singleton
+paths, zero fan-outs, zero sidecars, and zero compactions**, demonstrating
+that the former per-statement whole-map clone is absent. The run then reached
+a distinct, fail-closed frontend diagnostic after about 33 more seconds:
+`coercing Integer to BigInt (mixing BigInt and number) at "BigInt operand"`.
+It no longer stalls in continuation-environment copying. The bounded run's
+reported maximum resident set size was 20.9 GiB.
+
+The focused environment tests and `portal-jsc-waffle` lib suite pass; the
+release CoreGC differential suite passes 14/14. A targeted e2e JVM test
+(`executes_arrays_as_objects_with_named_fields`) still fails with `split
+function fell through`, but it reproduces on the Phase-1/baseline converter
+and is therefore not attributed to this redesign. It remains a pre-existing
+JVM-emitter correctness bug to diagnose separately.

@@ -69,6 +69,18 @@ pub fn emit_coregc(
     // positions become i32 handles at this boundary.
     let raw_imports = declare_coregc_function_imports(source, &inventory, &mut module)?;
     let runtime = coregc_runtime::build(&mut module, options, &descriptors)?;
+    let has_handle_boundary = source.funcs.entries().any(|(_, decl)| {
+        let signature = match decl {
+            FuncDecl::Import(signature, _) | FuncDecl::Body(signature, _, _) => *signature,
+            _ => return false,
+        };
+        let SignatureData::Func { params, returns, .. } = &source.signatures[signature] else {
+            return false;
+        };
+        params.iter().chain(returns).any(|ty| {
+            coregc_lower::boundary_uses_handle(source, &inventory, *ty).unwrap_or(false)
+        })
+    });
     let lowered = coregc_lower::lower_with_imports(
         source,
         &inventory,
@@ -81,6 +93,16 @@ pub fn emit_coregc(
         module.exports.push(Export {
             name,
             kind: ExportKind::Func(func),
+        });
+    }
+    if has_handle_boundary {
+        module.exports.push(Export {
+            name: "__coregc_handle_retain".to_owned(),
+            kind: ExportKind::Func(runtime.handle_retain),
+        });
+        module.exports.push(Export {
+            name: "__coregc_handle_release".to_owned(),
+            kind: ExportKind::Func(runtime.handle_release),
         });
     }
     if options.export_runtime_debug {

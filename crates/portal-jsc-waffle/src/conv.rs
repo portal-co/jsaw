@@ -659,6 +659,22 @@ enum LowerValue {
 /// This is private implementation policy, deliberately not a converter ABI.
 const MAX_SIDECAR_DEPTH: u16 = 16;
 
+/// Aggregate evidence that the continuation driver is moving environments on
+/// singleton paths and sharing them only at actual fan-outs. It is deliberately
+/// local to one `lower_function` invocation, so it cannot retain a lowered
+/// body or affect the public converter interface.
+#[derive(Default)]
+struct ContinuationStats {
+    statements_lowered: usize,
+    zero_result_paths: usize,
+    singleton_result_paths: usize,
+    fan_out_paths: usize,
+    sidecars_frozen: usize,
+    max_sidecar_depth: u16,
+    compactions: usize,
+    compacted_bindings: usize,
+}
+
 /// Immutable bindings shared by a suffix of split continuations.
 ///
 /// The newest sidecar shadows its parent. A sidecar is only constructed by
@@ -752,21 +768,21 @@ impl ContinuationValues {
     /// An empty overlay already has precisely the right immutable history. A
     /// bounded-depth sidecar takes ownership of the overlay without cloning;
     /// only the explicit depth-limit compaction copies historical bindings.
-    fn freeze(self) -> Arc<ValueSidecar> {
+    fn freeze(self, stats: &mut ContinuationStats) -> Arc<ValueSidecar> {
         if self.writable.is_empty() {
             return self.sidecar;
         }
 
+        stats.sidecars_frozen += 1;
         if self.sidecar.depth >= MAX_SIDECAR_DEPTH {
             let mut bindings = self.sidecar.compact();
+            stats.compactions += 1;
+            stats.compacted_bindings += bindings.len();
             bindings.extend(self.writable);
-            Arc::new(ValueSidecar {
-                parent: None,
-                bindings,
-                depth: 0,
-            })
+            ValueSidecar::root(bindings)
         } else {
             let depth = self.sidecar.depth + 1;
+            stats.max_sidecar_depth = stats.max_sidecar_depth.max(depth);
             Arc::new(ValueSidecar {
                 parent: Some(self.sidecar),
                 bindings: self.writable,
@@ -2171,6 +2187,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         // jsaw's entry shim parameters may be referenced directly from later
         // blocks without being explicit jump arguments. Keep them available
         // while lowering every source block.
+        let continuation_stats_enabled = std::env::var_os("JSAW_CONTINUATION_STATS").is_some();
+        let mut continuation_stats = ContinuationStats::default();
         let entry_values = ValueSidecar::root(
             sfunc.cfg.blocks[sfunc.entry]
                 .params
@@ -2226,6 +2244,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             }];
 
             for stmt in sfunc.cfg.blocks[sblock].stmts.iter().copied() {
+                continuation_stats.statements_lowered += 1;
                 let mut next = Vec::new();
                 for mut continuation in continuations {
                     let results = self.lower_statement(
@@ -2238,8 +2257,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         &sfunc.cfg.values[stmt].value,
                     )?;
                     match results.len() {
-                        0 => {}
+                        0 => continuation_stats.zero_result_paths += 1,
                         1 => {
+                            continuation_stats.singleton_result_paths += 1;
                             let (block, value) = results
                                 .into_iter()
                                 .next()
@@ -2249,7 +2269,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                             next.push(continuation);
                         }
                         _ => {
-                            let base = continuation.values.freeze();
+                            continuation_stats.fan_out_paths += 1;
+                            let base = continuation.values.freeze(&mut continuation_stats);
                             next.extend(results.into_iter().map(|(block, value)| Continuation {
                                 block,
                                 values: ContinuationValues::child(base.clone(), stmt, value),
@@ -2513,6 +2534,20 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     return Err(ConvertError::unsupported("switch terminator", ()));
                 }
             }
+        }
+        if continuation_stats_enabled {
+            eprintln!(
+                "JSAW_CONTINUATION_STATS: statements={} zero={} singleton={} fanout={} \
+                 sidecars={} max_depth={} compactions={} compacted_bindings={}",
+                continuation_stats.statements_lowered,
+                continuation_stats.zero_result_paths,
+                continuation_stats.singleton_result_paths,
+                continuation_stats.fan_out_paths,
+                continuation_stats.sidecars_frozen,
+                continuation_stats.max_sidecar_depth,
+                continuation_stats.compactions,
+                continuation_stats.compacted_bindings,
+            );
         }
         Ok(())
     }
@@ -13079,7 +13114,7 @@ mod continuation_values_tests {
     fn continuation_values_lookup_prefers_writable_bindings() {
         let mut root = ContinuationValues::new(ValueSidecar::empty());
         root.insert(id(1), value(10));
-        let base = root.freeze();
+        let base = root.freeze(&mut ContinuationStats::default());
         let mut continuation = ContinuationValues::new(base);
         continuation.insert(id(1), value(11));
         continuation.insert(id(2), value(20));
@@ -13092,7 +13127,7 @@ mod continuation_values_tests {
     fn continuation_values_children_share_history_and_keep_split_results() {
         let mut parent = ContinuationValues::new(ValueSidecar::empty());
         parent.insert(id(1), value(10));
-        let base = parent.freeze();
+        let base = parent.freeze(&mut ContinuationStats::default());
         let left = ContinuationValues::child(base.clone(), id(2), value(20));
         let right = ContinuationValues::child(base, id(2), value(21));
 
@@ -13117,26 +13152,27 @@ mod continuation_values_tests {
     fn continuation_values_empty_freeze_reuses_the_existing_sidecar() {
         let sidecar = ValueSidecar::empty();
         let continuation = ContinuationValues::new(sidecar.clone());
-        let frozen = continuation.freeze();
+        let frozen = continuation.freeze(&mut ContinuationStats::default());
 
         assert!(Arc::ptr_eq(&sidecar, &frozen));
     }
 
     #[test]
     fn continuation_values_compaction_preserves_newest_binding_precedence() {
+        let mut stats = ContinuationStats::default();
         let mut continuation = ContinuationValues::new(ValueSidecar::empty());
         continuation.insert(id(0), value(0));
-        let mut base = continuation.freeze();
+        let mut base = continuation.freeze(&mut stats);
         for index in 1..usize::from(MAX_SIDECAR_DEPTH) {
             let mut next = ContinuationValues::new(base);
             next.insert(id(index), value(index));
-            base = next.freeze();
+            base = next.freeze(&mut stats);
         }
         assert_eq!(base.depth, MAX_SIDECAR_DEPTH);
 
         let mut overflowing = ContinuationValues::new(base);
         overflowing.insert(id(0), value(100));
-        let compacted = overflowing.freeze();
+        let compacted = overflowing.freeze(&mut stats);
         let values = ContinuationValues::new(compacted);
 
         assert_eq!(values.sidecar.depth, 0);
@@ -13144,6 +13180,8 @@ mod continuation_values_tests {
         assert_eq!(value_index(&values, id(0)), 100);
         let last = usize::from(MAX_SIDECAR_DEPTH) - 1;
         assert_eq!(value_index(&values, id(last)), last);
+        assert_eq!(stats.compactions, 1);
+        assert_eq!(stats.compacted_bindings, usize::from(MAX_SIDECAR_DEPTH));
     }
 }
 

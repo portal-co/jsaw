@@ -79,5 +79,12 @@ fn m19_real_compiler_js_lowers_lazily_with_wasi_glue() {
         })
         .expect("should create a dedicated real-compiler lowering thread")
         .join()
-        .expect("real-compiler lowering thread should not panic");
+        .unwrap_or_else(|payload| {
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "<non-string panic>".to_string());
+            panic!("real-compiler lowering thread panicked: {msg}");
+        });
 }

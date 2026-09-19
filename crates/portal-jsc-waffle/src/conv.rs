@@ -1867,9 +1867,15 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn lower_all(&mut self) -> Result<(), ConvertError> {
+        let progress = std::env::var_os("JSAW_LOWER_ALL_PROGRESS").is_some();
+        let mut done = 0usize;
         while let Some((key, sfunc)) = self.pending.pop_front() {
             if !self.lowered.insert(key) {
                 continue;
+            }
+            done += 1;
+            if progress && done % 100 == 0 {
+                eprintln!("JSAW_LOWER_ALL_PROGRESS: lowered {done} functions");
             }
             // Imports resolve against the module that *declares* the
             // function being lowered, which is not necessarily the module

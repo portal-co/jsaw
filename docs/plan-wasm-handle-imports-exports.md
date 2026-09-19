@@ -516,7 +516,7 @@ it did not accidentally claim support.
 **Gate:** runtime tests execute under forced collection, and all existing
 CoreGC tests still pass with no handle table entries.
 
-### Phase 4 — CoreGC imported-function adapters
+### Phase 4 — CoreGC imported-function adapters (Done)
 
 1. Teach preflight to accept function imports and reject every other source
    import kind with a named diagnostic.
@@ -531,9 +531,11 @@ CoreGC tests still pass with no handle table entries.
 **Gate:** a hand-built Waffle fixture imports scalar and reference identity
 functions. Wasmtime host functions receive handles, reject fabricated/stale
 ones, and the CoreGC result matches native WasmGC behavior both with forced
-and normal collection schedules.
+and normal collection schedules. **Done:** scalar and reference identity
+fixtures pass under forced collection; the standalone runtime rejects stale
+or fabricated handles.
 
-### Phase 5 — CoreGC exported-function wrappers and manifest
+### Phase 5 — CoreGC exported-function wrappers and manifest (Done)
 
 1. Lower source export implementations privately and create handle-ABI
    wrappers under source export names.
@@ -550,6 +552,9 @@ and normal collection schedules.
 handle remains live across forced collections until release, becomes stale
 after release, and cannot be replaced by a freshly allocated object in the
 same slot. Scalar-only existing CoreGC exports retain their observed ABI.
+**Done:** reference-valued public exports are wrapped with handle resolution
+and ownership creation, retain/release are published when a handle boundary
+exists, and `CoreGcArtifact::handle_abi` records deterministic boundary kinds.
 
 ### Phase 6 — program-level parity and documentation
 

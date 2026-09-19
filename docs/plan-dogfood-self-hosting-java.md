@@ -270,6 +270,43 @@ e2e that runs the generated Java compiler on a fixture module set and
 diffs its wasm/java/swift outputs against the Milestone 12 binary's
 (golden). This is the milestone that *proves* self-hosting.
 
+#### M19 Stage-C ingestion blockers (as diagnosed, September 2026)
+
+The bounded lazy-ingestion gate
+(`jsaw-wasi-bin/tests/dogfood_m19.rs`, ignored; requires the real
+`target/dogfood-m15/compiler.js`) exposed three frontend-scale defects, in
+order:
+
+1. **TAC rewriter gap (fixed).** The TAC→AST rewriter lacked an
+   `Item::Tpl` inverse even though TAC conversion produces it; the 164 MiB
+   artifact panicked immediately at `swc-tac/src/rew.rs`. Fixed in
+   jsaw-core `cac93f8` (render template literals when rewriting TAC).
+2. **Unconditional HCR inventory fingerprinting (fixed).**
+   `SModuleBuilder::append` computed a canonical SSA→TAC→AST fingerprint
+   for every completed function even when no caller ever consumed the
+   inventory; at 8,096 generated functions that pass dominated ingestion.
+   Fixed in jsaw-core `ce15489` by making inventory opt-in (`for_module`
+   computes fingerprints; `new` does not). This moved 15-minute ingestion
+   progress from byte 78 KB to byte 4.47 MB.
+3. **SSA conversion is super-linear in `|decls| × |blocks|` (open).**
+   The remaining wall is `swc-ssa`'s `TFunc → SFunc` conversion: every
+   block allocates one block-param per declared identifier and every
+   jump threads the full `all` set (`convert_block`'s `state`/`params`
+   over `self.all`), while `load()` additionally runs `TCfg::def`'s
+   whole-body scan per non-inlinable-miss load. The first multi-hundred-KB
+   generated stack-machine function (`$272`, ~1.6 MB source, ~520 labeled
+   loop blocks) does not finish conversion within 15 minutes, and a
+   whole-module release run was killed at 50.2 GB peak RSS before
+   ingestion completed. Two separable remedies, in increasing invasiveness:
+   (a) bound `all` per block to variables actually live across edges
+   (dominance/liveness-driven instead of the current conservative
+   full-set threading), and (b) stream Stage C per function: finish the
+   `IncrementalConverter` seam so completed `SFunc`s lower to WasmGC as
+   they are produced and the module-wide SSA map is never materialized.
+   Until at least (a) lands, M19 cannot run on realistic hardware; the
+   CoreGC parity suite (`portal-jsc-waffle/tests/coregc_cross.rs`) remains
+   the operative correctness gate in the meantime.
+
 ### Milestone 20 — the Gradle plugin switches hosts (§2.5, §4)
 `JsawRunner` gains the generated-Java backend; Chicory is removed from
 the plugin's dependencies; the functional tests run the compiler as Java.

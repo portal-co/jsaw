@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     mem::take,
+    sync::Arc,
 };
 
 use portal_jsc_swc_ssa::{SBlockId, SFunc, SValue, SValueId, module::SModule};
@@ -653,11 +654,139 @@ enum LowerValue {
     },
 }
 
+/// Maximum number of immutable continuation-environment sidecars traversed
+/// by a lookup before the next freeze compacts their bindings into one root.
+/// This is private implementation policy, deliberately not a converter ABI.
+const MAX_SIDECAR_DEPTH: u16 = 16;
+
+/// Immutable bindings shared by a suffix of split continuations.
+///
+/// The newest sidecar shadows its parent. A sidecar is only constructed by
+/// consuming a continuation's private writable overlay at a genuine fan-out;
+/// it is never mutated after being placed behind an [`Arc`].
+#[derive(Debug)]
+struct ValueSidecar {
+    parent: Option<Arc<ValueSidecar>>,
+    bindings: BTreeMap<SValueId, LowerValue>,
+    depth: u16,
+}
+
+impl ValueSidecar {
+    fn empty() -> Arc<Self> {
+        Arc::new(Self {
+            parent: None,
+            bindings: BTreeMap::new(),
+            depth: 0,
+        })
+    }
+
+    /// Materialize a bounded sidecar chain oldest first, so a newer binding
+    /// replaces its older value. This is the sole intentional full-history
+    /// copy, used only after nested continuation fan-out reaches the bound.
+    fn compact(&self) -> BTreeMap<SValueId, LowerValue> {
+        let mut sidecars = Vec::with_capacity(usize::from(self.depth) + 1);
+        let mut current = self;
+        loop {
+            sidecars.push(current);
+            let Some(parent) = current.parent.as_deref() else {
+                break;
+            };
+            current = parent;
+        }
+
+        let mut bindings = BTreeMap::new();
+        for sidecar in sidecars.into_iter().rev() {
+            bindings.extend(sidecar.bindings.iter().map(|(id, value)| (*id, value.clone())));
+        }
+        bindings
+    }
+}
+
+/// The private continuation-value environment.
+///
+/// A continuation exclusively owns `writable` until it forks. At a fork,
+/// [`Self::freeze`] moves it into an immutable [`ValueSidecar`], allowing all
+/// children to share historical [`LowerValue`]s without cloning their whole
+/// environments. Do not implement `Clone`: every fork must be explicit.
+#[derive(Debug)]
+struct ContinuationValues {
+    sidecar: Arc<ValueSidecar>,
+    writable: BTreeMap<SValueId, LowerValue>,
+}
+
+impl ContinuationValues {
+    fn new(sidecar: Arc<ValueSidecar>) -> Self {
+        Self {
+            sidecar,
+            writable: BTreeMap::new(),
+        }
+    }
+
+    fn get(&self, id: &SValueId) -> Option<&LowerValue> {
+        if let Some(value) = self.writable.get(id) {
+            return Some(value);
+        }
+
+        let mut sidecar = self.sidecar.as_ref();
+        loop {
+            if let Some(value) = sidecar.bindings.get(id) {
+                return Some(value);
+            }
+            let Some(parent) = sidecar.parent.as_deref() else {
+                return None;
+            };
+            sidecar = parent;
+        }
+    }
+
+    fn insert(&mut self, id: SValueId, value: LowerValue) {
+        self.writable.insert(id, value);
+    }
+
+    /// Consume this private environment for a continuation fan-out.
+    ///
+    /// An empty overlay already has precisely the right immutable history. A
+    /// bounded-depth sidecar takes ownership of the overlay without cloning;
+    /// only the explicit depth-limit compaction copies historical bindings.
+    fn freeze(self) -> Arc<ValueSidecar> {
+        if self.writable.is_empty() {
+            return self.sidecar;
+        }
+
+        if self.sidecar.depth >= MAX_SIDECAR_DEPTH {
+            let mut bindings = self.sidecar.compact();
+            bindings.extend(self.writable);
+            Arc::new(ValueSidecar {
+                parent: None,
+                bindings,
+                depth: 0,
+            })
+        } else {
+            let depth = self.sidecar.depth + 1;
+            Arc::new(ValueSidecar {
+                parent: Some(self.sidecar),
+                bindings: self.writable,
+                depth,
+            })
+        }
+    }
+
+    fn child(base: Arc<ValueSidecar>, id: SValueId, value: LowerValue) -> Self {
+        let mut child = Self::new(base);
+        child.insert(id, value);
+        child
+    }
+}
+
 /// One Wasm control-flow continuation while lowering a source SSA block.
 ///
 /// A source value may split into distinct raw primitive and reference paths.
 /// Keeping a separate value map for each path lets subsequent source
 /// statements be emitted with the representation refined by that split.
+///
+/// This remains the legacy map only while Phase 1 proves
+/// [`ContinuationValues`] in isolation. Phase 2 changes it to the private
+/// move-oriented environment and removes this `Clone` implementation.
 #[derive(Clone, Debug)]
 struct Continuation {
     block: Block,
@@ -12900,6 +13029,103 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[self.repr.value],
         );
         Ok((context, this, code, arrow))
+    }
+}
+
+#[cfg(test)]
+mod continuation_values_tests {
+    use super::*;
+
+    fn id(index: usize) -> SValueId {
+        SValueId::new(index)
+    }
+
+    fn value(index: usize) -> LowerValue {
+        LowerValue::Wasm {
+            value: Value::new(index),
+            kind: ValueKind::Reference,
+        }
+    }
+
+    fn value_index(values: &ContinuationValues, value: SValueId) -> usize {
+        values
+            .get(&value)
+            .expect("binding should be visible")
+            .wasm()
+            .expect("test values are Wasm values")
+            .0
+            .index()
+    }
+
+    #[test]
+    fn continuation_values_lookup_prefers_writable_bindings() {
+        let mut root = ContinuationValues::new(ValueSidecar::empty());
+        root.insert(id(1), value(10));
+        let base = root.freeze();
+        let mut continuation = ContinuationValues::new(base);
+        continuation.insert(id(1), value(11));
+        continuation.insert(id(2), value(20));
+
+        assert_eq!(value_index(&continuation, id(1)), 11);
+        assert_eq!(value_index(&continuation, id(2)), 20);
+    }
+
+    #[test]
+    fn continuation_values_children_share_history_and_keep_split_results() {
+        let mut parent = ContinuationValues::new(ValueSidecar::empty());
+        parent.insert(id(1), value(10));
+        let base = parent.freeze();
+        let left = ContinuationValues::child(base.clone(), id(2), value(20));
+        let right = ContinuationValues::child(base, id(2), value(21));
+
+        assert_eq!(value_index(&left, id(1)), 10);
+        assert_eq!(value_index(&right, id(1)), 10);
+        assert_eq!(value_index(&left, id(2)), 20);
+        assert_eq!(value_index(&right, id(2)), 21);
+    }
+
+    #[test]
+    fn continuation_values_singleton_move_accepts_later_bindings() {
+        let mut continuation = ContinuationValues::new(ValueSidecar::empty());
+        continuation.insert(id(1), value(10));
+        continuation.insert(id(2), value(20));
+
+        assert_eq!(value_index(&continuation, id(1)), 10);
+        assert_eq!(value_index(&continuation, id(2)), 20);
+        assert!(continuation.sidecar.bindings.is_empty());
+    }
+
+    #[test]
+    fn continuation_values_empty_freeze_reuses_the_existing_sidecar() {
+        let sidecar = ValueSidecar::empty();
+        let continuation = ContinuationValues::new(sidecar.clone());
+        let frozen = continuation.freeze();
+
+        assert!(Arc::ptr_eq(&sidecar, &frozen));
+    }
+
+    #[test]
+    fn continuation_values_compaction_preserves_newest_binding_precedence() {
+        let mut continuation = ContinuationValues::new(ValueSidecar::empty());
+        continuation.insert(id(0), value(0));
+        let mut base = continuation.freeze();
+        for index in 1..usize::from(MAX_SIDECAR_DEPTH) {
+            let mut next = ContinuationValues::new(base);
+            next.insert(id(index), value(index));
+            base = next.freeze();
+        }
+        assert_eq!(base.depth, MAX_SIDECAR_DEPTH);
+
+        let mut overflowing = ContinuationValues::new(base);
+        overflowing.insert(id(0), value(100));
+        let compacted = overflowing.freeze();
+        let values = ContinuationValues::new(compacted);
+
+        assert_eq!(values.sidecar.depth, 0);
+        assert!(values.sidecar.parent.is_none());
+        assert_eq!(value_index(&values, id(0)), 100);
+        let last = usize::from(MAX_SIDECAR_DEPTH) - 1;
+        assert_eq!(value_index(&values, id(last)), last);
     }
 }
 

@@ -26,6 +26,29 @@ pub struct CoreGcArtifact {
     pub module: Module<'static>,
     pub inventory: CoreGcInventory,
     pub descriptors: CoreGcDescriptorTable,
+    /// Deterministic public handle-boundary contract for embeds.
+    pub handle_abi: Vec<CoreGcHandleAbi>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoreGcHandleAbi {
+    pub direction: CoreGcHandleDirection,
+    pub name: String,
+    pub module: Option<String>,
+    pub parameters: Vec<CoreGcHandleKind>,
+    pub result: Option<CoreGcHandleKind>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreGcHandleDirection {
+    Import,
+    Export,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreGcHandleKind {
+    Scalar,
+    Handle,
 }
 
 /// Lower `source` (jsaw's typed WasmGC IR) to a pure core-Wasm module with
@@ -110,10 +133,51 @@ pub fn emit_coregc(
     })?;
     verify_core_only(&bytes)?;
 
+    let mut handle_abi = Vec::new();
+    for (func, decl) in source.funcs.entries() {
+        let signature = match decl {
+            FuncDecl::Import(signature, _) | FuncDecl::Body(signature, _, _) => *signature,
+            _ => continue,
+        };
+        let SignatureData::Func { params, returns, .. } = &source.signatures[signature] else {
+            continue;
+        };
+        let kinds = |types: &[Type]| {
+            types.iter().map(|ty| {
+                if coregc_lower::boundary_uses_handle(source, &inventory, *ty).unwrap_or(false) {
+                    CoreGcHandleKind::Handle
+                } else {
+                    CoreGcHandleKind::Scalar
+                }
+            }).collect::<Vec<_>>()
+        };
+        if let FuncDecl::Import(_, field) = decl {
+            if let Some(import) = source.imports.iter().find(|import| matches!(import.kind, ImportKind::Func(imported) if imported == func)) {
+                handle_abi.push(CoreGcHandleAbi {
+                    direction: CoreGcHandleDirection::Import,
+                    name: field.clone(),
+                    module: Some(import.module.clone()),
+                    parameters: kinds(params),
+                    result: returns.first().map(|ty| kinds(std::slice::from_ref(ty))[0]),
+                });
+            }
+        }
+        if source.exports.iter().any(|export| matches!(export.kind, ExportKind::Func(exported) if exported == func)) {
+            handle_abi.push(CoreGcHandleAbi {
+                direction: CoreGcHandleDirection::Export,
+                name: source.exports.iter().find(|export| matches!(export.kind, ExportKind::Func(exported) if exported == func)).unwrap().name.clone(),
+                module: None,
+                parameters: kinds(params),
+                result: returns.first().map(|ty| kinds(std::slice::from_ref(ty))[0]),
+            });
+        }
+    }
+    handle_abi.sort_by(|a, b| (a.direction as u8, &a.module, &a.name).cmp(&(b.direction as u8, &b.module, &b.name)));
     Ok(CoreGcArtifact {
         module,
         inventory,
         descriptors,
+        handle_abi,
     })
 }
 

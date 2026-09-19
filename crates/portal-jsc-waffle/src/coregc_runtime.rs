@@ -66,6 +66,9 @@ pub mod trap_code {
     pub const WORKLIST_OOM: u32 = 6;
     pub const ALLOCATOR_CORRUPTION: u32 = 7;
     pub const BAD_CAST: u32 = 8;
+    pub const BAD_HANDLE: u32 = 9;
+    pub const HANDLE_TABLE_FULL: u32 = 10;
+    pub const HANDLE_REFCOUNT_OVERFLOW: u32 = 11;
 }
 
 /// Configuration for the generated coregc runtime and heap.
@@ -84,6 +87,9 @@ pub struct CoreGcOptions {
     /// v1 does not grow this region; exceeding it is a deterministic
     /// `WORKLIST_OOM` trap.
     pub worklist_bytes: u32,
+    /// Fixed reservation for 16-byte host-handle entries. A nonzero
+    /// refcount is a collector root; the table never moves.
+    pub handle_table_bytes: u32,
     /// Bytes allocated since the last collection before a checkpoint call
     /// triggers a collection. `0` forces a collection at every checkpoint
     /// (used by the forced-collection acceptance fixtures).
@@ -108,6 +114,7 @@ impl Default for CoreGcOptions {
             heap_base: 0x10_0000,
             root_stack_bytes: 256 * 1024,
             worklist_bytes: 64 * 1024,
+            handle_table_bytes: 64 * 1024,
             collect_threshold_bytes: 1 << 20,
             export_runtime_debug: false,
             debug_trace: false,
@@ -127,6 +134,13 @@ pub(crate) struct CoreGcRuntime {
     pub(crate) root_head: Global,
     pub(crate) block_list_head: Global,
     pub(crate) root_bump: Global,
+    /// Host boundary handle helpers. `handle_new` owns a reference; retain
+    /// adds one; release drops one; accessors validate generation and liveness.
+    pub(crate) handle_new: Func,
+    pub(crate) handle_address: Func,
+    pub(crate) handle_type: Func,
+    pub(crate) handle_retain: Func,
+    pub(crate) handle_release: Func,
     /// `(type_id: i32, payload_bytes: i32) -> address: i32`
     pub(crate) alloc: Func,
     /// `(address: i32, byte_len: i32) -> ()`
@@ -190,14 +204,18 @@ pub(crate) fn build(
         .checked_add(options.root_stack_bytes)
         .and_then(align8)
         .ok_or_else(overflow_error)?;
-    let min_heap_base = worklist_start
+    let handle_table_start = worklist_start
         .checked_add(options.worklist_bytes)
+        .and_then(align8)
+        .ok_or_else(overflow_error)?;
+    let min_heap_base = handle_table_start
+        .checked_add(options.handle_table_bytes)
         .ok_or_else(overflow_error)?;
     if options.heap_base < min_heap_base {
         return Err(CoreGcError {
             message: format!(
                 "coregc heap_base {} is smaller than the required reservation of {} bytes \
-                 (descriptors + root stack + worklist)",
+                 (descriptors + root stack + worklist + handle table)",
                 options.heap_base, min_heap_base
             ),
         });
@@ -205,6 +223,16 @@ pub(crate) fn build(
     if options.worklist_bytes < 8 || options.worklist_bytes % 8 != 0 {
         return Err(CoreGcError {
             message: "coregc worklist_bytes must be a nonzero multiple of 8".to_owned(),
+        });
+    }
+    if options.handle_table_bytes < 16 || options.handle_table_bytes % 16 != 0 {
+        return Err(CoreGcError {
+            message: "coregc handle_table_bytes must be a nonzero multiple of 16".to_owned(),
+        });
+    }
+    if options.handle_table_bytes / 16 > u16::MAX as u32 - 1 {
+        return Err(CoreGcError {
+            message: "coregc handle table exceeds its 65,534-slot ABI limit".to_owned(),
         });
     }
     let initial_bytes = options
@@ -260,6 +288,19 @@ pub(crate) fn build(
     );
     let mark_ref = add_mark_ref(module, memory, trap_code, validate_ref, worklist_start,
         options.worklist_bytes, worklist_count);
+    let handle_slot = add_handle_slot(
+        module, memory, trap_code, handle_table_start, options.handle_table_bytes,
+    );
+    let handle_new = add_handle_new(
+        module, memory, trap_code, validate_ref, handle_table_start, options.handle_table_bytes,
+    );
+    let handle_address = add_handle_field(module, memory, handle_slot, 0, "__coregc_handle_address");
+    let handle_type = add_handle_field(module, memory, handle_slot, 4, "__coregc_handle_type");
+    let handle_retain = add_handle_retain(module, memory, trap_code, handle_slot);
+    let handle_release = add_handle_release(module, memory, handle_slot);
+    let mark_handles = add_mark_handles(
+        module, memory, handle_table_start, options.handle_table_bytes, mark_ref,
+    );
     let roots = coregc_roots::add_shadow_roots(
         module,
         memory,
@@ -283,6 +324,7 @@ pub(crate) fn build(
         worklist_start,
         worklist_count,
         root_walk,
+        mark_handles,
         mark_ref,
         debug_trace_fn,
     );
@@ -304,6 +346,11 @@ pub(crate) fn build(
         root_head,
         block_list_head,
         root_bump,
+        handle_new,
+        handle_address,
+        handle_type,
+        handle_retain,
+        handle_release,
         alloc,
         zero_bytes,
         validate_ref,
@@ -432,6 +479,295 @@ struct SigCtx {
 fn finish_func(module: &mut Module<'static>, placeholder: Func, ctx: SigCtx) -> Func {
     module.funcs[placeholder] = FuncDecl::Body(ctx.signature, ctx.name, ctx.body);
     placeholder
+}
+
+
+/// Resolve a non-null live handle to its 16-byte table slot. Handles encode
+/// `(generation << 16) | (slot + 1)`; slot zero and generation zero are never
+/// issued. The helper returns the slot address so all callers share exactly
+/// the stale/forged-handle checks.
+fn add_handle_slot(
+    module: &mut Module<'static>,
+    memory: portal_pc_waffle::Memory,
+    trap_code: Global,
+    table_start: u32,
+    table_bytes: u32,
+) -> Func {
+    let (placeholder, mut ctx) = push_func(module, vec![Type::I32], vec![Type::I32], "__coregc_handle_slot");
+    let body = &mut ctx.body;
+    let entry = body.entry;
+    let handle = body.blocks[entry].params[0].1;
+    let bad = body.add_block();
+    let check = body.add_block();
+    let is_zero = body.add_op(entry, Operator::I32Eqz, &[handle], &[Type::I32]);
+    body.set_terminator(entry, Terminator::CondBr {
+        cond: is_zero,
+        if_true: BlockTarget { block: bad, args: vec![] },
+        if_false: BlockTarget { block: check, args: vec![handle] },
+    });
+    let check_handle = body.add_blockparam(check, Type::I32);
+    let index_mask = i32_const(body, check, 0xffff);
+    let slot_plus_one = body.add_op(check, Operator::I32And, &[check_handle, index_mask], &[Type::I32]);
+    let no_slot = body.add_op(check, Operator::I32Eqz, &[slot_plus_one], &[Type::I32]);
+    let one = i32_const(body, check, 1);
+    let slot_index = body.add_op(check, Operator::I32Sub, &[slot_plus_one, one], &[Type::I32]);
+    let capacity = i32_const(body, check, table_bytes / 16);
+    let out_of_range = body.add_op(check, Operator::I32GeU, &[slot_index, capacity], &[Type::I32]);
+    let invalid_index = body.add_op(check, Operator::I32Or, &[no_slot, out_of_range], &[Type::I32]);
+    let inspect = body.add_block();
+    body.set_terminator(check, Terminator::CondBr {
+        cond: invalid_index,
+        if_true: BlockTarget { block: bad, args: vec![] },
+        if_false: BlockTarget { block: inspect, args: vec![check_handle, slot_index] },
+    });
+    let inspect_handle = body.add_blockparam(inspect, Type::I32);
+    let inspect_index = body.add_blockparam(inspect, Type::I32);
+    let stride = i32_const(body, inspect, 16);
+    let offset = body.add_op(inspect, Operator::I32Mul, &[inspect_index, stride], &[Type::I32]);
+    let base = i32_const(body, inspect, table_start);
+    let slot = body.add_op(inspect, Operator::I32Add, &[base, offset], &[Type::I32]);
+    let refcount = load32(body, inspect, memory, slot, 12);
+    let dead = body.add_op(inspect, Operator::I32Eqz, &[refcount], &[Type::I32]);
+    let shift = i32_const(body, inspect, 16);
+    let supplied_generation = body.add_op(inspect, Operator::I32ShrU, &[inspect_handle, shift], &[Type::I32]);
+    let stored_generation = load32(body, inspect, memory, slot, 8);
+    let wrong_generation = body.add_op(inspect, Operator::I32Ne, &[supplied_generation, stored_generation], &[Type::I32]);
+    let invalid = body.add_op(inspect, Operator::I32Or, &[dead, wrong_generation], &[Type::I32]);
+    let good = body.add_block();
+    body.set_terminator(inspect, Terminator::CondBr {
+        cond: invalid,
+        if_true: BlockTarget { block: bad, args: vec![] },
+        if_false: BlockTarget { block: good, args: vec![slot] },
+    });
+    let good_slot = body.add_blockparam(good, Type::I32);
+    body.set_terminator(good, Terminator::Return { values: vec![good_slot] });
+    set_trap(body, bad, trap_code, trap_code::BAD_HANDLE);
+    body.set_terminator(bad, Terminator::Unreachable);
+    finish_func(module, placeholder, ctx)
+}
+
+fn add_handle_new(
+    module: &mut Module<'static>,
+    memory: portal_pc_waffle::Memory,
+    trap_code: Global,
+    validate_ref: Func,
+    table_start: u32,
+    table_bytes: u32,
+) -> Func {
+    let (placeholder, mut ctx) = push_func(module, vec![Type::I32, Type::I32], vec![Type::I32], "__coregc_handle_new");
+    let body = &mut ctx.body;
+    let entry = body.entry;
+    let address = body.blocks[entry].params[0].1;
+    let type_id = body.blocks[entry].params[1].1;
+    // Validate the whole pair before recognizing null. In particular an i31
+    // immediate may have a zero payload, while `(0, nonzero)` is a malformed
+    // partial-null pair that must trap rather than become a null handle.
+    let checked = body.add_op(entry, Operator::Call { function_index: validate_ref }, &[address, type_id], &[Type::I32]);
+    let null = body.add_block();
+    let scan = body.add_block();
+    let is_null = body.add_op(entry, Operator::I32Eqz, &[checked], &[Type::I32]);
+    let zero_index = i32_const(body, entry, 0);
+    body.set_terminator(entry, Terminator::CondBr {
+        cond: is_null,
+        if_true: BlockTarget { block: null, args: vec![] },
+        if_false: BlockTarget { block: scan, args: vec![checked, type_id, zero_index] },
+    });
+    let zero = i32_const(body, null, 0);
+    body.set_terminator(null, Terminator::Return { values: vec![zero] });
+    let scan_address = body.add_blockparam(scan, Type::I32);
+    let scan_type = body.add_blockparam(scan, Type::I32);
+    let index = body.add_blockparam(scan, Type::I32);
+    let capacity = i32_const(body, scan, table_bytes / 16);
+    let full = body.add_op(scan, Operator::I32GeU, &[index, capacity], &[Type::I32]);
+    let fail = body.add_block();
+    let inspect = body.add_block();
+    body.set_terminator(scan, Terminator::CondBr {
+        cond: full,
+        if_true: BlockTarget { block: fail, args: vec![] },
+        if_false: BlockTarget { block: inspect, args: vec![scan_address, scan_type, index] },
+    });
+    set_trap(body, fail, trap_code, trap_code::HANDLE_TABLE_FULL);
+    body.set_terminator(fail, Terminator::Unreachable);
+    let inspect_address = body.add_blockparam(inspect, Type::I32);
+    let inspect_type = body.add_blockparam(inspect, Type::I32);
+    let inspect_index = body.add_blockparam(inspect, Type::I32);
+    let stride = i32_const(body, inspect, 16);
+    let offset = body.add_op(inspect, Operator::I32Mul, &[inspect_index, stride], &[Type::I32]);
+    let base = i32_const(body, inspect, table_start);
+    let slot = body.add_op(inspect, Operator::I32Add, &[base, offset], &[Type::I32]);
+    let refcount = load32(body, inspect, memory, slot, 12);
+    let vacant = body.add_op(inspect, Operator::I32Eqz, &[refcount], &[Type::I32]);
+    let use_slot = body.add_block();
+    let next = body.add_block();
+    body.set_terminator(inspect, Terminator::CondBr {
+        cond: vacant,
+        if_true: BlockTarget { block: use_slot, args: vec![inspect_address, inspect_type, inspect_index, slot] },
+        if_false: BlockTarget { block: next, args: vec![inspect_address, inspect_type, inspect_index] },
+    });
+    let next_address = body.add_blockparam(next, Type::I32);
+    let next_type = body.add_blockparam(next, Type::I32);
+    let next_index = body.add_blockparam(next, Type::I32);
+    let one = i32_const(body, next, 1);
+    let advanced = body.add_op(next, Operator::I32Add, &[next_index, one], &[Type::I32]);
+    body.set_terminator(next, Terminator::Br { target: BlockTarget { block: scan, args: vec![next_address, next_type, advanced] } });
+    let use_address = body.add_blockparam(use_slot, Type::I32);
+    let use_type = body.add_blockparam(use_slot, Type::I32);
+    let use_index = body.add_blockparam(use_slot, Type::I32);
+    let use_slot_addr = body.add_blockparam(use_slot, Type::I32);
+    let previous_generation = load32(body, use_slot, memory, use_slot_addr, 8);
+    let one = i32_const(body, use_slot, 1);
+    let generation = body.add_op(use_slot, Operator::I32Add, &[previous_generation, one], &[Type::I32]);
+    let generation_limit = i32_const(body, use_slot, 0x1_0000);
+    let exhausted_generation = body.add_op(use_slot, Operator::I32GeU, &[generation, generation_limit], &[Type::I32]);
+    let retired = body.add_block();
+    let commit = body.add_block();
+    body.set_terminator(use_slot, Terminator::CondBr {
+        cond: exhausted_generation,
+        if_true: BlockTarget { block: retired, args: vec![use_address, use_type, use_index] },
+        if_false: BlockTarget { block: commit, args: vec![use_address, use_type, use_index, use_slot_addr, generation] },
+    });
+    // A generation wrap retires the slot forever. A nonzero refcount keeps
+    // allocator scans from reusing it, while generation zero cannot match
+    // any issued handle.
+    let retired_address = body.add_blockparam(retired, Type::I32);
+    let retired_type = body.add_blockparam(retired, Type::I32);
+    let retired_index = body.add_blockparam(retired, Type::I32);
+    let retired_stride = i32_const(body, retired, 16);
+    let retired_offset = body.add_op(retired, Operator::I32Mul, &[retired_index, retired_stride], &[Type::I32]);
+    let retired_base = i32_const(body, retired, table_start);
+    let retired_slot = body.add_op(retired, Operator::I32Add, &[retired_base, retired_offset], &[Type::I32]);
+    let zero = i32_const(body, retired, 0);
+    let one = i32_const(body, retired, 1);
+    store32(body, retired, memory, retired_slot, 0, zero);
+    store32(body, retired, memory, retired_slot, 4, zero);
+    store32(body, retired, memory, retired_slot, 8, zero);
+    store32(body, retired, memory, retired_slot, 12, one);
+    body.set_terminator(retired, Terminator::Br { target: BlockTarget { block: next, args: vec![retired_address, retired_type, retired_index] } });
+    let commit_address = body.add_blockparam(commit, Type::I32);
+    let commit_type = body.add_blockparam(commit, Type::I32);
+    let commit_index = body.add_blockparam(commit, Type::I32);
+    let commit_slot = body.add_blockparam(commit, Type::I32);
+    let generation = body.add_blockparam(commit, Type::I32);
+    store32(body, commit, memory, commit_slot, 0, commit_address);
+    store32(body, commit, memory, commit_slot, 4, commit_type);
+    store32(body, commit, memory, commit_slot, 8, generation);
+    let one = i32_const(body, commit, 1);
+    store32(body, commit, memory, commit_slot, 12, one);
+    let slot_plus_one = body.add_op(commit, Operator::I32Add, &[commit_index, one], &[Type::I32]);
+    let shift = i32_const(body, commit, 16);
+    let encoded_generation = body.add_op(commit, Operator::I32Shl, &[generation, shift], &[Type::I32]);
+    let handle = body.add_op(commit, Operator::I32Or, &[encoded_generation, slot_plus_one], &[Type::I32]);
+    body.set_terminator(commit, Terminator::Return { values: vec![handle] });
+    finish_func(module, placeholder, ctx)
+}
+
+fn add_handle_field(
+    module: &mut Module<'static>, memory: portal_pc_waffle::Memory, handle_slot: Func,
+    offset: u64, name: &str,
+) -> Func {
+    let (placeholder, mut ctx) = push_func(module, vec![Type::I32], vec![Type::I32], name);
+    let body = &mut ctx.body;
+    let entry = body.entry;
+    let handle = body.blocks[entry].params[0].1;
+    let slot = body.add_op(entry, Operator::Call { function_index: handle_slot }, &[handle], &[Type::I32]);
+    let value = load32(body, entry, memory, slot, offset);
+    body.set_terminator(entry, Terminator::Return { values: vec![value] });
+    finish_func(module, placeholder, ctx)
+}
+
+fn add_handle_retain(
+    module: &mut Module<'static>, memory: portal_pc_waffle::Memory, trap_code: Global, handle_slot: Func,
+) -> Func {
+    let (placeholder, mut ctx) = push_func(module, vec![Type::I32], vec![Type::I32], "__coregc_handle_retain");
+    let body = &mut ctx.body;
+    let entry = body.entry;
+    let handle = body.blocks[entry].params[0].1;
+    let slot = body.add_op(entry, Operator::Call { function_index: handle_slot }, &[handle], &[Type::I32]);
+    let refcount = load32(body, entry, memory, slot, 12);
+    let max = i32_const(body, entry, u32::MAX);
+    let overflow = body.add_op(entry, Operator::I32Eq, &[refcount, max], &[Type::I32]);
+    let fail = body.add_block();
+    let done = body.add_block();
+    body.set_terminator(entry, Terminator::CondBr { cond: overflow, if_true: BlockTarget { block: fail, args: vec![] }, if_false: BlockTarget { block: done, args: vec![slot, refcount, handle] } });
+    set_trap(body, fail, trap_code, trap_code::HANDLE_REFCOUNT_OVERFLOW);
+    body.set_terminator(fail, Terminator::Unreachable);
+    let done_slot = body.add_blockparam(done, Type::I32);
+    let done_refcount = body.add_blockparam(done, Type::I32);
+    let done_handle = body.add_blockparam(done, Type::I32);
+    let one = i32_const(body, done, 1);
+    let incremented = body.add_op(done, Operator::I32Add, &[done_refcount, one], &[Type::I32]);
+    store32(body, done, memory, done_slot, 12, incremented);
+    body.set_terminator(done, Terminator::Return { values: vec![done_handle] });
+    finish_func(module, placeholder, ctx)
+}
+
+fn add_handle_release(
+    module: &mut Module<'static>, memory: portal_pc_waffle::Memory, handle_slot: Func,
+) -> Func {
+    let (placeholder, mut ctx) = push_func(module, vec![Type::I32], vec![], "__coregc_handle_release");
+    let body = &mut ctx.body;
+    let entry = body.entry;
+    let handle = body.blocks[entry].params[0].1;
+    let slot = body.add_op(entry, Operator::Call { function_index: handle_slot }, &[handle], &[Type::I32]);
+    let refcount = load32(body, entry, memory, slot, 12);
+    let one = i32_const(body, entry, 1);
+    let decremented = body.add_op(entry, Operator::I32Sub, &[refcount, one], &[Type::I32]);
+    store32(body, entry, memory, slot, 12, decremented);
+    let clear = body.add_block();
+    let done = body.add_block();
+    let zero = i32_const(body, entry, 0);
+    let empty = body.add_op(entry, Operator::I32Eq, &[decremented, zero], &[Type::I32]);
+    body.set_terminator(entry, Terminator::CondBr { cond: empty, if_true: BlockTarget { block: clear, args: vec![slot] }, if_false: BlockTarget { block: done, args: vec![] } });
+    let clear_slot = body.add_blockparam(clear, Type::I32);
+    let zero = i32_const(body, clear, 0);
+    store32(body, clear, memory, clear_slot, 0, zero);
+    store32(body, clear, memory, clear_slot, 4, zero);
+    body.set_terminator(clear, Terminator::Br { target: BlockTarget { block: done, args: vec![] } });
+    body.set_terminator(done, Terminator::Return { values: vec![] });
+    finish_func(module, placeholder, ctx)
+}
+
+fn add_mark_handles(
+    module: &mut Module<'static>, memory: portal_pc_waffle::Memory,
+    table_start: u32, table_bytes: u32, mark_ref: Func,
+) -> Func {
+    let (placeholder, mut ctx) = push_func(module, vec![], vec![], "__coregc_mark_handles");
+    let body = &mut ctx.body;
+    let entry = body.entry;
+    let loop_block = body.add_block();
+    let body_block = body.add_block();
+    let done = body.add_block();
+    let zero = i32_const(body, entry, 0);
+    body.set_terminator(entry, Terminator::Br { target: BlockTarget { block: loop_block, args: vec![zero] } });
+    let index = body.add_blockparam(loop_block, Type::I32);
+    let capacity = i32_const(body, loop_block, table_bytes / 16);
+    let finished = body.add_op(loop_block, Operator::I32GeU, &[index, capacity], &[Type::I32]);
+    body.set_terminator(loop_block, Terminator::CondBr { cond: finished, if_true: BlockTarget { block: done, args: vec![] }, if_false: BlockTarget { block: body_block, args: vec![index] } });
+    let index = body.add_blockparam(body_block, Type::I32);
+    let stride = i32_const(body, body_block, 16);
+    let offset = body.add_op(body_block, Operator::I32Mul, &[index, stride], &[Type::I32]);
+    let base = i32_const(body, body_block, table_start);
+    let slot = body.add_op(body_block, Operator::I32Add, &[base, offset], &[Type::I32]);
+    let refcount = load32(body, body_block, memory, slot, 12);
+    let generation = load32(body, body_block, memory, slot, 8);
+    let empty = body.add_op(body_block, Operator::I32Eqz, &[refcount], &[Type::I32]);
+    let retired = body.add_op(body_block, Operator::I32Eqz, &[generation], &[Type::I32]);
+    let skip = body.add_op(body_block, Operator::I32Or, &[empty, retired], &[Type::I32]);
+    let mark = body.add_block();
+    let next = body.add_block();
+    body.set_terminator(body_block, Terminator::CondBr { cond: skip, if_true: BlockTarget { block: next, args: vec![index] }, if_false: BlockTarget { block: mark, args: vec![index, slot] } });
+    let mark_index = body.add_blockparam(mark, Type::I32);
+    let mark_slot = body.add_blockparam(mark, Type::I32);
+    let address = load32(body, mark, memory, mark_slot, 0);
+    let type_id = load32(body, mark, memory, mark_slot, 4);
+    body.add_op(mark, Operator::Call { function_index: mark_ref }, &[address, type_id], &[]);
+    body.set_terminator(mark, Terminator::Br { target: BlockTarget { block: next, args: vec![mark_index] } });
+    let next_index = body.add_blockparam(next, Type::I32);
+    let one = i32_const(body, next, 1);
+    let next_index = body.add_op(next, Operator::I32Add, &[next_index, one], &[Type::I32]);
+    body.set_terminator(next, Terminator::Br { target: BlockTarget { block: loop_block, args: vec![next_index] } });
+    body.set_terminator(done, Terminator::Return { values: vec![] });
+    finish_func(module, placeholder, ctx)
 }
 
 /// `validate_ref(address, type_id) -> address` (or traps `BAD_FAT_REF`/`BAD_TYPE_ID`).
@@ -1045,6 +1381,7 @@ fn add_collect(
     worklist_start: u32,
     worklist_count: Global,
     root_walk: Func,
+    mark_handles: Func,
     mark_ref: Func,
     debug_trace_fn: Option<Func>,
 ) -> Func {
@@ -1072,6 +1409,7 @@ fn add_collect(
 
     let one = i32_const(body, start, 1);
     body.add_op(start, Operator::GlobalSet { global_index: collecting }, &[one], &[]);
+    body.add_op(start, Operator::Call { function_index: mark_handles }, &[], &[]);
     body.add_op(start, Operator::Call { function_index: root_walk }, &[], &[]);
     let drain_loop = body.add_block();
     body.set_terminator(start, Terminator::Br { target: BlockTarget { block: drain_loop, args: vec![] } });
@@ -1690,6 +2028,11 @@ mod tests {
             ("pop_frame", ExportKind::Func(runtime.roots.pop)),
             ("root_store", ExportKind::Func(runtime.roots.store)),
             ("root_clear", ExportKind::Func(runtime.roots.clear)),
+            ("handle_new", ExportKind::Func(runtime.handle_new)),
+            ("handle_address", ExportKind::Func(runtime.handle_address)),
+            ("handle_type", ExportKind::Func(runtime.handle_type)),
+            ("handle_retain", ExportKind::Func(runtime.handle_retain)),
+            ("handle_release", ExportKind::Func(runtime.handle_release)),
             ("memory", ExportKind::Memory(runtime.memory)),
         ] {
             module.exports.push(Export {
@@ -1747,6 +2090,36 @@ mod tests {
                 .call(&mut self.store, ())
                 .expect("collection");
         }
+        fn handle_new(&mut self, addr: i32, type_id: i32) -> Result<i32, wasmtime::Error> {
+            self.instance
+                .get_typed_func::<(i32, i32), i32>(&mut self.store, "handle_new")
+                .unwrap()
+                .call(&mut self.store, (addr, type_id))
+        }
+        fn handle_address(&mut self, handle: i32) -> Result<i32, wasmtime::Error> {
+            self.instance
+                .get_typed_func::<i32, i32>(&mut self.store, "handle_address")
+                .unwrap()
+                .call(&mut self.store, handle)
+        }
+        fn handle_type(&mut self, handle: i32) -> Result<i32, wasmtime::Error> {
+            self.instance
+                .get_typed_func::<i32, i32>(&mut self.store, "handle_type")
+                .unwrap()
+                .call(&mut self.store, handle)
+        }
+        fn handle_retain(&mut self, handle: i32) -> Result<i32, wasmtime::Error> {
+            self.instance
+                .get_typed_func::<i32, i32>(&mut self.store, "handle_retain")
+                .unwrap()
+                .call(&mut self.store, handle)
+        }
+        fn handle_release(&mut self, handle: i32) -> Result<(), wasmtime::Error> {
+            self.instance
+                .get_typed_func::<i32, ()>(&mut self.store, "handle_release")
+                .unwrap()
+                .call(&mut self.store, handle)
+        }
         fn checkpoint(&mut self, frame: i32) -> Result<(), wasmtime::Error> {
             self.instance
                 .get_typed_func::<i32, ()>(&mut self.store, "checkpoint")
@@ -1787,6 +2160,58 @@ mod tests {
                 .write(&mut self.store, (addr + offset) as usize, &value.to_le_bytes())
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn host_handle_keeps_an_object_alive_until_release() {
+        let mut rig = build_rig(CoreGcOptions::default());
+        let type_id = rig.node_type_id;
+        let object = rig.alloc(type_id, rig.node_payload_bytes);
+        let handle = rig.handle_new(object, type_id).expect("new handle");
+        assert_ne!(handle, 0, "non-null object gets a nonzero handle");
+        rig.collect();
+        assert!(rig.validate_ok(object, type_id), "live handle is a GC root");
+        assert_eq!(rig.handle_address(handle).unwrap(), object);
+        assert_eq!(rig.handle_type(handle).unwrap(), type_id);
+        rig.handle_release(handle).expect("release");
+        rig.collect();
+        assert!(!rig.validate_ok(object, type_id), "released handle no longer roots object");
+        assert!(rig.handle_address(handle).is_err(), "released handle is stale");
+    }
+
+    #[test]
+    fn host_handle_retain_balances_release_and_rejects_null() {
+        let mut rig = build_rig(CoreGcOptions::default());
+        let type_id = rig.node_type_id;
+        let object = rig.alloc(type_id, rig.node_payload_bytes);
+        let handle = rig.handle_new(object, type_id).unwrap();
+        assert_eq!(rig.handle_retain(handle).unwrap(), handle);
+        rig.handle_release(handle).unwrap();
+        rig.collect();
+        assert!(rig.validate_ok(object, type_id), "one retained ownership remains");
+        rig.handle_release(handle).unwrap();
+        rig.collect();
+        assert!(!rig.validate_ok(object, type_id));
+        assert!(rig.handle_new(0, 0).is_ok_and(|handle| handle == 0));
+        assert!(rig.handle_retain(0).is_err());
+        assert!(rig.handle_release(0).is_err());
+    }
+
+    #[test]
+    fn host_handle_generation_prevents_slot_reuse_from_reviving_stale_handle() {
+        let mut rig = build_rig(CoreGcOptions {
+            handle_table_bytes: 16,
+            ..CoreGcOptions::default()
+        });
+        let type_id = rig.node_type_id;
+        let first = rig.alloc(type_id, rig.node_payload_bytes);
+        let stale = rig.handle_new(first, type_id).unwrap();
+        rig.handle_release(stale).unwrap();
+        let second = rig.alloc(type_id, rig.node_payload_bytes);
+        let current = rig.handle_new(second, type_id).unwrap();
+        assert_ne!(stale, current, "slot reuse changes the generation");
+        assert!(rig.handle_address(stale).is_err(), "old generation cannot resolve");
+        assert_eq!(rig.handle_address(current).unwrap(), second);
     }
 
     #[test]

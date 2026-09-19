@@ -2250,12 +2250,10 @@ fn reserves_wasm_host_import_syntax_without_module_set_resolution() {
         "main.mjs",
         "import { add$wasm$i32_i32$i32 as add } from 'wasm:env'; export function run(x) { return add(x, 1); }",
     )];
-    let error = lower_modules(fixtures, "main.mjs", &Default::default())
-        .expect_err("phase 1 reserves the host binding but does not lower it yet");
-    assert!(
-        !error.to_string().contains("only relative"),
-        "wasm: must not be treated as an ESM bare specifier: {error}"
-    );
+    let module = lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect("wasm: must bypass ModuleSet resolution and lower as a host import");
+    assert_eq!(module.imports.len(), 1);
+    assert_eq!(module.imports[0].module, "env");
 
     for (source, needle) in [
         (
@@ -2280,6 +2278,55 @@ fn reserves_wasm_host_import_syntax_without_module_set_resolution() {
             .expect_err("malformed host import must fail before lowering");
         assert!(error.to_string().contains(needle), "{error}");
     }
+}
+
+#[test]
+fn emits_and_executes_wasm_host_scalar_imports_and_exports() {
+    let fixtures: Fixture<'_> = &[(
+        "main.mjs",
+        "import { add$wasm$i32_i32$i32 as add } from 'wasm:env'; export function run$wasm$i32$i32(x) { return add(x, 7); }",
+    )];
+    let module = lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect("typed host import and raw export should lower");
+    for (_, declaration) in module.funcs.entries() {
+        if let FuncDecl::Body(_, _, body) = declaration {
+            body.validate().expect("generated Waffle function should validate");
+        }
+    }
+    assert!(
+        portal_jsc_mob_emit::audit::audit_module(&module).is_err(),
+        "mobile audit must keep rejecting host function imports"
+    );
+    assert_eq!(module.imports.len(), 1, "one deduplicated host import");
+    assert_eq!(module.imports[0].module, "env");
+    assert_eq!(module.imports[0].name, "add");
+    assert!(module.exports.iter().any(|export| export.name == "run"));
+    assert!(
+        !module.exports.iter().any(|export| export.name.contains("$wasm$")),
+        "the source ABI suffix is not part of the emitted field name"
+    );
+    let wasm = portal_pc_waffle::to_wasm_bytes(&module).expect("module should encode");
+    let engine = Engine::default();
+    let compiled = WasmtimeModule::new(&engine, &wasm).expect("wasmtime should compile the module");
+    let mut store = Store::new(&engine, ());
+    let host = wasmtime::Func::wrap(&mut store, |a: i32, b: i32| a + b);
+    let instance = Instance::new(&mut store, &compiled, &[host.into()])
+        .expect("host import should instantiate");
+    let run = instance
+        .get_typed_func::<i32, i32>(&mut store, "run")
+        .expect("raw i32 export should be visible");
+    assert_eq!(run.call(&mut store, 9).unwrap(), 16);
+}
+
+#[test]
+fn wasm_host_imports_are_deduplicated_across_local_aliases() {
+    let fixtures: Fixture<'_> = &[(
+        "main.mjs",
+        "import { add$wasm$i32_i32$i32 as first } from 'wasm:env'; import { add$wasm$i32_i32$i32 as second } from 'wasm:env'; export function run$wasm$i32$i32(x) { return first(x, 1) + second(x, 2); }",
+    )];
+    let module = lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect("aliases with the same host ABI should lower");
+    assert_eq!(module.imports.len(), 1, "raw host import is deduplicated");
 }
 
 #[test]

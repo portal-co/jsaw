@@ -8,11 +8,13 @@ use portal_jsc_swc_ssa::{SBlockId, SFunc, SValue, SValueId, module::SModule};
 use portal_jsc_swc_tac::{Item, LId, PropKey, PropVal, TCallee, TTerm};
 use portal_pc_waffle::{
     Block, BlockTarget, EntityRef, Export, ExportKind, Func, FuncDecl, FunctionBody, HeapType,
-    Module, Operator, SignatureData, Table, TableData, Terminator, Type, Value, WithNullable,
+    Import, ImportKind, Module, Operator, SignatureData, Table, TableData, Terminator, Type, Value,
+    WithNullable,
 };
 use swc_ecma_ast::{BinaryOp, Id as Ident, Lit, UnaryOp};
 
 use crate::linker::{ImportTarget, ModuleSet};
+use crate::wasm_boundary::{WasmBoundarySignature, WasmBoundaryType, WasmImportSpec};
 use crate::repr::{
     ConvertError, FUNCTION_FIELD_TAG, JS_NULL_SENTINEL, Repr, TypedArrayKind, field, ref_sig,
 };
@@ -217,8 +219,14 @@ pub fn convert_modules<'a, 'wasm>(
         }
     }
 
+    // Core Wasm requires the import section (and therefore imported function
+    // indices) to precede every defined function. Declare all raw host
+    // imports before `Converter::new`, whose representation setup emits
+    // helper bodies.
+    let wasm_host_imports = declare_wasm_host_imports(module, &import_tables);
     let mut converter = Converter::new(module);
     converter.import_tables = import_tables;
+    converter.wasm_host_imports = wasm_host_imports;
     // The entry module's top-level body performs the context stores that
     // install hoisted function declarations (`function run(){}` lowers to a
     // `StoreId` of the literal). Walk it first so its assignments participate
@@ -248,10 +256,9 @@ pub fn convert_modules<'a, 'wasm>(
     }
     let mut exports = Vec::with_capacity(exported.len());
     for (name, function) in exported {
-        // Validate and strip the declarative raw-host ABI suffix before any
-        // code generation. Phase 2 will use the preserved signature to emit
-        // the wrapper; Phase 1 reserves its external name now.
-        let name = boundary_export_name(&name)?;
+        // Parse the declarative raw-host ABI suffix before code generation;
+        // preserve its source spelling until the wrapper is emitted.
+        let _ = boundary_export_signature(&name)?;
         converter.collect_shapes(function)?;
         converter.shadowed_names.clear();
         converter.function_literal_locals.clear();
@@ -262,10 +269,15 @@ pub fn convert_modules<'a, 'wasm>(
     converter.lower_all()?;
 
     for (name, info) in exports {
-        if options.numeric_exports {
+        let boundary = boundary_export_signature(&name)?;
+        if let Some(signature) = &boundary {
+            converter.export_wasm_boundary_function(&name, info, signature)?;
+        } else if options.numeric_exports {
             converter.export_numeric_function(&name, info)?;
         }
-        if let Some(suffix) = &options.gc_export_suffix {
+        // A suffix-marked export has its own raw host ABI and deliberately
+        // does not grow a second internal-GC adapter export.
+        if boundary.is_none() && let Some(suffix) = &options.gc_export_suffix {
             converter.module.exports.push(Export {
                 name: format!("{name}{suffix}"),
                 kind: ExportKind::Func(info.adapter),
@@ -275,14 +287,80 @@ pub fn convert_modules<'a, 'wasm>(
     Ok(())
 }
 
-/// Parse a source export boundary name if it opts into the `$wasm$` ABI;
-/// ordinary ESM export names retain their existing spelling.
-fn boundary_export_name(name: &str) -> Result<String, ConvertError> {
-    if name.contains("$wasm$") {
-        Ok(crate::wasm_boundary::wasm_export_spec(name)?.field)
-    } else {
-        Ok(name.to_owned())
+/// Declare every raw host import before the converter creates any defined
+/// helper function. BTree ordering gives reproducible import/function indices.
+fn declare_wasm_host_imports<'wasm>(
+    module: &mut Module<'wasm>,
+    tables: &BTreeMap<String, BTreeMap<Ident, ImportTarget<'_>>>,
+) -> BTreeMap<WasmImportSpec, Func> {
+    let mut specs = BTreeSet::new();
+    for table in tables.values() {
+        for target in table.values() {
+            if let ImportTarget::WasmHost(spec) = target {
+                specs.insert(spec.clone());
+            }
+        }
     }
+    let mut imports = BTreeMap::new();
+    for spec in specs {
+        let signature = module.signatures.push(SignatureData::Func {
+            params: spec
+                .signature
+                .params
+                .iter()
+                .copied()
+                .map(wasm_boundary_type)
+                .collect(),
+            returns: spec
+                .signature
+                .result
+                .map(wasm_boundary_type)
+                .into_iter()
+                .collect(),
+            shared: false,
+        });
+        let func = module
+            .funcs
+            .push(FuncDecl::Import(signature, spec.field.clone()));
+        module.imports.push(Import {
+            module: spec.module.clone(),
+            name: spec.field.clone(),
+            kind: ImportKind::Func(func),
+        });
+        imports.insert(spec, func);
+    }
+    imports
+}
+
+fn wasm_boundary_type(ty: WasmBoundaryType) -> Type {
+    match ty {
+        WasmBoundaryType::I32 => Type::I32,
+        WasmBoundaryType::I64 => Type::I64,
+        WasmBoundaryType::F32 => Type::F32,
+        WasmBoundaryType::F64 => Type::F64,
+        WasmBoundaryType::Ref => Type::Heap(WithNullable {
+            value: HeapType::Any,
+            nullable: true,
+        }),
+    }
+}
+
+/// Parse a source export boundary name if it opts into the `$wasm$` ABI.
+fn boundary_export_signature(
+    name: &str,
+) -> Result<Option<(String, WasmBoundarySignature)>, ConvertError> {
+    if name.contains("$wasm$") {
+        let spec = crate::wasm_boundary::wasm_export_spec(name)?;
+        Ok(Some((spec.field, spec.signature)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// The eventual Wasm export name, used for collision detection before any
+/// wrapper generation has mutated the module.
+fn boundary_export_name(name: &str) -> Result<String, ConvertError> {
+    Ok(boundary_export_signature(name)?.map_or_else(|| name.to_owned(), |(field, _)| field))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -999,6 +1077,10 @@ struct Converter<'a, 'module, 'wasm> {
     /// The function currently being lowered (its source), and its key.
     lowering_function: Option<&'a SFunc>,
     lowering_function_key: Option<usize>,
+    /// Deduplicated raw Wasm imports, keyed by module, field, and ABI.
+    wasm_host_imports: BTreeMap<WasmImportSpec, Func>,
+    /// Generated jsaw callable metadata for every raw host import.
+    wasm_host_functions: BTreeMap<WasmImportSpec, FunctionInfo>,
     /// Per-module import tables for multi-module ingestion: resolved
     /// binding → linked target function. Keyed by module path; the single-
     /// module and bare-script paths use the same shape with an empty table
@@ -1060,6 +1142,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             function_self_names: BTreeMap::new(),
             lowering_function: None,
             lowering_function_key: None,
+            wasm_host_imports: BTreeMap::new(),
+            wasm_host_functions: BTreeMap::new(),
             import_tables: BTreeMap::new(),
             module_of_function: BTreeMap::new(),
             current_module: String::new(),
@@ -1913,6 +1997,125 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     /// Export a host-callable numeric wrapper around a native JavaScript
     /// function body. The wrapper intentionally has a conventional Wasm ABI;
     /// callers never need to construct the internal GC object/value types.
+    /// Create or reuse the raw Wasm import associated with one parsed host
+    /// binding. The generated JavaScript-call adapter below remains distinct
+    /// from this raw ABI function.
+    fn wasm_host_import(&self, spec: &WasmImportSpec) -> Result<Func, ConvertError> {
+        self.wasm_host_imports.get(spec).copied().ok_or_else(|| {
+            ConvertError::invalid(format!(
+                "missing predeclared Wasm host import {}.{}",
+                spec.module, spec.field
+            ))
+        })
+    }
+
+    fn wasm_boundary_signature(&mut self, signature: &WasmBoundarySignature) -> portal_pc_waffle::Signature {
+        self.module.signatures.push(SignatureData::Func {
+            params: signature
+                .params
+                .iter()
+                .copied()
+                .map(|ty| self.wasm_boundary_type(ty))
+                .collect(),
+            returns: signature
+                .result
+                .map(|ty| self.wasm_boundary_type(ty))
+                .into_iter()
+                .collect(),
+            shared: false,
+        })
+    }
+
+    fn wasm_boundary_type(&self, ty: WasmBoundaryType) -> Type {
+        match ty {
+            WasmBoundaryType::I32 => Type::I32,
+            WasmBoundaryType::I64 => Type::I64,
+            WasmBoundaryType::F32 => Type::F32,
+            WasmBoundaryType::F64 => Type::F64,
+            WasmBoundaryType::Ref => self.repr.value,
+        }
+    }
+
+    /// Generate a normal jsaw native body plus its standard adapter around a
+    /// raw typed Wasm import. Keeping the native signature conventional is
+    /// important: guarded direct-call lowering may call it without going
+    /// through the boxed adapter.
+    fn wasm_host_adapter(&mut self, spec: &WasmImportSpec) -> Result<FunctionInfo, ConvertError> {
+        if let Some(info) = self.wasm_host_functions.get(spec) {
+            return Ok(*info);
+        }
+        let raw = self.wasm_host_import(spec)?;
+        let arity = spec.signature.params.len();
+        let native_sig = self.module.signatures.push(SignatureData::Func {
+            params: std::iter::once(self.repr.object_ty())
+                .chain(std::iter::once(self.repr.value))
+                .chain(std::iter::once(self.repr.arguments_ty()))
+                .chain(std::iter::repeat_n(self.repr.value, arity))
+                .collect(),
+            returns: vec![self.repr.value],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, native_sig);
+        let block = body.entry;
+        let formals = body.blocks[block].params[3..]
+            .iter()
+            .map(|(_, value)| *value)
+            .collect::<Vec<_>>();
+        let mut raw_args = Vec::with_capacity(arity);
+        for (value, ty) in formals.into_iter().zip(spec.signature.params.iter().copied()) {
+            let value = LowerValue::Wasm {
+                value,
+                kind: ValueKind::Reference,
+            };
+            raw_args.push(match ty {
+                WasmBoundaryType::I32 => self.as_i32(&mut body, block, &value)?,
+                WasmBoundaryType::I64 => self.as_i64(&mut body, block, &value)?,
+                WasmBoundaryType::F32 => {
+                    let number = self.as_f64(&mut body, block, &value)?;
+                    body.add_op(block, Operator::F32DemoteF64, &[number], &[Type::F32])
+                }
+                WasmBoundaryType::F64 => self.as_f64(&mut body, block, &value)?,
+                WasmBoundaryType::Ref => value.wasm()?.0,
+            });
+        }
+        let result_types = spec.signature.result.map(|ty| self.wasm_boundary_type(ty)).into_iter().collect::<Vec<_>>();
+        let result = body.add_op(block, Operator::Call { function_index: raw }, &raw_args, &result_types);
+        let result = match spec.signature.result {
+            None => self.undef(&mut body, block).wasm()?.0,
+            Some(WasmBoundaryType::I32) => self.box_value(&mut body, block, &LowerValue::Wasm { value: result, kind: ValueKind::Integer })?,
+            Some(WasmBoundaryType::I64) => self.box_value(&mut body, block, &LowerValue::Wasm { value: result, kind: ValueKind::BigInt })?,
+            Some(WasmBoundaryType::F32) => {
+                let number = body.add_op(block, Operator::F64PromoteF32, &[result], &[Type::F64]);
+                self.box_value(&mut body, block, &LowerValue::Wasm { value: number, kind: ValueKind::Number })?
+            }
+            Some(WasmBoundaryType::F64) => self.box_value(&mut body, block, &LowerValue::Wasm { value: result, kind: ValueKind::Number })?,
+            Some(WasmBoundaryType::Ref) => result,
+        };
+        body.set_terminator(block, Terminator::Return { values: vec![result] });
+        let native = self.module.funcs.push(FuncDecl::Body(
+            native_sig,
+            format!("js_wasm_import_native_{}_{}", spec.module, spec.field),
+            body,
+        ));
+        let adapter = self.make_adapter(native, arity)?;
+        let tag = self.next_function_tag;
+        self.next_function_tag = self.next_function_tag.checked_add(1).ok_or_else(|| {
+            ConvertError::invalid("function tag space exhausted")
+        })?;
+        let info = FunctionInfo {
+            native,
+            adapter,
+            arity,
+            tag,
+            returns: ReturnKinds::default(),
+        };
+        self.wasm_host_functions.insert(spec.clone(), info);
+        Ok(info)
+    }
+
+    /// Export a host-callable numeric wrapper around a native JavaScript
+    /// function body. The wrapper intentionally has a conventional Wasm ABI;
+    /// callers never need to construct the internal GC object/value types.
     fn export_numeric_function(
         &mut self,
         name: &str,
@@ -2000,6 +2203,80 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             name: name.to_owned(),
             kind: ExportKind::Func(func),
         });
+        Ok(())
+    }
+
+    /// Export a source function through the explicitly declared raw host ABI.
+    /// Unlike the legacy numeric wrapper, this preserves the suffix-selected
+    /// scalar/reference representation and exports the suffix-stripped field.
+    fn export_wasm_boundary_function(
+        &mut self,
+        source_name: &str,
+        info: FunctionInfo,
+        signature: &(String, WasmBoundarySignature),
+    ) -> Result<(), ConvertError> {
+        let (field, abi) = signature;
+        let wrapper_sig = self.wasm_boundary_signature(abi);
+        let mut body = FunctionBody::new(self.module, wrapper_sig);
+        let block = body.entry;
+        let params = body.blocks[block].params.iter().map(|(_, value)| *value).collect::<Vec<_>>();
+        let module_init = self.ensure_module_init()?;
+        let context = body.add_op(
+            block,
+            Operator::Call { function_index: module_init },
+            &[],
+            &[self.repr.object_ty()],
+        );
+        let this = self.undef(&mut body, block).wasm()?.0;
+        let mut arguments = Vec::with_capacity(params.len());
+        for (value, ty) in params.into_iter().zip(abi.params.iter().copied()) {
+            let value = match ty {
+                WasmBoundaryType::I32 => LowerValue::Wasm { value, kind: ValueKind::Integer },
+                WasmBoundaryType::I64 => LowerValue::Wasm { value, kind: ValueKind::BigInt },
+                WasmBoundaryType::F32 => {
+                    let value = body.add_op(block, Operator::F64PromoteF32, &[value], &[Type::F64]);
+                    LowerValue::Wasm { value, kind: ValueKind::Number }
+                }
+                WasmBoundaryType::F64 => LowerValue::Wasm { value, kind: ValueKind::Number },
+                WasmBoundaryType::Ref => LowerValue::Wasm { value, kind: ValueKind::Reference },
+            };
+            arguments.push(self.box_value(&mut body, block, &value)?);
+        }
+        let arguments = body.add_op(
+            block,
+            Operator::ArrayNewFixed { sig: self.repr.arguments, num: arguments.len() },
+            &arguments,
+            &[self.repr.arguments_ty()],
+        );
+        let result = body.add_op(
+            block,
+            Operator::Call { function_index: info.adapter },
+            &[context, this, arguments],
+            &[self.repr.value],
+        );
+        let result = LowerValue::Wasm { value: result, kind: ValueKind::Reference };
+        let values = match abi.result {
+            None => Vec::new(),
+            Some(WasmBoundaryType::I32) => vec![self.as_i32(&mut body, block, &result)?],
+            Some(WasmBoundaryType::I64) => vec![self.as_i64(&mut body, block, &result)?],
+            Some(WasmBoundaryType::F32) => {
+                let value = self.as_f64(&mut body, block, &result)?;
+                vec![body.add_op(block, Operator::F32DemoteF64, &[value], &[Type::F32])]
+            }
+            Some(WasmBoundaryType::F64) => vec![self.as_f64(&mut body, block, &result)?],
+            Some(WasmBoundaryType::Ref) => vec![result.wasm()?.0],
+        };
+        body.set_terminator(block, Terminator::Return { values });
+        let func = self.module.funcs.push(FuncDecl::Body(
+            wrapper_sig,
+            format!("js_wasm_export_{field}"),
+            body,
+        ));
+        self.module.exports.push(Export {
+            name: field.clone(),
+            kind: ExportKind::Func(func),
+        });
+        let _ = source_name; // retained for future diagnostics/source maps.
         Ok(())
     }
 
@@ -2694,10 +2971,17 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                             return Ok(vec![(block, value)]);
                         }
                         ImportTarget::WasmHost(spec) => {
-                            return Err(ConvertError::invalid(format!(
-                                "Wasm host import {}.{} is parsed but native host-import lowering is not enabled yet",
-                                spec.module, spec.field
-                            )));
+                            let info = self.wasm_host_adapter(&spec)?;
+                            let value = self.function_object_from_info(
+                                body,
+                                block,
+                                context,
+                                this.clone(),
+                                info,
+                                false,
+                                true,
+                            )?;
+                            return Ok(vec![(block, value)]);
                         }
                     }
                 }

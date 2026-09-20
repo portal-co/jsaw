@@ -42,7 +42,9 @@ fn main() -> ExitCode {
     // The result is a single JSON line on stdout, always.
     match serde_json::to_string(&result) {
         Ok(line) => println!("{line}"),
-        Err(error) => println!("{{\"status\":\"error\",\"error\":\"result serialization failed: {error}\"}}"),
+        Err(error) => {
+            println!("{{\"status\":\"error\",\"error\":\"result serialization failed: {error}\"}}")
+        }
     }
     match &result {
         manifest::Result::Ok { .. } => ExitCode::SUCCESS,

@@ -52,7 +52,13 @@ fn compiler_wasm_path() -> PathBuf {
 /// func types (for `mach_operators`), the parallel `wasm_encoder` func types
 /// (for `on_mach`), and the per-function-index signature indices (imports
 /// first, then the function section).
-fn parse_sigs(wasm: &[u8]) -> (Vec<WpFuncType>, Vec<portal_solutions_blitz_common::wasm_encoder::FuncType>, Vec<u32>) {
+fn parse_sigs(
+    wasm: &[u8],
+) -> (
+    Vec<WpFuncType>,
+    Vec<portal_solutions_blitz_common::wasm_encoder::FuncType>,
+    Vec<u32>,
+) {
     let mut sigs_wp: Vec<WpFuncType> = Vec::new();
     let mut fsigs: Vec<u32> = Vec::new();
     for payload in wasmparser::Parser::new(0).parse_all(wasm).flatten() {
@@ -149,7 +155,10 @@ fn compile_wasm_to_esm_js_opt(wasm: &[u8], opt: bool) -> String {
 
     let import_count = imports_ref.len() as u32;
     let raw_ops = mach_operators::<(), wasmparser::BinaryReaderError>(
-        &bodies, &fsigs, &sigs_wp, import_count,
+        &bodies,
+        &fsigs,
+        &sigs_wp,
+        import_count,
     );
     let ops = dce_pass!(raw_ops);
 
@@ -240,7 +249,10 @@ fn trivial_core_wasm_round_trips_to_js() {
     // proving the opt-mode stack tracking produces correct code (not just
     // non-crashing output). The fixes to Drop/Select/branch boundaries are only
     // trustworthy if the emitted JS computes the right answer.
-    for (label, compiled) in [("non-opt", js), ("opt", compile_wasm_to_esm_js_opt(&wasm, true))] {
+    for (label, compiled) in [
+        ("non-opt", js),
+        ("opt", compile_wasm_to_esm_js_opt(&wasm, true)),
+    ] {
         let got = node_call(&compiled, "add", &[40, 2]);
         assert_eq!(got, 42, "{label} compiled add(40,2) should be 42");
     }
@@ -291,10 +303,7 @@ fn characterize_compiler_wasm_js() {
 
     // ---- WASI import inventory (this scopes Milestone 18's glue) ----
     let imports = parse_imports(&wasm);
-    let mut wasi_imports: Vec<String> = imports
-        .iter()
-        .map(|(m, n)| format!("{m}::{n}"))
-        .collect();
+    let mut wasi_imports: Vec<String> = imports.iter().map(|(m, n)| format!("{m}::{n}")).collect();
     wasi_imports.sort();
     wasi_imports.dedup();
 

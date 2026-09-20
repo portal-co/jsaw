@@ -3588,31 +3588,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[patch.unused]]
-name = "portal-jsc-swc-opt-ssa"
-version = "0.8.0-pre.11"
-
-[[patch.unused]]
-name = "portal-jit-host-names"
+name = "vane-aarch64"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-circuit-exec-core"
+name = "vane-riscv"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-llvm-constchain"
+name = "lazy-repo"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-llvm-import-core"
+name = "lazy-repo-crypto"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-llvm-pass-build"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-llvm-pass-support"
+name = "lazy-repo-std"
 version = "0.1.0"
 
 [[patch.unused]]
@@ -3620,11 +3612,11 @@ name = "thin-mcp"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "vane-aarch64"
-version = "0.1.0"
+name = "pit-patch"
+version = "0.5.0-alpha.1"
 
 [[patch.unused]]
-name = "vane-riscv"
+name = "portal-jit-host-names"
 version = "0.1.0"
 
 [[patch.unused]]
@@ -3740,10 +3732,6 @@ name = "xtask"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "rv-asm"
-version = "0.2.1"
-
-[[patch.unused]]
 name = "volar-circuit-exec-core"
 version = "0.1.0"
 
@@ -3756,11 +3744,111 @@ name = "volar-llvm-import-core"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "volar-llvm-jumpthread"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "volar-llvm-pass-build"
 version = "0.1.0"
 
 [[patch.unused]]
 name = "volar-llvm-pass-support"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-jsc-swc-opt-ssa"
+version = "0.8.0-pre.11"
+
+[[patch.unused]]
+name = "portal-pc-waffle-copying"
+version = "0.6.0-alpha.1"
+
+[[patch.unused]]
+name = "portal-pc-waffle-copying-passes"
+version = "0.6.0-alpha.1"
+
+[[patch.unused]]
+name = "portal-pc-waffle-fuzzing"
+version = "0.6.0-alpha.1"
+
+[[patch.unused]]
+name = "portal-pc-waffle-hooking"
+version = "0.6.0-alpha.1"
+
+[[patch.unused]]
+name = "portal-pc-waffle-lowering"
+version = "0.6.0-alpha.1"
+
+[[patch.unused]]
+name = "rv-asm"
+version = "0.2.1"
+
+[[patch.unused]]
+name = "portal-jit-host-names"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-blitz-aarch64"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-blitz-arm"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-blitz-c"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-blitz-common"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-blitz-i686"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-blitz-js"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-blitz-riscv32"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-blitz-x86-64"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-asm-aarch64"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-asm-arm"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-asm-riscv32"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-asm-writer"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-solutions-asm-x86"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "lazy-repo"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "lazy-repo-crypto"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "lazy-repo-std"
 version = "0.1.0"
 
 [[patch.unused]]
@@ -3880,10 +3968,6 @@ name = "os-unix-wasi"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-jit-host-names"
-version = "0.1.0"
-
-[[patch.unused]]
 name = "volar-ir"
 version = "0.1.0"
 
@@ -3912,69 +3996,25 @@ name = "volar-wasm-circuit-import"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "lazy-repo"
+name = "volar-circuit-exec-core"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "lazy-repo-crypto"
+name = "volar-llvm-constchain"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "lazy-repo-std"
+name = "volar-llvm-import-core"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-solutions-blitz-aarch64"
+name = "volar-llvm-jumpthread"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-solutions-blitz-arm"
+name = "volar-llvm-pass-build"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-solutions-blitz-c"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-solutions-blitz-common"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-solutions-blitz-i686"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-solutions-blitz-js"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-solutions-blitz-riscv32"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-solutions-blitz-x86-64"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-solutions-asm-arm"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-solutions-asm-riscv32"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-solutions-asm-x86"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "lazy-repo"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "lazy-repo-crypto"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "lazy-repo-std"
+name = "volar-llvm-pass-support"
 version = "0.1.0"

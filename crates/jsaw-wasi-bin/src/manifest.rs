@@ -57,15 +57,9 @@ fn default_true() -> bool {
 /// Emission targets; each absent/`null` target is skipped.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Emit {
-    /// Output-root-relative path of the native WasmGC `.wasm` file to write.
+    /// Output-root-relative path of the WasmGC `.wasm` file to write.
     #[serde(default)]
     pub wasm: Option<String>,
-    /// Output-root-relative path of the pure core-Wasm CoreGC artifact.
-    /// This lowers managed references to the generated linear-memory
-    /// collector, so MVP-oriented consumers such as wasm-blitz do not need
-    /// WasmGC proposal support.
-    #[serde(default)]
-    pub coregc_wasm: Option<String>,
     /// Output-root-relative directory to write the Java sources into.
     #[serde(default)]
     pub java: Option<String>,

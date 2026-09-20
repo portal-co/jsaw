@@ -26,7 +26,6 @@ const FIXTURE: &[(&str, &str)] = &[
 fn manifest() -> jsaw_wasi_bin::manifest::Manifest {
     manifest_with_emit(jsaw_wasi_bin::manifest::Emit {
         wasm: Some("module.wasm".to_string()),
-        coregc_wasm: None,
         java: None,
         swift: None,
     })
@@ -49,38 +48,12 @@ fn fixture_sources() -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
-#[test]
-fn coregc_output_is_emitted_as_core_wasm() {
-    let manifest = manifest_with_emit(jsaw_wasi_bin::manifest::Emit {
-        wasm: None,
-        coregc_wasm: Some("module.coregc.wasm".to_string()),
-        java: None,
-        swift: None,
-    });
-    let (_exports, outputs) =
-        jsaw_wasi_bin::compile_to_outputs(&manifest, &fixture_sources()).expect("CoreGC compile");
-    let bytes = outputs.get("module.coregc.wasm").expect("CoreGC output");
-    // CoreGC's contract is a plain core-Wasm artifact. The default validator
-    // intentionally has GC/reference-types disabled, matching wasm-blitz's
-    // MVP-oriented input contract.
-    wasmparser::Validator::new()
-        .validate_all(bytes)
-        .expect("CoreGC output must validate as core Wasm");
-}
-
 /// Build the wasip1 binary (cargo makes this a no-op when it is fresh)
 /// and return its path. Done unconditionally so the test always runs the
 /// current source, never a stale artifact.
 fn compiler_wasm() -> PathBuf {
     let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
-        .args([
-            "build",
-            "-p",
-            "jsaw-wasi-bin",
-            "--target",
-            "wasm32-wasip1",
-            "--release",
-        ])
+        .args(["build", "-p", "jsaw-wasi-bin", "--target", "wasm32-wasip1", "--release"])
         .status()
         .expect("cargo build for wasm32-wasip1 should run");
     assert!(status.success(), "wasm32-wasip1 build should succeed");
@@ -119,19 +92,9 @@ fn run_compiler(src: &Path, out: &Path, manifest_json: &str) -> (String, String,
         .arg("/src")
         .arg("--out")
         .arg("/out")
-        .preopened_dir(
-            src,
-            "/src",
-            wasmtime_wasi::DirPerms::READ,
-            wasmtime_wasi::FilePerms::READ,
-        )
+        .preopened_dir(src, "/src", wasmtime_wasi::DirPerms::READ, wasmtime_wasi::FilePerms::READ)
         .expect("preopen src")
-        .preopened_dir(
-            out,
-            "/out",
-            wasmtime_wasi::DirPerms::all(),
-            wasmtime_wasi::FilePerms::all(),
-        )
+        .preopened_dir(out, "/out", wasmtime_wasi::DirPerms::all(), wasmtime_wasi::FilePerms::all())
         .expect("preopen out");
     let mut store = Store::new(&engine, builder.build_p1());
 
@@ -189,14 +152,8 @@ fn compiles_module_set_to_valid_wasmgc_under_wasmtime() {
         .iter()
         .map(|e| e.as_str().unwrap())
         .collect();
-    assert!(
-        exports.contains(&"run"),
-        "exports should contain run: {exports:?}"
-    );
-    assert!(
-        exports.contains(&"count"),
-        "exports should contain count: {exports:?}"
-    );
+    assert!(exports.contains(&"run"), "exports should contain run: {exports:?}");
+    assert!(exports.contains(&"count"), "exports should contain count: {exports:?}");
 
     // The emitted WasmGC module must exist and validate with GC enabled.
     let wasm_path = out.path().join("module.wasm");
@@ -216,20 +173,14 @@ fn reports_a_manifest_error_cleanly() {
     // Entry not in the module set is a structured error, exit code 1.
     let mut bad = manifest();
     bad.entry = "nope.js".to_string();
-    let (stdout, _stderr, success) = run_compiler(
-        src.path(),
-        out.path(),
-        &serde_json::to_string(&bad).unwrap(),
-    );
+    let (stdout, _stderr, success) =
+        run_compiler(src.path(), out.path(), &serde_json::to_string(&bad).unwrap());
     assert!(!success, "bad manifest should exit nonzero");
     let line = stdout.lines().next().expect("a result line");
     let result: serde_json::Value = serde_json::from_str(line).unwrap();
     assert_eq!(result["status"], "error");
     assert!(
-        result["error"]
-            .as_str()
-            .unwrap()
-            .contains("not in the module set"),
+        result["error"].as_str().unwrap().contains("not in the module set"),
         "error should mention the entry: {line}"
     );
 }
@@ -242,7 +193,6 @@ fn reports_a_manifest_error_cleanly() {
 fn java_and_swift_outputs_match_native_emission_byte_for_byte() {
     let emit = jsaw_wasi_bin::manifest::Emit {
         wasm: None,
-        coregc_wasm: None,
         java: Some("java".to_string()),
         swift: Some("swift".to_string()),
     };
@@ -262,11 +212,8 @@ fn java_and_swift_outputs_match_native_emission_byte_for_byte() {
 
     // wasip1 emission.
     let (src, out) = fixture_dirs();
-    let (stdout, stderr, success) = run_compiler(
-        src.path(),
-        out.path(),
-        &serde_json::to_string(&manifest).unwrap(),
-    );
+    let (stdout, stderr, success) =
+        run_compiler(src.path(), out.path(), &serde_json::to_string(&manifest).unwrap());
     assert!(success, "compiler should exit 0; stderr: {stderr}");
     let line = stdout.lines().next().expect("a result line");
     let result: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -285,11 +232,7 @@ fn java_and_swift_outputs_match_native_emission_byte_for_byte() {
                 if path.is_dir() {
                     stack.push(path);
                 } else {
-                    let rel = path
-                        .strip_prefix(out.path())
-                        .unwrap()
-                        .to_string_lossy()
-                        .replace('\\', "/");
+                    let rel = path.strip_prefix(out.path()).unwrap().to_string_lossy().replace('\\', "/");
                     wasip1_outputs.insert(rel, std::fs::read(&path).unwrap());
                 }
             }

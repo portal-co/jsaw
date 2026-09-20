@@ -6,9 +6,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use portal_jsc_waffle::{
-    ConvertOptions, CoreGcOptions, ModuleSet, convert_modules, emit_coregc, module_set_from_sources,
-};
+use portal_jsc_waffle::{ConvertOptions, ModuleSet, convert_modules, module_set_from_sources};
 
 pub mod manifest;
 
@@ -66,15 +64,9 @@ pub fn compile_to_outputs(
     let mut outputs: BTreeMap<String, Vec<u8>> = BTreeMap::new();
 
     if let Some(wasm_path) = &manifest.emit.wasm {
-        let bytes = portal_pc_waffle::to_wasm_bytes(&module).context("WasmGC emission failed")?;
+        let bytes = portal_pc_waffle::to_wasm_bytes(&module)
+            .context("Wasm emission failed")?;
         outputs.insert(wasm_path.clone(), bytes);
-    }
-    if let Some(coregc_path) = &manifest.emit.coregc_wasm {
-        let artifact = emit_coregc(&module, &CoreGcOptions::default())
-            .map_err(|error| anyhow::anyhow!("CoreGC lowering failed: {error}"))?;
-        let bytes = portal_pc_waffle::to_wasm_bytes(&artifact.module)
-            .context("CoreGC core-Wasm emission failed")?;
-        outputs.insert(coregc_path.clone(), bytes);
     }
     if let Some(java_dir) = &manifest.emit.java {
         let sources = portal_jsc_jvm_emit::emit_java(&module).context("Java emission failed")?;

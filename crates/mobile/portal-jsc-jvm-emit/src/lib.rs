@@ -110,8 +110,10 @@ struct Emitter<'m> {
 
 impl<'m> Emitter<'m> {
     fn file(&mut self, name: &str, content: impl Into<String>) {
-        self.files
-            .insert(format!("{}/{name}.java", PACKAGE.replace('.', "/")), content.into());
+        self.files.insert(
+            format!("{}/{name}.java", PACKAGE.replace('.', "/")),
+            content.into(),
+        );
     }
 
     fn emit_runtime(&mut self) {
@@ -267,7 +269,8 @@ impl<'m> Emitter<'m> {
                 continue;
             };
             let name = names::struct_name(sig.index());
-            let mut out = format!("package {PACKAGE};\n\npublic final class {name} implements IStruct {{\n");
+            let mut out =
+                format!("package {PACKAGE};\n\npublic final class {name} implements IStruct {{\n");
             for (i, field) in fields.iter().enumerate() {
                 let StorageType::Val(ty) = field.value else {
                     continue;
@@ -304,7 +307,10 @@ impl<'m> Emitter<'m> {
 
     fn emit_funcref_interfaces(&mut self) {
         for (sig, data) in self.module.signatures.entries() {
-            let SignatureData::Func { params, returns, .. } = data else {
+            let SignatureData::Func {
+                params, returns, ..
+            } = data
+            else {
                 continue;
             };
             let name = iface_name(sig.index());
@@ -392,12 +398,8 @@ impl<'m> Emitter<'m> {
         while prefix - start > CHUNK {
             let end = start + CHUNK;
             let helper = format!("f{}$split{chunk}", func.index());
-            let rendered = renderer.render_fragment_in_frame(
-                func,
-                sfunc,
-                &sfunc.body[start..end],
-                "frame",
-            )?;
+            let rendered =
+                renderer.render_fragment_in_frame(func, sfunc, &sfunc.body[start..end], "frame")?;
             out.push_str(&format!(
                 "\n    private static void {helper}({frame} frame) {{\n{rendered}    }}\n"
             ));
@@ -410,23 +412,23 @@ impl<'m> Emitter<'m> {
         // `frame.result`/`frame.control`, while unexpected fallthrough traps
         // at the public-method boundary.
         let helper = format!("f{}$split{chunk}", func.index());
-        let rendered = renderer.render_fragment_in_frame(
-            func,
-            sfunc,
-            &sfunc.body[start..],
-            "frame",
-        )?;
+        let rendered =
+            renderer.render_fragment_in_frame(func, sfunc, &sfunc.body[start..], "frame")?;
         out.push_str(&format!(
             "\n    private static void {helper}({frame} frame) {{\n{rendered}    }}\n"
         ));
         result.push_str(&format!("    {helper}(frame);\n"));
-        result.push_str(&format!("    if (frame.control != 0) {}\n", Self::frame_return(ret)));
+        result.push_str(&format!(
+            "    if (frame.control != 0) {}\n",
+            Self::frame_return(ret)
+        ));
         result.push_str("    throw new W.WasmTrap(\"split function fell through\");\n");
         Ok(result)
     }
 
     fn emit_mod(&mut self) -> anyhow::Result<()> {
-        let mut out = format!("package {PACKAGE};\n\npublic final class Mod {{\n    private Mod() {{}}\n");
+        let mut out =
+            format!("package {PACKAGE};\n\npublic final class Mod {{\n    private Mod() {{}}\n");
         let tail_set = portal_jsc_mob_emit::tail::tail_callable_set(self.module);
         let mut renderer = render::Renderer::new(self.module, &tail_set);
         for (func, decl) in self.module.funcs.entries() {
@@ -434,7 +436,10 @@ impl<'m> Emitter<'m> {
                 FuncDecl::Body(sig, name, _) => (*sig, name.as_str()),
                 _ => bail!("mobile closure violation: non-body function {func:?}"),
             };
-            let SignatureData::Func { params, returns, .. } = &self.module.signatures[sig] else {
+            let SignatureData::Func {
+                params, returns, ..
+            } = &self.module.signatures[sig]
+            else {
                 bail!("function {name} has a non-function signature");
             };
             let ret = match returns.first() {
@@ -534,7 +539,10 @@ impl<'m> Emitter<'m> {
             let FuncDecl::Body(sig, _, _) = &self.module.funcs[func] else {
                 continue;
             };
-            let SignatureData::Func { params, returns, .. } = &self.module.signatures[*sig] else {
+            let SignatureData::Func {
+                params, returns, ..
+            } = &self.module.signatures[*sig]
+            else {
                 continue;
             };
             let ret = match returns.first() {

@@ -110,16 +110,22 @@ fn skeleton_emission_shape() {
     assert!(names.iter().any(|n| n.ends_with("/Mod.java")), "{names:?}");
     assert!(names.iter().any(|n| n.ends_with("/W.java")), "{names:?}");
     assert!(
-        names.iter().any(|n| n.contains("/S") && n.ends_with(".java")),
+        names
+            .iter()
+            .any(|n| n.contains("/S") && n.ends_with(".java")),
         "struct classes should be emitted: {names:?}"
     );
     assert!(
-        names.iter().any(|n| n.contains("/I") && n.ends_with(".java")),
+        names
+            .iter()
+            .any(|n| n.contains("/I") && n.ends_with(".java")),
         "funcref interfaces should be emitted: {names:?}"
     );
     let mod_src = &sources.files["pc/portal/mob/Mod.java"];
-    assert!(mod_src.contains("public static double run(double a0)"), "{mod_src}");
+    assert!(
+        mod_src.contains("public static double run(double a0)"),
+        "{mod_src}"
+    );
     // Milestone 8: bodies are real SIR renderings, not stubs.
     assert!(!mod_src.contains("not yet emitted"), "{mod_src}");
 }
-

@@ -72,7 +72,8 @@ fn skeleton_emission_typechecks_with_swiftc() {
         return;
     };
     let module = compile_module("export function run(a) { return a + 1; }");
-    let sources = portal_jsc_swift_emit::emit_swift(&module).expect("Swift emission should succeed");
+    let sources =
+        portal_jsc_swift_emit::emit_swift(&module).expect("Swift emission should succeed");
     let dir = std::env::temp_dir().join(format!("swift_emit_gate_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp dir should be creatable");
@@ -100,16 +101,21 @@ fn skeleton_emission_typechecks_with_swiftc() {
 #[test]
 fn skeleton_emission_shape() {
     let module = compile_module("export function run(a) { return a + 1; }");
-    let sources = portal_jsc_swift_emit::emit_swift(&module).expect("Swift emission should succeed");
+    let sources =
+        portal_jsc_swift_emit::emit_swift(&module).expect("Swift emission should succeed");
     let names: Vec<&str> = sources.files.keys().map(|s| s.as_str()).collect();
     assert!(names.iter().any(|n| *n == "Mod.swift"), "{names:?}");
     assert!(names.iter().any(|n| *n == "Runtime.swift"), "{names:?}");
     assert!(
-        names.iter().any(|n| n.starts_with("S") && n.ends_with(".swift")),
+        names
+            .iter()
+            .any(|n| n.starts_with("S") && n.ends_with(".swift")),
         "struct classes should be emitted: {names:?}"
     );
     assert!(
-        names.iter().any(|n| n.starts_with("Fn") && n.ends_with(".swift")),
+        names
+            .iter()
+            .any(|n| n.starts_with("Fn") && n.ends_with(".swift")),
         "funcref boxes should be emitted: {names:?}"
     );
     let mod_src = &sources.files["Mod.swift"];

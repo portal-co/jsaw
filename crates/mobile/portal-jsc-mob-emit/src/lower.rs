@@ -24,7 +24,8 @@ use crate::sir::{SExpr, SFunc, SLabel, SStmt};
 /// The body must already satisfy the feature closure (see
 /// [`crate::audit`]); violations discovered while walking are hard errors.
 pub fn lower_body(body: &FunctionBody) -> anyhow::Result<SFunc> {
-    body.validate().context("SIR lowering requires a valid body")?;
+    body.validate()
+        .context("SIR lowering requires a valid body")?;
     // For ownership reasons (to avoid a self-referential struct with the
     // `Cow::Owned` case when the Reducifier modifies the body), run the
     // Reducifier first — exactly like the Wasm backend.
@@ -217,10 +218,7 @@ impl<'a, 'b> Walker<'a, 'b> {
                     values.len() <= 1,
                     "multi-value return is outside the mobile feature closure"
                 );
-                let value = values
-                    .first()
-                    .map(|&v| self.value_expr(v))
-                    .transpose()?;
+                let value = values.first().map(|&v| self.value_expr(v)).transpose()?;
                 into.push(SStmt::Return { value });
             }
             WasmBlock::ReturnCall { func, values } => {

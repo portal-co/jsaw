@@ -346,7 +346,10 @@ pub(crate) fn build_import_table<'a>(
                     )));
                 }
             };
-            table.insert(id, ImportTarget::WasmHost(wasm_import_spec(host_module, &name)?));
+            table.insert(
+                id,
+                ImportTarget::WasmHost(wasm_import_spec(host_module, &name)?),
+            );
             continue;
         }
         let (target_path, _) = resolve_specifier_target(set, path, &specifier)?;
@@ -381,7 +384,10 @@ pub(crate) fn build_import_table<'a>(
 /// Validate every declared host import, including imports not presently
 /// referenced by a lowered function. A malformed ABI declaration must not be
 /// hidden merely because dead source did not create a `LoadId`.
-fn validate_wasm_host_import_declarations(path: &str, module: &SModule) -> Result<(), ConvertError> {
+fn validate_wasm_host_import_declarations(
+    path: &str,
+    module: &SModule,
+) -> Result<(), ConvertError> {
     let mut signatures = BTreeMap::new();
     for declaration in &module.imports {
         let specifier = declaration.src.value.to_atom_lossy().to_string();

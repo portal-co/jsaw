@@ -43,9 +43,7 @@ pub(crate) struct WasmExportSpec {
 /// `None` means that the specifier is not in the reserved namespace; `Err`
 /// means that it is reserved but malformed, so callers must not fall back to
 /// normal ESM resolution.
-pub(crate) fn parse_wasm_import_specifier(
-    specifier: &str,
-) -> Option<Result<&str, ConvertError>> {
+pub(crate) fn parse_wasm_import_specifier(specifier: &str) -> Option<Result<&str, ConvertError>> {
     let module = specifier.strip_prefix("wasm:")?;
     Some(if module.is_empty() {
         Err(ConvertError::invalid(format!(
@@ -104,10 +102,7 @@ pub(crate) fn parse_wasm_boundary_name(
     } else {
         Some(parse_type(name, result, true)?)
     };
-    Ok((
-        field.to_owned(),
-        WasmBoundarySignature { params, result },
-    ))
+    Ok((field.to_owned(), WasmBoundarySignature { params, result }))
 }
 
 /// Parse a host import declaration after its source namespace and named-import
@@ -204,9 +199,7 @@ mod tests {
     #[test]
     fn recognizes_reserved_host_specifiers() {
         assert_eq!(
-            parse_wasm_import_specifier("wasm:env")
-                .unwrap()
-                .unwrap(),
+            parse_wasm_import_specifier("wasm:env").unwrap().unwrap(),
             "env"
         );
         assert!(parse_wasm_import_specifier("wasm:").unwrap().is_err());

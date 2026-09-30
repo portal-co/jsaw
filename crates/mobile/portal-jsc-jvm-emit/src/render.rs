@@ -15,7 +15,9 @@ use std::fmt::Write as _;
 use anyhow::bail;
 use portal_jsc_mob_emit::names;
 use portal_jsc_mob_emit::sir::{SExpr, SFunc, SLabel, SStmt};
-use portal_pc_waffle::{EntityRef, Func, HeapType, Module, Operator, SignatureData, StorageType, Type};
+use portal_pc_waffle::{
+    EntityRef, Func, HeapType, Module, Operator, SignatureData, StorageType, Type,
+};
 
 use crate::{array_ty, iface_name, java_ty};
 
@@ -138,7 +140,11 @@ impl<'m> Renderer<'m> {
                 Type::I32 | Type::I64 | Type::F32 | Type::F64 => "0",
                 _ => "null",
             };
-            let _ = writeln!(out, "    {jty} {} = {default};", names::local_name(i as u32));
+            let _ = writeln!(
+                out,
+                "    {jty} {} = {default};",
+                names::local_name(i as u32)
+            );
         }
         self.render_seq(&sfunc.body, &mut out, 1)?;
         Ok(RenderedBody {
@@ -207,7 +213,12 @@ impl<'m> Renderer<'m> {
 
     // ---- statements ----
 
-    fn render_seq(&mut self, stmts: &[SStmt], out: &mut String, indent: usize) -> anyhow::Result<()> {
+    fn render_seq(
+        &mut self,
+        stmts: &[SStmt],
+        out: &mut String,
+        indent: usize,
+    ) -> anyhow::Result<()> {
         for stmt in stmts {
             self.render_stmt_indented(stmt, out, indent)?;
             if self.stmt_terminates(stmt) {
@@ -467,7 +478,12 @@ impl<'m> Renderer<'m> {
         }
     }
 
-    fn op_expr(&self, op: &Operator, args: &[SExpr], _ty: Option<Type>) -> anyhow::Result<(String, JTy)> {
+    fn op_expr(
+        &self,
+        op: &Operator,
+        args: &[SExpr],
+        _ty: Option<Type>,
+    ) -> anyhow::Result<(String, JTy)> {
         use Operator::*;
         let a = |i: usize, ty: Type| self.coerce(&args[i], ty);
         let any = |i: usize| self.expr(&args[i]);
@@ -475,96 +491,397 @@ impl<'m> Renderer<'m> {
             // ---- constants ----
             I32Const { value } => (i32_lit(*value as i32), JTy::Int),
             I64Const { value } => (i64_lit(*value as i64), JTy::Long),
-            F32Const { value } => (format!("Float.intBitsToFloat({})", i32_lit(*value as i32)), JTy::Float),
-            F64Const { value } => (format!("Double.longBitsToDouble({})", i64_lit(*value as i64)), JTy::Double),
+            F32Const { value } => (
+                format!("Float.intBitsToFloat({})", i32_lit(*value as i32)),
+                JTy::Float,
+            ),
+            F64Const { value } => (
+                format!("Double.longBitsToDouble({})", i64_lit(*value as i64)),
+                JTy::Double,
+            ),
             // ---- i32 ----
             I32Eqz => (format!("({} == 0)", a(0, Type::I32)?), JTy::Boolean),
-            I32Eq => (format!("({} == {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Boolean),
-            I32Ne => (format!("({} != {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Boolean),
-            I32LtS => (format!("({} < {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Boolean),
-            I32GtS => (format!("({} > {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Boolean),
-            I32LeS => (format!("({} <= {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Boolean),
-            I32GeS => (format!("({} >= {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Boolean),
-            I32LtU => (format!("(Integer.compareUnsigned({}, {}) < 0)", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Boolean),
-            I32GtU => (format!("(Integer.compareUnsigned({}, {}) > 0)", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Boolean),
-            I32LeU => (format!("(Integer.compareUnsigned({}, {}) <= 0)", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Boolean),
-            I32GeU => (format!("(Integer.compareUnsigned({}, {}) >= 0)", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Boolean),
-            I32Clz => (format!("Integer.numberOfLeadingZeros({})", a(0, Type::I32)?), JTy::Int),
-            I32Ctz => (format!("Integer.numberOfTrailingZeros({})", a(0, Type::I32)?), JTy::Int),
+            I32Eq => (
+                format!("({} == {})", a(0, Type::I32)?, a(1, Type::I32)?),
+                JTy::Boolean,
+            ),
+            I32Ne => (
+                format!("({} != {})", a(0, Type::I32)?, a(1, Type::I32)?),
+                JTy::Boolean,
+            ),
+            I32LtS => (
+                format!("({} < {})", a(0, Type::I32)?, a(1, Type::I32)?),
+                JTy::Boolean,
+            ),
+            I32GtS => (
+                format!("({} > {})", a(0, Type::I32)?, a(1, Type::I32)?),
+                JTy::Boolean,
+            ),
+            I32LeS => (
+                format!("({} <= {})", a(0, Type::I32)?, a(1, Type::I32)?),
+                JTy::Boolean,
+            ),
+            I32GeS => (
+                format!("({} >= {})", a(0, Type::I32)?, a(1, Type::I32)?),
+                JTy::Boolean,
+            ),
+            I32LtU => (
+                format!(
+                    "(Integer.compareUnsigned({}, {}) < 0)",
+                    a(0, Type::I32)?,
+                    a(1, Type::I32)?
+                ),
+                JTy::Boolean,
+            ),
+            I32GtU => (
+                format!(
+                    "(Integer.compareUnsigned({}, {}) > 0)",
+                    a(0, Type::I32)?,
+                    a(1, Type::I32)?
+                ),
+                JTy::Boolean,
+            ),
+            I32LeU => (
+                format!(
+                    "(Integer.compareUnsigned({}, {}) <= 0)",
+                    a(0, Type::I32)?,
+                    a(1, Type::I32)?
+                ),
+                JTy::Boolean,
+            ),
+            I32GeU => (
+                format!(
+                    "(Integer.compareUnsigned({}, {}) >= 0)",
+                    a(0, Type::I32)?,
+                    a(1, Type::I32)?
+                ),
+                JTy::Boolean,
+            ),
+            I32Clz => (
+                format!("Integer.numberOfLeadingZeros({})", a(0, Type::I32)?),
+                JTy::Int,
+            ),
+            I32Ctz => (
+                format!("Integer.numberOfTrailingZeros({})", a(0, Type::I32)?),
+                JTy::Int,
+            ),
             I32Popcnt => (format!("Integer.bitCount({})", a(0, Type::I32)?), JTy::Int),
-            I32Add => (format!("({} + {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Int),
-            I32Sub => (format!("({} - {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Int),
-            I32Mul => (format!("({} * {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Int),
-            I32DivS => (format!("W.divS({}, {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Int),
-            I32DivU => (format!("Integer.divideUnsigned({}, {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Int),
-            I32RemS => (format!("W.remS({}, {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Int),
-            I32RemU => (format!("Integer.remainderUnsigned({}, {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Int),
-            I32And => (format!("({} & {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Int),
-            I32Or => (format!("({} | {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Int),
-            I32Xor => (format!("({} ^ {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Int),
-            I32Shl => (format!("({} << {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Int),
-            I32ShrS => (format!("({} >> {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Int),
-            I32ShrU => (format!("({} >>> {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Int),
-            I32Rotl => (format!("Integer.rotateLeft({}, {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Int),
-            I32Rotr => (format!("Integer.rotateRight({}, {})", a(0, Type::I32)?, a(1, Type::I32)?), JTy::Int),
+            I32Add => (
+                format!("({} + {})", a(0, Type::I32)?, a(1, Type::I32)?),
+                JTy::Int,
+            ),
+            I32Sub => (
+                format!("({} - {})", a(0, Type::I32)?, a(1, Type::I32)?),
+                JTy::Int,
+            ),
+            I32Mul => (
+                format!("({} * {})", a(0, Type::I32)?, a(1, Type::I32)?),
+                JTy::Int,
+            ),
+            I32DivS => (
+                format!("W.divS({}, {})", a(0, Type::I32)?, a(1, Type::I32)?),
+                JTy::Int,
+            ),
+            I32DivU => (
+                format!(
+                    "Integer.divideUnsigned({}, {})",
+                    a(0, Type::I32)?,
+                    a(1, Type::I32)?
+                ),
+                JTy::Int,
+            ),
+            I32RemS => (
+                format!("W.remS({}, {})", a(0, Type::I32)?, a(1, Type::I32)?),
+                JTy::Int,
+            ),
+            I32RemU => (
+                format!(
+                    "Integer.remainderUnsigned({}, {})",
+                    a(0, Type::I32)?,
+                    a(1, Type::I32)?
+                ),
+                JTy::Int,
+            ),
+            I32And => (
+                format!("({} & {})", a(0, Type::I32)?, a(1, Type::I32)?),
+                JTy::Int,
+            ),
+            I32Or => (
+                format!("({} | {})", a(0, Type::I32)?, a(1, Type::I32)?),
+                JTy::Int,
+            ),
+            I32Xor => (
+                format!("({} ^ {})", a(0, Type::I32)?, a(1, Type::I32)?),
+                JTy::Int,
+            ),
+            I32Shl => (
+                format!("({} << {})", a(0, Type::I32)?, a(1, Type::I32)?),
+                JTy::Int,
+            ),
+            I32ShrS => (
+                format!("({} >> {})", a(0, Type::I32)?, a(1, Type::I32)?),
+                JTy::Int,
+            ),
+            I32ShrU => (
+                format!("({} >>> {})", a(0, Type::I32)?, a(1, Type::I32)?),
+                JTy::Int,
+            ),
+            I32Rotl => (
+                format!(
+                    "Integer.rotateLeft({}, {})",
+                    a(0, Type::I32)?,
+                    a(1, Type::I32)?
+                ),
+                JTy::Int,
+            ),
+            I32Rotr => (
+                format!(
+                    "Integer.rotateRight({}, {})",
+                    a(0, Type::I32)?,
+                    a(1, Type::I32)?
+                ),
+                JTy::Int,
+            ),
             // ---- i64 ----
             I64Eqz => (format!("({} == 0L)", a(0, Type::I64)?), JTy::Boolean),
-            I64Eq => (format!("({} == {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Boolean),
-            I64Ne => (format!("({} != {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Boolean),
-            I64LtS => (format!("({} < {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Boolean),
-            I64GtS => (format!("({} > {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Boolean),
-            I64LeS => (format!("({} <= {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Boolean),
-            I64GeS => (format!("({} >= {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Boolean),
-            I64LtU => (format!("(Long.compareUnsigned({}, {}) < 0)", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Boolean),
-            I64GtU => (format!("(Long.compareUnsigned({}, {}) > 0)", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Boolean),
-            I64LeU => (format!("(Long.compareUnsigned({}, {}) <= 0)", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Boolean),
-            I64GeU => (format!("(Long.compareUnsigned({}, {}) >= 0)", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Boolean),
-            I64Clz => (format!("Long.numberOfLeadingZeros({})", a(0, Type::I64)?), JTy::Int),
-            I64Ctz => (format!("Long.numberOfTrailingZeros({})", a(0, Type::I64)?), JTy::Int),
+            I64Eq => (
+                format!("({} == {})", a(0, Type::I64)?, a(1, Type::I64)?),
+                JTy::Boolean,
+            ),
+            I64Ne => (
+                format!("({} != {})", a(0, Type::I64)?, a(1, Type::I64)?),
+                JTy::Boolean,
+            ),
+            I64LtS => (
+                format!("({} < {})", a(0, Type::I64)?, a(1, Type::I64)?),
+                JTy::Boolean,
+            ),
+            I64GtS => (
+                format!("({} > {})", a(0, Type::I64)?, a(1, Type::I64)?),
+                JTy::Boolean,
+            ),
+            I64LeS => (
+                format!("({} <= {})", a(0, Type::I64)?, a(1, Type::I64)?),
+                JTy::Boolean,
+            ),
+            I64GeS => (
+                format!("({} >= {})", a(0, Type::I64)?, a(1, Type::I64)?),
+                JTy::Boolean,
+            ),
+            I64LtU => (
+                format!(
+                    "(Long.compareUnsigned({}, {}) < 0)",
+                    a(0, Type::I64)?,
+                    a(1, Type::I64)?
+                ),
+                JTy::Boolean,
+            ),
+            I64GtU => (
+                format!(
+                    "(Long.compareUnsigned({}, {}) > 0)",
+                    a(0, Type::I64)?,
+                    a(1, Type::I64)?
+                ),
+                JTy::Boolean,
+            ),
+            I64LeU => (
+                format!(
+                    "(Long.compareUnsigned({}, {}) <= 0)",
+                    a(0, Type::I64)?,
+                    a(1, Type::I64)?
+                ),
+                JTy::Boolean,
+            ),
+            I64GeU => (
+                format!(
+                    "(Long.compareUnsigned({}, {}) >= 0)",
+                    a(0, Type::I64)?,
+                    a(1, Type::I64)?
+                ),
+                JTy::Boolean,
+            ),
+            I64Clz => (
+                format!("Long.numberOfLeadingZeros({})", a(0, Type::I64)?),
+                JTy::Int,
+            ),
+            I64Ctz => (
+                format!("Long.numberOfTrailingZeros({})", a(0, Type::I64)?),
+                JTy::Int,
+            ),
             I64Popcnt => (format!("Long.bitCount({})", a(0, Type::I64)?), JTy::Int),
-            I64Add => (format!("({} + {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Long),
-            I64Sub => (format!("({} - {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Long),
-            I64Mul => (format!("({} * {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Long),
-            I64DivS => (format!("W.divS64({}, {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Long),
-            I64DivU => (format!("Long.divideUnsigned({}, {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Long),
-            I64RemS => (format!("W.remS64({}, {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Long),
-            I64RemU => (format!("Long.remainderUnsigned({}, {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Long),
-            I64And => (format!("({} & {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Long),
-            I64Or => (format!("({} | {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Long),
-            I64Xor => (format!("({} ^ {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Long),
-            I64Shl => (format!("({} << {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Long),
-            I64ShrS => (format!("({} >> {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Long),
-            I64ShrU => (format!("({} >>> {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Long),
-            I64Rotl => (format!("Long.rotateLeft({}, {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Long),
-            I64Rotr => (format!("Long.rotateRight({}, {})", a(0, Type::I64)?, a(1, Type::I64)?), JTy::Long),
+            I64Add => (
+                format!("({} + {})", a(0, Type::I64)?, a(1, Type::I64)?),
+                JTy::Long,
+            ),
+            I64Sub => (
+                format!("({} - {})", a(0, Type::I64)?, a(1, Type::I64)?),
+                JTy::Long,
+            ),
+            I64Mul => (
+                format!("({} * {})", a(0, Type::I64)?, a(1, Type::I64)?),
+                JTy::Long,
+            ),
+            I64DivS => (
+                format!("W.divS64({}, {})", a(0, Type::I64)?, a(1, Type::I64)?),
+                JTy::Long,
+            ),
+            I64DivU => (
+                format!(
+                    "Long.divideUnsigned({}, {})",
+                    a(0, Type::I64)?,
+                    a(1, Type::I64)?
+                ),
+                JTy::Long,
+            ),
+            I64RemS => (
+                format!("W.remS64({}, {})", a(0, Type::I64)?, a(1, Type::I64)?),
+                JTy::Long,
+            ),
+            I64RemU => (
+                format!(
+                    "Long.remainderUnsigned({}, {})",
+                    a(0, Type::I64)?,
+                    a(1, Type::I64)?
+                ),
+                JTy::Long,
+            ),
+            I64And => (
+                format!("({} & {})", a(0, Type::I64)?, a(1, Type::I64)?),
+                JTy::Long,
+            ),
+            I64Or => (
+                format!("({} | {})", a(0, Type::I64)?, a(1, Type::I64)?),
+                JTy::Long,
+            ),
+            I64Xor => (
+                format!("({} ^ {})", a(0, Type::I64)?, a(1, Type::I64)?),
+                JTy::Long,
+            ),
+            I64Shl => (
+                format!("({} << {})", a(0, Type::I64)?, a(1, Type::I64)?),
+                JTy::Long,
+            ),
+            I64ShrS => (
+                format!("({} >> {})", a(0, Type::I64)?, a(1, Type::I64)?),
+                JTy::Long,
+            ),
+            I64ShrU => (
+                format!("({} >>> {})", a(0, Type::I64)?, a(1, Type::I64)?),
+                JTy::Long,
+            ),
+            I64Rotl => (
+                format!(
+                    "Long.rotateLeft({}, {})",
+                    a(0, Type::I64)?,
+                    a(1, Type::I64)?
+                ),
+                JTy::Long,
+            ),
+            I64Rotr => (
+                format!(
+                    "Long.rotateRight({}, {})",
+                    a(0, Type::I64)?,
+                    a(1, Type::I64)?
+                ),
+                JTy::Long,
+            ),
             // ---- f32 ----
-            F32Eq => (format!("({} == {})", a(0, Type::F32)?, a(1, Type::F32)?), JTy::Boolean),
-            F32Ne => (format!("({} != {})", a(0, Type::F32)?, a(1, Type::F32)?), JTy::Boolean),
-            F32Lt => (format!("({} < {})", a(0, Type::F32)?, a(1, Type::F32)?), JTy::Boolean),
-            F32Gt => (format!("({} > {})", a(0, Type::F32)?, a(1, Type::F32)?), JTy::Boolean),
-            F32Le => (format!("({} <= {})", a(0, Type::F32)?, a(1, Type::F32)?), JTy::Boolean),
-            F32Ge => (format!("({} >= {})", a(0, Type::F32)?, a(1, Type::F32)?), JTy::Boolean),
+            F32Eq => (
+                format!("({} == {})", a(0, Type::F32)?, a(1, Type::F32)?),
+                JTy::Boolean,
+            ),
+            F32Ne => (
+                format!("({} != {})", a(0, Type::F32)?, a(1, Type::F32)?),
+                JTy::Boolean,
+            ),
+            F32Lt => (
+                format!("({} < {})", a(0, Type::F32)?, a(1, Type::F32)?),
+                JTy::Boolean,
+            ),
+            F32Gt => (
+                format!("({} > {})", a(0, Type::F32)?, a(1, Type::F32)?),
+                JTy::Boolean,
+            ),
+            F32Le => (
+                format!("({} <= {})", a(0, Type::F32)?, a(1, Type::F32)?),
+                JTy::Boolean,
+            ),
+            F32Ge => (
+                format!("({} >= {})", a(0, Type::F32)?, a(1, Type::F32)?),
+                JTy::Boolean,
+            ),
             F32Abs => (format!("Math.abs({})", a(0, Type::F32)?), JTy::Float),
             F32Neg => (format!("(-{})", a(0, Type::F32)?), JTy::Float),
-            F32Ceil => (format!("(float)Math.ceil((double){})", a(0, Type::F32)?), JTy::Float),
-            F32Floor => (format!("(float)Math.floor((double){})", a(0, Type::F32)?), JTy::Float),
+            F32Ceil => (
+                format!("(float)Math.ceil((double){})", a(0, Type::F32)?),
+                JTy::Float,
+            ),
+            F32Floor => (
+                format!("(float)Math.floor((double){})", a(0, Type::F32)?),
+                JTy::Float,
+            ),
             F32Trunc => (format!("W.truncF({})", a(0, Type::F32)?), JTy::Float),
-            F32Nearest => (format!("(float)Math.rint((double){})", a(0, Type::F32)?), JTy::Float),
-            F32Sqrt => (format!("(float)Math.sqrt((double){})", a(0, Type::F32)?), JTy::Float),
-            F32Add => (format!("({} + {})", a(0, Type::F32)?, a(1, Type::F32)?), JTy::Float),
-            F32Sub => (format!("({} - {})", a(0, Type::F32)?, a(1, Type::F32)?), JTy::Float),
-            F32Mul => (format!("({} * {})", a(0, Type::F32)?, a(1, Type::F32)?), JTy::Float),
-            F32Div => (format!("({} / {})", a(0, Type::F32)?, a(1, Type::F32)?), JTy::Float),
-            F32Min => (format!("W.f32min({}, {})", a(0, Type::F32)?, a(1, Type::F32)?), JTy::Float),
-            F32Max => (format!("W.f32max({}, {})", a(0, Type::F32)?, a(1, Type::F32)?), JTy::Float),
-            F32Copysign => (format!("Math.copySign({}, {})", a(0, Type::F32)?, a(1, Type::F32)?), JTy::Float),
+            F32Nearest => (
+                format!("(float)Math.rint((double){})", a(0, Type::F32)?),
+                JTy::Float,
+            ),
+            F32Sqrt => (
+                format!("(float)Math.sqrt((double){})", a(0, Type::F32)?),
+                JTy::Float,
+            ),
+            F32Add => (
+                format!("({} + {})", a(0, Type::F32)?, a(1, Type::F32)?),
+                JTy::Float,
+            ),
+            F32Sub => (
+                format!("({} - {})", a(0, Type::F32)?, a(1, Type::F32)?),
+                JTy::Float,
+            ),
+            F32Mul => (
+                format!("({} * {})", a(0, Type::F32)?, a(1, Type::F32)?),
+                JTy::Float,
+            ),
+            F32Div => (
+                format!("({} / {})", a(0, Type::F32)?, a(1, Type::F32)?),
+                JTy::Float,
+            ),
+            F32Min => (
+                format!("W.f32min({}, {})", a(0, Type::F32)?, a(1, Type::F32)?),
+                JTy::Float,
+            ),
+            F32Max => (
+                format!("W.f32max({}, {})", a(0, Type::F32)?, a(1, Type::F32)?),
+                JTy::Float,
+            ),
+            F32Copysign => (
+                format!("Math.copySign({}, {})", a(0, Type::F32)?, a(1, Type::F32)?),
+                JTy::Float,
+            ),
             // ---- f64 ----
-            F64Eq => (format!("({} == {})", a(0, Type::F64)?, a(1, Type::F64)?), JTy::Boolean),
-            F64Ne => (format!("({} != {})", a(0, Type::F64)?, a(1, Type::F64)?), JTy::Boolean),
-            F64Lt => (format!("({} < {})", a(0, Type::F64)?, a(1, Type::F64)?), JTy::Boolean),
-            F64Gt => (format!("({} > {})", a(0, Type::F64)?, a(1, Type::F64)?), JTy::Boolean),
-            F64Le => (format!("({} <= {})", a(0, Type::F64)?, a(1, Type::F64)?), JTy::Boolean),
-            F64Ge => (format!("({} >= {})", a(0, Type::F64)?, a(1, Type::F64)?), JTy::Boolean),
+            F64Eq => (
+                format!("({} == {})", a(0, Type::F64)?, a(1, Type::F64)?),
+                JTy::Boolean,
+            ),
+            F64Ne => (
+                format!("({} != {})", a(0, Type::F64)?, a(1, Type::F64)?),
+                JTy::Boolean,
+            ),
+            F64Lt => (
+                format!("({} < {})", a(0, Type::F64)?, a(1, Type::F64)?),
+                JTy::Boolean,
+            ),
+            F64Gt => (
+                format!("({} > {})", a(0, Type::F64)?, a(1, Type::F64)?),
+                JTy::Boolean,
+            ),
+            F64Le => (
+                format!("({} <= {})", a(0, Type::F64)?, a(1, Type::F64)?),
+                JTy::Boolean,
+            ),
+            F64Ge => (
+                format!("({} >= {})", a(0, Type::F64)?, a(1, Type::F64)?),
+                JTy::Boolean,
+            ),
             F64Abs => (format!("Math.abs({})", a(0, Type::F64)?), JTy::Double),
             F64Neg => (format!("(-{})", a(0, Type::F64)?), JTy::Double),
             F64Ceil => (format!("Math.ceil({})", a(0, Type::F64)?), JTy::Double),
@@ -572,13 +889,34 @@ impl<'m> Renderer<'m> {
             F64Trunc => (format!("W.trunc({})", a(0, Type::F64)?), JTy::Double),
             F64Nearest => (format!("Math.rint({})", a(0, Type::F64)?), JTy::Double),
             F64Sqrt => (format!("Math.sqrt({})", a(0, Type::F64)?), JTy::Double),
-            F64Add => (format!("({} + {})", a(0, Type::F64)?, a(1, Type::F64)?), JTy::Double),
-            F64Sub => (format!("({} - {})", a(0, Type::F64)?, a(1, Type::F64)?), JTy::Double),
-            F64Mul => (format!("({} * {})", a(0, Type::F64)?, a(1, Type::F64)?), JTy::Double),
-            F64Div => (format!("({} / {})", a(0, Type::F64)?, a(1, Type::F64)?), JTy::Double),
-            F64Min => (format!("W.f64min({}, {})", a(0, Type::F64)?, a(1, Type::F64)?), JTy::Double),
-            F64Max => (format!("W.f64max({}, {})", a(0, Type::F64)?, a(1, Type::F64)?), JTy::Double),
-            F64Copysign => (format!("Math.copySign({}, {})", a(0, Type::F64)?, a(1, Type::F64)?), JTy::Double),
+            F64Add => (
+                format!("({} + {})", a(0, Type::F64)?, a(1, Type::F64)?),
+                JTy::Double,
+            ),
+            F64Sub => (
+                format!("({} - {})", a(0, Type::F64)?, a(1, Type::F64)?),
+                JTy::Double,
+            ),
+            F64Mul => (
+                format!("({} * {})", a(0, Type::F64)?, a(1, Type::F64)?),
+                JTy::Double,
+            ),
+            F64Div => (
+                format!("({} / {})", a(0, Type::F64)?, a(1, Type::F64)?),
+                JTy::Double,
+            ),
+            F64Min => (
+                format!("W.f64min({}, {})", a(0, Type::F64)?, a(1, Type::F64)?),
+                JTy::Double,
+            ),
+            F64Max => (
+                format!("W.f64max({}, {})", a(0, Type::F64)?, a(1, Type::F64)?),
+                JTy::Double,
+            ),
+            F64Copysign => (
+                format!("Math.copySign({}, {})", a(0, Type::F64)?, a(1, Type::F64)?),
+                JTy::Double,
+            ),
             // ---- conversions ----
             I32WrapI64 => (format!("(int)({})", a(0, Type::I64)?), JTy::Int),
             I32TruncF32S => (format!("W.truncF32I32({})", a(0, Type::F32)?), JTy::Int),
@@ -592,12 +930,18 @@ impl<'m> Renderer<'m> {
             I64TruncF64S => (format!("W.truncF64I64({})", a(0, Type::F64)?), JTy::Long),
             I64TruncF64U => (format!("W.truncF64U64({})", a(0, Type::F64)?), JTy::Long),
             F32ConvertI32S => (format!("(float)({})", a(0, Type::I32)?), JTy::Float),
-            F32ConvertI32U => (format!("(float)(({}) & 0xffffffffL)", a(0, Type::I32)?), JTy::Float),
+            F32ConvertI32U => (
+                format!("(float)(({}) & 0xffffffffL)", a(0, Type::I32)?),
+                JTy::Float,
+            ),
             F32ConvertI64S => (format!("(float)({})", a(0, Type::I64)?), JTy::Float),
             F32ConvertI64U => (format!("W.u64ToF32({})", a(0, Type::I64)?), JTy::Float),
             F32DemoteF64 => (format!("(float)({})", a(0, Type::F64)?), JTy::Float),
             F64ConvertI32S => (format!("(double)({})", a(0, Type::I32)?), JTy::Double),
-            F64ConvertI32U => (format!("(double)(({}) & 0xffffffffL)", a(0, Type::I32)?), JTy::Double),
+            F64ConvertI32U => (
+                format!("(double)(({}) & 0xffffffffL)", a(0, Type::I32)?),
+                JTy::Double,
+            ),
             F64ConvertI64S => (format!("(double)({})", a(0, Type::I64)?), JTy::Double),
             F64ConvertI64U => (format!("W.u64ToF64({})", a(0, Type::I64)?), JTy::Double),
             F64PromoteF32 => (format!("(double)({})", a(0, Type::F32)?), JTy::Double),
@@ -610,10 +954,22 @@ impl<'m> Renderer<'m> {
             I32TruncSatF32U | I32TruncSatF64U => (format!("W.truncSatU32({})", any(0)?), JTy::Int),
             I64TruncSatF32S | I64TruncSatF64S => (format!("(long)({})", any(0)?), JTy::Long),
             I64TruncSatF32U | I64TruncSatF64U => (format!("W.truncSatU64({})", any(0)?), JTy::Long),
-            F32ReinterpretI32 => (format!("Float.intBitsToFloat({})", a(0, Type::I32)?), JTy::Float),
-            I32ReinterpretF32 => (format!("Float.floatToRawIntBits({})", a(0, Type::F32)?), JTy::Int),
-            F64ReinterpretI64 => (format!("Double.longBitsToDouble({})", a(0, Type::I64)?), JTy::Double),
-            I64ReinterpretF64 => (format!("Double.doubleToRawLongBits({})", a(0, Type::F64)?), JTy::Long),
+            F32ReinterpretI32 => (
+                format!("Float.intBitsToFloat({})", a(0, Type::I32)?),
+                JTy::Float,
+            ),
+            I32ReinterpretF32 => (
+                format!("Float.floatToRawIntBits({})", a(0, Type::F32)?),
+                JTy::Int,
+            ),
+            F64ReinterpretI64 => (
+                format!("Double.longBitsToDouble({})", a(0, Type::I64)?),
+                JTy::Double,
+            ),
+            I64ReinterpretF64 => (
+                format!("Double.doubleToRawLongBits({})", a(0, Type::F64)?),
+                JTy::Long,
+            ),
             // ---- select ----
             TypedSelect { ty } => {
                 let cond = self.cond_expr(&args[2])?;
@@ -623,7 +979,12 @@ impl<'m> Renderer<'m> {
                 // Java's ternary needs a common type; pin ref-typed
                 // selects to their declared type.
                 let rendered = match ty {
-                    Type::Heap(h) if !matches!(h.value, HeapType::Any | HeapType::Eq | HeapType::I31 | HeapType::None) => {
+                    Type::Heap(h)
+                        if !matches!(
+                            h.value,
+                            HeapType::Any | HeapType::Eq | HeapType::I31 | HeapType::None
+                        ) =>
+                    {
                         format!("({})((Object)({inner}))", java_ty(self.module, *ty))
                     }
                     _ => inner,
@@ -648,7 +1009,10 @@ impl<'m> Renderer<'m> {
                     .collect::<anyhow::Result<Vec<_>>>()?
                     .join(", ");
                 let jty = self.func_ret_jty(*function_index)?;
-                (format!("{}({rendered})", names::func_name(function_index.index())), jty)
+                (
+                    format!("{}({rendered})", names::func_name(function_index.index())),
+                    jty,
+                )
             }
             CallRef { sig_index } => {
                 let (params, rets) = self.sig_parts(*sig_index)?;
@@ -661,7 +1025,10 @@ impl<'m> Renderer<'m> {
                 let funcref = self.expr(args.last().unwrap())?;
                 let jty = rets.first().map(|t| jty_of(*t)).unwrap_or(JTy::Ref);
                 (
-                    format!("(({})((Object)({funcref}))).apply({rendered})", iface_name(sig_index.index())),
+                    format!(
+                        "(({})((Object)({funcref}))).apply({rendered})",
+                        iface_name(sig_index.index())
+                    ),
                     jty,
                 )
             }
@@ -684,14 +1051,20 @@ impl<'m> Renderer<'m> {
                     for (i, ty) in fields.iter().enumerate() {
                         let _ = write!(init, " s.f{i} = {};", self.coerce(&args[i], *ty)?);
                     }
-                    (format!("W.build(new {name}(), (final {name} s) -> {{{init} }})"), JTy::Ref)
+                    (
+                        format!("W.build(new {name}(), (final {name} s) -> {{{init} }})"),
+                        JTy::Ref,
+                    )
                 }
             }
             StructNewDefault { sig: sig_index } => (
                 format!("new {}()", names::struct_name(sig_index.index())),
                 JTy::Ref,
             ),
-            StructGet { sig: sig_index, idx: field_index } => {
+            StructGet {
+                sig: sig_index,
+                idx: field_index,
+            } => {
                 let fields = self.struct_field_tys(*sig_index)?;
                 let jty = fields
                     .get(*field_index as usize)
@@ -706,7 +1079,10 @@ impl<'m> Renderer<'m> {
                     jty,
                 )
             }
-            StructSet { sig: sig_index, idx: field_index } => {
+            StructSet {
+                sig: sig_index,
+                idx: field_index,
+            } => {
                 let fields = self.struct_field_tys(*sig_index)?;
                 let fty = fields[*field_index as usize];
                 (
@@ -723,7 +1099,10 @@ impl<'m> Renderer<'m> {
                 bail!("packed struct fields are outside the mobile closure")
             }
             // ---- arrays ----
-            ArrayNewFixed { sig: array_type_index, .. } => {
+            ArrayNewFixed {
+                sig: array_type_index,
+                ..
+            } => {
                 let elem = self.array_elem(*array_type_index)?;
                 let aty = array_ty(self.module, elem);
                 let rendered = (0..args.len())
@@ -732,7 +1111,9 @@ impl<'m> Renderer<'m> {
                     .join(", ");
                 (format!("new {aty}{{{rendered}}}"), JTy::Ref)
             }
-            ArrayNewDefault { sig: array_type_index } => {
+            ArrayNewDefault {
+                sig: array_type_index,
+            } => {
                 let elem = self.array_elem(*array_type_index)?;
                 let aty = array_ty(self.module, elem);
                 (
@@ -740,7 +1121,9 @@ impl<'m> Renderer<'m> {
                     JTy::Ref,
                 )
             }
-            ArrayNew { sig: array_type_index } => {
+            ArrayNew {
+                sig: array_type_index,
+            } => {
                 let elem = self.array_elem(*array_type_index)?;
                 let aty = array_ty(self.module, elem);
                 let base = &aty[..aty.len() - 2];
@@ -755,7 +1138,15 @@ impl<'m> Renderer<'m> {
                     JTy::Ref,
                 )
             }
-            ArrayGet { sig: array_type_index } | ArrayGetS { sig: array_type_index } | ArrayGetU { sig: array_type_index } => {
+            ArrayGet {
+                sig: array_type_index,
+            }
+            | ArrayGetS {
+                sig: array_type_index,
+            }
+            | ArrayGetU {
+                sig: array_type_index,
+            } => {
                 let elem = self.array_elem(*array_type_index)?;
                 let aty = array_ty(self.module, elem);
                 let arr = any(0)?;
@@ -775,7 +1166,9 @@ impl<'m> Renderer<'m> {
                 };
                 (rendered, jty)
             }
-            ArraySet { sig: array_type_index } => {
+            ArraySet {
+                sig: array_type_index,
+            } => {
                 let elem = self.array_elem(*array_type_index)?;
                 let arr = any(0)?;
                 let idx = a(1, Type::I32)?;
@@ -786,7 +1179,10 @@ impl<'m> Renderer<'m> {
                     StorageType::Val(ty) => self.coerce(&args[2], ty)?,
                     _ => bail!("array storage outside the mobile closure"),
                 };
-                (format!("(({aty})((Object)({arr})))[{idx}] = {val}"), JTy::Ref)
+                (
+                    format!("(({aty})((Object)({arr})))[{idx}] = {val}"),
+                    JTy::Ref,
+                )
             }
             ArrayLen => (format!("(({})).length", any(0)?), JTy::Int),
             ArrayCopy { .. } => (
@@ -847,7 +1243,10 @@ impl<'m> Renderer<'m> {
             }
             RefTest { ty } => (self.ref_test(*ty, &any(0)?)?, JTy::Boolean),
             RefCast { ty } => (self.ref_cast(*ty, &any(0)?)?, JTy::Ref),
-            RefEq => (format!("((Object)({}) == (Object)({}))", any(0)?, any(1)?), JTy::Boolean),
+            RefEq => (
+                format!("((Object)({}) == (Object)({}))", any(0)?, any(1)?),
+                JTy::Boolean,
+            ),
             // The only i31 ever materialized is the JS-null sentinel.
             RefI31 => ("W.JsNull.INSTANCE".to_string(), JTy::Ref),
             I31GetS | I31GetU => {
@@ -861,9 +1260,14 @@ impl<'m> Renderer<'m> {
 
     // ---- helpers ----
 
-    fn sig_parts(&self, sig: portal_pc_waffle::Signature) -> anyhow::Result<(Vec<Type>, Vec<Type>)> {
+    fn sig_parts(
+        &self,
+        sig: portal_pc_waffle::Signature,
+    ) -> anyhow::Result<(Vec<Type>, Vec<Type>)> {
         match &self.module.signatures[sig] {
-            SignatureData::Func { params, returns, .. } => Ok((params.clone(), returns.clone())),
+            SignatureData::Func {
+                params, returns, ..
+            } => Ok((params.clone(), returns.clone())),
             _ => bail!("signature {sig:?} is not a function signature"),
         }
     }
@@ -877,7 +1281,10 @@ impl<'m> Renderer<'m> {
         Ok(rets.first().map(|t| jty_of(*t)).unwrap_or(JTy::Ref))
     }
 
-    fn sig_of_func(&self, func: portal_pc_waffle::Func) -> anyhow::Result<portal_pc_waffle::Signature> {
+    fn sig_of_func(
+        &self,
+        func: portal_pc_waffle::Func,
+    ) -> anyhow::Result<portal_pc_waffle::Signature> {
         match &self.module.funcs[func] {
             portal_pc_waffle::FuncDecl::Body(sig, _, _) => Ok(*sig),
             _ => bail!("function {func:?} has no body in the mobile closure"),
@@ -904,7 +1311,12 @@ impl<'m> Renderer<'m> {
         }
     }
 
-    fn array_elem_expr(&self, elem: StorageType, i: usize, args: &[SExpr]) -> anyhow::Result<String> {
+    fn array_elem_expr(
+        &self,
+        elem: StorageType,
+        i: usize,
+        args: &[SExpr],
+    ) -> anyhow::Result<String> {
         match elem {
             StorageType::I8 => Ok(format!("(byte)({})", self.coerce(&args[i], Type::I32)?)),
             StorageType::I16 => Ok(format!("(char)({})", self.coerce(&args[i], Type::I32)?)),
@@ -920,12 +1332,21 @@ impl<'m> Renderer<'m> {
         Ok(match h.value {
             HeapType::Sig { sig_index } => match &self.module.signatures[sig_index] {
                 SignatureData::Struct { .. } => {
-                    format!("((Object)({e}) instanceof {})", names::struct_name(sig_index.index()))
+                    format!(
+                        "((Object)({e}) instanceof {})",
+                        names::struct_name(sig_index.index())
+                    )
                 }
                 SignatureData::Array { ty, .. } => {
-                    format!("((Object)({e}) instanceof {})", array_ty(self.module, ty.value))
+                    format!(
+                        "((Object)({e}) instanceof {})",
+                        array_ty(self.module, ty.value)
+                    )
                 }
-                SignatureData::Func { .. } => format!("((Object)({e}) instanceof {})", iface_name(sig_index.index())),
+                SignatureData::Func { .. } => format!(
+                    "((Object)({e}) instanceof {})",
+                    iface_name(sig_index.index())
+                ),
                 _ => bail!("ref.test target outside the mobile closure"),
             },
             HeapType::FuncRef => format!("((Object)({e}) instanceof IFun)"),
@@ -945,12 +1366,17 @@ impl<'m> Renderer<'m> {
         Ok(match h.value {
             HeapType::Sig { sig_index } => match &self.module.signatures[sig_index] {
                 SignatureData::Struct { .. } => {
-                    format!("(({})((Object)({e})))", names::struct_name(sig_index.index()))
+                    format!(
+                        "(({})((Object)({e})))",
+                        names::struct_name(sig_index.index())
+                    )
                 }
                 SignatureData::Array { ty, .. } => {
                     format!("(({})((Object)({e})))", array_ty(self.module, ty.value))
                 }
-                SignatureData::Func { .. } => format!("(({})((Object)({e})))", iface_name(sig_index.index())),
+                SignatureData::Func { .. } => {
+                    format!("(({})((Object)({e})))", iface_name(sig_index.index()))
+                }
                 _ => bail!("ref.cast target outside the mobile closure"),
             },
             HeapType::FuncRef => format!("((IFun)((Object)({e})))"),

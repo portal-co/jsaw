@@ -14,10 +14,10 @@ use portal_pc_waffle::{
 use swc_ecma_ast::{BinaryOp, Id as Ident, Lit, UnaryOp};
 
 use crate::linker::{ImportTarget, ModuleSet};
-use crate::wasm_boundary::{WasmBoundarySignature, WasmBoundaryType, WasmImportSpec};
 use crate::repr::{
     ConvertError, FUNCTION_FIELD_TAG, JS_NULL_SENTINEL, Repr, TypedArrayKind, field, ref_sig,
 };
+use crate::wasm_boundary::{WasmBoundarySignature, WasmBoundaryType, WasmImportSpec};
 
 /// Convert jsaw-core SSA into a WasmGC module.
 ///
@@ -277,7 +277,9 @@ pub fn convert_modules<'a, 'wasm>(
         }
         // A suffix-marked export has its own raw host ABI and deliberately
         // does not grow a second internal-GC adapter export.
-        if boundary.is_none() && let Some(suffix) = &options.gc_export_suffix {
+        if boundary.is_none()
+            && let Some(suffix) = &options.gc_export_suffix
+        {
             converter.module.exports.push(Export {
                 name: format!("{name}{suffix}"),
                 kind: ExportKind::Func(info.adapter),
@@ -809,7 +811,12 @@ impl ValueSidecar {
 
         let mut bindings = BTreeMap::new();
         for sidecar in sidecars.into_iter().rev() {
-            bindings.extend(sidecar.bindings.iter().map(|(id, value)| (*id, value.clone())));
+            bindings.extend(
+                sidecar
+                    .bindings
+                    .iter()
+                    .map(|(id, value)| (*id, value.clone())),
+            );
         }
         bindings
     }
@@ -2009,7 +2016,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         })
     }
 
-    fn wasm_boundary_signature(&mut self, signature: &WasmBoundarySignature) -> portal_pc_waffle::Signature {
+    fn wasm_boundary_signature(
+        &mut self,
+        signature: &WasmBoundarySignature,
+    ) -> portal_pc_waffle::Signature {
         self.module.signatures.push(SignatureData::Func {
             params: signature
                 .params
@@ -2062,7 +2072,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             .map(|(_, value)| *value)
             .collect::<Vec<_>>();
         let mut raw_args = Vec::with_capacity(arity);
-        for (value, ty) in formals.into_iter().zip(spec.signature.params.iter().copied()) {
+        for (value, ty) in formals
+            .into_iter()
+            .zip(spec.signature.params.iter().copied())
+        {
             let value = LowerValue::Wasm {
                 value,
                 kind: ValueKind::Reference,
@@ -2078,20 +2091,65 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 WasmBoundaryType::Ref => value.wasm()?.0,
             });
         }
-        let result_types = spec.signature.result.map(|ty| self.wasm_boundary_type(ty)).into_iter().collect::<Vec<_>>();
-        let result = body.add_op(block, Operator::Call { function_index: raw }, &raw_args, &result_types);
+        let result_types = spec
+            .signature
+            .result
+            .map(|ty| self.wasm_boundary_type(ty))
+            .into_iter()
+            .collect::<Vec<_>>();
+        let result = body.add_op(
+            block,
+            Operator::Call {
+                function_index: raw,
+            },
+            &raw_args,
+            &result_types,
+        );
         let result = match spec.signature.result {
             None => self.undef(&mut body, block).wasm()?.0,
-            Some(WasmBoundaryType::I32) => self.box_value(&mut body, block, &LowerValue::Wasm { value: result, kind: ValueKind::Integer })?,
-            Some(WasmBoundaryType::I64) => self.box_value(&mut body, block, &LowerValue::Wasm { value: result, kind: ValueKind::BigInt })?,
+            Some(WasmBoundaryType::I32) => self.box_value(
+                &mut body,
+                block,
+                &LowerValue::Wasm {
+                    value: result,
+                    kind: ValueKind::Integer,
+                },
+            )?,
+            Some(WasmBoundaryType::I64) => self.box_value(
+                &mut body,
+                block,
+                &LowerValue::Wasm {
+                    value: result,
+                    kind: ValueKind::BigInt,
+                },
+            )?,
             Some(WasmBoundaryType::F32) => {
                 let number = body.add_op(block, Operator::F64PromoteF32, &[result], &[Type::F64]);
-                self.box_value(&mut body, block, &LowerValue::Wasm { value: number, kind: ValueKind::Number })?
+                self.box_value(
+                    &mut body,
+                    block,
+                    &LowerValue::Wasm {
+                        value: number,
+                        kind: ValueKind::Number,
+                    },
+                )?
             }
-            Some(WasmBoundaryType::F64) => self.box_value(&mut body, block, &LowerValue::Wasm { value: result, kind: ValueKind::Number })?,
+            Some(WasmBoundaryType::F64) => self.box_value(
+                &mut body,
+                block,
+                &LowerValue::Wasm {
+                    value: result,
+                    kind: ValueKind::Number,
+                },
+            )?,
             Some(WasmBoundaryType::Ref) => result,
         };
-        body.set_terminator(block, Terminator::Return { values: vec![result] });
+        body.set_terminator(
+            block,
+            Terminator::Return {
+                values: vec![result],
+            },
+        );
         let native = self.module.funcs.push(FuncDecl::Body(
             native_sig,
             format!("js_wasm_import_native_{}_{}", spec.module, spec.field),
@@ -2099,9 +2157,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         ));
         let adapter = self.make_adapter(native, arity)?;
         let tag = self.next_function_tag;
-        self.next_function_tag = self.next_function_tag.checked_add(1).ok_or_else(|| {
-            ConvertError::invalid("function tag space exhausted")
-        })?;
+        self.next_function_tag = self
+            .next_function_tag
+            .checked_add(1)
+            .ok_or_else(|| ConvertError::invalid("function tag space exhausted"))?;
         let info = FunctionInfo {
             native,
             adapter,
@@ -2219,11 +2278,17 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let wrapper_sig = self.wasm_boundary_signature(abi);
         let mut body = FunctionBody::new(self.module, wrapper_sig);
         let block = body.entry;
-        let params = body.blocks[block].params.iter().map(|(_, value)| *value).collect::<Vec<_>>();
+        let params = body.blocks[block]
+            .params
+            .iter()
+            .map(|(_, value)| *value)
+            .collect::<Vec<_>>();
         let module_init = self.ensure_module_init()?;
         let context = body.add_op(
             block,
-            Operator::Call { function_index: module_init },
+            Operator::Call {
+                function_index: module_init,
+            },
             &[],
             &[self.repr.object_ty()],
         );
@@ -2231,30 +2296,53 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         let mut arguments = Vec::with_capacity(params.len());
         for (value, ty) in params.into_iter().zip(abi.params.iter().copied()) {
             let value = match ty {
-                WasmBoundaryType::I32 => LowerValue::Wasm { value, kind: ValueKind::Integer },
-                WasmBoundaryType::I64 => LowerValue::Wasm { value, kind: ValueKind::BigInt },
+                WasmBoundaryType::I32 => LowerValue::Wasm {
+                    value,
+                    kind: ValueKind::Integer,
+                },
+                WasmBoundaryType::I64 => LowerValue::Wasm {
+                    value,
+                    kind: ValueKind::BigInt,
+                },
                 WasmBoundaryType::F32 => {
                     let value = body.add_op(block, Operator::F64PromoteF32, &[value], &[Type::F64]);
-                    LowerValue::Wasm { value, kind: ValueKind::Number }
+                    LowerValue::Wasm {
+                        value,
+                        kind: ValueKind::Number,
+                    }
                 }
-                WasmBoundaryType::F64 => LowerValue::Wasm { value, kind: ValueKind::Number },
-                WasmBoundaryType::Ref => LowerValue::Wasm { value, kind: ValueKind::Reference },
+                WasmBoundaryType::F64 => LowerValue::Wasm {
+                    value,
+                    kind: ValueKind::Number,
+                },
+                WasmBoundaryType::Ref => LowerValue::Wasm {
+                    value,
+                    kind: ValueKind::Reference,
+                },
             };
             arguments.push(self.box_value(&mut body, block, &value)?);
         }
         let arguments = body.add_op(
             block,
-            Operator::ArrayNewFixed { sig: self.repr.arguments, num: arguments.len() },
+            Operator::ArrayNewFixed {
+                sig: self.repr.arguments,
+                num: arguments.len(),
+            },
             &arguments,
             &[self.repr.arguments_ty()],
         );
         let result = body.add_op(
             block,
-            Operator::Call { function_index: info.adapter },
+            Operator::Call {
+                function_index: info.adapter,
+            },
             &[context, this, arguments],
             &[self.repr.value],
         );
-        let result = LowerValue::Wasm { value: result, kind: ValueKind::Reference };
+        let result = LowerValue::Wasm {
+            value: result,
+            kind: ValueKind::Reference,
+        };
         let values = match abi.result {
             None => Vec::new(),
             Some(WasmBoundaryType::I32) => vec![self.as_i32(&mut body, block, &result)?],

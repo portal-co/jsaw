@@ -96,8 +96,12 @@ fn compile_module(source: &str) -> Module<'static> {
         let tac = TModule::try_from(cfg).expect("TAC lowering should succeed");
         let ssa = SModule::try_from(tac).expect("SSA lowering should succeed");
         let mut wasm = Module::empty();
-        portal_jsc_waffle::convert_module(&ssa, &mut wasm, &portal_jsc_waffle::ConvertOptions::default())
-            .expect("WasmGC module lowering should succeed");
+        portal_jsc_waffle::convert_module(
+            &ssa,
+            &mut wasm,
+            &portal_jsc_waffle::ConvertOptions::default(),
+        )
+        .expect("WasmGC module lowering should succeed");
         wasm
     })
 }
@@ -170,7 +174,9 @@ fn execute(bytes: &[u8], name: &str, args: &[f64], gc: bool) -> Outcome {
                 }
                 if let Some(g) = instance.get_global(&mut store, "__coregc_root_bump") {
                     if let Val::I32(v) = g.get(&mut store) {
-                        eprintln!("coregc root_bump = {v:#x} (worklist starts at 0x100200, heap at 0x200000)");
+                        eprintln!(
+                            "coregc root_bump = {v:#x} (worklist starts at 0x100200, heap at 0x200000)"
+                        );
                     }
                 }
                 // Walk the full block list and print every allocation's
@@ -184,7 +190,10 @@ fn execute(bytes: &[u8], name: &str, args: &[f64], gc: bool) -> Outcome {
                         let mut seen = 0;
                         while cur != 0 && seen < 2000 {
                             let mut header = [0u8; 24];
-                            if memory.read(&store, (cur - 24) as usize, &mut header).is_err() {
+                            if memory
+                                .read(&store, (cur - 24) as usize, &mut header)
+                                .is_err()
+                            {
                                 break;
                             }
                             let flags = u32::from_le_bytes(header[0..4].try_into().unwrap());
@@ -208,7 +217,10 @@ fn execute(bytes: &[u8], name: &str, args: &[f64], gc: bool) -> Outcome {
                     let addr = debug_pair.0;
                     if addr >= 24 {
                         let mut header = [0u8; 24];
-                        if memory.read(&store, (addr - 24) as usize, &mut header).is_ok() {
+                        if memory
+                            .read(&store, (addr - 24) as usize, &mut header)
+                            .is_ok()
+                        {
                             let flags = u32::from_le_bytes(header[0..4].try_into().unwrap());
                             let ty = u32::from_le_bytes(header[4..8].try_into().unwrap());
                             let bytes = u32::from_le_bytes(header[8..12].try_into().unwrap());
@@ -277,11 +289,16 @@ fn execute_with_trace(bytes: &[u8], name: &str, args: &[f64], watch_addr: i32) -
             eprintln!("trace: {label} addr={addr:#x} type_id={type_id:#x}");
         }
     });
-    let instance = Instance::new(&mut store, &module, &[trace.into()]).expect("module instantiates");
+    let instance =
+        Instance::new(&mut store, &module, &[trace.into()]).expect("module instantiates");
     let function = instance
         .get_func(&mut store, name)
         .unwrap_or_else(|| panic!("missing export {name:?}"));
-    let inputs: Vec<Val> = args.iter().copied().map(|value| Val::F64(value.to_bits())).collect();
+    let inputs: Vec<Val> = args
+        .iter()
+        .copied()
+        .map(|value| Val::F64(value.to_bits()))
+        .collect();
     let mut outputs = [Val::F64(0)];
     match function.call(&mut store, &inputs, &mut outputs) {
         Ok(()) => match outputs[0] {
@@ -331,18 +348,20 @@ fn cross_test_cases(source: &str, cases: &[(&str, &[f64])]) {
     if std::env::var("COREGC_CROSS_SSA").is_ok() {
         check_ssa_sanity(&module);
     }
-    let artifact = portal_jsc_waffle::emit_coregc(&module, &portal_jsc_waffle::CoreGcOptions {
-        collect_threshold_bytes: 0,
-        export_runtime_debug: true,
-        ..portal_jsc_waffle::CoreGcOptions::default()
-    })
-    .expect("fixture must lower under coregc");
-    let core_bytes_forced = portal_pc_waffle::to_wasm_bytes(&artifact.module).expect("coregc encodes");
-    let artifact_normal = portal_jsc_waffle::emit_coregc(
+    let artifact = portal_jsc_waffle::emit_coregc(
         &module,
-        &portal_jsc_waffle::CoreGcOptions::default(),
+        &portal_jsc_waffle::CoreGcOptions {
+            collect_threshold_bytes: 0,
+            export_runtime_debug: true,
+            ..portal_jsc_waffle::CoreGcOptions::default()
+        },
     )
-    .expect("normal-threshold lowering");
+    .expect("fixture must lower under coregc");
+    let core_bytes_forced =
+        portal_pc_waffle::to_wasm_bytes(&artifact.module).expect("coregc encodes");
+    let artifact_normal =
+        portal_jsc_waffle::emit_coregc(&module, &portal_jsc_waffle::CoreGcOptions::default())
+            .expect("normal-threshold lowering");
     let core_bytes_normal =
         portal_pc_waffle::to_wasm_bytes(&artifact_normal.module).expect("coregc encodes");
 
@@ -351,16 +370,21 @@ fn cross_test_cases(source: &str, cases: &[(&str, &[f64])]) {
         let watch_addr = if watch_hex.is_empty() {
             0
         } else {
-            i64::from_str_radix(watch_hex, 16).expect("COREGC_CROSS_TRACE must be a hex address or empty") as i32
+            i64::from_str_radix(watch_hex, 16)
+                .expect("COREGC_CROSS_TRACE must be a hex address or empty") as i32
         };
-        let traced_artifact = portal_jsc_waffle::emit_coregc(&module, &portal_jsc_waffle::CoreGcOptions {
-            collect_threshold_bytes: 0,
-            export_runtime_debug: true,
-            debug_trace: true,
-            ..portal_jsc_waffle::CoreGcOptions::default()
-        })
+        let traced_artifact = portal_jsc_waffle::emit_coregc(
+            &module,
+            &portal_jsc_waffle::CoreGcOptions {
+                collect_threshold_bytes: 0,
+                export_runtime_debug: true,
+                debug_trace: true,
+                ..portal_jsc_waffle::CoreGcOptions::default()
+            },
+        )
         .expect("traced lowering");
-        let traced_bytes = portal_pc_waffle::to_wasm_bytes(&traced_artifact.module).expect("coregc encodes");
+        let traced_bytes =
+            portal_pc_waffle::to_wasm_bytes(&traced_artifact.module).expect("coregc encodes");
         for &(name, args) in cases {
             execute_with_trace(&traced_bytes, name, args, watch_addr);
         }
@@ -465,7 +489,6 @@ fn strings_and_length() {
         &[],
     );
 }
-
 
 /// Source-level `throw` becomes a core-Wasm trap in jsaw, not a Wasm
 /// exception terminator; its non-throwing path is therefore already part of
@@ -575,7 +598,11 @@ fn object_accessors_and_tail_dispatch() {
                 return object.invoke(value);
             }
         ",
-        &[("paired", &[]), ("accessor_call", &[]), ("accessor_tail", &[4.0])],
+        &[
+            ("paired", &[]),
+            ("accessor_call", &[]),
+            ("accessor_tail", &[4.0]),
+        ],
     );
 }
 

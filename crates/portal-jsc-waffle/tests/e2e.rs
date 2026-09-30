@@ -1,11 +1,11 @@
 use portal_jsc_swc_cfg::module::CfgModule;
 use portal_jsc_swc_ssa::{SFunc, SValue, module::SModule};
 use portal_jsc_swc_tac::{Item, module::TModule};
+use portal_pc_waffle::entity::EntityRef;
 use portal_pc_waffle::{
     ExportKind, FuncDecl, FunctionBody, HeapType, Module, Operator, SignatureData, StorageType,
     Terminator, Type, ValueDef, WithMutablility,
 };
-use portal_pc_waffle::entity::EntityRef;
 use swc_common::{FileName, GLOBALS, Globals, SourceMap, sync::Lrc};
 use swc_ecma_ast::{EsVersion, Module as SwcModule, ModuleItem};
 use swc_ecma_parser::{EsSyntax, Syntax, parse_file_as_module, parse_file_as_script};
@@ -75,7 +75,12 @@ fn incremental_converter_rejects_an_abi_changing_replacement() {
         .recompile(component, replacement_helper)
         .expect_err("arity changes require a complete immutable module revision");
     assert!(error.message.contains("ABI changed"));
-    assert_eq!(before, converter.functions(component).expect("original slots remain"));
+    assert_eq!(
+        before,
+        converter
+            .functions(component)
+            .expect("original slots remain")
+    );
     drop(converter);
     validate(&module);
 }
@@ -101,11 +106,15 @@ fn incremental_converter_recompiles_a_component_in_its_existing_wasm_slots() {
         .expect("same-ABI helper replacement recompiles its dependency closure");
     assert_eq!(
         helper_before,
-        converter.functions(helper_component).expect("helper slots after replacement")
+        converter
+            .functions(helper_component)
+            .expect("helper slots after replacement")
     );
     assert_eq!(
         root_before,
-        converter.functions(root_component).expect("caller slots after replacement")
+        converter
+            .functions(root_component)
+            .expect("caller slots after replacement")
     );
     drop(converter);
     validate(&module);
@@ -284,7 +293,9 @@ fn java_bin() -> Option<std::path::PathBuf> {
         candidates.push(std::path::PathBuf::from(home).join("bin/java"));
     }
     candidates.push(std::path::PathBuf::from("java"));
-    candidates.push(std::path::PathBuf::from("/opt/homebrew/opt/openjdk/bin/java"));
+    candidates.push(std::path::PathBuf::from(
+        "/opt/homebrew/opt/openjdk/bin/java",
+    ));
     candidates.into_iter().find(|candidate| {
         std::process::Command::new(candidate)
             .arg("-version")
@@ -1364,13 +1375,17 @@ fn compiles_native_wasm_gc_typed_array_constructor() {
 
 #[test]
 fn validates_native_wasm_gc_typed_array_constructor() {
-    let module = compile_module("export function make() { let a = new Uint8Array(2); a[0] = 3; return a[0]; }");
+    let module = compile_module(
+        "export function make() { let a = new Uint8Array(2); a[0] = 3; return a[0]; }",
+    );
     validate(&module);
 }
 
 #[test]
 fn executes_native_wasm_gc_typed_array_constructor() {
-    let module = compile_module("export function make() { let a = new Uint8Array(2); a[0] = 3; return a[0]; }");
+    let module = compile_module(
+        "export function make() { let a = new Uint8Array(2); a[0] = 3; return a[0]; }",
+    );
     validate(&module);
     assert_executes_in_all_runtimes(&module, "make", &[], 3.0);
 }
@@ -1476,7 +1491,12 @@ fn executes_object_descriptor_manipulation() {
     validate(&module);
 
     assert_executes_in_all_runtimes(&module, "define_property_data", &[], 42.0);
-    assert_executes_in_all_runtimes(&module, "define_property_non_writable_blocks_write", &[], 42.0);
+    assert_executes_in_all_runtimes(
+        &module,
+        "define_property_non_writable_blocks_write",
+        &[],
+        42.0,
+    );
     assert_executes_in_all_runtimes(&module, "define_property_writable_allows_write", &[], 100.0);
     assert_executes_in_all_runtimes(&module, "define_property_accessor_getter", &[], 7.0);
     assert_executes_in_all_runtimes(&module, "get_own_property_descriptor_value", &[], 42.0);
@@ -1602,7 +1622,12 @@ fn executes_object_assign_freeze_and_is_frozen() {
         ",
     );
     validate(&module);
-    assert_executes_in_all_runtimes(&module, "assign_merges_and_overwrites", &[], 10000.0 + 2000.0 + 30.0);
+    assert_executes_in_all_runtimes(
+        &module,
+        "assign_merges_and_overwrites",
+        &[],
+        10000.0 + 2000.0 + 30.0,
+    );
     assert_executes_in_all_runtimes(&module, "freeze_blocks_write", &[], 1.0);
     assert_executes_in_all_runtimes(&module, "is_frozen_false_before_freeze", &[], 0.0);
     assert_executes_in_all_runtimes(&module, "is_frozen_true_after_freeze", &[], 1.0);
@@ -1802,22 +1827,6 @@ fn call_then_prop_read_combined_in_one_expression() {
     assert_executes_in_all_runtimes(&module, "pop_combined_expr", &[], 302.0);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #[test]
 fn provable_math_call_reaches_fast_core_directly() {
     let module = compile_module(
@@ -1841,7 +1850,10 @@ fn provable_math_call_reaches_fast_core_directly() {
             }
         }
     }
-    assert!(fast_core_called, "provable Math call must reach the fast core directly");
+    assert!(
+        fast_core_called,
+        "provable Math call must reach the fast core directly"
+    );
 }
 
 #[test]
@@ -1977,7 +1989,10 @@ fn provenance_local_call_reaches_native_body_directly() {
             }
         }
     }
-    assert!(native_called, "a provenance-tracked call must hit the native body directly");
+    assert!(
+        native_called,
+        "a provenance-tracked call must hit the native body directly"
+    );
 }
 
 #[test]
@@ -2010,7 +2025,10 @@ fn provenance_single_kind_native_returns_raw() {
             }
         }
     }
-    assert!(raw_f64, "a single-Number-kind native body must declare an f64 return");
+    assert!(
+        raw_f64,
+        "a single-Number-kind native body must declare an f64 return"
+    );
     assert!(boxed, "the Reference-kind callee must keep the boxed ABI");
 }
 
@@ -2120,14 +2138,21 @@ fn lower_modules(
 }
 
 fn compile_modules(fixtures: Fixture<'_>, entry: &str) -> Module<'static> {
-    lower_modules(fixtures, entry, &portal_jsc_waffle::ConvertOptions::default())
-        .expect("multi-module lowering should succeed")
+    lower_modules(
+        fixtures,
+        entry,
+        &portal_jsc_waffle::ConvertOptions::default(),
+    )
+    .expect("multi-module lowering should succeed")
 }
 
 #[test]
 fn lazy_module_ingestion_preserves_export_execution() {
     let fixtures: Fixture<'_> = &[
-        ("main.mjs", "import { twice } from './lib.js'; export function run(x) { return twice(x) + 1; }"),
+        (
+            "main.mjs",
+            "import { twice } from './lib.js'; export function run(x) { return twice(x) + 1; }",
+        ),
         ("lib.js", "export function twice(x) { return x * 2; }"),
     ];
     let set = portal_jsc_waffle::module_set_from_sources_lazy(fixtures.iter().copied())
@@ -2147,7 +2172,10 @@ fn lazy_module_ingestion_preserves_export_execution() {
 #[test]
 fn links_cross_module_imports_and_executes_in_all_runtimes() {
     let fixtures: Fixture<'_> = &[
-        ("main.mjs", "import { add } from './lib.js'; export function run(a) { return add(a, 10); }"),
+        (
+            "main.mjs",
+            "import { add } from './lib.js'; export function run(a) { return add(a, 10); }",
+        ),
         ("lib.js", "export function add(a, b) { return a + b; }"),
     ];
     let module = compile_modules(fixtures, "main.mjs");
@@ -2158,8 +2186,14 @@ fn links_cross_module_imports_and_executes_in_all_runtimes() {
 #[test]
 fn links_transitive_import_chains() {
     let fixtures: Fixture<'_> = &[
-        ("main.mjs", "import { c } from './a.js'; export function run(a) { return c(a) + 1; }"),
-        ("a.js", "import { b } from './b.js'; export function c(v) { return b(v) * 2; }"),
+        (
+            "main.mjs",
+            "import { c } from './a.js'; export function run(a) { return c(a) + 1; }",
+        ),
+        (
+            "a.js",
+            "import { b } from './b.js'; export function c(v) { return b(v) * 2; }",
+        ),
         ("b.js", "export function b(v) { return v + 3; }"),
     ];
     let module = compile_modules(fixtures, "main.mjs");
@@ -2192,7 +2226,10 @@ fn links_mutual_recursion_across_modules() {
 #[test]
 fn links_default_imports() {
     let fixtures: Fixture<'_> = &[
-        ("main.mjs", "import triple from './lib.js'; export function run(a) { return triple(a); }"),
+        (
+            "main.mjs",
+            "import triple from './lib.js'; export function run(a) { return triple(a); }",
+        ),
         ("lib.js", "export default function(v) { return v * 3; }"),
     ];
     let module = compile_modules(fixtures, "main.mjs");
@@ -2208,14 +2245,17 @@ fn exports_full_main_module_surface_with_reexports() {
             "export { helper as util } from './lib.js'; export * from './extra.js'; export function local() { return 1; } export const constant = 2;",
         ),
         ("lib.js", "export function helper() { return 2; }"),
-        ("extra.js", "export function alpha(v) { return v; } export function beta(v) { return v; } export default function() { return 9; }"),
+        (
+            "extra.js",
+            "export function alpha(v) { return v; } export function beta(v) { return v; } export default function() { return 9; }",
+        ),
     ];
     let options = portal_jsc_waffle::ConvertOptions {
         gc_export_suffix: Some("$gc".to_owned()),
         ..Default::default()
     };
-    let module = lower_modules(fixtures, "main.mjs", &options)
-        .expect("re-export lowering should succeed");
+    let module =
+        lower_modules(fixtures, "main.mjs", &options).expect("re-export lowering should succeed");
     validate(&module);
     let mut names: Vec<_> = module.exports.iter().map(|e| e.name.as_str()).collect();
     names.sort();
@@ -2234,8 +2274,14 @@ fn exports_full_main_module_surface_with_reexports() {
 #[test]
 fn star_exports_do_not_shadow_local_declarations() {
     let fixtures: Fixture<'_> = &[
-        ("main.mjs", "export * from './lib.js'; export function pick() { return 1; }"),
-        ("lib.js", "export function pick() { return 2; } export function other() { return 3; }"),
+        (
+            "main.mjs",
+            "export * from './lib.js'; export function pick() { return 1; }",
+        ),
+        (
+            "lib.js",
+            "export function pick() { return 2; } export function other() { return 3; }",
+        ),
     ];
     let module = compile_modules(fixtures, "main.mjs");
     validate(&module);
@@ -2290,7 +2336,8 @@ fn emits_and_executes_wasm_host_scalar_imports_and_exports() {
         .expect("typed host import and raw export should lower");
     for (_, declaration) in module.funcs.entries() {
         if let FuncDecl::Body(_, _, body) = declaration {
-            body.validate().expect("generated Waffle function should validate");
+            body.validate()
+                .expect("generated Waffle function should validate");
         }
     }
     assert!(
@@ -2302,7 +2349,10 @@ fn emits_and_executes_wasm_host_scalar_imports_and_exports() {
     assert_eq!(module.imports[0].name, "add");
     assert!(module.exports.iter().any(|export| export.name == "run"));
     assert!(
-        !module.exports.iter().any(|export| export.name.contains("$wasm$")),
+        !module
+            .exports
+            .iter()
+            .any(|export| export.name.contains("$wasm$")),
         "the source ABI suffix is not part of the emitted field name"
     );
     let wasm = portal_pc_waffle::to_wasm_bytes(&module).expect("module should encode");
@@ -2348,26 +2398,35 @@ fn reserves_stripped_wasm_export_names_and_detects_collisions() {
     )];
     let error = lower_modules(fixtures, "main.mjs", &Default::default())
         .expect_err("raw Wasm export names must be collision checked before lowering");
-    assert!(error.to_string().contains("duplicate Wasm export name"), "{error}");
+    assert!(
+        error.to_string().contains("duplicate Wasm export name"),
+        "{error}"
+    );
 
-    let fixtures: Fixture<'_> = &[(
-        "main.mjs",
-        "export function bad$wasm$i32() { return 0; }",
-    )];
+    let fixtures: Fixture<'_> = &[("main.mjs", "export function bad$wasm$i32() { return 0; }")];
     let error = lower_modules(fixtures, "main.mjs", &Default::default())
         .expect_err("malformed raw Wasm export suffix must fail before lowering");
-    assert!(error.to_string().contains("$wasm$<params>$<result>"), "{error}");
+    assert!(
+        error.to_string().contains("$wasm$<params>$<result>"),
+        "{error}"
+    );
 }
 
 #[test]
 fn rejects_missing_and_bare_module_specifiers() {
-    let missing: Fixture<'_> = &[("main.mjs", "import { x } from './nope.js'; export function run() { return x(); }")];
+    let missing: Fixture<'_> = &[(
+        "main.mjs",
+        "import { x } from './nope.js'; export function run() { return x(); }",
+    )];
     let error = lower_modules(missing, "main.mjs", &Default::default())
         .expect_err("a missing target module must be rejected");
     assert!(error.to_string().contains("nope.js"), "{error}");
     assert!(error.to_string().contains("main.mjs"), "{error}");
 
-    let bare: Fixture<'_> = &[("main.mjs", "import fs from 'fs'; export function run() { return fs(); }")];
+    let bare: Fixture<'_> = &[(
+        "main.mjs",
+        "import fs from 'fs'; export function run() { return fs(); }",
+    )];
     let error = lower_modules(bare, "main.mjs", &Default::default())
         .expect_err("a bare specifier must be rejected");
     assert!(error.to_string().contains("only relative"), "{error}");
@@ -2376,7 +2435,10 @@ fn rejects_missing_and_bare_module_specifiers() {
 #[test]
 fn rejects_unlinkable_import_forms() {
     let star: Fixture<'_> = &[
-        ("main.mjs", "import * as ns from './lib.js'; export function run() { return ns.f(); }"),
+        (
+            "main.mjs",
+            "import * as ns from './lib.js'; export function run() { return ns.f(); }",
+        ),
         ("lib.js", "export function f() { return 1; }"),
     ];
     let error = lower_modules(star, "main.mjs", &Default::default())
@@ -2384,15 +2446,24 @@ fn rejects_unlinkable_import_forms() {
     assert!(error.to_string().contains("namespace"), "{error}");
 
     let value: Fixture<'_> = &[
-        ("main.mjs", "import { count } from './lib.js'; export function run() { return count + 1; }"),
+        (
+            "main.mjs",
+            "import { count } from './lib.js'; export function run() { return count + 1; }",
+        ),
         ("lib.js", "export const count = 1;"),
     ];
     let error = lower_modules(value, "main.mjs", &Default::default())
         .expect_err("non-function imports must be rejected");
-    assert!(error.to_string().contains("not a hoisted function"), "{error}");
+    assert!(
+        error.to_string().contains("not a hoisted function"),
+        "{error}"
+    );
 
     let missing_name: Fixture<'_> = &[
-        ("main.mjs", "import { absent } from './lib.js'; export function run() { return absent(); }"),
+        (
+            "main.mjs",
+            "import { absent } from './lib.js'; export function run() { return absent(); }",
+        ),
         ("lib.js", "export function present() { return 1; }"),
     ];
     let error = lower_modules(missing_name, "main.mjs", &Default::default())
@@ -2408,7 +2479,10 @@ fn rejects_unsupported_main_module_export_forms() {
     assert!(error.to_string().contains("export default"), "{error}");
 
     let star_as: Fixture<'_> = &[
-        ("main.mjs", "export * as ns from './lib.js'; export function run() { return 0; }"),
+        (
+            "main.mjs",
+            "export * as ns from './lib.js'; export function run() { return 0; }",
+        ),
         ("lib.js", "export function f() { return 1; }"),
     ];
     let error = lower_modules(star_as, "main.mjs", &Default::default())
@@ -2443,7 +2517,8 @@ fn rejects_missing_entry_and_duplicate_paths() {
         let ssa = SModule::try_from(tac).expect("SSA lowering should succeed");
         let leaked: &'static SModule = Box::leak(Box::new(ssa));
         let mut set = portal_jsc_waffle::ModuleSet::new();
-        set.insert("a.js", leaked).expect("first insert should succeed");
+        set.insert("a.js", leaked)
+            .expect("first insert should succeed");
         let error = set
             .insert("a.js", leaked)
             .expect_err("a duplicate module path must be rejected");
@@ -2454,7 +2529,10 @@ fn rejects_missing_entry_and_duplicate_paths() {
 #[test]
 fn rejects_ambiguous_star_exports() {
     let fixtures: Fixture<'_> = &[
-        ("main.mjs", "export * from './a.js'; export * from './b.js';"),
+        (
+            "main.mjs",
+            "export * from './a.js'; export * from './b.js';",
+        ),
         ("a.js", "export function clash() { return 1; }"),
         ("b.js", "export function clash() { return 2; }"),
     ];
@@ -2466,9 +2544,18 @@ fn rejects_ambiguous_star_exports() {
 #[test]
 fn rejects_circular_reexport_chains() {
     let fixtures: Fixture<'_> = &[
-        ("main.mjs", "export { ping } from './a.js'; export function run() { return 0; }"),
-        ("a.js", "export { pong } from './b.js'; export const ping = 1;"),
-        ("b.js", "export { ping } from './a.js'; export const pong = 2;"),
+        (
+            "main.mjs",
+            "export { ping } from './a.js'; export function run() { return 0; }",
+        ),
+        (
+            "a.js",
+            "export { pong } from './b.js'; export const ping = 1;",
+        ),
+        (
+            "b.js",
+            "export { ping } from './a.js'; export const pong = 2;",
+        ),
     ];
     let error = lower_modules(fixtures, "main.mjs", &Default::default())
         .expect_err("a circular re-export chain must be rejected");
@@ -2631,19 +2718,6 @@ fn dump_ssa_values_for_recursion() {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 #[test]
 fn multi_return_propagates_through_multi_kind_caller() {
     // `middle` returns `pick(w)` directly — its analysis is exactly
@@ -2768,11 +2842,14 @@ fn multi_kind_singleton_regression_no_union_in_all_single_module() {
                         .collect();
                     tys[0] == Type::I32 && tys[2] == Type::I32 && tys[3] == Type::F64
                 }
-        }).then_some(sid)
+        })
+        .then_some(sid)
     });
     if let Some(multi_sig) = multi_sig {
         let multi_ret = portal_pc_waffle::Type::Heap(portal_pc_waffle::WithNullable {
-            value: portal_pc_waffle::HeapType::Sig { sig_index: multi_sig },
+            value: portal_pc_waffle::HeapType::Sig {
+                sig_index: multi_sig,
+            },
             nullable: false,
         });
         for (_, func) in module.funcs.entries() {
@@ -2955,7 +3032,10 @@ fn union_tail_recursion_forwards_untouched() {
         ("Wasmtime", execute_in_wasmtime(&bytes, "run", &[100_000.0])),
         ("Node.js", execute_in_node(&bytes, "run", &[100_000.0])),
     ] {
-        assert_eq!(result, 0.0, "{runtime} union tail recursion at depth 100000");
+        assert_eq!(
+            result, 0.0,
+            "{runtime} union tail recursion at depth 100000"
+        );
     }
 }
 
@@ -3097,11 +3177,8 @@ fn boolean_float_core_returns_dedicated_layout() {
         ",
     );
     validate(&module);
-    let (_, _) = body_returning_struct_with_fields(
-        &module,
-        &[Type::I32, Type::I32, Type::F64],
-    )
-    .expect("{Boolean, Number} core must return the dedicated if layout");
+    let (_, _) = body_returning_struct_with_fields(&module, &[Type::I32, Type::I32, Type::F64])
+        .expect("{Boolean, Number} core must return the dedicated if layout");
     // No core in this module should return any layout carrying an anyref
     // slot: the only multi set here is {Boolean, Number}.
     let bytes = wasm_bytes(&module);
@@ -3125,11 +3202,8 @@ fn ref_float_core_returns_dedicated_layout() {
         ",
     );
     validate(&module);
-    body_returning_struct_with_fields(
-        &module,
-        &[Type::I32, repr_anyref(), Type::F64],
-    )
-    .expect("{Number, Reference} core must return the dedicated rf layout");
+    body_returning_struct_with_fields(&module, &[Type::I32, repr_anyref(), Type::F64])
+        .expect("{Number, Reference} core must return the dedicated rf layout");
     let bytes = wasm_bytes(&module);
     assert_eq!(execute_in_wasmtime(&bytes, "run", &[2.0]), 4.0);
     assert_eq!(execute_in_wasmtime(&bytes, "run", &[-1.0]), -7.0);
@@ -3179,8 +3253,7 @@ fn forwarding_chain_has_no_interior_unpacks() {
     }
     assert!(interior >= 2, "chain should have at least two union cores");
     assert_eq!(
-        with_return_call,
-        interior,
+        with_return_call, interior,
         "every same-set link must tail-forward via ReturnCall"
     );
     let bytes = wasm_bytes(&module);
@@ -3275,16 +3348,11 @@ fn dedicated_layouts_differ_between_kind_sets() {
         ",
     );
     validate(&module);
-    let if_layout = body_returning_struct_with_fields(
-        &module,
-        &[Type::I32, Type::I32, Type::F64],
-    )
-    .expect("bf core must return the if layout");
-    let rf_layout = body_returning_struct_with_fields(
-        &module,
-        &[Type::I32, repr_anyref(), Type::F64],
-    )
-    .expect("rf core must return the rf layout");
+    let if_layout = body_returning_struct_with_fields(&module, &[Type::I32, Type::I32, Type::F64])
+        .expect("bf core must return the if layout");
+    let rf_layout =
+        body_returning_struct_with_fields(&module, &[Type::I32, repr_anyref(), Type::F64])
+            .expect("rf core must return the rf layout");
     assert_ne!(
         if_layout.0, rf_layout.0,
         "different kind sets must produce different struct types"
@@ -3293,12 +3361,6 @@ fn dedicated_layouts_differ_between_kind_sets() {
     assert_eq!(execute_in_wasmtime(&bytes, "run", &[0.0]), 1.0);
     assert_eq!(execute_in_wasmtime(&bytes, "run", &[2.0]), 9.0);
 }
-
-
-
-
-
-
 
 fn swiftc_bin() -> Option<std::path::PathBuf> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
@@ -3624,12 +3686,6 @@ fn bigint_i64_range_arithmetic() {
     validate(&module);
     assert_executes_in_all_runtimes(&module, "run", &[], 1.0);
 }
-
-
-
-
-
-
 
 // M17 idiom probes: each fixture mirrors a blitz-js opt-mode idiom.
 
@@ -4074,7 +4130,6 @@ fn m17_unlabeled_infinite_for() {
     assert_executes_in_all_runtimes(&module, "run", &[], 3.0);
 }
 
-
 #[test]
 fn m17_array_destructure_no_rest() {
     let module = compile_module(
@@ -4103,11 +4158,6 @@ fn m17_array_destructure_rest_only() {
     validate(&module);
     assert_executes_in_all_runtimes(&module, "run", &[], 342.0);
 }
-
-
-
-
-
 
 #[test]
 fn m17_truthy_falsy_values() {
@@ -4146,7 +4196,6 @@ fn m17_buffer_returns_object() {
     validate(&module);
     assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
 }
-
 
 #[test]
 fn m17_dataview_all_widths_le() {
@@ -4301,7 +4350,6 @@ fn m17_dataview_large_offset() {
     assert_executes_in_all_runtimes(&module, "run", &[], 42.0);
 }
 
-
 // ── Module top-level evaluation (Milestone 18 foundation) ────────────────
 
 #[test]
@@ -4411,7 +4459,6 @@ fn m18_wasi_glue_module_lowers() {
     // splitting; the lowering integration remains valuable independently.
 }
 
-
 #[test]
 fn jvm_emitter_splits_terminal_conditional_cfg() {
     let mut source = String::from("export function run(flag){");
@@ -4443,7 +4490,6 @@ fn m18_debug_imported_glue_dataview_literal_write() {
     assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
 }
 
-
 #[test]
 fn jvm_emitter_splits_large_straight_line_function() {
     let mut source = String::from("export function run(){");
@@ -4459,8 +4505,14 @@ fn jvm_emitter_splits_large_straight_line_function() {
 #[test]
 fn m18_imported_dynamic_array_index() {
     let fixtures: Fixture<'_> = &[
-        ("lib.js", "let state=[[42],0]; export function read(){return state[0][state[1]];}"),
-        ("main.mjs", "import {read} from './lib.js'; export function run(){return read();}"),
+        (
+            "lib.js",
+            "let state=[[42],0]; export function read(){return state[0][state[1]];}",
+        ),
+        (
+            "main.mjs",
+            "import {read} from './lib.js'; export function run(){return read();}",
+        ),
     ];
     let module = compile_modules(fixtures, "main.mjs");
     validate(&module);
@@ -4479,8 +4531,14 @@ fn m18_fd_read_imported_memory_roundtrip() {
 #[test]
 fn m18_debug_cross_module_array_parameter_state() {
     let fixtures: Fixture<'_> = &[
-        ("lib.js", "let state=[[]]; export function set(x){state[0]=x;} export function get(){return Number(state[0][0]);}"),
-        ("main.mjs", "import {set,get} from './lib.js'; export function run(){set([42]);return get();}"),
+        (
+            "lib.js",
+            "let state=[[]]; export function set(x){state[0]=x;} export function get(){return Number(state[0][0]);}",
+        ),
+        (
+            "main.mjs",
+            "import {set,get} from './lib.js'; export function run(){set([42]);return get();}",
+        ),
     ];
     let module = compile_modules(fixtures, "main.mjs");
     validate(&module);
@@ -4489,17 +4547,21 @@ fn m18_debug_cross_module_array_parameter_state() {
 
 #[test]
 fn m18_debug_same_module_array_parameter_state() {
-    let module = compile_module("let state=[[]]; function set(x){state[0]=x;} function get(){return Number(state[0][0]);} export function run(){set([42]);return get();}");
+    let module = compile_module(
+        "let state=[[]]; function set(x){state[0]=x;} function get(){return Number(state[0][0]);} export function run(){set([42]);return get();}",
+    );
     validate(&module);
     assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
 }
-
 
 #[test]
 fn m18_debug_cross_module_imported_literal_return() {
     let fixtures: Fixture<'_> = &[
         ("lib.js", "export function answer(){return 42;}"),
-        ("main.mjs", "import {answer} from './lib.js'; export function run(){return answer();}"),
+        (
+            "main.mjs",
+            "import {answer} from './lib.js'; export function run(){return answer();}",
+        ),
     ];
     let module = compile_modules(fixtures, "main.mjs");
     validate(&module);
@@ -4510,7 +4572,10 @@ fn m18_debug_cross_module_imported_literal_return() {
 fn m18_debug_cross_module_imported_number_param() {
     let fixtures: Fixture<'_> = &[
         ("lib.js", "export function add1(x){return x+1;}"),
-        ("main.mjs", "import {add1} from './lib.js'; export function run(){return add1(41);}"),
+        (
+            "main.mjs",
+            "import {add1} from './lib.js'; export function run(){return add1(41);}",
+        ),
     ];
     let module = compile_modules(fixtures, "main.mjs");
     validate(&module);
@@ -4521,7 +4586,10 @@ fn m18_debug_cross_module_imported_number_param() {
 fn m18_debug_cross_module_array_param_unused() {
     let fixtures: Fixture<'_> = &[
         ("lib.js", "export function ignore(x){return 42;}"),
-        ("main.mjs", "import {ignore} from './lib.js'; export function run(){return ignore([99]);}"),
+        (
+            "main.mjs",
+            "import {ignore} from './lib.js'; export function run(){return ignore([99]);}",
+        ),
     ];
     let module = compile_modules(fixtures, "main.mjs");
     validate(&module);
@@ -4532,7 +4600,10 @@ fn m18_debug_cross_module_array_param_unused() {
 fn m18_debug_cross_module_array_param_round_trips() {
     let fixtures: Fixture<'_> = &[
         ("lib.js", "export function echo(x){return x;}"),
-        ("main.mjs", "import {echo} from './lib.js'; export function run(){return Number(echo([42])[0]);}"),
+        (
+            "main.mjs",
+            "import {echo} from './lib.js'; export function run(){return Number(echo([42])[0]);}",
+        ),
     ];
     let module = compile_modules(fixtures, "main.mjs");
     validate(&module);
@@ -4542,8 +4613,14 @@ fn m18_debug_cross_module_array_param_round_trips() {
 #[test]
 fn m18_debug_cross_module_callee_local_array() {
     let fixtures: Fixture<'_> = &[
-        ("lib.js", "export function head(){let x=[42];return Number(x[0]);}"),
-        ("main.mjs", "import {head} from './lib.js'; export function run(){return head();}"),
+        (
+            "lib.js",
+            "export function head(){let x=[42];return Number(x[0]);}",
+        ),
+        (
+            "main.mjs",
+            "import {head} from './lib.js'; export function run(){return head();}",
+        ),
     ];
     let module = compile_modules(fixtures, "main.mjs");
     validate(&module);
@@ -4555,8 +4632,14 @@ fn m18_debug_cross_module_callee_local_array() {
 #[test]
 fn m18_debug_cross_module_primitive_toplevel_state() {
     let fixtures: Fixture<'_> = &[
-        ("lib.js", "let state=42; export function get(){return state;}"),
-        ("main.mjs", "import {get} from './lib.js'; export function run(){return get();}"),
+        (
+            "lib.js",
+            "let state=42; export function get(){return state;}",
+        ),
+        (
+            "main.mjs",
+            "import {get} from './lib.js'; export function run(){return get();}",
+        ),
     ];
     let module = compile_modules(fixtures, "main.mjs");
     validate(&module);
@@ -4567,7 +4650,10 @@ fn m18_debug_cross_module_primitive_toplevel_state() {
 fn m18_debug_cross_module_number_global() {
     let fixtures: Fixture<'_> = &[
         ("lib.js", "export function f(){return Number(42);}"),
-        ("main.mjs", "import {f} from './lib.js'; export function run(){return f();}"),
+        (
+            "main.mjs",
+            "import {f} from './lib.js'; export function run(){return f();}",
+        ),
     ];
     let module = compile_modules(fixtures, "main.mjs");
     validate(&module);
@@ -4577,8 +4663,14 @@ fn m18_debug_cross_module_number_global() {
 #[test]
 fn m18_debug_cross_module_number_of_element() {
     let fixtures: Fixture<'_> = &[
-        ("lib.js", "export function f(){let x=[42];return Number(x[0]);}"),
-        ("main.mjs", "import {f} from './lib.js'; export function run(){return f();}"),
+        (
+            "lib.js",
+            "export function f(){let x=[42];return Number(x[0]);}",
+        ),
+        (
+            "main.mjs",
+            "import {f} from './lib.js'; export function run(){return f();}",
+        ),
     ];
     let module = compile_modules(fixtures, "main.mjs");
     validate(&module);
@@ -4589,7 +4681,10 @@ fn m18_debug_cross_module_number_of_element() {
 fn m18_debug_cross_module_callee_local_array_read_unused() {
     let fixtures: Fixture<'_> = &[
         ("lib.js", "export function f(){let x=[42];x[0];return 42;}"),
-        ("main.mjs", "import {f} from './lib.js'; export function run(){return f();}"),
+        (
+            "main.mjs",
+            "import {f} from './lib.js'; export function run(){return f();}",
+        ),
     ];
     let module = compile_modules(fixtures, "main.mjs");
     validate(&module);
@@ -4600,7 +4695,10 @@ fn m18_debug_cross_module_callee_local_array_read_unused() {
 fn m18_debug_cross_module_callee_local_array_raw_element() {
     let fixtures: Fixture<'_> = &[
         ("lib.js", "export function f(){let x=[42];return x[0];}"),
-        ("main.mjs", "import {f} from './lib.js'; export function run(){return f();}"),
+        (
+            "main.mjs",
+            "import {f} from './lib.js'; export function run(){return f();}",
+        ),
     ];
     let module = compile_modules(fixtures, "main.mjs");
     validate(&module);
@@ -4611,7 +4709,10 @@ fn m18_debug_cross_module_callee_local_array_raw_element() {
 fn m18_debug_cross_module_callee_returns_array_unused() {
     let fixtures: Fixture<'_> = &[
         ("lib.js", "export function make(){return [42];}"),
-        ("main.mjs", "import {make} from './lib.js'; export function run(){make();return 42;}"),
+        (
+            "main.mjs",
+            "import {make} from './lib.js'; export function run(){make();return 42;}",
+        ),
     ];
     let module = compile_modules(fixtures, "main.mjs");
     validate(&module);
@@ -4622,7 +4723,10 @@ fn m18_debug_cross_module_callee_returns_array_unused() {
 fn m18_debug_cross_module_callee_returns_array_consumed() {
     let fixtures: Fixture<'_> = &[
         ("lib.js", "export function make(){return [42];}"),
-        ("main.mjs", "import {make} from './lib.js'; export function run(){return Number(make()[0]);}"),
+        (
+            "main.mjs",
+            "import {make} from './lib.js'; export function run(){return Number(make()[0]);}",
+        ),
     ];
     let module = compile_modules(fixtures, "main.mjs");
     validate(&module);
@@ -4633,7 +4737,10 @@ fn m18_debug_cross_module_callee_returns_array_consumed() {
 fn m18_debug_cross_module_array_param_return_constant() {
     let fixtures: Fixture<'_> = &[
         ("lib.js", "export function f(x){x[0];return 42;}"),
-        ("main.mjs", "import {f} from './lib.js'; export function run(){return f([42]);}"),
+        (
+            "main.mjs",
+            "import {f} from './lib.js'; export function run(){return f([42]);}",
+        ),
     ];
     let module = compile_modules(fixtures, "main.mjs");
     validate(&module);
@@ -4644,18 +4751,29 @@ fn m18_debug_cross_module_array_param_return_constant() {
 fn m18_debug_cross_module_imported_array_param() {
     let fixtures: Fixture<'_> = &[
         ("lib.js", "export function head(x){return Number(x[0]);}"),
-        ("main.mjs", "import {head} from './lib.js'; export function run(){return head([42]);}"),
+        (
+            "main.mjs",
+            "import {head} from './lib.js'; export function run(){return head([42]);}",
+        ),
     ];
-    let module = compile_modules(fixtures, "main.mjs"); validate(&module);
-    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]),42.0);
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
 }
 
 #[test]
 fn m18_debug_cross_module_state_no_param() {
     let fixtures: Fixture<'_> = &[
-        ("lib.js", "let state=[[42]]; export function get(){return Number(state[0][0]);}"),
-        ("main.mjs", "import {get} from './lib.js'; export function run(){return get();}"),
+        (
+            "lib.js",
+            "let state=[[42]]; export function get(){return Number(state[0][0]);}",
+        ),
+        (
+            "main.mjs",
+            "import {get} from './lib.js'; export function run(){return get();}",
+        ),
     ];
-    let module = compile_modules(fixtures, "main.mjs"); validate(&module);
-    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]),42.0);
+    let module = compile_modules(fixtures, "main.mjs");
+    validate(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
 }

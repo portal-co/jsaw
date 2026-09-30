@@ -21,7 +21,12 @@ fn i32_const(
     body.add_op(block, Operator::I32Const { value }, &[], &[Type::I32])
 }
 
-fn set_trap(body: &mut FunctionBody, block: portal_pc_waffle::Block, trap_code_global: Global, code: u32) {
+fn set_trap(
+    body: &mut FunctionBody,
+    block: portal_pc_waffle::Block,
+    trap_code_global: Global,
+    code: u32,
+) {
     let value = i32_const(body, block, code);
     body.add_op(
         block,
@@ -59,7 +64,14 @@ pub(crate) fn add_shadow_roots(
     debug_addr: Global,
     debug_type: Global,
 ) -> ShadowRootFunctions {
-    let push = add_root_push(module, memory, root_stack_end, root_head, root_bump, trap_code_global);
+    let push = add_root_push(
+        module,
+        memory,
+        root_stack_end,
+        root_head,
+        root_bump,
+        trap_code_global,
+    );
     let pop = add_root_pop(module, memory, root_head, root_bump, trap_code_global);
     let store = add_root_store(
         module,
@@ -127,7 +139,12 @@ fn add_root_push(
             },
         },
     );
-    set_trap(&mut body, fail, trap_code_global, trap_code::ROOT_STACK_OVERFLOW);
+    set_trap(
+        &mut body,
+        fail,
+        trap_code_global,
+        trap_code::ROOT_STACK_OVERFLOW,
+    );
     body.set_terminator(fail, Terminator::Unreachable);
     let previous = body.add_op(
         commit,
@@ -208,9 +225,19 @@ fn add_root_push(
     let step_i = body.add_blockparam(zero_step, Type::I32);
     let eight = i32_const(&mut body, zero_step, 8);
     let slot_offset = body.add_op(zero_step, Operator::I32Mul, &[step_i, eight], &[Type::I32]);
-    let slot_base = body.add_op(zero_step, Operator::I32Add, &[frame, slot_offset], &[Type::I32]);
+    let slot_base = body.add_op(
+        zero_step,
+        Operator::I32Add,
+        &[frame, slot_offset],
+        &[Type::I32],
+    );
     let prefix = i32_const(&mut body, zero_step, 8);
-    let slot_addr = body.add_op(zero_step, Operator::I32Add, &[slot_base, prefix], &[Type::I32]);
+    let slot_addr = body.add_op(
+        zero_step,
+        Operator::I32Add,
+        &[slot_base, prefix],
+        &[Type::I32],
+    );
     let zero = i32_const(&mut body, zero_step, 0);
     body.add_op(
         zero_step,
@@ -243,9 +270,11 @@ fn add_root_push(
             values: vec![frame],
         },
     );
-    module
-        .funcs
-        .push(FuncDecl::Body(signature, "__coregc_push_frame".to_owned(), body))
+    module.funcs.push(FuncDecl::Body(
+        signature,
+        "__coregc_push_frame".to_owned(),
+        body,
+    ))
 }
 
 fn add_root_pop(
@@ -288,7 +317,12 @@ fn add_root_pop(
             },
         },
     );
-    set_trap(&mut body, fail, trap_code_global, trap_code::ROOT_STACK_OVERFLOW);
+    set_trap(
+        &mut body,
+        fail,
+        trap_code_global,
+        trap_code::ROOT_STACK_OVERFLOW,
+    );
     body.set_terminator(fail, Terminator::Unreachable);
     // Restore the linked-list head before rewinding the reserved frame region.
     let previous = body.add_op(
@@ -320,9 +354,11 @@ fn add_root_pop(
         &[],
     );
     body.set_terminator(commit, Terminator::Return { values: vec![] });
-    module
-        .funcs
-        .push(FuncDecl::Body(signature, "__coregc_pop_frame".to_owned(), body))
+    module.funcs.push(FuncDecl::Body(
+        signature,
+        "__coregc_pop_frame".to_owned(),
+        body,
+    ))
 }
 
 fn add_root_store(
@@ -405,26 +441,63 @@ fn add_root_store(
     let heap_base_c = i32_const(&mut body, commit, heap_base);
     let zero_c = i32_const(&mut body, commit, 0);
     let non_null = body.add_op(commit, Operator::I32Ne, &[address, zero_c], &[Type::I32]);
-    let below_heap = body.add_op(commit, Operator::I32LtU, &[address, heap_base_c], &[Type::I32]);
-    let suspicious = body.add_op(commit, Operator::I32And, &[non_null, below_heap], &[Type::I32]);
+    let below_heap = body.add_op(
+        commit,
+        Operator::I32LtU,
+        &[address, heap_base_c],
+        &[Type::I32],
+    );
+    let suspicious = body.add_op(
+        commit,
+        Operator::I32And,
+        &[non_null, below_heap],
+        &[Type::I32],
+    );
     let skip_guard = body.add_block();
     let guard_fail = body.add_block();
     body.set_terminator(
         commit,
         Terminator::CondBr {
             cond: suspicious,
-            if_true: BlockTarget { block: guard_fail, args: vec![] },
-            if_false: BlockTarget { block: skip_guard, args: vec![] },
+            if_true: BlockTarget {
+                block: guard_fail,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: skip_guard,
+                args: vec![],
+            },
         },
     );
-    body.add_op(guard_fail, Operator::GlobalSet { global_index: debug_addr }, &[address], &[]);
-    body.add_op(guard_fail, Operator::GlobalSet { global_index: debug_type }, &[type_id], &[]);
-    set_trap(&mut body, guard_fail, trap_code_global, trap_code::BAD_FAT_REF);
+    body.add_op(
+        guard_fail,
+        Operator::GlobalSet {
+            global_index: debug_addr,
+        },
+        &[address],
+        &[],
+    );
+    body.add_op(
+        guard_fail,
+        Operator::GlobalSet {
+            global_index: debug_type,
+        },
+        &[type_id],
+        &[],
+    );
+    set_trap(
+        &mut body,
+        guard_fail,
+        trap_code_global,
+        trap_code::BAD_FAT_REF,
+    );
     body.set_terminator(guard_fail, Terminator::Unreachable);
     body.set_terminator(skip_guard, Terminator::Return { values: vec![] });
-    module
-        .funcs
-        .push(FuncDecl::Body(signature, "__coregc_root_store".to_owned(), body))
+    module.funcs.push(FuncDecl::Body(
+        signature,
+        "__coregc_root_store".to_owned(),
+        body,
+    ))
 }
 
 fn add_root_clear(
@@ -498,9 +571,11 @@ fn add_root_clear(
         &[],
     );
     body.set_terminator(commit, Terminator::Return { values: vec![] });
-    module
-        .funcs
-        .push(FuncDecl::Body(signature, "__coregc_root_clear".to_owned(), body))
+    module.funcs.push(FuncDecl::Body(
+        signature,
+        "__coregc_root_clear".to_owned(),
+        body,
+    ))
 }
 
 /// Generate a root-iteration function: walk the linked shadow-frame chain
@@ -683,7 +758,9 @@ pub(crate) fn add_root_walk(
         },
     );
     body.set_terminator(done, Terminator::Return { values: vec![] });
-    module
-        .funcs
-        .push(FuncDecl::Body(signature, "__coregc_walk_roots".to_owned(), body))
+    module.funcs.push(FuncDecl::Body(
+        signature,
+        "__coregc_walk_roots".to_owned(),
+        body,
+    ))
 }

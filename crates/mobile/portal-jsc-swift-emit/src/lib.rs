@@ -71,7 +71,9 @@ pub fn swift_ty(module: &Module<'_>, ty: Type) -> String {
         Type::F64 => "Double".to_string(),
         Type::Heap(h) => match h.value {
             HeapType::Sig { sig_index } => match &module.signatures[sig_index] {
-                SignatureData::Struct { .. } => format!("{}?", names::struct_name(sig_index.index())),
+                SignatureData::Struct { .. } => {
+                    format!("{}?", names::struct_name(sig_index.index()))
+                }
                 SignatureData::Array { .. } => format!("{}?", arr_name(sig_index.index())),
                 SignatureData::Func { .. } => format!("{}?", fnbox_name(sig_index.index())),
                 _ => "Any?".to_string(),
@@ -252,10 +254,13 @@ impl<'m> Emitter<'m> {
                 .enumerate()
                 .map(|(i, field)| {
                     let (sty, default) = match field.value {
-                        StorageType::Val(ty) => (swift_ty(self.module, ty), match ty {
-                            Type::I32 | Type::I64 | Type::F32 | Type::F64 => "0",
-                            _ => "nil",
-                        }),
+                        StorageType::Val(ty) => (
+                            swift_ty(self.module, ty),
+                            match ty {
+                                Type::I32 | Type::I64 | Type::F32 | Type::F64 => "0",
+                                _ => "nil",
+                            },
+                        ),
                         _ => ("Int32".to_string(), "0"),
                     };
                     format!("f{i}: {sty} = {default}")
@@ -288,7 +293,10 @@ impl<'m> Emitter<'m> {
 
     fn emit_funcref_boxes(&mut self) {
         for (sig, data) in self.module.signatures.entries() {
-            let SignatureData::Func { params, returns, .. } = data else {
+            let SignatureData::Func {
+                params, returns, ..
+            } = data
+            else {
                 continue;
             };
             let name = fnbox_name(sig.index());
@@ -326,7 +334,10 @@ impl<'m> Emitter<'m> {
                 FuncDecl::Body(sig, name, _) => (*sig, name.as_str()),
                 _ => bail!("mobile closure violation: non-body function {func:?}"),
             };
-            let SignatureData::Func { params, returns, .. } = &self.module.signatures[sig] else {
+            let SignatureData::Func {
+                params, returns, ..
+            } = &self.module.signatures[sig]
+            else {
                 bail!("function {name} has a non-function signature");
             };
             let ret = match returns.first() {
@@ -404,7 +415,10 @@ impl<'m> Emitter<'m> {
             let FuncDecl::Body(sig, _, _) = &self.module.funcs[func] else {
                 continue;
             };
-            let SignatureData::Func { params, returns, .. } = &self.module.signatures[*sig] else {
+            let SignatureData::Func {
+                params, returns, ..
+            } = &self.module.signatures[*sig]
+            else {
                 continue;
             };
             let ret = match returns.first() {

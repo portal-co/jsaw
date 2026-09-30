@@ -227,10 +227,10 @@ mod liveness {
             });
         }
         body.blocks[block].terminator.terminator.visit_uses(|used| {
-                if is_fatref(used) {
-                    raw_uses.insert(used);
-                }
-            });
+            if is_fatref(used) {
+                raw_uses.insert(used);
+            }
+        });
         let uses: HashSet<Value> = raw_uses.difference(&defs).copied().collect();
         (defs, uses)
     }
@@ -296,10 +296,10 @@ mod liveness {
             let mut live = live_out[&block].clone();
             let mut terminator_uses = Vec::new();
             body.blocks[block].terminator.terminator.visit_uses(|used| {
-                    if is_fatref(used) {
-                        terminator_uses.push(used);
-                    }
-                });
+                if is_fatref(used) {
+                    terminator_uses.push(used);
+                }
+            });
             live.extend(terminator_uses);
 
             if matches!(
@@ -757,12 +757,12 @@ pub(crate) fn preflight(
                 (*signature, FunctionKind::Import { raw_func })
             }
             other => {
-            return Err(CoreGcError {
-                message: format!(
+                return Err(CoreGcError {
+                    message: format!(
                         "coregc lowering does not support function declaration {other:?} (function {})",
-                    func.index()
-                ),
-            });
+                        func.index()
+                    ),
+                });
             }
         };
         let (params, returns) = function_signature(source, signature)?;
@@ -843,8 +843,8 @@ pub(crate) fn preflight(
                 }
                 let next_slot =
                     u32::try_from(func_ref_slots.len() + 1).map_err(|_| CoreGcError {
-                    message: "coregc function-reference table exceeds u32 slots".to_owned(),
-                })?;
+                        message: "coregc function-reference table exceeds u32 slots".to_owned(),
+                    })?;
                 func_ref_slots.entry(*func_index).or_insert(next_slot);
             }
             if let ValueDef::Operator(
@@ -1516,11 +1516,11 @@ impl<'a> FunctionLowering<'a> {
                     .inventory
                     .id_for(sig_index)
                     .ok_or_else(|| CoreGcError {
-                    message: format!(
-                        "coregc lowering: ref.test against unmanaged signature {}",
-                        sig_index.index()
-                    ),
-                })?;
+                        message: format!(
+                            "coregc lowering: ref.test against unmanaged signature {}",
+                            sig_index.index()
+                        ),
+                    })?;
                 let id_c = emit.const_i32(id.get());
                 emit.op(Operator::I32Eq, &[type_id, id_c], &[Type::I32])
             }
@@ -2036,8 +2036,8 @@ impl<'a> FunctionLowering<'a> {
                 let payload_bytes =
                     4u32.checked_add((*num as u32).checked_mul(stride).ok_or_else(|| {
                         CoreGcError {
-                        message: "coregc lowering: array.new_fixed payload size overflows u32"
-                            .to_owned(),
+                            message: "coregc lowering: array.new_fixed payload size overflows u32"
+                                .to_owned(),
                         }
                     })?)
                     .ok_or_else(|| CoreGcError {
@@ -2781,7 +2781,7 @@ impl<'a> FunctionLowering<'a> {
             _ => Err(CoreGcError {
                 message:
                     "coregc lowering internal error: array.len receiver is not a fat reference"
-                    .to_owned(),
+                        .to_owned(),
             }),
         }
     }
@@ -3497,7 +3497,13 @@ fn lower_export_wrapper(
     let returns = function
         .return_plan
         .iter()
-        .map(|plan| if plan.needs_root() { Type::I32 } else { plan.flat_types()[0] })
+        .map(|plan| {
+            if plan.needs_root() {
+                Type::I32
+            } else {
+                plan.flat_types()[0]
+            }
+        })
         .collect::<Vec<_>>();
     let signature = out.signatures.push(SignatureData::Func {
         params,
@@ -3523,8 +3529,22 @@ fn lower_export_wrapper(
     for plan in &function.param_plan {
         if plan.needs_root() {
             let handle = flat_params[cursor];
-            let address = body.add_op(entry, Operator::Call { function_index: runtime.handle_address }, &[handle], &[Type::I32]);
-            let type_id = body.add_op(entry, Operator::Call { function_index: runtime.handle_type }, &[handle], &[Type::I32]);
+            let address = body.add_op(
+                entry,
+                Operator::Call {
+                    function_index: runtime.handle_address,
+                },
+                &[handle],
+                &[Type::I32],
+            );
+            let type_id = body.add_op(
+                entry,
+                Operator::Call {
+                    function_index: runtime.handle_type,
+                },
+                &[handle],
+                &[Type::I32],
+            );
             args.extend([address, type_id]);
             cursor += 1;
         } else {
@@ -3533,8 +3553,19 @@ fn lower_export_wrapper(
             cursor += count;
         }
     }
-    let raw_returns = function.return_plan.iter().flat_map(|plan| plan.flat_types()).collect::<Vec<_>>();
-    let result = body.add_op(entry, Operator::Call { function_index: function.lowered_func }, &args, &raw_returns);
+    let raw_returns = function
+        .return_plan
+        .iter()
+        .flat_map(|plan| plan.flat_types())
+        .collect::<Vec<_>>();
+    let result = body.add_op(
+        entry,
+        Operator::Call {
+            function_index: function.lowered_func,
+        },
+        &args,
+        &raw_returns,
+    );
     let mut outputs = Vec::new();
     let mut result_index = 0u32;
     for plan in &function.return_plan {
@@ -3543,18 +3574,31 @@ fn lower_export_wrapper(
             body.append_to_block(entry, address);
             let type_id = body.add_value(ValueDef::PickOutput(result, result_index + 1, Type::I32));
             body.append_to_block(entry, type_id);
-            let handle = body.add_op(entry, Operator::Call { function_index: runtime.handle_new }, &[address, type_id], &[Type::I32]);
+            let handle = body.add_op(
+                entry,
+                Operator::Call {
+                    function_index: runtime.handle_new,
+                },
+                &[address, type_id],
+                &[Type::I32],
+            );
             outputs.push(handle);
             result_index += 2;
         } else {
-            outputs.push(body.add_value(ValueDef::PickOutput(result, result_index, plan.flat_types()[0])));
+            outputs.push(body.add_value(ValueDef::PickOutput(
+                result,
+                result_index,
+                plan.flat_types()[0],
+            )));
             body.append_to_block(entry, *outputs.last().unwrap());
             result_index += 1;
         }
     }
     body.set_terminator(entry, Terminator::Return { values: outputs });
     body.recompute_edges();
-    body.validate().map_err(|error| CoreGcError { message: format!("coregc export wrapper {export_name} is invalid: {error}") })?;
+    body.validate().map_err(|error| CoreGcError {
+        message: format!("coregc export wrapper {export_name} is invalid: {error}"),
+    })?;
     Ok(wrapper)
 }
 
@@ -3570,15 +3614,15 @@ pub(crate) fn lower_with_imports(
     for (func, decl) in source.funcs.entries() {
         match decl {
             FuncDecl::Body(_, name, body) => lower_function(
-            source,
-            inventory,
-            descriptors,
-            runtime,
-            &plan,
-            out,
-            func,
-            body,
-            format!("coregc_{name}"),
+                source,
+                inventory,
+                descriptors,
+                runtime,
+                &plan,
+                out,
+                func,
+                body,
+                format!("coregc_{name}"),
             )?,
             FuncDecl::Import(_, name) => lower_import_adapter(
                 runtime,
@@ -4088,8 +4132,8 @@ pub(crate) mod tests_fixtures {
         caller_body.validate().expect("caller body validates");
         let caller =
             module
-            .funcs
-            .push(FuncDecl::Body(caller_sig, "caller".to_owned(), caller_body));
+                .funcs
+                .push(FuncDecl::Body(caller_sig, "caller".to_owned(), caller_body));
         module.exports.push(Export {
             name: "caller".to_owned(),
             kind: ExportKind::Func(caller),
@@ -4395,8 +4439,8 @@ pub(crate) mod tests_fixtures {
         callee_body.validate().expect("callee body validates");
         let callee =
             module
-            .funcs
-            .push(FuncDecl::Body(callee_sig, "callee".to_owned(), callee_body));
+                .funcs
+                .push(FuncDecl::Body(callee_sig, "callee".to_owned(), callee_body));
 
         // outer(cond): arr = array.new_fixed 0 [checkpoint, like jsaw's
         // empty-arguments-array]; len = arr.len() [non-checkpoint use
@@ -4796,7 +4840,7 @@ pub(crate) mod tests_fixtures {
                 if_false: BlockTarget {
                     block: check_double,
                     args: vec![],
-            },
+                },
             },
         );
         let add_one_ref = body.add_op(
@@ -5687,8 +5731,8 @@ pub(crate) mod tests_fixtures {
         callee_body.validate().expect("callee body validates");
         let callee =
             module
-            .funcs
-            .push(FuncDecl::Body(callee_sig, "callee".to_owned(), callee_body));
+                .funcs
+                .push(FuncDecl::Body(callee_sig, "callee".to_owned(), callee_body));
 
         let caller_sig = module.signatures.push(SignatureData::Func {
             params: vec![Type::I32],
@@ -5721,8 +5765,8 @@ pub(crate) mod tests_fixtures {
         caller_body.validate().expect("caller body validates");
         let caller =
             module
-            .funcs
-            .push(FuncDecl::Body(caller_sig, "caller".to_owned(), caller_body));
+                .funcs
+                .push(FuncDecl::Body(caller_sig, "caller".to_owned(), caller_body));
         module.exports.push(Export {
             name: "caller".to_owned(),
             kind: ExportKind::Func(caller),

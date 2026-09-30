@@ -74,12 +74,16 @@ pub fn emit_coregc(
             FuncDecl::Import(signature, _) | FuncDecl::Body(signature, _, _) => *signature,
             _ => return false,
         };
-        let SignatureData::Func { params, returns, .. } = &source.signatures[signature] else {
+        let SignatureData::Func {
+            params, returns, ..
+        } = &source.signatures[signature]
+        else {
             return false;
         };
-        params.iter().chain(returns).any(|ty| {
-            coregc_lower::boundary_uses_handle(source, &inventory, *ty).unwrap_or(false)
-        })
+        params
+            .iter()
+            .chain(returns)
+            .any(|ty| coregc_lower::boundary_uses_handle(source, &inventory, *ty).unwrap_or(false))
     });
     let lowered = coregc_lower::lower_with_imports(
         source,
@@ -161,20 +165,29 @@ pub fn emit_coregc(
             FuncDecl::Import(signature, _) | FuncDecl::Body(signature, _, _) => *signature,
             _ => continue,
         };
-        let SignatureData::Func { params, returns, .. } = &source.signatures[signature] else {
+        let SignatureData::Func {
+            params, returns, ..
+        } = &source.signatures[signature]
+        else {
             continue;
         };
         let kinds = |types: &[Type]| {
-            types.iter().map(|ty| {
-                if coregc_lower::boundary_uses_handle(source, &inventory, *ty).unwrap_or(false) {
-                    CoreGcHandleKind::Handle
-                } else {
-                    CoreGcHandleKind::Scalar
-                }
-            }).collect::<Vec<_>>()
+            types
+                .iter()
+                .map(|ty| {
+                    if coregc_lower::boundary_uses_handle(source, &inventory, *ty).unwrap_or(false)
+                    {
+                        CoreGcHandleKind::Handle
+                    } else {
+                        CoreGcHandleKind::Scalar
+                    }
+                })
+                .collect::<Vec<_>>()
         };
         if let FuncDecl::Import(_, field) = decl {
-            if let Some(import) = source.imports.iter().find(|import| matches!(import.kind, ImportKind::Func(imported) if imported == func)) {
+            if let Some(import) = source.imports.iter().find(
+                |import| matches!(import.kind, ImportKind::Func(imported) if imported == func),
+            ) {
                 handle_abi.push(CoreGcHandleAbi {
                     direction: CoreGcHandleDirection::Import,
                     name: field.clone(),
@@ -184,7 +197,11 @@ pub fn emit_coregc(
                 });
             }
         }
-        if source.exports.iter().any(|export| matches!(export.kind, ExportKind::Func(exported) if exported == func)) {
+        if source
+            .exports
+            .iter()
+            .any(|export| matches!(export.kind, ExportKind::Func(exported) if exported == func))
+        {
             handle_abi.push(CoreGcHandleAbi {
                 direction: CoreGcHandleDirection::Export,
                 name: source.exports.iter().find(|export| matches!(export.kind, ExportKind::Func(exported) if exported == func)).unwrap().name.clone(),
@@ -194,7 +211,9 @@ pub fn emit_coregc(
             });
         }
     }
-    handle_abi.sort_by(|a, b| (a.direction as u8, &a.module, &a.name).cmp(&(b.direction as u8, &b.module, &b.name)));
+    handle_abi.sort_by(|a, b| {
+        (a.direction as u8, &a.module, &a.name).cmp(&(b.direction as u8, &b.module, &b.name))
+    });
     Ok(CoreGcArtifact {
         module,
         inventory,

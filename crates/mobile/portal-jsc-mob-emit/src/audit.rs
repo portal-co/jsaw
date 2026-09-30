@@ -29,7 +29,11 @@ pub struct AuditError {
 
 impl fmt::Display for AuditError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "mobile audit failed in {}: {}", self.context, self.message)
+        write!(
+            f,
+            "mobile audit failed in {}: {}",
+            self.context, self.message
+        )
     }
 }
 
@@ -79,7 +83,9 @@ pub fn audit_module(module: &Module<'_>) -> AuditResult {
         if data.func_elements.is_none() {
             return err(
                 "module",
-                format!("table {table:?} has no static func_elements; runtime table use is unsupported"),
+                format!(
+                    "table {table:?} has no static func_elements; runtime table use is unsupported"
+                ),
             );
         }
     }
@@ -121,7 +127,10 @@ pub fn audit_module(module: &Module<'_>) -> AuditResult {
                 }
             }
             FuncDecl::Import(..) => {
-                return err("module", format!("imported function {func:?} is not supported"));
+                return err(
+                    "module",
+                    format!("imported function {func:?} is not supported"),
+                );
             }
             _ => {
                 return err(
@@ -161,7 +170,10 @@ fn audit_signature(sig: usize, data: &SignatureData) -> AuditResult {
             StorageType::I8 | StorageType::I16 => {}
             StorageType::Val(ty) => audit_type(&context, ty)?,
             other => {
-                return err(&context, format!("array element storage {other:?} is not supported"));
+                return err(
+                    &context,
+                    format!("array element storage {other:?} is not supported"),
+                );
             }
         },
         other => {
@@ -191,7 +203,10 @@ fn audit_type(context: &str, ty: Type) -> AuditResult {
                 format!("heap type {other:?} is outside the mobile closure"),
             ),
         },
-        other => err(context, format!("type {other:?} is outside the mobile closure")),
+        other => err(
+            context,
+            format!("type {other:?} is outside the mobile closure"),
+        ),
     }
 }
 
@@ -225,14 +240,20 @@ fn audit_value(
         ),
         ValueDef::Operator(op, _args, tys) => {
             if tys.len() > 1 {
-                return err(context, format!("multi-result operator {op:?} is not supported"));
+                return err(
+                    context,
+                    format!("multi-result operator {op:?} is not supported"),
+                );
             }
             for ty in body.type_pool[*tys].iter() {
                 audit_type(context, *ty)?;
             }
             audit_operator(context, op)
         }
-        other => err(context, format!("value definition {other:?} is not supported")),
+        other => err(
+            context,
+            format!("value definition {other:?} is not supported"),
+        ),
     }
 }
 
@@ -270,12 +291,17 @@ fn audit_operator(context: &str, op: &Operator) -> AuditResult {
         | I32Extend8S | I32Extend16S | I64Extend8S | I64Extend16S | I64Extend32S
         | I32TruncSatF32S | I32TruncSatF32U | I32TruncSatF64S | I32TruncSatF64U
         | I64TruncSatF32S | I64TruncSatF32U | I64TruncSatF64S | I64TruncSatF64U
-        | F32ReinterpretI32 | F64ReinterpretI64 | I32ReinterpretF32 | I64ReinterpretF64 => {
-            Ok(())
-        }
+        | F32ReinterpretI32 | F64ReinterpretI64 | I32ReinterpretF32 | I64ReinterpretF64 => Ok(()),
         // References.
-        RefNull { .. } | RefIsNull { .. } | RefFunc { .. } | RefTest { .. } | RefCast { .. }
-        | RefEq { .. } | RefI31 { .. } | I31GetS { .. } | I31GetU { .. } => Ok(()),
+        RefNull { .. }
+        | RefIsNull { .. }
+        | RefFunc { .. }
+        | RefTest { .. }
+        | RefCast { .. }
+        | RefEq { .. }
+        | RefI31 { .. }
+        | I31GetS { .. }
+        | I31GetU { .. } => Ok(()),
         // Structs.
         StructNew { .. }
         | StructNewDefault { .. }

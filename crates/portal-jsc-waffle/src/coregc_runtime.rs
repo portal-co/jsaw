@@ -182,9 +182,7 @@ pub(crate) fn build(
             returns: vec![],
             shared: false,
         });
-        let func = module
-            .funcs
-            .push(FuncDecl::Import(sig, "trace".to_owned()));
+        let func = module.funcs.push(FuncDecl::Import(sig, "trace".to_owned()));
         module.imports.push(portal_pc_waffle::Import {
             module: "coregc_debug".to_owned(),
             name: "trace".to_owned(),
@@ -194,12 +192,13 @@ pub(crate) fn build(
     } else {
         None
     };
-    let root_stack_start = align8(
-        u32::try_from(descriptors.bytes.len()).map_err(|_| CoreGcError {
-            message: "coregc descriptor table exceeds u32 bytes".to_owned(),
-        })?,
-    )
-    .ok_or_else(overflow_error)?;
+    let root_stack_start =
+        align8(
+            u32::try_from(descriptors.bytes.len()).map_err(|_| CoreGcError {
+                message: "coregc descriptor table exceeds u32 bytes".to_owned(),
+            })?,
+        )
+        .ok_or_else(overflow_error)?;
     let worklist_start = root_stack_start
         .checked_add(options.root_stack_bytes)
         .and_then(align8)
@@ -286,20 +285,41 @@ pub(crate) fn build(
         options.heap_base,
         debug_trace_fn,
     );
-    let mark_ref = add_mark_ref(module, memory, trap_code, validate_ref, worklist_start,
-        options.worklist_bytes, worklist_count);
+    let mark_ref = add_mark_ref(
+        module,
+        memory,
+        trap_code,
+        validate_ref,
+        worklist_start,
+        options.worklist_bytes,
+        worklist_count,
+    );
     let handle_slot = add_handle_slot(
-        module, memory, trap_code, handle_table_start, options.handle_table_bytes,
+        module,
+        memory,
+        trap_code,
+        handle_table_start,
+        options.handle_table_bytes,
     );
     let handle_new = add_handle_new(
-        module, memory, trap_code, validate_ref, handle_table_start, options.handle_table_bytes,
+        module,
+        memory,
+        trap_code,
+        validate_ref,
+        handle_table_start,
+        options.handle_table_bytes,
     );
-    let handle_address = add_handle_field(module, memory, handle_slot, 0, "__coregc_handle_address");
+    let handle_address =
+        add_handle_field(module, memory, handle_slot, 0, "__coregc_handle_address");
     let handle_type = add_handle_field(module, memory, handle_slot, 4, "__coregc_handle_type");
     let handle_retain = add_handle_retain(module, memory, trap_code, handle_slot);
     let handle_release = add_handle_release(module, memory, handle_slot);
     let mark_handles = add_mark_handles(
-        module, memory, handle_table_start, options.handle_table_bytes, mark_ref,
+        module,
+        memory,
+        handle_table_start,
+        options.handle_table_bytes,
+        mark_ref,
     );
     let roots = coregc_roots::add_shadow_roots(
         module,
@@ -380,7 +400,11 @@ fn global_i32(module: &mut Module<'static>, initial: u64) -> Global {
     })
 }
 
-fn i32_const(body: &mut FunctionBody, block: portal_pc_waffle::Block, value: u32) -> portal_pc_waffle::Value {
+fn i32_const(
+    body: &mut FunctionBody,
+    block: portal_pc_waffle::Block,
+    value: u32,
+) -> portal_pc_waffle::Value {
     body.add_op(block, Operator::I32Const { value }, &[], &[Type::I32])
 }
 
@@ -445,7 +469,12 @@ fn header_of(
     payload: portal_pc_waffle::Value,
 ) -> portal_pc_waffle::Value {
     let header_bytes = i32_const(body, block, COREGC_HEADER_BYTES);
-    body.add_op(block, Operator::I32Sub, &[payload, header_bytes], &[Type::I32])
+    body.add_op(
+        block,
+        Operator::I32Sub,
+        &[payload, header_bytes],
+        &[Type::I32],
+    )
 }
 
 fn push_func(
@@ -481,7 +510,6 @@ fn finish_func(module: &mut Module<'static>, placeholder: Func, ctx: SigCtx) -> 
     placeholder
 }
 
-
 /// Resolve a non-null live handle to its 16-byte table slot. Handles encode
 /// `(generation << 16) | (slot + 1)`; slot zero and generation zero are never
 /// issued. The helper returns the slot address so all callers share exactly
@@ -493,54 +521,126 @@ fn add_handle_slot(
     table_start: u32,
     table_bytes: u32,
 ) -> Func {
-    let (placeholder, mut ctx) = push_func(module, vec![Type::I32], vec![Type::I32], "__coregc_handle_slot");
+    let (placeholder, mut ctx) = push_func(
+        module,
+        vec![Type::I32],
+        vec![Type::I32],
+        "__coregc_handle_slot",
+    );
     let body = &mut ctx.body;
     let entry = body.entry;
     let handle = body.blocks[entry].params[0].1;
     let bad = body.add_block();
     let check = body.add_block();
     let is_zero = body.add_op(entry, Operator::I32Eqz, &[handle], &[Type::I32]);
-    body.set_terminator(entry, Terminator::CondBr {
-        cond: is_zero,
-        if_true: BlockTarget { block: bad, args: vec![] },
-        if_false: BlockTarget { block: check, args: vec![handle] },
-    });
+    body.set_terminator(
+        entry,
+        Terminator::CondBr {
+            cond: is_zero,
+            if_true: BlockTarget {
+                block: bad,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: check,
+                args: vec![handle],
+            },
+        },
+    );
     let check_handle = body.add_blockparam(check, Type::I32);
     let index_mask = i32_const(body, check, 0xffff);
-    let slot_plus_one = body.add_op(check, Operator::I32And, &[check_handle, index_mask], &[Type::I32]);
+    let slot_plus_one = body.add_op(
+        check,
+        Operator::I32And,
+        &[check_handle, index_mask],
+        &[Type::I32],
+    );
     let no_slot = body.add_op(check, Operator::I32Eqz, &[slot_plus_one], &[Type::I32]);
     let one = i32_const(body, check, 1);
     let slot_index = body.add_op(check, Operator::I32Sub, &[slot_plus_one, one], &[Type::I32]);
     let capacity = i32_const(body, check, table_bytes / 16);
-    let out_of_range = body.add_op(check, Operator::I32GeU, &[slot_index, capacity], &[Type::I32]);
-    let invalid_index = body.add_op(check, Operator::I32Or, &[no_slot, out_of_range], &[Type::I32]);
+    let out_of_range = body.add_op(
+        check,
+        Operator::I32GeU,
+        &[slot_index, capacity],
+        &[Type::I32],
+    );
+    let invalid_index = body.add_op(
+        check,
+        Operator::I32Or,
+        &[no_slot, out_of_range],
+        &[Type::I32],
+    );
     let inspect = body.add_block();
-    body.set_terminator(check, Terminator::CondBr {
-        cond: invalid_index,
-        if_true: BlockTarget { block: bad, args: vec![] },
-        if_false: BlockTarget { block: inspect, args: vec![check_handle, slot_index] },
-    });
+    body.set_terminator(
+        check,
+        Terminator::CondBr {
+            cond: invalid_index,
+            if_true: BlockTarget {
+                block: bad,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: inspect,
+                args: vec![check_handle, slot_index],
+            },
+        },
+    );
     let inspect_handle = body.add_blockparam(inspect, Type::I32);
     let inspect_index = body.add_blockparam(inspect, Type::I32);
     let stride = i32_const(body, inspect, 16);
-    let offset = body.add_op(inspect, Operator::I32Mul, &[inspect_index, stride], &[Type::I32]);
+    let offset = body.add_op(
+        inspect,
+        Operator::I32Mul,
+        &[inspect_index, stride],
+        &[Type::I32],
+    );
     let base = i32_const(body, inspect, table_start);
     let slot = body.add_op(inspect, Operator::I32Add, &[base, offset], &[Type::I32]);
     let refcount = load32(body, inspect, memory, slot, 12);
     let dead = body.add_op(inspect, Operator::I32Eqz, &[refcount], &[Type::I32]);
     let shift = i32_const(body, inspect, 16);
-    let supplied_generation = body.add_op(inspect, Operator::I32ShrU, &[inspect_handle, shift], &[Type::I32]);
+    let supplied_generation = body.add_op(
+        inspect,
+        Operator::I32ShrU,
+        &[inspect_handle, shift],
+        &[Type::I32],
+    );
     let stored_generation = load32(body, inspect, memory, slot, 8);
-    let wrong_generation = body.add_op(inspect, Operator::I32Ne, &[supplied_generation, stored_generation], &[Type::I32]);
-    let invalid = body.add_op(inspect, Operator::I32Or, &[dead, wrong_generation], &[Type::I32]);
+    let wrong_generation = body.add_op(
+        inspect,
+        Operator::I32Ne,
+        &[supplied_generation, stored_generation],
+        &[Type::I32],
+    );
+    let invalid = body.add_op(
+        inspect,
+        Operator::I32Or,
+        &[dead, wrong_generation],
+        &[Type::I32],
+    );
     let good = body.add_block();
-    body.set_terminator(inspect, Terminator::CondBr {
-        cond: invalid,
-        if_true: BlockTarget { block: bad, args: vec![] },
-        if_false: BlockTarget { block: good, args: vec![slot] },
-    });
+    body.set_terminator(
+        inspect,
+        Terminator::CondBr {
+            cond: invalid,
+            if_true: BlockTarget {
+                block: bad,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: good,
+                args: vec![slot],
+            },
+        },
+    );
     let good_slot = body.add_blockparam(good, Type::I32);
-    body.set_terminator(good, Terminator::Return { values: vec![good_slot] });
+    body.set_terminator(
+        good,
+        Terminator::Return {
+            values: vec![good_slot],
+        },
+    );
     set_trap(body, bad, trap_code, trap_code::BAD_HANDLE);
     body.set_terminator(bad, Terminator::Unreachable);
     finish_func(module, placeholder, ctx)
@@ -554,7 +654,12 @@ fn add_handle_new(
     table_start: u32,
     table_bytes: u32,
 ) -> Func {
-    let (placeholder, mut ctx) = push_func(module, vec![Type::I32, Type::I32], vec![Type::I32], "__coregc_handle_new");
+    let (placeholder, mut ctx) = push_func(
+        module,
+        vec![Type::I32, Type::I32],
+        vec![Type::I32],
+        "__coregc_handle_new",
+    );
     let body = &mut ctx.body;
     let entry = body.entry;
     let address = body.blocks[entry].params[0].1;
@@ -562,16 +667,32 @@ fn add_handle_new(
     // Validate the whole pair before recognizing null. In particular an i31
     // immediate may have a zero payload, while `(0, nonzero)` is a malformed
     // partial-null pair that must trap rather than become a null handle.
-    let checked = body.add_op(entry, Operator::Call { function_index: validate_ref }, &[address, type_id], &[Type::I32]);
+    let checked = body.add_op(
+        entry,
+        Operator::Call {
+            function_index: validate_ref,
+        },
+        &[address, type_id],
+        &[Type::I32],
+    );
     let null = body.add_block();
     let scan = body.add_block();
     let is_null = body.add_op(entry, Operator::I32Eqz, &[checked], &[Type::I32]);
     let zero_index = i32_const(body, entry, 0);
-    body.set_terminator(entry, Terminator::CondBr {
-        cond: is_null,
-        if_true: BlockTarget { block: null, args: vec![] },
-        if_false: BlockTarget { block: scan, args: vec![checked, type_id, zero_index] },
-    });
+    body.set_terminator(
+        entry,
+        Terminator::CondBr {
+            cond: is_null,
+            if_true: BlockTarget {
+                block: null,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: scan,
+                args: vec![checked, type_id, zero_index],
+            },
+        },
+    );
     let zero = i32_const(body, null, 0);
     body.set_terminator(null, Terminator::Return { values: vec![zero] });
     let scan_address = body.add_blockparam(scan, Type::I32);
@@ -581,51 +702,101 @@ fn add_handle_new(
     let full = body.add_op(scan, Operator::I32GeU, &[index, capacity], &[Type::I32]);
     let fail = body.add_block();
     let inspect = body.add_block();
-    body.set_terminator(scan, Terminator::CondBr {
-        cond: full,
-        if_true: BlockTarget { block: fail, args: vec![] },
-        if_false: BlockTarget { block: inspect, args: vec![scan_address, scan_type, index] },
-    });
+    body.set_terminator(
+        scan,
+        Terminator::CondBr {
+            cond: full,
+            if_true: BlockTarget {
+                block: fail,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: inspect,
+                args: vec![scan_address, scan_type, index],
+            },
+        },
+    );
     set_trap(body, fail, trap_code, trap_code::HANDLE_TABLE_FULL);
     body.set_terminator(fail, Terminator::Unreachable);
     let inspect_address = body.add_blockparam(inspect, Type::I32);
     let inspect_type = body.add_blockparam(inspect, Type::I32);
     let inspect_index = body.add_blockparam(inspect, Type::I32);
     let stride = i32_const(body, inspect, 16);
-    let offset = body.add_op(inspect, Operator::I32Mul, &[inspect_index, stride], &[Type::I32]);
+    let offset = body.add_op(
+        inspect,
+        Operator::I32Mul,
+        &[inspect_index, stride],
+        &[Type::I32],
+    );
     let base = i32_const(body, inspect, table_start);
     let slot = body.add_op(inspect, Operator::I32Add, &[base, offset], &[Type::I32]);
     let refcount = load32(body, inspect, memory, slot, 12);
     let vacant = body.add_op(inspect, Operator::I32Eqz, &[refcount], &[Type::I32]);
     let use_slot = body.add_block();
     let next = body.add_block();
-    body.set_terminator(inspect, Terminator::CondBr {
-        cond: vacant,
-        if_true: BlockTarget { block: use_slot, args: vec![inspect_address, inspect_type, inspect_index, slot] },
-        if_false: BlockTarget { block: next, args: vec![inspect_address, inspect_type, inspect_index] },
-    });
+    body.set_terminator(
+        inspect,
+        Terminator::CondBr {
+            cond: vacant,
+            if_true: BlockTarget {
+                block: use_slot,
+                args: vec![inspect_address, inspect_type, inspect_index, slot],
+            },
+            if_false: BlockTarget {
+                block: next,
+                args: vec![inspect_address, inspect_type, inspect_index],
+            },
+        },
+    );
     let next_address = body.add_blockparam(next, Type::I32);
     let next_type = body.add_blockparam(next, Type::I32);
     let next_index = body.add_blockparam(next, Type::I32);
     let one = i32_const(body, next, 1);
     let advanced = body.add_op(next, Operator::I32Add, &[next_index, one], &[Type::I32]);
-    body.set_terminator(next, Terminator::Br { target: BlockTarget { block: scan, args: vec![next_address, next_type, advanced] } });
+    body.set_terminator(
+        next,
+        Terminator::Br {
+            target: BlockTarget {
+                block: scan,
+                args: vec![next_address, next_type, advanced],
+            },
+        },
+    );
     let use_address = body.add_blockparam(use_slot, Type::I32);
     let use_type = body.add_blockparam(use_slot, Type::I32);
     let use_index = body.add_blockparam(use_slot, Type::I32);
     let use_slot_addr = body.add_blockparam(use_slot, Type::I32);
     let previous_generation = load32(body, use_slot, memory, use_slot_addr, 8);
     let one = i32_const(body, use_slot, 1);
-    let generation = body.add_op(use_slot, Operator::I32Add, &[previous_generation, one], &[Type::I32]);
+    let generation = body.add_op(
+        use_slot,
+        Operator::I32Add,
+        &[previous_generation, one],
+        &[Type::I32],
+    );
     let generation_limit = i32_const(body, use_slot, 0x1_0000);
-    let exhausted_generation = body.add_op(use_slot, Operator::I32GeU, &[generation, generation_limit], &[Type::I32]);
+    let exhausted_generation = body.add_op(
+        use_slot,
+        Operator::I32GeU,
+        &[generation, generation_limit],
+        &[Type::I32],
+    );
     let retired = body.add_block();
     let commit = body.add_block();
-    body.set_terminator(use_slot, Terminator::CondBr {
-        cond: exhausted_generation,
-        if_true: BlockTarget { block: retired, args: vec![use_address, use_type, use_index] },
-        if_false: BlockTarget { block: commit, args: vec![use_address, use_type, use_index, use_slot_addr, generation] },
-    });
+    body.set_terminator(
+        use_slot,
+        Terminator::CondBr {
+            cond: exhausted_generation,
+            if_true: BlockTarget {
+                block: retired,
+                args: vec![use_address, use_type, use_index],
+            },
+            if_false: BlockTarget {
+                block: commit,
+                args: vec![use_address, use_type, use_index, use_slot_addr, generation],
+            },
+        },
+    );
     // A generation wrap retires the slot forever. A nonzero refcount keeps
     // allocator scans from reusing it, while generation zero cannot match
     // any issued handle.
@@ -633,16 +804,34 @@ fn add_handle_new(
     let retired_type = body.add_blockparam(retired, Type::I32);
     let retired_index = body.add_blockparam(retired, Type::I32);
     let retired_stride = i32_const(body, retired, 16);
-    let retired_offset = body.add_op(retired, Operator::I32Mul, &[retired_index, retired_stride], &[Type::I32]);
+    let retired_offset = body.add_op(
+        retired,
+        Operator::I32Mul,
+        &[retired_index, retired_stride],
+        &[Type::I32],
+    );
     let retired_base = i32_const(body, retired, table_start);
-    let retired_slot = body.add_op(retired, Operator::I32Add, &[retired_base, retired_offset], &[Type::I32]);
+    let retired_slot = body.add_op(
+        retired,
+        Operator::I32Add,
+        &[retired_base, retired_offset],
+        &[Type::I32],
+    );
     let zero = i32_const(body, retired, 0);
     let one = i32_const(body, retired, 1);
     store32(body, retired, memory, retired_slot, 0, zero);
     store32(body, retired, memory, retired_slot, 4, zero);
     store32(body, retired, memory, retired_slot, 8, zero);
     store32(body, retired, memory, retired_slot, 12, one);
-    body.set_terminator(retired, Terminator::Br { target: BlockTarget { block: next, args: vec![retired_address, retired_type, retired_index] } });
+    body.set_terminator(
+        retired,
+        Terminator::Br {
+            target: BlockTarget {
+                block: next,
+                args: vec![retired_address, retired_type, retired_index],
+            },
+        },
+    );
     let commit_address = body.add_blockparam(commit, Type::I32);
     let commit_type = body.add_blockparam(commit, Type::I32);
     let commit_index = body.add_blockparam(commit, Type::I32);
@@ -655,40 +844,94 @@ fn add_handle_new(
     store32(body, commit, memory, commit_slot, 12, one);
     let slot_plus_one = body.add_op(commit, Operator::I32Add, &[commit_index, one], &[Type::I32]);
     let shift = i32_const(body, commit, 16);
-    let encoded_generation = body.add_op(commit, Operator::I32Shl, &[generation, shift], &[Type::I32]);
-    let handle = body.add_op(commit, Operator::I32Or, &[encoded_generation, slot_plus_one], &[Type::I32]);
-    body.set_terminator(commit, Terminator::Return { values: vec![handle] });
+    let encoded_generation =
+        body.add_op(commit, Operator::I32Shl, &[generation, shift], &[Type::I32]);
+    let handle = body.add_op(
+        commit,
+        Operator::I32Or,
+        &[encoded_generation, slot_plus_one],
+        &[Type::I32],
+    );
+    body.set_terminator(
+        commit,
+        Terminator::Return {
+            values: vec![handle],
+        },
+    );
     finish_func(module, placeholder, ctx)
 }
 
 fn add_handle_field(
-    module: &mut Module<'static>, memory: portal_pc_waffle::Memory, handle_slot: Func,
-    offset: u64, name: &str,
+    module: &mut Module<'static>,
+    memory: portal_pc_waffle::Memory,
+    handle_slot: Func,
+    offset: u64,
+    name: &str,
 ) -> Func {
     let (placeholder, mut ctx) = push_func(module, vec![Type::I32], vec![Type::I32], name);
     let body = &mut ctx.body;
     let entry = body.entry;
     let handle = body.blocks[entry].params[0].1;
-    let slot = body.add_op(entry, Operator::Call { function_index: handle_slot }, &[handle], &[Type::I32]);
+    let slot = body.add_op(
+        entry,
+        Operator::Call {
+            function_index: handle_slot,
+        },
+        &[handle],
+        &[Type::I32],
+    );
     let value = load32(body, entry, memory, slot, offset);
-    body.set_terminator(entry, Terminator::Return { values: vec![value] });
+    body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![value],
+        },
+    );
     finish_func(module, placeholder, ctx)
 }
 
 fn add_handle_retain(
-    module: &mut Module<'static>, memory: portal_pc_waffle::Memory, trap_code: Global, handle_slot: Func,
+    module: &mut Module<'static>,
+    memory: portal_pc_waffle::Memory,
+    trap_code: Global,
+    handle_slot: Func,
 ) -> Func {
-    let (placeholder, mut ctx) = push_func(module, vec![Type::I32], vec![Type::I32], "__coregc_handle_retain");
+    let (placeholder, mut ctx) = push_func(
+        module,
+        vec![Type::I32],
+        vec![Type::I32],
+        "__coregc_handle_retain",
+    );
     let body = &mut ctx.body;
     let entry = body.entry;
     let handle = body.blocks[entry].params[0].1;
-    let slot = body.add_op(entry, Operator::Call { function_index: handle_slot }, &[handle], &[Type::I32]);
+    let slot = body.add_op(
+        entry,
+        Operator::Call {
+            function_index: handle_slot,
+        },
+        &[handle],
+        &[Type::I32],
+    );
     let refcount = load32(body, entry, memory, slot, 12);
     let max = i32_const(body, entry, u32::MAX);
     let overflow = body.add_op(entry, Operator::I32Eq, &[refcount, max], &[Type::I32]);
     let fail = body.add_block();
     let done = body.add_block();
-    body.set_terminator(entry, Terminator::CondBr { cond: overflow, if_true: BlockTarget { block: fail, args: vec![] }, if_false: BlockTarget { block: done, args: vec![slot, refcount, handle] } });
+    body.set_terminator(
+        entry,
+        Terminator::CondBr {
+            cond: overflow,
+            if_true: BlockTarget {
+                block: fail,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: done,
+                args: vec![slot, refcount, handle],
+            },
+        },
+    );
     set_trap(body, fail, trap_code, trap_code::HANDLE_REFCOUNT_OVERFLOW);
     body.set_terminator(fail, Terminator::Unreachable);
     let done_slot = body.add_blockparam(done, Type::I32);
@@ -697,18 +940,33 @@ fn add_handle_retain(
     let one = i32_const(body, done, 1);
     let incremented = body.add_op(done, Operator::I32Add, &[done_refcount, one], &[Type::I32]);
     store32(body, done, memory, done_slot, 12, incremented);
-    body.set_terminator(done, Terminator::Return { values: vec![done_handle] });
+    body.set_terminator(
+        done,
+        Terminator::Return {
+            values: vec![done_handle],
+        },
+    );
     finish_func(module, placeholder, ctx)
 }
 
 fn add_handle_release(
-    module: &mut Module<'static>, memory: portal_pc_waffle::Memory, handle_slot: Func,
+    module: &mut Module<'static>,
+    memory: portal_pc_waffle::Memory,
+    handle_slot: Func,
 ) -> Func {
-    let (placeholder, mut ctx) = push_func(module, vec![Type::I32], vec![], "__coregc_handle_release");
+    let (placeholder, mut ctx) =
+        push_func(module, vec![Type::I32], vec![], "__coregc_handle_release");
     let body = &mut ctx.body;
     let entry = body.entry;
     let handle = body.blocks[entry].params[0].1;
-    let slot = body.add_op(entry, Operator::Call { function_index: handle_slot }, &[handle], &[Type::I32]);
+    let slot = body.add_op(
+        entry,
+        Operator::Call {
+            function_index: handle_slot,
+        },
+        &[handle],
+        &[Type::I32],
+    );
     let refcount = load32(body, entry, memory, slot, 12);
     let one = i32_const(body, entry, 1);
     let decremented = body.add_op(entry, Operator::I32Sub, &[refcount, one], &[Type::I32]);
@@ -717,19 +975,43 @@ fn add_handle_release(
     let done = body.add_block();
     let zero = i32_const(body, entry, 0);
     let empty = body.add_op(entry, Operator::I32Eq, &[decremented, zero], &[Type::I32]);
-    body.set_terminator(entry, Terminator::CondBr { cond: empty, if_true: BlockTarget { block: clear, args: vec![slot] }, if_false: BlockTarget { block: done, args: vec![] } });
+    body.set_terminator(
+        entry,
+        Terminator::CondBr {
+            cond: empty,
+            if_true: BlockTarget {
+                block: clear,
+                args: vec![slot],
+            },
+            if_false: BlockTarget {
+                block: done,
+                args: vec![],
+            },
+        },
+    );
     let clear_slot = body.add_blockparam(clear, Type::I32);
     let zero = i32_const(body, clear, 0);
     store32(body, clear, memory, clear_slot, 0, zero);
     store32(body, clear, memory, clear_slot, 4, zero);
-    body.set_terminator(clear, Terminator::Br { target: BlockTarget { block: done, args: vec![] } });
+    body.set_terminator(
+        clear,
+        Terminator::Br {
+            target: BlockTarget {
+                block: done,
+                args: vec![],
+            },
+        },
+    );
     body.set_terminator(done, Terminator::Return { values: vec![] });
     finish_func(module, placeholder, ctx)
 }
 
 fn add_mark_handles(
-    module: &mut Module<'static>, memory: portal_pc_waffle::Memory,
-    table_start: u32, table_bytes: u32, mark_ref: Func,
+    module: &mut Module<'static>,
+    memory: portal_pc_waffle::Memory,
+    table_start: u32,
+    table_bytes: u32,
+    mark_ref: Func,
 ) -> Func {
     let (placeholder, mut ctx) = push_func(module, vec![], vec![], "__coregc_mark_handles");
     let body = &mut ctx.body;
@@ -738,11 +1020,37 @@ fn add_mark_handles(
     let body_block = body.add_block();
     let done = body.add_block();
     let zero = i32_const(body, entry, 0);
-    body.set_terminator(entry, Terminator::Br { target: BlockTarget { block: loop_block, args: vec![zero] } });
+    body.set_terminator(
+        entry,
+        Terminator::Br {
+            target: BlockTarget {
+                block: loop_block,
+                args: vec![zero],
+            },
+        },
+    );
     let index = body.add_blockparam(loop_block, Type::I32);
     let capacity = i32_const(body, loop_block, table_bytes / 16);
-    let finished = body.add_op(loop_block, Operator::I32GeU, &[index, capacity], &[Type::I32]);
-    body.set_terminator(loop_block, Terminator::CondBr { cond: finished, if_true: BlockTarget { block: done, args: vec![] }, if_false: BlockTarget { block: body_block, args: vec![index] } });
+    let finished = body.add_op(
+        loop_block,
+        Operator::I32GeU,
+        &[index, capacity],
+        &[Type::I32],
+    );
+    body.set_terminator(
+        loop_block,
+        Terminator::CondBr {
+            cond: finished,
+            if_true: BlockTarget {
+                block: done,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: body_block,
+                args: vec![index],
+            },
+        },
+    );
     let index = body.add_blockparam(body_block, Type::I32);
     let stride = i32_const(body, body_block, 16);
     let offset = body.add_op(body_block, Operator::I32Mul, &[index, stride], &[Type::I32]);
@@ -755,17 +1063,53 @@ fn add_mark_handles(
     let skip = body.add_op(body_block, Operator::I32Or, &[empty, retired], &[Type::I32]);
     let mark = body.add_block();
     let next = body.add_block();
-    body.set_terminator(body_block, Terminator::CondBr { cond: skip, if_true: BlockTarget { block: next, args: vec![index] }, if_false: BlockTarget { block: mark, args: vec![index, slot] } });
+    body.set_terminator(
+        body_block,
+        Terminator::CondBr {
+            cond: skip,
+            if_true: BlockTarget {
+                block: next,
+                args: vec![index],
+            },
+            if_false: BlockTarget {
+                block: mark,
+                args: vec![index, slot],
+            },
+        },
+    );
     let mark_index = body.add_blockparam(mark, Type::I32);
     let mark_slot = body.add_blockparam(mark, Type::I32);
     let address = load32(body, mark, memory, mark_slot, 0);
     let type_id = load32(body, mark, memory, mark_slot, 4);
-    body.add_op(mark, Operator::Call { function_index: mark_ref }, &[address, type_id], &[]);
-    body.set_terminator(mark, Terminator::Br { target: BlockTarget { block: next, args: vec![mark_index] } });
+    body.add_op(
+        mark,
+        Operator::Call {
+            function_index: mark_ref,
+        },
+        &[address, type_id],
+        &[],
+    );
+    body.set_terminator(
+        mark,
+        Terminator::Br {
+            target: BlockTarget {
+                block: next,
+                args: vec![mark_index],
+            },
+        },
+    );
     let next_index = body.add_blockparam(next, Type::I32);
     let one = i32_const(body, next, 1);
     let next_index = body.add_op(next, Operator::I32Add, &[next_index, one], &[Type::I32]);
-    body.set_terminator(next, Terminator::Br { target: BlockTarget { block: loop_block, args: vec![next_index] } });
+    body.set_terminator(
+        next,
+        Terminator::Br {
+            target: BlockTarget {
+                block: loop_block,
+                args: vec![next_index],
+            },
+        },
+    );
     body.set_terminator(done, Terminator::Return { values: vec![] });
     finish_func(module, placeholder, ctx)
 }
@@ -808,18 +1152,35 @@ fn add_validate_ref(
         entry,
         Terminator::CondBr {
             cond: is_immediate,
-            if_true: BlockTarget { block: immediate_ok, args: vec![] },
-            if_false: BlockTarget { block: check_null, args: vec![] },
+            if_true: BlockTarget {
+                block: immediate_ok,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: check_null,
+                args: vec![],
+            },
         },
     );
-    body.set_terminator(immediate_ok, Terminator::Return { values: vec![address] });
+    body.set_terminator(
+        immediate_ok,
+        Terminator::Return {
+            values: vec![address],
+        },
+    );
     let address_is_null = body.add_op(check_null, Operator::I32Eqz, &[address], &[Type::I32]);
     body.set_terminator(
         check_null,
         Terminator::CondBr {
             cond: address_is_null,
-            if_true: BlockTarget { block: null_case, args: vec![] },
-            if_false: BlockTarget { block: non_null, args: vec![] },
+            if_true: BlockTarget {
+                block: null_case,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: non_null,
+                args: vec![],
+            },
         },
     );
     let type_is_null = body.add_op(null_case, Operator::I32Eqz, &[type_id], &[Type::I32]);
@@ -827,29 +1188,61 @@ fn add_validate_ref(
         null_case,
         Terminator::CondBr {
             cond: type_is_null,
-            if_true: BlockTarget { block: null_ok, args: vec![] },
-            if_false: BlockTarget { block: fail, args: vec![] },
+            if_true: BlockTarget {
+                block: null_ok,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: fail,
+                args: vec![],
+            },
         },
     );
-    body.set_terminator(null_ok, Terminator::Return { values: vec![address] });
+    body.set_terminator(
+        null_ok,
+        Terminator::Return {
+            values: vec![address],
+        },
+    );
 
     let type_is_zero = body.add_op(non_null, Operator::I32Eqz, &[type_id], &[Type::I32]);
     let header_bytes = i32_const(body, non_null, COREGC_HEADER_BYTES);
-    let underflows = body.add_op(non_null, Operator::I32LtU, &[address, header_bytes], &[Type::I32]);
-    let invalid = body.add_op(non_null, Operator::I32Or, &[type_is_zero, underflows], &[Type::I32]);
+    let underflows = body.add_op(
+        non_null,
+        Operator::I32LtU,
+        &[address, header_bytes],
+        &[Type::I32],
+    );
+    let invalid = body.add_op(
+        non_null,
+        Operator::I32Or,
+        &[type_is_zero, underflows],
+        &[Type::I32],
+    );
     body.set_terminator(
         non_null,
         Terminator::CondBr {
             cond: invalid,
-            if_true: BlockTarget { block: fail, args: vec![] },
-            if_false: BlockTarget { block: live, args: vec![] },
+            if_true: BlockTarget {
+                block: fail,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: live,
+                args: vec![],
+            },
         },
     );
 
     let header = header_of(body, live, address);
     let flags = load32(body, live, memory, header, 0);
     let allocated_bit = i32_const(body, live, FLAG_ALLOCATED);
-    let has_allocated = body.add_op(live, Operator::I32And, &[flags, allocated_bit], &[Type::I32]);
+    let has_allocated = body.add_op(
+        live,
+        Operator::I32And,
+        &[flags, allocated_bit],
+        &[Type::I32],
+    );
     let not_allocated = body.add_op(live, Operator::I32Eqz, &[has_allocated], &[Type::I32]);
     let free_bit = i32_const(body, live, FLAG_FREE);
     let has_free = body.add_op(live, Operator::I32And, &[flags, free_bit], &[Type::I32]);
@@ -857,12 +1250,27 @@ fn add_validate_ref(
     // header will generally set bits this runtime never writes.
     let known_mask = i32_const(body, live, FLAG_ALLOCATED | FLAG_MARK);
     let all_ones = i32_const(body, live, u32::MAX);
-    let inverse_mask = body.add_op(live, Operator::I32Xor, &[known_mask, all_ones], &[Type::I32]);
+    let inverse_mask = body.add_op(
+        live,
+        Operator::I32Xor,
+        &[known_mask, all_ones],
+        &[Type::I32],
+    );
     let stray_bits = body.add_op(live, Operator::I32And, &[flags, inverse_mask], &[Type::I32]);
     let zero = i32_const(body, live, 0);
     let has_stray_bits = body.add_op(live, Operator::I32Ne, &[stray_bits, zero], &[Type::I32]);
-    let bad_flags = body.add_op(live, Operator::I32Or, &[not_allocated, has_free], &[Type::I32]);
-    let bad_flags = body.add_op(live, Operator::I32Or, &[bad_flags, has_stray_bits], &[Type::I32]);
+    let bad_flags = body.add_op(
+        live,
+        Operator::I32Or,
+        &[not_allocated, has_free],
+        &[Type::I32],
+    );
+    let bad_flags = body.add_op(
+        live,
+        Operator::I32Or,
+        &[bad_flags, has_stray_bits],
+        &[Type::I32],
+    );
     let actual_type = load32(body, live, memory, header, 4);
     let bad_type = body.add_op(live, Operator::I32Ne, &[actual_type, type_id], &[Type::I32]);
     let bad_flags_block = body.add_block();
@@ -873,15 +1281,32 @@ fn add_validate_ref(
         live,
         Terminator::CondBr {
             cond: bad_flags,
-            if_true: BlockTarget { block: bad_flags_block, args: vec![] },
+            if_true: BlockTarget {
+                block: bad_flags_block,
+                args: vec![],
+            },
             if_false: BlockTarget {
                 block: bad_type_check,
                 args: vec![bad_type],
             },
         },
     );
-    body.add_op(bad_flags_block, Operator::GlobalSet { global_index: debug_addr }, &[address], &[]);
-    body.add_op(bad_flags_block, Operator::GlobalSet { global_index: debug_type }, &[type_id], &[]);
+    body.add_op(
+        bad_flags_block,
+        Operator::GlobalSet {
+            global_index: debug_addr,
+        },
+        &[address],
+        &[],
+    );
+    body.add_op(
+        bad_flags_block,
+        Operator::GlobalSet {
+            global_index: debug_type,
+        },
+        &[type_id],
+        &[],
+    );
     set_trap(body, bad_flags_block, trap_code, trap_code::BAD_FAT_REF);
     body.set_terminator(bad_flags_block, Terminator::Unreachable);
     let bad_type_p = body.add_blockparam(bad_type_check, Type::I32);
@@ -889,17 +1314,56 @@ fn add_validate_ref(
         bad_type_check,
         Terminator::CondBr {
             cond: bad_type_p,
-            if_true: BlockTarget { block: bad_type_block, args: vec![] },
-            if_false: BlockTarget { block: success, args: vec![] },
+            if_true: BlockTarget {
+                block: bad_type_block,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: success,
+                args: vec![],
+            },
         },
     );
-    body.add_op(bad_type_block, Operator::GlobalSet { global_index: debug_addr }, &[address], &[]);
-    body.add_op(bad_type_block, Operator::GlobalSet { global_index: debug_type }, &[type_id], &[]);
+    body.add_op(
+        bad_type_block,
+        Operator::GlobalSet {
+            global_index: debug_addr,
+        },
+        &[address],
+        &[],
+    );
+    body.add_op(
+        bad_type_block,
+        Operator::GlobalSet {
+            global_index: debug_type,
+        },
+        &[type_id],
+        &[],
+    );
     set_trap(body, bad_type_block, trap_code, trap_code::BAD_TYPE_ID);
     body.set_terminator(bad_type_block, Terminator::Unreachable);
-    body.set_terminator(success, Terminator::Return { values: vec![address] });
-    body.add_op(fail, Operator::GlobalSet { global_index: debug_addr }, &[address], &[]);
-    body.add_op(fail, Operator::GlobalSet { global_index: debug_type }, &[type_id], &[]);
+    body.set_terminator(
+        success,
+        Terminator::Return {
+            values: vec![address],
+        },
+    );
+    body.add_op(
+        fail,
+        Operator::GlobalSet {
+            global_index: debug_addr,
+        },
+        &[address],
+        &[],
+    );
+    body.add_op(
+        fail,
+        Operator::GlobalSet {
+            global_index: debug_type,
+        },
+        &[type_id],
+        &[],
+    );
     set_trap(body, fail, trap_code, trap_code::BAD_FAT_REF);
     body.set_terminator(fail, Terminator::Unreachable);
 
@@ -926,7 +1390,9 @@ fn add_array_bounds(
     let index = body.blocks[entry].params[2].1;
     let checked = body.add_op(
         entry,
-        Operator::Call { function_index: validate_ref },
+        Operator::Call {
+            function_index: validate_ref,
+        },
         &[address, type_id],
         &[Type::I32],
     );
@@ -938,11 +1404,22 @@ fn add_array_bounds(
         entry,
         Terminator::CondBr {
             cond: in_bounds,
-            if_true: BlockTarget { block: success, args: vec![] },
-            if_false: BlockTarget { block: fail, args: vec![] },
+            if_true: BlockTarget {
+                block: success,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: fail,
+                args: vec![],
+            },
         },
     );
-    body.set_terminator(success, Terminator::Return { values: vec![index] });
+    body.set_terminator(
+        success,
+        Terminator::Return {
+            values: vec![index],
+        },
+    );
     set_trap(body, fail, trap_code, trap_code::OUT_OF_BOUNDS);
     body.set_terminator(fail, Terminator::Unreachable);
     finish_func(module, placeholder, ctx)
@@ -950,7 +1427,12 @@ fn add_array_bounds(
 
 /// `zero_bytes(address, byte_len) -> ()`, used by `array.new_default`.
 fn add_zero_bytes(module: &mut Module<'static>, memory: portal_pc_waffle::Memory) -> Func {
-    let (placeholder, mut ctx) = push_func(module, vec![Type::I32, Type::I32], vec![], "__coregc_zero_bytes");
+    let (placeholder, mut ctx) = push_func(
+        module,
+        vec![Type::I32, Type::I32],
+        vec![],
+        "__coregc_zero_bytes",
+    );
     let body = &mut ctx.body;
     let entry = body.entry;
     let addr = body.blocks[entry].params[0].1;
@@ -961,7 +1443,12 @@ fn add_zero_bytes(module: &mut Module<'static>, memory: portal_pc_waffle::Memory
     let zero_start = i32_const(body, entry, 0);
     body.set_terminator(
         entry,
-        Terminator::Br { target: BlockTarget { block: loop_block, args: vec![zero_start] } },
+        Terminator::Br {
+            target: BlockTarget {
+                block: loop_block,
+                args: vec![zero_start],
+            },
+        },
     );
     let i = body.add_blockparam(loop_block, Type::I32);
     let finished = body.add_op(loop_block, Operator::I32GeU, &[i, len], &[Type::I32]);
@@ -969,8 +1456,14 @@ fn add_zero_bytes(module: &mut Module<'static>, memory: portal_pc_waffle::Memory
         loop_block,
         Terminator::CondBr {
             cond: finished,
-            if_true: BlockTarget { block: done, args: vec![] },
-            if_false: BlockTarget { block: step, args: vec![i] },
+            if_true: BlockTarget {
+                block: done,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: step,
+                args: vec![i],
+            },
         },
     );
     let step_i = body.add_blockparam(step, Type::I32);
@@ -979,14 +1472,26 @@ fn add_zero_bytes(module: &mut Module<'static>, memory: portal_pc_waffle::Memory
     body.add_op(
         step,
         Operator::I32Store8 {
-            memory: MemoryArg { align: 0, offset: 0, memory },
+            memory: MemoryArg {
+                align: 0,
+                offset: 0,
+                memory,
+            },
         },
         &[target, zero],
         &[],
     );
     let one = i32_const(body, step, 1);
     let next_i = body.add_op(step, Operator::I32Add, &[step_i, one], &[Type::I32]);
-    body.set_terminator(step, Terminator::Br { target: BlockTarget { block: loop_block, args: vec![next_i] } });
+    body.set_terminator(
+        step,
+        Terminator::Br {
+            target: BlockTarget {
+                block: loop_block,
+                args: vec![next_i],
+            },
+        },
+    );
     body.set_terminator(done, Terminator::Return { values: vec![] });
     finish_func(module, placeholder, ctx)
 }
@@ -1022,25 +1527,47 @@ fn add_alloc(
         entry,
         Terminator::CondBr {
             cond: type_is_zero,
-            if_true: BlockTarget { block: fail, args: vec![] },
-            if_false: BlockTarget { block: sizing, args: vec![] },
+            if_true: BlockTarget {
+                block: fail,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: sizing,
+                args: vec![],
+            },
         },
     );
 
     let header_bytes = i32_const(body, sizing, COREGC_HEADER_BYTES);
-    let total = body.add_op(sizing, Operator::I32Add, &[payload_bytes, header_bytes], &[Type::I32]);
+    let total = body.add_op(
+        sizing,
+        Operator::I32Add,
+        &[payload_bytes, header_bytes],
+        &[Type::I32],
+    );
     let seven = i32_const(body, sizing, 7);
     let rounded = body.add_op(sizing, Operator::I32Add, &[total, seven], &[Type::I32]);
     let mask = i32_const(body, sizing, !7u32);
     let block_bytes = body.add_op(sizing, Operator::I32And, &[rounded, mask], &[Type::I32]);
-    let bad_size = body.add_op(sizing, Operator::I32LtU, &[block_bytes, total], &[Type::I32]);
+    let bad_size = body.add_op(
+        sizing,
+        Operator::I32LtU,
+        &[block_bytes, total],
+        &[Type::I32],
+    );
     let search_init = body.add_block();
     body.set_terminator(
         sizing,
         Terminator::CondBr {
             cond: bad_size,
-            if_true: BlockTarget { block: fail, args: vec![] },
-            if_false: BlockTarget { block: search_init, args: vec![block_bytes] },
+            if_true: BlockTarget {
+                block: fail,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: search_init,
+                args: vec![block_bytes],
+            },
         },
     );
     set_trap(body, fail, trap_code, trap_code::BAD_FAT_REF);
@@ -1050,7 +1577,9 @@ fn add_alloc(
     let block_bytes_p = body.add_blockparam(search_init, Type::I32);
     let free_head = body.add_op(
         search_init,
-        Operator::GlobalGet { global_index: free_list_head },
+        Operator::GlobalGet {
+            global_index: free_list_head,
+        },
         &[],
         &[Type::I32],
     );
@@ -1059,7 +1588,10 @@ fn add_alloc(
     body.set_terminator(
         search_init,
         Terminator::Br {
-            target: BlockTarget { block: search_loop, args: vec![block_bytes_p, zero, free_head] },
+            target: BlockTarget {
+                block: search_loop,
+                args: vec![block_bytes_p, zero, free_head],
+            },
         },
     );
     let sl_block_bytes = body.add_blockparam(search_loop, Type::I32);
@@ -1072,8 +1604,14 @@ fn add_alloc(
         search_loop,
         Terminator::CondBr {
             cond: cur_is_null,
-            if_true: BlockTarget { block: bump_path, args: vec![sl_block_bytes] },
-            if_false: BlockTarget { block: check_size, args: vec![sl_block_bytes, sl_prev, sl_cur] },
+            if_true: BlockTarget {
+                block: bump_path,
+                args: vec![sl_block_bytes],
+            },
+            if_false: BlockTarget {
+                block: check_size,
+                args: vec![sl_block_bytes, sl_prev, sl_cur],
+            },
         },
     );
     let cs_block_bytes = body.add_blockparam(check_size, Type::I32);
@@ -1081,15 +1619,26 @@ fn add_alloc(
     let cs_cur = body.add_blockparam(check_size, Type::I32);
     let cur_header = header_of(body, check_size, cs_cur);
     let cur_block_bytes = load32(body, check_size, memory, cur_header, 20);
-    let big_enough = body.add_op(check_size, Operator::I32GeU, &[cur_block_bytes, cs_block_bytes], &[Type::I32]);
+    let big_enough = body.add_op(
+        check_size,
+        Operator::I32GeU,
+        &[cur_block_bytes, cs_block_bytes],
+        &[Type::I32],
+    );
     let reuse = body.add_block();
     let advance = body.add_block();
     body.set_terminator(
         check_size,
         Terminator::CondBr {
             cond: big_enough,
-            if_true: BlockTarget { block: reuse, args: vec![cs_block_bytes, cs_prev, cs_cur] },
-            if_false: BlockTarget { block: advance, args: vec![cs_block_bytes, cs_prev, cs_cur] },
+            if_true: BlockTarget {
+                block: reuse,
+                args: vec![cs_block_bytes, cs_prev, cs_cur],
+            },
+            if_false: BlockTarget {
+                block: advance,
+                args: vec![cs_block_bytes, cs_prev, cs_cur],
+            },
         },
     );
     let adv_block_bytes = body.add_blockparam(advance, Type::I32);
@@ -1101,7 +1650,10 @@ fn add_alloc(
     body.set_terminator(
         advance,
         Terminator::Br {
-            target: BlockTarget { block: search_loop, args: vec![adv_block_bytes, adv_cur, adv_next] },
+            target: BlockTarget {
+                block: search_loop,
+                args: vec![adv_block_bytes, adv_cur, adv_next],
+            },
         },
     );
 
@@ -1118,20 +1670,44 @@ fn add_alloc(
         reuse,
         Terminator::CondBr {
             cond: prev_is_zero,
-            if_true: BlockTarget { block: unlink_head, args: vec![] },
-            if_false: BlockTarget { block: unlink_mid, args: vec![] },
+            if_true: BlockTarget {
+                block: unlink_head,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: unlink_mid,
+                args: vec![],
+            },
         },
     );
     body.add_op(
         unlink_head,
-        Operator::GlobalSet { global_index: free_list_head },
+        Operator::GlobalSet {
+            global_index: free_list_head,
+        },
         &[re_next_free],
         &[],
     );
-    body.set_terminator(unlink_head, Terminator::Br { target: BlockTarget { block: unlinked, args: vec![] } });
+    body.set_terminator(
+        unlink_head,
+        Terminator::Br {
+            target: BlockTarget {
+                block: unlinked,
+                args: vec![],
+            },
+        },
+    );
     let prev_header = header_of(body, unlink_mid, re_prev);
     store32(body, unlink_mid, memory, prev_header, 16, re_next_free);
-    body.set_terminator(unlink_mid, Terminator::Br { target: BlockTarget { block: unlinked, args: vec![] } });
+    body.set_terminator(
+        unlink_mid,
+        Terminator::Br {
+            target: BlockTarget {
+                block: unlinked,
+                args: vec![],
+            },
+        },
+    );
 
     let allocated_flags = i32_const(body, unlinked, FLAG_ALLOCATED);
     store32(body, unlinked, memory, re_header, 0, allocated_flags);
@@ -1141,19 +1717,54 @@ fn add_alloc(
     let reused_kind = i32_const(body, unlinked, 2);
     body.set_terminator(
         unlinked,
-        Terminator::Br { target: BlockTarget { block: finish, args: vec![re_cur, re_block_bytes, reused_kind] } },
+        Terminator::Br {
+            target: BlockTarget {
+                block: finish,
+                args: vec![re_cur, re_block_bytes, reused_kind],
+            },
+        },
     );
 
     // Bump-allocation fallback (grows memory as needed).
     let bp_block_bytes = body.add_blockparam(bump_path, Type::I32);
-    let bump_value = body.add_op(bump_path, Operator::GlobalGet { global_index: bump }, &[], &[Type::I32]);
-    let next = body.add_op(bump_path, Operator::I32Add, &[bump_value, bp_block_bytes], &[Type::I32]);
-    let wrapped = body.add_op(bump_path, Operator::I32LtU, &[next, bump_value], &[Type::I32]);
-    let pages = body.add_op(bump_path, Operator::MemorySize { mem: memory }, &[], &[Type::I32]);
+    let bump_value = body.add_op(
+        bump_path,
+        Operator::GlobalGet { global_index: bump },
+        &[],
+        &[Type::I32],
+    );
+    let next = body.add_op(
+        bump_path,
+        Operator::I32Add,
+        &[bump_value, bp_block_bytes],
+        &[Type::I32],
+    );
+    let wrapped = body.add_op(
+        bump_path,
+        Operator::I32LtU,
+        &[next, bump_value],
+        &[Type::I32],
+    );
+    let pages = body.add_op(
+        bump_path,
+        Operator::MemorySize { mem: memory },
+        &[],
+        &[Type::I32],
+    );
     let page_shift = i32_const(body, bump_path, 16);
-    let limit = body.add_op(bump_path, Operator::I32Shl, &[pages, page_shift], &[Type::I32]);
+    let limit = body.add_op(
+        bump_path,
+        Operator::I32Shl,
+        &[pages, page_shift],
+        &[Type::I32],
+    );
     let needs_grow = body.add_op(bump_path, Operator::I32GtU, &[next, limit], &[Type::I32]);
-    let invalid = body.add_op(bump_path, Operator::I32Or, &[wrapped, needs_grow], &[Type::I32]);
+    let invalid = body.add_op(
+        bump_path,
+        Operator::I32Or,
+        &[wrapped, needs_grow],
+        &[Type::I32],
+    );
     let grow = body.add_block();
     let grow_check_ok = body.add_block();
     let commit = body.add_block();
@@ -1161,8 +1772,14 @@ fn add_alloc(
         bump_path,
         Terminator::CondBr {
             cond: wrapped,
-            if_true: BlockTarget { block: fail, args: vec![] },
-            if_false: BlockTarget { block: grow_check_ok, args: vec![bp_block_bytes, bump_value, next, limit] },
+            if_true: BlockTarget {
+                block: fail,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: grow_check_ok,
+                args: vec![bp_block_bytes, bump_value, next, limit],
+            },
         },
     );
     let _ = invalid;
@@ -1170,13 +1787,24 @@ fn add_alloc(
     let gc_bump_value = body.add_blockparam(grow_check_ok, Type::I32);
     let gc_next = body.add_blockparam(grow_check_ok, Type::I32);
     let gc_limit = body.add_blockparam(grow_check_ok, Type::I32);
-    let gc_needs_grow = body.add_op(grow_check_ok, Operator::I32GtU, &[gc_next, gc_limit], &[Type::I32]);
+    let gc_needs_grow = body.add_op(
+        grow_check_ok,
+        Operator::I32GtU,
+        &[gc_next, gc_limit],
+        &[Type::I32],
+    );
     body.set_terminator(
         grow_check_ok,
         Terminator::CondBr {
             cond: gc_needs_grow,
-            if_true: BlockTarget { block: grow, args: vec![gc_block_bytes, gc_bump_value, gc_next, gc_limit] },
-            if_false: BlockTarget { block: commit, args: vec![gc_block_bytes, gc_bump_value, gc_next] },
+            if_true: BlockTarget {
+                block: grow,
+                args: vec![gc_block_bytes, gc_bump_value, gc_next, gc_limit],
+            },
+            if_false: BlockTarget {
+                block: commit,
+                args: vec![gc_block_bytes, gc_bump_value, gc_next],
+            },
         },
     );
     let g_block_bytes = body.add_blockparam(grow, Type::I32);
@@ -1186,17 +1814,38 @@ fn add_alloc(
     let deficit = body.add_op(grow, Operator::I32Sub, &[g_next, g_limit], &[Type::I32]);
     let page_mask = i32_const(body, grow, 0xffff);
     let rounded_deficit = body.add_op(grow, Operator::I32Add, &[deficit, page_mask], &[Type::I32]);
-    let grow_pages = body.add_op(grow, Operator::I32ShrU, &[rounded_deficit, page_shift], &[Type::I32]);
-    let previous_pages = body.add_op(grow, Operator::MemoryGrow { mem: memory }, &[grow_pages], &[Type::I32]);
+    let grow_pages = body.add_op(
+        grow,
+        Operator::I32ShrU,
+        &[rounded_deficit, page_shift],
+        &[Type::I32],
+    );
+    let previous_pages = body.add_op(
+        grow,
+        Operator::MemoryGrow { mem: memory },
+        &[grow_pages],
+        &[Type::I32],
+    );
     let grow_failed_value = i32_const(body, grow, u32::MAX);
-    let grow_failed = body.add_op(grow, Operator::I32Eq, &[previous_pages, grow_failed_value], &[Type::I32]);
+    let grow_failed = body.add_op(
+        grow,
+        Operator::I32Eq,
+        &[previous_pages, grow_failed_value],
+        &[Type::I32],
+    );
     let grow_fail_block = body.add_block();
     body.set_terminator(
         grow,
         Terminator::CondBr {
             cond: grow_failed,
-            if_true: BlockTarget { block: grow_fail_block, args: vec![] },
-            if_false: BlockTarget { block: commit, args: vec![g_block_bytes, g_bump_value, g_next] },
+            if_true: BlockTarget {
+                block: grow_fail_block,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: commit,
+                args: vec![g_block_bytes, g_bump_value, g_next],
+            },
         },
     );
     set_trap(body, grow_fail_block, trap_code, trap_code::HEAP_OOM);
@@ -1211,7 +1860,9 @@ fn add_alloc(
     store32(body, commit, memory, c_bump_value, 8, payload_bytes);
     let old_block_list_head = body.add_op(
         commit,
-        Operator::GlobalGet { global_index: block_list_head },
+        Operator::GlobalGet {
+            global_index: block_list_head,
+        },
         &[],
         &[Type::I32],
     );
@@ -1219,19 +1870,36 @@ fn add_alloc(
     let zero = i32_const(body, commit, 0);
     store32(body, commit, memory, c_bump_value, 16, zero);
     store32(body, commit, memory, c_bump_value, 20, c_block_bytes);
-    body.add_op(commit, Operator::GlobalSet { global_index: bump }, &[c_next], &[]);
-    let header_bytes2 = i32_const(body, commit, COREGC_HEADER_BYTES);
-    let payload = body.add_op(commit, Operator::I32Add, &[c_bump_value, header_bytes2], &[Type::I32]);
     body.add_op(
         commit,
-        Operator::GlobalSet { global_index: block_list_head },
+        Operator::GlobalSet { global_index: bump },
+        &[c_next],
+        &[],
+    );
+    let header_bytes2 = i32_const(body, commit, COREGC_HEADER_BYTES);
+    let payload = body.add_op(
+        commit,
+        Operator::I32Add,
+        &[c_bump_value, header_bytes2],
+        &[Type::I32],
+    );
+    body.add_op(
+        commit,
+        Operator::GlobalSet {
+            global_index: block_list_head,
+        },
         &[payload],
         &[],
     );
     let fresh_kind = i32_const(body, commit, 1);
     body.set_terminator(
         commit,
-        Terminator::Br { target: BlockTarget { block: finish, args: vec![payload, c_block_bytes, fresh_kind] } },
+        Terminator::Br {
+            target: BlockTarget {
+                block: finish,
+                args: vec![payload, c_block_bytes, fresh_kind],
+            },
+        },
     );
 
     let f_address = body.add_blockparam(finish, Type::I32);
@@ -1240,25 +1908,41 @@ fn add_alloc(
     if let Some(trace_fn) = debug_trace_fn {
         body.add_op(
             finish,
-            Operator::Call { function_index: trace_fn },
+            Operator::Call {
+                function_index: trace_fn,
+            },
             &[f_kind, f_address, type_id],
             &[],
         );
     }
     let prior = body.add_op(
         finish,
-        Operator::GlobalGet { global_index: bytes_since_collect },
+        Operator::GlobalGet {
+            global_index: bytes_since_collect,
+        },
         &[],
         &[Type::I32],
     );
-    let updated = body.add_op(finish, Operator::I32Add, &[prior, f_block_bytes], &[Type::I32]);
+    let updated = body.add_op(
+        finish,
+        Operator::I32Add,
+        &[prior, f_block_bytes],
+        &[Type::I32],
+    );
     body.add_op(
         finish,
-        Operator::GlobalSet { global_index: bytes_since_collect },
+        Operator::GlobalSet {
+            global_index: bytes_since_collect,
+        },
         &[updated],
         &[],
     );
-    body.set_terminator(finish, Terminator::Return { values: vec![f_address] });
+    body.set_terminator(
+        finish,
+        Terminator::Return {
+            values: vec![f_address],
+        },
+    );
     let _ = heap_base;
 
     finish_func(module, placeholder, ctx)
@@ -1275,7 +1959,12 @@ fn add_mark_ref(
     worklist_bytes: u32,
     worklist_count: Global,
 ) -> Func {
-    let (placeholder, mut ctx) = push_func(module, vec![Type::I32, Type::I32], vec![], "__coregc_mark_ref");
+    let (placeholder, mut ctx) = push_func(
+        module,
+        vec![Type::I32, Type::I32],
+        vec![],
+        "__coregc_mark_ref",
+    );
     let body = &mut ctx.body;
     let entry = body.entry;
     let address = body.blocks[entry].params[0].1;
@@ -1292,13 +1981,21 @@ fn add_mark_ref(
         entry,
         Terminator::CondBr {
             cond: is_immediate,
-            if_true: BlockTarget { block: done, args: vec![] },
-            if_false: BlockTarget { block: heap_case, args: vec![] },
+            if_true: BlockTarget {
+                block: done,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: heap_case,
+                args: vec![],
+            },
         },
     );
     let checked = body.add_op(
         heap_case,
-        Operator::Call { function_index: validate_ref },
+        Operator::Call {
+            function_index: validate_ref,
+        },
         &[address, type_id],
         &[Type::I32],
     );
@@ -1308,8 +2005,14 @@ fn add_mark_ref(
         heap_case,
         Terminator::CondBr {
             cond: is_null,
-            if_true: BlockTarget { block: done, args: vec![] },
-            if_false: BlockTarget { block: non_null, args: vec![] },
+            if_true: BlockTarget {
+                block: done,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: non_null,
+                args: vec![],
+            },
         },
     );
     let header = header_of(body, non_null, checked);
@@ -1321,15 +2024,23 @@ fn add_mark_ref(
         non_null,
         Terminator::CondBr {
             cond: already_marked,
-            if_true: BlockTarget { block: done, args: vec![] },
-            if_false: BlockTarget { block: to_mark, args: vec![] },
+            if_true: BlockTarget {
+                block: done,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: to_mark,
+                args: vec![],
+            },
         },
     );
     let new_flags = body.add_op(to_mark, Operator::I32Or, &[flags, mark_bit], &[Type::I32]);
     store32(body, to_mark, memory, header, 0, new_flags);
     let count = body.add_op(
         to_mark,
-        Operator::GlobalGet { global_index: worklist_count },
+        Operator::GlobalGet {
+            global_index: worklist_count,
+        },
         &[],
         &[Type::I32],
     );
@@ -1341,8 +2052,14 @@ fn add_mark_ref(
         to_mark,
         Terminator::CondBr {
             cond: full,
-            if_true: BlockTarget { block: overflow, args: vec![] },
-            if_false: BlockTarget { block: push, args: vec![] },
+            if_true: BlockTarget {
+                block: overflow,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: push,
+                args: vec![],
+            },
         },
     );
     set_trap(body, overflow, trap_code, trap_code::WORKLIST_OOM);
@@ -1357,11 +2074,21 @@ fn add_mark_ref(
     let new_count = body.add_op(push, Operator::I32Add, &[count, one], &[Type::I32]);
     body.add_op(
         push,
-        Operator::GlobalSet { global_index: worklist_count },
+        Operator::GlobalSet {
+            global_index: worklist_count,
+        },
         &[new_count],
         &[],
     );
-    body.set_terminator(push, Terminator::Br { target: BlockTarget { block: done, args: vec![] } });
+    body.set_terminator(
+        push,
+        Terminator::Br {
+            target: BlockTarget {
+                block: done,
+                args: vec![],
+            },
+        },
+    );
     body.set_terminator(done, Terminator::Return { values: vec![] });
     finish_func(module, placeholder, ctx)
 }
@@ -1390,7 +2117,9 @@ fn add_collect(
     let entry = body.entry;
     let already = body.add_op(
         entry,
-        Operator::GlobalGet { global_index: collecting },
+        Operator::GlobalGet {
+            global_index: collecting,
+        },
         &[],
         &[Type::I32],
     );
@@ -1400,24 +2129,61 @@ fn add_collect(
         entry,
         Terminator::CondBr {
             cond: already,
-            if_true: BlockTarget { block: reentrant, args: vec![] },
-            if_false: BlockTarget { block: start, args: vec![] },
+            if_true: BlockTarget {
+                block: reentrant,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: start,
+                args: vec![],
+            },
         },
     );
     set_trap(body, reentrant, trap_code, trap_code::ALLOCATOR_CORRUPTION);
     body.set_terminator(reentrant, Terminator::Unreachable);
 
     let one = i32_const(body, start, 1);
-    body.add_op(start, Operator::GlobalSet { global_index: collecting }, &[one], &[]);
-    body.add_op(start, Operator::Call { function_index: mark_handles }, &[], &[]);
-    body.add_op(start, Operator::Call { function_index: root_walk }, &[], &[]);
+    body.add_op(
+        start,
+        Operator::GlobalSet {
+            global_index: collecting,
+        },
+        &[one],
+        &[],
+    );
+    body.add_op(
+        start,
+        Operator::Call {
+            function_index: mark_handles,
+        },
+        &[],
+        &[],
+    );
+    body.add_op(
+        start,
+        Operator::Call {
+            function_index: root_walk,
+        },
+        &[],
+        &[],
+    );
     let drain_loop = body.add_block();
-    body.set_terminator(start, Terminator::Br { target: BlockTarget { block: drain_loop, args: vec![] } });
+    body.set_terminator(
+        start,
+        Terminator::Br {
+            target: BlockTarget {
+                block: drain_loop,
+                args: vec![],
+            },
+        },
+    );
 
     // --- drain worklist ---
     let count = body.add_op(
         drain_loop,
-        Operator::GlobalGet { global_index: worklist_count },
+        Operator::GlobalGet {
+            global_index: worklist_count,
+        },
         &[],
         &[Type::I32],
     );
@@ -1428,14 +2194,27 @@ fn add_collect(
         drain_loop,
         Terminator::CondBr {
             cond: empty,
-            if_true: BlockTarget { block: sweep_start, args: vec![] },
-            if_false: BlockTarget { block: pop, args: vec![count] },
+            if_true: BlockTarget {
+                block: sweep_start,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: pop,
+                args: vec![count],
+            },
         },
     );
     let pop_count = body.add_blockparam(pop, Type::I32);
     let one_p = i32_const(body, pop, 1);
     let new_count = body.add_op(pop, Operator::I32Sub, &[pop_count, one_p], &[Type::I32]);
-    body.add_op(pop, Operator::GlobalSet { global_index: worklist_count }, &[new_count], &[]);
+    body.add_op(
+        pop,
+        Operator::GlobalSet {
+            global_index: worklist_count,
+        },
+        &[new_count],
+        &[],
+    );
     let eight = i32_const(body, pop, 8);
     let slot_offset = body.add_op(pop, Operator::I32Mul, &[new_count, eight], &[Type::I32]);
     let base = i32_const(body, pop, worklist_start);
@@ -1447,7 +2226,12 @@ fn add_collect(
     let zero_row = i32_const(body, pop, DESCRIPTOR_TABLE_HEADER_BYTES);
     body.set_terminator(
         pop,
-        Terminator::Br { target: BlockTarget { block: find_row, args: vec![addr, type_id, zero_index, zero_row] } },
+        Terminator::Br {
+            target: BlockTarget {
+                block: find_row,
+                args: vec![addr, type_id, zero_index, zero_row],
+            },
+        },
     );
 
     // --- find descriptor row for `type_id` ---
@@ -1457,15 +2241,26 @@ fn add_collect(
     let fr_row = body.add_blockparam(find_row, Type::I32);
     let descriptor_table_base = i32_const(body, find_row, 0);
     let descriptor_count = load32(body, find_row, memory, descriptor_table_base, 8);
-    let exhausted = body.add_op(find_row, Operator::I32GeU, &[fr_index, descriptor_count], &[Type::I32]);
+    let exhausted = body.add_op(
+        find_row,
+        Operator::I32GeU,
+        &[fr_index, descriptor_count],
+        &[Type::I32],
+    );
     let row_missing = body.add_block();
     let row_check = body.add_block();
     body.set_terminator(
         find_row,
         Terminator::CondBr {
             cond: exhausted,
-            if_true: BlockTarget { block: row_missing, args: vec![] },
-            if_false: BlockTarget { block: row_check, args: vec![fr_addr, fr_type, fr_index, fr_row] },
+            if_true: BlockTarget {
+                block: row_missing,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: row_check,
+                args: vec![fr_addr, fr_type, fr_index, fr_row],
+            },
         },
     );
     set_trap(body, row_missing, trap_code, trap_code::BAD_TYPE_ID);
@@ -1476,15 +2271,26 @@ fn add_collect(
     let rc_index = body.add_blockparam(row_check, Type::I32);
     let rc_row = body.add_blockparam(row_check, Type::I32);
     let row_type_id = load32(body, row_check, memory, rc_row, 0);
-    let matches = body.add_op(row_check, Operator::I32Eq, &[row_type_id, rc_type], &[Type::I32]);
+    let matches = body.add_op(
+        row_check,
+        Operator::I32Eq,
+        &[row_type_id, rc_type],
+        &[Type::I32],
+    );
     let dispatch = body.add_block();
     let advance_row = body.add_block();
     body.set_terminator(
         row_check,
         Terminator::CondBr {
             cond: matches,
-            if_true: BlockTarget { block: dispatch, args: vec![rc_addr, rc_row] },
-            if_false: BlockTarget { block: advance_row, args: vec![rc_addr, rc_type, rc_index, rc_row] },
+            if_true: BlockTarget {
+                block: dispatch,
+                args: vec![rc_addr, rc_row],
+            },
+            if_false: BlockTarget {
+                block: advance_row,
+                args: vec![rc_addr, rc_type, rc_index, rc_row],
+            },
         },
     );
     let ar_addr = body.add_blockparam(advance_row, Type::I32);
@@ -1493,15 +2299,40 @@ fn add_collect(
     let ar_row = body.add_blockparam(advance_row, Type::I32);
     let row_slot_count = load32(body, advance_row, memory, ar_row, 16);
     let slot_bytes_c = i32_const(body, advance_row, DESCRIPTOR_SLOT_BYTES);
-    let slots_size = body.add_op(advance_row, Operator::I32Mul, &[row_slot_count, slot_bytes_c], &[Type::I32]);
+    let slots_size = body.add_op(
+        advance_row,
+        Operator::I32Mul,
+        &[row_slot_count, slot_bytes_c],
+        &[Type::I32],
+    );
     let row_header_c = i32_const(body, advance_row, DESCRIPTOR_ROW_HEADER_BYTES);
-    let row_size = body.add_op(advance_row, Operator::I32Add, &[row_header_c, slots_size], &[Type::I32]);
-    let next_row = body.add_op(advance_row, Operator::I32Add, &[ar_row, row_size], &[Type::I32]);
+    let row_size = body.add_op(
+        advance_row,
+        Operator::I32Add,
+        &[row_header_c, slots_size],
+        &[Type::I32],
+    );
+    let next_row = body.add_op(
+        advance_row,
+        Operator::I32Add,
+        &[ar_row, row_size],
+        &[Type::I32],
+    );
     let one_r = i32_const(body, advance_row, 1);
-    let next_index = body.add_op(advance_row, Operator::I32Add, &[ar_index, one_r], &[Type::I32]);
+    let next_index = body.add_op(
+        advance_row,
+        Operator::I32Add,
+        &[ar_index, one_r],
+        &[Type::I32],
+    );
     body.set_terminator(
         advance_row,
-        Terminator::Br { target: BlockTarget { block: find_row, args: vec![ar_addr, ar_type, next_index, next_row] } },
+        Terminator::Br {
+            target: BlockTarget {
+                block: find_row,
+                args: vec![ar_addr, ar_type, next_index, next_row],
+            },
+        },
     );
 
     // --- dispatch by descriptor kind ---
@@ -1509,10 +2340,20 @@ fn add_collect(
     let d_row = body.add_blockparam(dispatch, Type::I32);
     let kind = load32(body, dispatch, memory, d_row, 4);
     let struct_kind = i32_const(body, dispatch, COREGC_DESCRIPTOR_KIND_STRUCT);
-    let is_struct = body.add_op(dispatch, Operator::I32Eq, &[kind, struct_kind], &[Type::I32]);
+    let is_struct = body.add_op(
+        dispatch,
+        Operator::I32Eq,
+        &[kind, struct_kind],
+        &[Type::I32],
+    );
     let array_kind = i32_const(body, dispatch, COREGC_DESCRIPTOR_KIND_ARRAY);
     let is_array = body.add_op(dispatch, Operator::I32Eq, &[kind, array_kind], &[Type::I32]);
-    let is_known = body.add_op(dispatch, Operator::I32Or, &[is_struct, is_array], &[Type::I32]);
+    let is_known = body.add_op(
+        dispatch,
+        Operator::I32Or,
+        &[is_struct, is_array],
+        &[Type::I32],
+    );
     let unknown_kind = body.add_block();
     let struct_scan_init = body.add_block();
     let array_scan_init = body.add_block();
@@ -1521,11 +2362,22 @@ fn add_collect(
         dispatch,
         Terminator::CondBr {
             cond: is_known,
-            if_true: BlockTarget { block: known_check, args: vec![d_addr, d_row, is_struct] },
-            if_false: BlockTarget { block: unknown_kind, args: vec![] },
+            if_true: BlockTarget {
+                block: known_check,
+                args: vec![d_addr, d_row, is_struct],
+            },
+            if_false: BlockTarget {
+                block: unknown_kind,
+                args: vec![],
+            },
         },
     );
-    set_trap(body, unknown_kind, trap_code, trap_code::ALLOCATOR_CORRUPTION);
+    set_trap(
+        body,
+        unknown_kind,
+        trap_code,
+        trap_code::ALLOCATOR_CORRUPTION,
+    );
     body.set_terminator(unknown_kind, Terminator::Unreachable);
     let kc_addr = body.add_blockparam(known_check, Type::I32);
     let kc_row = body.add_blockparam(known_check, Type::I32);
@@ -1534,8 +2386,14 @@ fn add_collect(
         known_check,
         Terminator::CondBr {
             cond: kc_is_struct,
-            if_true: BlockTarget { block: struct_scan_init, args: vec![kc_addr, kc_row] },
-            if_false: BlockTarget { block: array_scan_init, args: vec![kc_addr, kc_row] },
+            if_true: BlockTarget {
+                block: struct_scan_init,
+                args: vec![kc_addr, kc_row],
+            },
+            if_false: BlockTarget {
+                block: array_scan_init,
+                args: vec![kc_addr, kc_row],
+            },
         },
     );
 
@@ -1555,21 +2413,35 @@ fn add_collect(
     body.set_terminator(
         struct_scan_init,
         Terminator::Br {
-            target: BlockTarget { block: struct_slot_loop, args: vec![ss_addr, slots_base, slot_count, zero_idx] },
+            target: BlockTarget {
+                block: struct_slot_loop,
+                args: vec![ss_addr, slots_base, slot_count, zero_idx],
+            },
         },
     );
     let sl_addr = body.add_blockparam(struct_slot_loop, Type::I32);
     let sl_slots_base = body.add_blockparam(struct_slot_loop, Type::I32);
     let sl_slot_count = body.add_blockparam(struct_slot_loop, Type::I32);
     let sl_idx = body.add_blockparam(struct_slot_loop, Type::I32);
-    let sl_done = body.add_op(struct_slot_loop, Operator::I32GeU, &[sl_idx, sl_slot_count], &[Type::I32]);
+    let sl_done = body.add_op(
+        struct_slot_loop,
+        Operator::I32GeU,
+        &[sl_idx, sl_slot_count],
+        &[Type::I32],
+    );
     let struct_slot_body = body.add_block();
     body.set_terminator(
         struct_slot_loop,
         Terminator::CondBr {
             cond: sl_done,
-            if_true: BlockTarget { block: drain_loop, args: vec![] },
-            if_false: BlockTarget { block: struct_slot_body, args: vec![sl_addr, sl_slots_base, sl_slot_count, sl_idx] },
+            if_true: BlockTarget {
+                block: drain_loop,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: struct_slot_body,
+                args: vec![sl_addr, sl_slots_base, sl_slot_count, sl_idx],
+            },
         },
     );
     let sb_addr = body.add_blockparam(struct_slot_body, Type::I32);
@@ -1577,8 +2449,18 @@ fn add_collect(
     let sb_slot_count = body.add_blockparam(struct_slot_body, Type::I32);
     let sb_idx = body.add_blockparam(struct_slot_body, Type::I32);
     let slot_bytes_c2 = i32_const(body, struct_slot_body, DESCRIPTOR_SLOT_BYTES);
-    let slot_off = body.add_op(struct_slot_body, Operator::I32Mul, &[sb_idx, slot_bytes_c2], &[Type::I32]);
-    let slot_addr = body.add_op(struct_slot_body, Operator::I32Add, &[sb_slots_base, slot_off], &[Type::I32]);
+    let slot_off = body.add_op(
+        struct_slot_body,
+        Operator::I32Mul,
+        &[sb_idx, slot_bytes_c2],
+        &[Type::I32],
+    );
+    let slot_addr = body.add_op(
+        struct_slot_body,
+        Operator::I32Add,
+        &[sb_slots_base, slot_off],
+        &[Type::I32],
+    );
     let field_offset = load32(body, struct_slot_body, memory, slot_addr, 0);
     let storage_tag = load32(body, struct_slot_body, memory, slot_addr, 4);
     let managed_ref_tag = i32_const(body, struct_slot_body, STORAGE_TAG_MANAGED_REF);
@@ -1607,8 +2489,14 @@ fn add_collect(
         struct_slot_body,
         Terminator::CondBr {
             cond: is_ref,
-            if_true: BlockTarget { block: mark_struct_field, args: vec![sb_addr, sb_slots_base, sb_slot_count, sb_idx, field_offset] },
-            if_false: BlockTarget { block: next_struct_slot, args: vec![sb_addr, sb_slots_base, sb_slot_count, sb_idx] },
+            if_true: BlockTarget {
+                block: mark_struct_field,
+                args: vec![sb_addr, sb_slots_base, sb_slot_count, sb_idx, field_offset],
+            },
+            if_false: BlockTarget {
+                block: next_struct_slot,
+                args: vec![sb_addr, sb_slots_base, sb_slot_count, sb_idx],
+            },
         },
     );
     let mf_addr = body.add_blockparam(mark_struct_field, Type::I32);
@@ -1616,35 +2504,62 @@ fn add_collect(
     let mf_slot_count = body.add_blockparam(mark_struct_field, Type::I32);
     let mf_idx = body.add_blockparam(mark_struct_field, Type::I32);
     let mf_offset = body.add_blockparam(mark_struct_field, Type::I32);
-    let field_addr = body.add_op(mark_struct_field, Operator::I32Add, &[mf_addr, mf_offset], &[Type::I32]);
+    let field_addr = body.add_op(
+        mark_struct_field,
+        Operator::I32Add,
+        &[mf_addr, mf_offset],
+        &[Type::I32],
+    );
     let child_addr = load32(body, mark_struct_field, memory, field_addr, 0);
     let child_type = load32(body, mark_struct_field, memory, field_addr, 4);
     body.add_op(
         mark_struct_field,
-        Operator::Call { function_index: mark_ref },
+        Operator::Call {
+            function_index: mark_ref,
+        },
         &[child_addr, child_type],
         &[],
     );
     body.set_terminator(
         mark_struct_field,
-        Terminator::Br { target: BlockTarget { block: next_struct_slot, args: vec![mf_addr, mf_slots_base, mf_slot_count, mf_idx] } },
+        Terminator::Br {
+            target: BlockTarget {
+                block: next_struct_slot,
+                args: vec![mf_addr, mf_slots_base, mf_slot_count, mf_idx],
+            },
+        },
     );
     let ns_addr = body.add_blockparam(next_struct_slot, Type::I32);
     let ns_slots_base = body.add_blockparam(next_struct_slot, Type::I32);
     let ns_slot_count = body.add_blockparam(next_struct_slot, Type::I32);
     let ns_idx = body.add_blockparam(next_struct_slot, Type::I32);
     let one_s = i32_const(body, next_struct_slot, 1);
-    let next_idx = body.add_op(next_struct_slot, Operator::I32Add, &[ns_idx, one_s], &[Type::I32]);
+    let next_idx = body.add_op(
+        next_struct_slot,
+        Operator::I32Add,
+        &[ns_idx, one_s],
+        &[Type::I32],
+    );
     body.set_terminator(
         next_struct_slot,
-        Terminator::Br { target: BlockTarget { block: struct_slot_loop, args: vec![ns_addr, ns_slots_base, ns_slot_count, next_idx] } },
+        Terminator::Br {
+            target: BlockTarget {
+                block: struct_slot_loop,
+                args: vec![ns_addr, ns_slots_base, ns_slot_count, next_idx],
+            },
+        },
     );
 
     // array: one element slot at `slots_base`; scan iff it is a ManagedRef.
     let as_addr = body.add_blockparam(array_scan_init, Type::I32);
     let as_row = body.add_blockparam(array_scan_init, Type::I32);
     let row_header_c2 = i32_const(body, array_scan_init, DESCRIPTOR_ROW_HEADER_BYTES);
-    let elem_slot_addr = body.add_op(array_scan_init, Operator::I32Add, &[as_row, row_header_c2], &[Type::I32]);
+    let elem_slot_addr = body.add_op(
+        array_scan_init,
+        Operator::I32Add,
+        &[as_row, row_header_c2],
+        &[Type::I32],
+    );
     let elem_storage_tag = load32(body, array_scan_init, memory, elem_slot_addr, 4);
     let elem_managed_ref_tag = i32_const(body, array_scan_init, STORAGE_TAG_MANAGED_REF);
     let elem_dynamic_ref_tag = i32_const(body, array_scan_init, STORAGE_TAG_DYNAMIC_REF);
@@ -1671,8 +2586,14 @@ fn add_collect(
         array_scan_init,
         Terminator::CondBr {
             cond: elem_is_ref,
-            if_true: BlockTarget { block: array_scan_body_init, args: vec![as_addr, as_row] },
-            if_false: BlockTarget { block: drain_loop, args: vec![] },
+            if_true: BlockTarget {
+                block: array_scan_body_init,
+                args: vec![as_addr, as_row],
+            },
+            if_false: BlockTarget {
+                block: drain_loop,
+                args: vec![],
+            },
         },
     );
     let ab_addr = body.add_blockparam(array_scan_body_init, Type::I32);
@@ -1683,54 +2604,107 @@ fn add_collect(
     let zero_i = i32_const(body, array_scan_body_init, 0);
     body.set_terminator(
         array_scan_body_init,
-        Terminator::Br { target: BlockTarget { block: array_elem_loop, args: vec![ab_addr, stride, length, zero_i] } },
+        Terminator::Br {
+            target: BlockTarget {
+                block: array_elem_loop,
+                args: vec![ab_addr, stride, length, zero_i],
+            },
+        },
     );
     let ael_addr = body.add_blockparam(array_elem_loop, Type::I32);
     let ael_stride = body.add_blockparam(array_elem_loop, Type::I32);
     let ael_length = body.add_blockparam(array_elem_loop, Type::I32);
     let ael_idx = body.add_blockparam(array_elem_loop, Type::I32);
-    let ael_done = body.add_op(array_elem_loop, Operator::I32GeU, &[ael_idx, ael_length], &[Type::I32]);
+    let ael_done = body.add_op(
+        array_elem_loop,
+        Operator::I32GeU,
+        &[ael_idx, ael_length],
+        &[Type::I32],
+    );
     let array_elem_body = body.add_block();
     body.set_terminator(
         array_elem_loop,
         Terminator::CondBr {
             cond: ael_done,
-            if_true: BlockTarget { block: drain_loop, args: vec![] },
-            if_false: BlockTarget { block: array_elem_body, args: vec![ael_addr, ael_stride, ael_length, ael_idx] },
+            if_true: BlockTarget {
+                block: drain_loop,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: array_elem_body,
+                args: vec![ael_addr, ael_stride, ael_length, ael_idx],
+            },
         },
     );
     let aeb_addr = body.add_blockparam(array_elem_body, Type::I32);
     let aeb_stride = body.add_blockparam(array_elem_body, Type::I32);
     let aeb_length = body.add_blockparam(array_elem_body, Type::I32);
     let aeb_idx = body.add_blockparam(array_elem_body, Type::I32);
-    let elem_off = body.add_op(array_elem_body, Operator::I32Mul, &[aeb_idx, aeb_stride], &[Type::I32]);
+    let elem_off = body.add_op(
+        array_elem_body,
+        Operator::I32Mul,
+        &[aeb_idx, aeb_stride],
+        &[Type::I32],
+    );
     let four = i32_const(body, array_elem_body, 4);
-    let elem_off = body.add_op(array_elem_body, Operator::I32Add, &[elem_off, four], &[Type::I32]);
-    let elem_addr = body.add_op(array_elem_body, Operator::I32Add, &[aeb_addr, elem_off], &[Type::I32]);
+    let elem_off = body.add_op(
+        array_elem_body,
+        Operator::I32Add,
+        &[elem_off, four],
+        &[Type::I32],
+    );
+    let elem_addr = body.add_op(
+        array_elem_body,
+        Operator::I32Add,
+        &[aeb_addr, elem_off],
+        &[Type::I32],
+    );
     let elem_child_addr = load32(body, array_elem_body, memory, elem_addr, 0);
     let elem_child_type = load32(body, array_elem_body, memory, elem_addr, 4);
     body.add_op(
         array_elem_body,
-        Operator::Call { function_index: mark_ref },
+        Operator::Call {
+            function_index: mark_ref,
+        },
         &[elem_child_addr, elem_child_type],
         &[],
     );
     let one_a = i32_const(body, array_elem_body, 1);
-    let next_aidx = body.add_op(array_elem_body, Operator::I32Add, &[aeb_idx, one_a], &[Type::I32]);
+    let next_aidx = body.add_op(
+        array_elem_body,
+        Operator::I32Add,
+        &[aeb_idx, one_a],
+        &[Type::I32],
+    );
     body.set_terminator(
         array_elem_body,
-        Terminator::Br { target: BlockTarget { block: array_elem_loop, args: vec![aeb_addr, aeb_stride, aeb_length, next_aidx] } },
+        Terminator::Br {
+            target: BlockTarget {
+                block: array_elem_loop,
+                args: vec![aeb_addr, aeb_stride, aeb_length, next_aidx],
+            },
+        },
     );
 
     // --- sweep ---
     let head = body.add_op(
         sweep_start,
-        Operator::GlobalGet { global_index: block_list_head },
+        Operator::GlobalGet {
+            global_index: block_list_head,
+        },
         &[],
         &[Type::I32],
     );
     let sweep_loop = body.add_block();
-    body.set_terminator(sweep_start, Terminator::Br { target: BlockTarget { block: sweep_loop, args: vec![head] } });
+    body.set_terminator(
+        sweep_start,
+        Terminator::Br {
+            target: BlockTarget {
+                block: sweep_loop,
+                args: vec![head],
+            },
+        },
+    );
     let sw_cur = body.add_blockparam(sweep_loop, Type::I32);
     let sw_done = body.add_op(sweep_loop, Operator::I32Eqz, &[sw_cur], &[Type::I32]);
     let sweep_finish = body.add_block();
@@ -1739,8 +2713,14 @@ fn add_collect(
         sweep_loop,
         Terminator::CondBr {
             cond: sw_done,
-            if_true: BlockTarget { block: sweep_finish, args: vec![] },
-            if_false: BlockTarget { block: sweep_body, args: vec![sw_cur] },
+            if_true: BlockTarget {
+                block: sweep_finish,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: sweep_body,
+                args: vec![sw_cur],
+            },
         },
     );
     let sb2_cur = body.add_blockparam(sweep_body, Type::I32);
@@ -1748,26 +2728,67 @@ fn add_collect(
     let sw_flags = load32(body, sweep_body, memory, sw_header, 0);
     let sw_next = load32(body, sweep_body, memory, sw_header, 12);
     let allocated_bit2 = i32_const(body, sweep_body, FLAG_ALLOCATED);
-    let has_allocated = body.add_op(sweep_body, Operator::I32And, &[sw_flags, allocated_bit2], &[Type::I32]);
+    let has_allocated = body.add_op(
+        sweep_body,
+        Operator::I32And,
+        &[sw_flags, allocated_bit2],
+        &[Type::I32],
+    );
     let zero_c = i32_const(body, sweep_body, 0);
-    let is_allocated_base = body.add_op(sweep_body, Operator::I32Ne, &[has_allocated, zero_c], &[Type::I32]);
+    let is_allocated_base = body.add_op(
+        sweep_body,
+        Operator::I32Ne,
+        &[has_allocated, zero_c],
+        &[Type::I32],
+    );
     let free_bit2 = i32_const(body, sweep_body, FLAG_FREE);
-    let is_free = body.add_op(sweep_body, Operator::I32Eq, &[sw_flags, free_bit2], &[Type::I32]);
+    let is_free = body.add_op(
+        sweep_body,
+        Operator::I32Eq,
+        &[sw_flags, free_bit2],
+        &[Type::I32],
+    );
     let known_mask2 = i32_const(body, sweep_body, FLAG_ALLOCATED | FLAG_MARK);
     let all_ones2 = i32_const(body, sweep_body, u32::MAX);
-    let inverse_mask2 = body.add_op(sweep_body, Operator::I32Xor, &[known_mask2, all_ones2], &[Type::I32]);
-    let stray2 = body.add_op(sweep_body, Operator::I32And, &[sw_flags, inverse_mask2], &[Type::I32]);
+    let inverse_mask2 = body.add_op(
+        sweep_body,
+        Operator::I32Xor,
+        &[known_mask2, all_ones2],
+        &[Type::I32],
+    );
+    let stray2 = body.add_op(
+        sweep_body,
+        Operator::I32And,
+        &[sw_flags, inverse_mask2],
+        &[Type::I32],
+    );
     let clean_allocated = body.add_op(sweep_body, Operator::I32Eqz, &[stray2], &[Type::I32]);
-    let is_allocated = body.add_op(sweep_body, Operator::I32And, &[is_allocated_base, clean_allocated], &[Type::I32]);
-    let recognized = body.add_op(sweep_body, Operator::I32Or, &[is_allocated, is_free], &[Type::I32]);
+    let is_allocated = body.add_op(
+        sweep_body,
+        Operator::I32And,
+        &[is_allocated_base, clean_allocated],
+        &[Type::I32],
+    );
+    let recognized = body.add_op(
+        sweep_body,
+        Operator::I32Or,
+        &[is_allocated, is_free],
+        &[Type::I32],
+    );
     let corrupt = body.add_block();
     let recognized_ok = body.add_block();
     body.set_terminator(
         sweep_body,
         Terminator::CondBr {
             cond: recognized,
-            if_true: BlockTarget { block: recognized_ok, args: vec![sb2_cur, sw_header, sw_flags, sw_next, is_allocated] },
-            if_false: BlockTarget { block: corrupt, args: vec![] },
+            if_true: BlockTarget {
+                block: recognized_ok,
+                args: vec![sb2_cur, sw_header, sw_flags, sw_next, is_allocated],
+            },
+            if_false: BlockTarget {
+                block: corrupt,
+                args: vec![],
+            },
         },
     );
     set_trap(body, corrupt, trap_code, trap_code::ALLOCATOR_CORRUPTION);
@@ -1783,8 +2804,14 @@ fn add_collect(
         recognized_ok,
         Terminator::CondBr {
             cond: ro_is_allocated,
-            if_true: BlockTarget { block: handle_allocated, args: vec![ro_cur, ro_header, ro_flags, ro_next] },
-            if_false: BlockTarget { block: sweep_loop, args: vec![ro_next] },
+            if_true: BlockTarget {
+                block: handle_allocated,
+                args: vec![ro_cur, ro_header, ro_flags, ro_next],
+            },
+            if_false: BlockTarget {
+                block: sweep_loop,
+                args: vec![ro_next],
+            },
         },
     );
     let ha_cur = body.add_blockparam(handle_allocated, Type::I32);
@@ -1792,22 +2819,41 @@ fn add_collect(
     let ha_flags = body.add_blockparam(handle_allocated, Type::I32);
     let ha_next = body.add_blockparam(handle_allocated, Type::I32);
     let mark_bit2 = i32_const(body, handle_allocated, FLAG_MARK);
-    let was_marked = body.add_op(handle_allocated, Operator::I32And, &[ha_flags, mark_bit2], &[Type::I32]);
+    let was_marked = body.add_op(
+        handle_allocated,
+        Operator::I32And,
+        &[ha_flags, mark_bit2],
+        &[Type::I32],
+    );
     let retain = body.add_block();
     let reclaim = body.add_block();
     body.set_terminator(
         handle_allocated,
         Terminator::CondBr {
             cond: was_marked,
-            if_true: BlockTarget { block: retain, args: vec![ha_header, ha_next] },
-            if_false: BlockTarget { block: reclaim, args: vec![ha_cur, ha_header, ha_next] },
+            if_true: BlockTarget {
+                block: retain,
+                args: vec![ha_header, ha_next],
+            },
+            if_false: BlockTarget {
+                block: reclaim,
+                args: vec![ha_cur, ha_header, ha_next],
+            },
         },
     );
     let rt_header = body.add_blockparam(retain, Type::I32);
     let rt_next = body.add_blockparam(retain, Type::I32);
     let cleared = i32_const(body, retain, FLAG_ALLOCATED);
     store32(body, retain, memory, rt_header, 0, cleared);
-    body.set_terminator(retain, Terminator::Br { target: BlockTarget { block: sweep_loop, args: vec![rt_next] } });
+    body.set_terminator(
+        retain,
+        Terminator::Br {
+            target: BlockTarget {
+                block: sweep_loop,
+                args: vec![rt_next],
+            },
+        },
+    );
 
     let rc2_cur = body.add_blockparam(reclaim, Type::I32);
     let rc2_header = body.add_blockparam(reclaim, Type::I32);
@@ -1817,7 +2863,9 @@ fn add_collect(
         let reclaim_kind = i32_const(body, reclaim, 3);
         body.add_op(
             reclaim,
-            Operator::Call { function_index: trace_fn },
+            Operator::Call {
+                function_index: trace_fn,
+            },
             &[reclaim_kind, rc2_cur, old_type_id],
             &[],
         );
@@ -1828,24 +2876,45 @@ fn add_collect(
     store32(body, reclaim, memory, rc2_header, 4, zero_type);
     let old_free_head = body.add_op(
         reclaim,
-        Operator::GlobalGet { global_index: free_list_head },
+        Operator::GlobalGet {
+            global_index: free_list_head,
+        },
         &[],
         &[Type::I32],
     );
     store32(body, reclaim, memory, rc2_header, 16, old_free_head);
     body.add_op(
         reclaim,
-        Operator::GlobalSet { global_index: free_list_head },
+        Operator::GlobalSet {
+            global_index: free_list_head,
+        },
         &[rc2_cur],
         &[],
     );
-    body.set_terminator(reclaim, Terminator::Br { target: BlockTarget { block: sweep_loop, args: vec![rc2_next] } });
+    body.set_terminator(
+        reclaim,
+        Terminator::Br {
+            target: BlockTarget {
+                block: sweep_loop,
+                args: vec![rc2_next],
+            },
+        },
+    );
 
     let zero_flag = i32_const(body, sweep_finish, 0);
-    body.add_op(sweep_finish, Operator::GlobalSet { global_index: collecting }, &[zero_flag], &[]);
     body.add_op(
         sweep_finish,
-        Operator::GlobalSet { global_index: bytes_since_collect },
+        Operator::GlobalSet {
+            global_index: collecting,
+        },
+        &[zero_flag],
+        &[],
+    );
+    body.add_op(
+        sweep_finish,
+        Operator::GlobalSet {
+            global_index: bytes_since_collect,
+        },
         &[zero_flag],
         &[],
     );
@@ -1878,19 +2947,38 @@ fn add_checkpoint(
         entry,
         Terminator::CondBr {
             cond: has_frame,
-            if_true: BlockTarget { block: verify, args: vec![] },
-            if_false: BlockTarget { block: check_threshold, args: vec![] },
+            if_true: BlockTarget {
+                block: verify,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: check_threshold,
+                args: vec![],
+            },
         },
     );
-    let head = body.add_op(verify, Operator::GlobalGet { global_index: root_head }, &[], &[Type::I32]);
+    let head = body.add_op(
+        verify,
+        Operator::GlobalGet {
+            global_index: root_head,
+        },
+        &[],
+        &[Type::I32],
+    );
     let matches = body.add_op(verify, Operator::I32Eq, &[frame, head], &[Type::I32]);
     let mismatch = body.add_block();
     body.set_terminator(
         verify,
         Terminator::CondBr {
             cond: matches,
-            if_true: BlockTarget { block: check_threshold, args: vec![] },
-            if_false: BlockTarget { block: mismatch, args: vec![] },
+            if_true: BlockTarget {
+                block: check_threshold,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: mismatch,
+                args: vec![],
+            },
         },
     );
     set_trap(body, mismatch, trap_code, trap_code::ALLOCATOR_CORRUPTION);
@@ -1898,29 +2986,64 @@ fn add_checkpoint(
 
     let bytes = body.add_op(
         check_threshold,
-        Operator::GlobalGet { global_index: bytes_since_collect },
+        Operator::GlobalGet {
+            global_index: bytes_since_collect,
+        },
         &[],
         &[Type::I32],
     );
     let threshold_c = i32_const(body, check_threshold, threshold);
-    let due = body.add_op(check_threshold, Operator::I32GeU, &[bytes, threshold_c], &[Type::I32]);
+    let due = body.add_op(
+        check_threshold,
+        Operator::I32GeU,
+        &[bytes, threshold_c],
+        &[Type::I32],
+    );
     let do_collect = body.add_block();
     let done = body.add_block();
     body.set_terminator(
         check_threshold,
         Terminator::CondBr {
             cond: due,
-            if_true: BlockTarget { block: do_collect, args: vec![] },
-            if_false: BlockTarget { block: done, args: vec![] },
+            if_true: BlockTarget {
+                block: do_collect,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: done,
+                args: vec![],
+            },
         },
     );
     if let Some(trace_fn) = debug_trace_fn {
         let kind = i32_const(body, do_collect, 6);
         let zero = i32_const(body, do_collect, 0);
-        body.add_op(do_collect, Operator::Call { function_index: trace_fn }, &[kind, zero, zero], &[]);
+        body.add_op(
+            do_collect,
+            Operator::Call {
+                function_index: trace_fn,
+            },
+            &[kind, zero, zero],
+            &[],
+        );
     }
-    body.add_op(do_collect, Operator::Call { function_index: collect }, &[], &[]);
-    body.set_terminator(do_collect, Terminator::Br { target: BlockTarget { block: done, args: vec![] } });
+    body.add_op(
+        do_collect,
+        Operator::Call {
+            function_index: collect,
+        },
+        &[],
+        &[],
+    );
+    body.set_terminator(
+        do_collect,
+        Terminator::Br {
+            target: BlockTarget {
+                block: done,
+                args: vec![],
+            },
+        },
+    );
     body.set_terminator(done, Terminator::Return { values: vec![] });
     finish_func(module, placeholder, ctx)
 }
@@ -2042,7 +3165,8 @@ mod tests {
         }
         for (_, decl) in module.funcs.entries() {
             if let FuncDecl::Body(_, _, body) = decl {
-                body.validate().expect("generated runtime function validates");
+                body.validate()
+                    .expect("generated runtime function validates");
             }
         }
         let bytes = portal_pc_waffle::to_wasm_bytes(&module).expect("core wasm encodes");
@@ -2157,7 +3281,11 @@ mod tests {
         }
         fn write_i32(&mut self, addr: i32, offset: i32, value: i32) {
             self.memory
-                .write(&mut self.store, (addr + offset) as usize, &value.to_le_bytes())
+                .write(
+                    &mut self.store,
+                    (addr + offset) as usize,
+                    &value.to_le_bytes(),
+                )
                 .unwrap();
         }
     }
@@ -2175,8 +3303,14 @@ mod tests {
         assert_eq!(rig.handle_type(handle).unwrap(), type_id);
         rig.handle_release(handle).expect("release");
         rig.collect();
-        assert!(!rig.validate_ok(object, type_id), "released handle no longer roots object");
-        assert!(rig.handle_address(handle).is_err(), "released handle is stale");
+        assert!(
+            !rig.validate_ok(object, type_id),
+            "released handle no longer roots object"
+        );
+        assert!(
+            rig.handle_address(handle).is_err(),
+            "released handle is stale"
+        );
     }
 
     #[test]
@@ -2188,7 +3322,10 @@ mod tests {
         assert_eq!(rig.handle_retain(handle).unwrap(), handle);
         rig.handle_release(handle).unwrap();
         rig.collect();
-        assert!(rig.validate_ok(object, type_id), "one retained ownership remains");
+        assert!(
+            rig.validate_ok(object, type_id),
+            "one retained ownership remains"
+        );
         rig.handle_release(handle).unwrap();
         rig.collect();
         assert!(!rig.validate_ok(object, type_id));
@@ -2210,7 +3347,10 @@ mod tests {
         let second = rig.alloc(type_id, rig.node_payload_bytes);
         let current = rig.handle_new(second, type_id).unwrap();
         assert_ne!(stale, current, "slot reuse changes the generation");
-        assert!(rig.handle_address(stale).is_err(), "old generation cannot resolve");
+        assert!(
+            rig.handle_address(stale).is_err(),
+            "old generation cannot resolve"
+        );
         assert_eq!(rig.handle_address(current).unwrap(), second);
     }
 
@@ -2251,7 +3391,10 @@ mod tests {
         rig.root_store(frame, 0, a, type_id);
         rig.collect();
         assert!(rig.validate_ok(a, type_id), "rooted node a survives");
-        assert!(rig.validate_ok(b, type_id), "cycle-reachable node b survives");
+        assert!(
+            rig.validate_ok(b, type_id),
+            "cycle-reachable node b survives"
+        );
         // Mark bits must be cleared after a successful sweep so the next
         // collection starts from a clean slate.
         let header_a = (a - COREGC_HEADER_BYTES as i32) as usize;
@@ -2286,7 +3429,10 @@ mod tests {
         rig.root_store(frame, 0, array, array_type);
         rig.collect();
         assert!(rig.validate_ok(array, array_type));
-        assert!(rig.validate_ok(child, node_type), "array element keeps child alive");
+        assert!(
+            rig.validate_ok(child, node_type),
+            "array element keeps child alive"
+        );
         rig.pop_frame(frame).expect("pop frame");
     }
 
@@ -2300,7 +3446,10 @@ mod tests {
             .instance
             .get_typed_func::<(i32, i32, i32), i32>(&mut rig.store, "array_bounds")
             .unwrap();
-        assert_eq!(bounds.call(&mut rig.store, (array, array_type, 0)).unwrap(), 0);
+        assert_eq!(
+            bounds.call(&mut rig.store, (array, array_type, 0)).unwrap(),
+            0
+        );
         assert!(bounds.call(&mut rig.store, (array, array_type, 1)).is_err());
     }
 
@@ -2341,12 +3490,13 @@ mod tests {
         rig.root_store(frame, 1, b, type_id);
         // Root-walk marks both `a` and `b` directly; only one worklist slot
         // exists, so the second root push must overflow deterministically.
-        assert!(rig
-            .instance
-            .get_typed_func::<(), ()>(&mut rig.store, "collect")
-            .unwrap()
-            .call(&mut rig.store, ())
-            .is_err());
+        assert!(
+            rig.instance
+                .get_typed_func::<(), ()>(&mut rig.store, "collect")
+                .unwrap()
+                .call(&mut rig.store, ())
+                .is_err()
+        );
     }
 
     #[test]

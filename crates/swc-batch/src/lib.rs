@@ -1,7 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
 use portal_jsc_swc_util::{ImportMap, ImportMapper, ModuleMapper};
+use std::{collections::BTreeMap, sync::Arc};
 use swc_atoms::{Atom, Wtf8Atom};
-use swc_common::{sync::Lrc, Mark, Spanned, SyntaxContext};
+use swc_common::{Mark, Spanned, SyntaxContext, sync::Lrc};
 use swc_ecma_ast::{
     BlockStmt, CallExpr, Decl, Expr, ExprOrSpread, FnDecl, FnExpr, Function, Id, Ident, IdentName,
     Import, ImportDecl, Lit, MemberExpr, MethodProp, Module, ModuleDecl, ModuleItem, ObjectLit,

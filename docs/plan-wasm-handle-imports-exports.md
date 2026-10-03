@@ -596,7 +596,8 @@ a separate, host-integration-approved change.
 - Bare ESM packages, Node builtins, dynamic import, import maps, or changing
   the relative `ModuleSet` linker.
 - Multi-value host ABI, typed concrete-ref suffixes, `funcref`/table host
-  mutation, `externref`, memory/global/table/tag imports, or exception ABI.
+  mutation, `externref`, memory/global/table/tag imports, or host-visible
+  exception transport (internal source-call exception propagation is separate).
 - Async host imports, callbacks retaining temporary import handles, host-side
   allocation of arbitrary CoreGC heap objects, or a raw-address escape hatch.
 - Adding host-import support to JVM/Swift/mobile emitters in this work. The

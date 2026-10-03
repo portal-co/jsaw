@@ -1711,6 +1711,7 @@ dependencies = [
  "swc_ecma_ast",
  "swc_ecma_codegen",
  "swc_ecma_parser",
+ "swc_ecma_visit",
  "wasmparser 0.240.0",
  "wasmtime",
 ]

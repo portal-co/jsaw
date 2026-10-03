@@ -89,6 +89,40 @@ pub fn audit_module(module: &Module<'_>) -> AuditResult {
             );
         }
     }
+    if module
+        .funcs
+        .entries()
+        .any(|(_, declaration)| match declaration {
+            FuncDecl::Body(_, _, body) => body.values.iter().any(|value| {
+                let ValueDef::Operator(operator, _, _) = &body.values[value] else {
+                    return false;
+                };
+                let signature = match operator {
+                    Operator::StructNew { sig }
+                    | Operator::StructNewDefault { sig }
+                    | Operator::StructGet { sig, .. }
+                    | Operator::StructGetS { sig, .. }
+                    | Operator::StructGetU { sig, .. }
+                    | Operator::StructSet { sig, .. } => Some(*sig),
+                    Operator::RefTest { ty } | Operator::RefCast { ty } => match ty {
+                        Type::Heap(reference) => match reference.value {
+                            HeapType::Sig { sig_index } => Some(sig_index),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                signature.is_some_and(|signature| is_exception_result_signature(module, signature))
+            }),
+            _ => false,
+        })
+    {
+        return err(
+            "module",
+            "private exception-result structs are not supported by mobile emitters",
+        );
+    }
     for export in &module.exports {
         if !matches!(export.kind, portal_pc_waffle::ExportKind::Func(_)) {
             return err(
@@ -141,6 +175,22 @@ pub fn audit_module(module: &Module<'_>) -> AuditResult {
         }
     }
     Ok(())
+}
+
+fn is_exception_result_signature(
+    module: &Module<'_>,
+    signature: portal_pc_waffle::Signature,
+) -> bool {
+    let Some(SignatureData::Struct { fields, .. }) = module.signatures.get(signature) else {
+        return false;
+    };
+    matches!(fields.as_slice(), [state, payload]
+    if state.value == StorageType::Val(portal_pc_waffle::Type::I32)
+        && matches!(
+            payload.value,
+            StorageType::Val(Type::Heap(reference))
+                if reference.nullable && reference.value == HeapType::Any
+        ))
 }
 
 fn audit_signature(sig: usize, data: &SignatureData) -> AuditResult {

@@ -1,16 +1,22 @@
 # Plan: source exceptions as explicit return structs
 
-**Status:** planned.
+**Status:** Phase 1 committed (`e9e56fa`); Phase 2 implemented and validated
+for native WasmGC; CoreGC parity and final semantic/preflight work remain.
 
 ## 1. Goal
 
 Implement synchronous JavaScript `throw` / `try`-`catch` in the WasmGC
 backend without using Wasm exception instructions. A thrown value is carried
-through ordinary calls as a private, nominal exception-result `struct`. Each
-call site inspects the result: it enters the nearest active catch handler, or
-propagates the same exceptional result through its own return. An exported
-entry wrapper converts an uncaught exception to the backend's existing trap
-behavior; it never exposes the private result struct as a JavaScript value.
+through ordinary calls as a private, nominal exception-result `struct`.
+When a source graph contains an explicit `throw`, source-callable functions
+in that graph use an `anyref` return ABI: normal returns carry ordinary boxed
+JavaScript values, while exceptional returns carry the private struct (upcast
+to `anyref`). Each caller tests for that exact nominal type: it enters the
+nearest active catch handler, or propagates the same exceptional result
+through its own return. Exception-free graphs retain their existing optimized
+return ABIs. An exported entry wrapper converts an uncaught exception to the
+backend's existing trap behavior; it never exposes the private result struct
+as a JavaScript value.
 
 This representation is disjoint from jsaw's JavaScript object/value
 representations. The result envelope has its own nominal Waffle struct type,
@@ -23,7 +29,9 @@ CoreGC should need no exception-specific runtime representation: the envelope
 is an ordinary managed aggregate struct. Existing struct inventory, layout,
 rooting, call-result flattening, and validation must lower it exactly as they
 lower polymorphic-return and other aggregate structs. CoreGC output must
-continue to contain no WasmGC references or exception instructions.
+continue to contain no WasmGC references or exception instructions. Mobile
+emitters do not support exception-bearing modules and must reject them in
+their feature-closure audit.
 
 ## 2. Initial semantic boundary
 
@@ -60,8 +68,8 @@ replaced, not constraints on the new design.
   before emission rather than silently skipping their semantics. Add them
   later using an explicit completion model that also handles return, break,
   and continue overriding a pending throw.
-- Adding exception support to the mobile emitters in this change. Their
-  existing audits remain fail-closed for unsupported artifacts.
+- Implementing exception semantics in the JVM, Swift, or mobile emitters.
+  The mobile feature-closure audit rejects exception-result modules.
 
 ## 3. Internal result representation and call protocol
 
@@ -72,51 +80,50 @@ example `repr.exception_result_ty()`):
 
 ```text
 ExceptionResult {
-    state: i32,          // NORMAL or THROWN; no other values are valid
-    payload: anyref,     // boxed normal JS result, or boxed thrown JS value
+    state: i32,          // THROWN only; any other value is malformed
+    payload: anyref,     // boxed thrown JavaScript value
 }
 ```
 
-Use distinct constructors/accessors (`normal_result`, `thrown_result`,
-`result_state`, `result_payload`) instead of repeating field indices in
-`conv.rs`. Validate the state before interpreting the payload. Do not add the
-envelope to the JS `Object` shape system, object tags, or ordinary dynamic
-value conversion. A plain JS object, even one with `state` and `payload`
-properties, is never a valid envelope.
+The envelope's nominal WasmGC signature is the exception discriminator;
+ordinary JS values are never encoded using this signature. Keep field metadata in `repr.rs` and centralize construction/decoding rather
+than repeating field indexes in `conv.rs`. Validate the state before using the
+payload. Do not add the envelope to the JS `Object` shape system,
+object tags, or ordinary dynamic value conversion. A plain JS object, even
+one with `state` and `payload` properties, is never a valid envelope.
 
-For the first correct implementation, all generated source-callable
-functions use the same internal `ExceptionResult` return ABI. On normal return,
-box the source result in the payload; on an escaping throw, put the thrown
-value there. This uniform ABI avoids unsound effect inference for recursive,
-indirect, rebound, or dynamically-called functions. Retain existing
-`ReturnKinds` information for normal-payload unboxing where convenient, but
-correctness must not depend on callers guessing whether a callee can throw.
-Restoring raw-return fast paths for proven no-throw functions is later
-optimization work.
+Within an exception-enabled source graph, source-callable functions return
+boxed JS values normally and the typed exception-result struct, upcast to
+`anyref`, when unwinding. The mode is selected before signatures are allocated
+by scanning source functions (including nested and linked functions) for
+explicit throws; this avoids changing ordinary modules and their fast ABIs.
+Within an enabled graph, callers test the nominal exception type rather than
+guessing from callee identity. Generated non-source helpers and host-import
+adapters retain their ordinary-value ABI.
 
-Generated non-source helpers and host-import adapters must explicitly adapt
-to this protocol: ordinary completion becomes `NORMAL`; any existing trap
-behavior remains a trap. No helper may return an uninitialized or malformed
-envelope.
+Only thrown completions are wrapped; there is no `NORMAL` envelope tag.
+Foreign import exceptions are not encoded as jsaw exception results. No source
+function may return an uninitialized or malformed exception envelope.
 
 ### 3.2 Caller handling
 
-For every direct, indirect, reference, and adapter-mediated source call:
+For every direct, indirect, reference, and adapter-mediated source call in an
+exception-enabled graph:
 
-1. Receive the typed `ExceptionResult` reference.
-2. Read and validate its state.
-3. For `NORMAL`, extract the payload, convert it to the normal internal
-   `LowerValue` expected by the continuation, and continue.
-4. For `THROWN`, extract the payload and branch to the nearest active catch
-   block, binding the value when requested. If no handler is active, return
-   the same typed exception result from the current function without wrapping
-   it again.
+1. Receive the `anyref` result and `ref.test` it against the exact nominal
+   exception-result type.
+2. If it is not that type, continue with the ordinary JS result.
+3. If it is that type, cast to the envelope, validate `state == THROWN`, and
+   extract the payload.
+4. Branch to the nearest active catch block, binding the value when requested.
+   If no handler is active, return the same envelope (upcast to `anyref`)
+   from the current function without wrapping it again.
 
 The check is mandatory even for a statically-known callee; recursive and
-indirect calls must use the same semantics. Tail-call optimizations may not
-skip the check or bypass a handler. Initially disable/fall back from tail-call
-paths whose result could be exceptional; a later optimization may forward the
-result only when it preserves the handler check.
+indirect calls must use the same semantics. A tail call may forward the raw
+`anyref` only when there is no local handler to bypass; a call in a protected
+region must be lowered as an ordinary call and checked before returning or
+continuing.
 
 A direct `throw` in the current function enters its active lexical handler, or
 constructs a `THROWN` result and returns it when no local handler exists.
@@ -127,19 +134,20 @@ consistent without relying on Wasm unwinding.
 ### 3.3 Public boundaries
 
 Keep public signatures unchanged. Generated numeric, `$gc`, and raw export
-wrappers call the internal source function, inspect its envelope, and:
+wrappers call the internal source function, test for the nominal envelope,
+and:
 
 - unwrap/coerce the normal payload using the existing export rules; or
 - execute `unreachable` for an uncaught thrown result.
 
 The private envelope must not be added to `CoreGcArtifact::handle_abi` or
 exposed as an `i32` handle. It is internal to the module. Normal `wasm:` host
-imports are adapted into `NORMAL` results; exception values returned by
-foreign host code are not invented or decoded as envelopes.
+imports keep their existing adapter ABI; foreign host exceptions are not
+invented or decoded as envelopes.
 
 ## 4. Ownership and implementation seams
 
-- `conv.rs` owns source-function exception return signatures, wrapper
+- `conv.rs` owns source-function exception return values, wrapper
   construction, call-site checks, lexical handler routing, and export
   unwrapping. Centralize envelope operations behind small helpers so every
   call form shares the same behavior.
@@ -211,23 +219,25 @@ forms are precisely classified before lowering is added.
 
 ### Phase 2 — native WasmGC result and caller protocol
 
-1. Change generated source-callable function signatures to return the private
-   envelope; pack normal returns and escaping throws.
-2. Lower each call form through a shared result-dispatch helper, including
-   direct native calls, `CallRef`/indirect calls, adapters, and recursive
-   calls. Update return-kind analysis and tail-call downgrade/eligibility
-   rules so throws are neither lost nor double-boxed.
-3. Lower lexical catch handlers: local throws branch to the active handler;
-   exceptional call results branch to the same handler; uncaught results
-   propagate unchanged.
-4. Adapt generated helpers/import adapters as normal completions and unwrap
-   only at public export wrappers.
+Exception-bearing source graphs are selected by a pre-scan and use the
+existing `anyref` return ABI: normal values stay ordinary boxed JS values,
+while throws return the private nominal aggregate. Exception-free graphs keep
+their prior raw/union ABIs.
+
+1. Emit thrown-result aggregates and validate their state at consumers.
+2. Dispatch direct, indirect, adapter-mediated, and imported source-call
+   results to the nearest lexical catch or propagate the original envelope.
+3. Lower direct throws, nested catch/rethrow, public numeric/raw/GC export
+   traps, and module-initializer traps.
+4. Keep foreign host-import behavior unchanged and reject exception-result
+   modules in the mobile feature-closure audit.
 
 **Commit:** `exceptions: propagate results through native callers`.
 
-**Gate:** validate and execute direct throw/catch, cross-function propagation,
-rethrow, nested catches, primitive/object payload identity, uncaught-export
-trap, and normal return regressions in native WasmGC.
+**Gate:** direct/local catches, linked cross-function propagation, nested
+catch/rethrow, primitive and object payload use, uncaught-export traps, and
+normal returns in exception-enabled graphs pass on Wasmtime and Node.js.
+Mobile emission rejects these modules; CoreGC parity is Phase 3.
 
 ### Phase 3 — CoreGC parity through generic aggregate lowering
 
@@ -289,4 +299,5 @@ emitters reject unsupported exception-bearing artifacts loudly.
 - `finally`, async/Promise rejection, generator unwinding, or cross-thread
   exceptions.
 - Exception support in JVM, Swift, or mobile emitters.
-- Optimizing away the uniform envelope for functions proven not to throw.
+- Per-function throw-effect inference to retain raw return ABIs inside a
+  graph that contains any throw; the current exception mode is graph-wide.

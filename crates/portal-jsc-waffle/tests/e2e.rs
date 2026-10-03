@@ -175,13 +175,23 @@ fn coregc_inventory_accepts_jsaw_generated_wasmgc_types() {
     );
 }
 
-fn validate(module: &Module<'_>) {
+fn validate_wasm_only(module: &Module<'_>) {
     for (_, declaration) in module.funcs.entries() {
         if let FuncDecl::Body(_, _, body) = declaration {
             body.validate()
                 .expect("generated Waffle function should validate");
         }
     }
+    let bytes = portal_pc_waffle::to_wasm_bytes(module).expect("Wasm emission should succeed");
+    let mut features = wasmparser::WasmFeatures::default();
+    features.set(wasmparser::WasmFeatures::GC, true);
+    wasmparser::Validator::new_with_features(features)
+        .validate_all(&bytes)
+        .expect("emitted WasmGC should validate");
+}
+
+fn validate(module: &Module<'_>) {
+    validate_wasm_only(module);
     // The mobile emitters' feature closure is a living contract: every
     // module this compiler produces must stay inside it.
     portal_jsc_mob_emit::audit::audit_module(module)
@@ -192,12 +202,6 @@ fn validate(module: &Module<'_>) {
                 .expect("SIR lowering should succeed for every body");
         }
     }
-    let bytes = portal_pc_waffle::to_wasm_bytes(module).expect("Wasm emission should succeed");
-    let mut features = wasmparser::WasmFeatures::default();
-    features.set(wasmparser::WasmFeatures::GC, true);
-    wasmparser::Validator::new_with_features(features)
-        .validate_all(&bytes)
-        .expect("emitted WasmGC should validate");
 }
 
 fn wasm_bytes(module: &Module<'_>) -> Vec<u8> {
@@ -270,6 +274,19 @@ fn execute_in_node(bytes: &[u8], name: &str, args: &[f64]) -> f64 {
         .expect("Node output should be UTF-8")
         .parse()
         .expect("Node numeric result should parse as f64")
+}
+
+fn assert_executes_in_wasm_runtimes(module: &Module<'_>, name: &str, args: &[f64], expected: f64) {
+    let bytes = wasm_bytes(module);
+    for (runtime, result) in [
+        ("Wasmtime", execute_in_wasmtime(&bytes, name, args)),
+        ("Node.js", execute_in_node(&bytes, name, args)),
+    ] {
+        assert!(
+            (result - expected).abs() < f64::EPSILON,
+            "{runtime} returned {result} from {name:?}; expected {expected}",
+        );
+    }
 }
 
 fn assert_executes_in_all_runtimes(module: &Module<'_>, name: &str, args: &[f64], expected: f64) {
@@ -3980,6 +3997,87 @@ fn m17_try_catch_never_throws() {
 }
 
 #[test]
+fn m17_try_catch_catches_cross_function_throw() {
+    let fixtures: Fixture<'_> = &[
+        (
+            "main.mjs",
+            "import { raise, raise_object, rethrow, maybe } from './thrower.js';\n\
+             export function caught(value) {\n\
+                 try { let result = raise(value); return result; }\n\
+                 catch (error) { return error + 1; }\n\
+             }\n\
+             export function catches_normal_return() {\n\
+                 try { return maybe(0); } catch (error) { return -1; }\n\
+             }\n\
+             export function local() {\n\
+                 try { throw 41; } catch (error) { return error + 1; }\n\
+             }\n\
+             export function nested_catch() {\n\
+                 try { try { throw 40; } catch (inner) { throw inner; } }\n\
+                 catch (outer) { return outer + 2; }\n\
+             }\n\
+             export function caught_object() {\n\
+                 try { throw { value: 42 }; } catch (error) { return error.value; }\n\
+             }\n\
+             export function caught_imported_object() {\n\
+                 try { raise_object(); } catch (error) { return error.value; }\n\
+             }\n\
+             export function catches_rethrow(value) {\n\
+                 try { rethrow(value); } catch (error) { return error + 1; }\n\
+             }\n\
+             export function uncaught() { throw 7; }\n\
+             export function uncaught_call(value) { return raise(value); }",
+        ),
+        (
+            "thrower.js",
+            "export function raise(value) { throw value; }\n\
+             export function raise_object() { throw { value: 42 }; }\n\
+             export function rethrow(value) { throw value; }\n\
+             export function maybe(value) { if (value > 0) throw value; return 42; }",
+        ),
+    ];
+    let module = compile_modules(fixtures, "main.mjs");
+    validate_wasm_only(&module);
+    let mobile_error = portal_jsc_mob_emit::audit::audit_module(&module)
+        .expect_err("mobile emitters must reject exception-result modules");
+    assert!(mobile_error.message.contains("exception-result"));
+    assert_executes_in_wasm_runtimes(&module, "local", &[], 42.0);
+    assert_executes_in_wasm_runtimes(&module, "caught", &[41.0], 42.0);
+    assert_executes_in_wasm_runtimes(&module, "catches_normal_return", &[], 42.0);
+    assert_executes_in_wasm_runtimes(&module, "nested_catch", &[], 42.0);
+    assert_executes_in_wasm_runtimes(&module, "caught_object", &[], 42.0);
+    assert_executes_in_wasm_runtimes(&module, "caught_imported_object", &[], 42.0);
+    assert_executes_in_wasm_runtimes(&module, "catches_rethrow", &[41.0], 42.0);
+    let bytes = wasm_bytes(&module);
+
+    let mut config = Config::new();
+    config.wasm_gc(true);
+    config.wasm_function_references(true);
+    let engine = Engine::new(&config).expect("Wasmtime engine should support WasmGC");
+    let wasm = WasmtimeModule::new(&engine, &bytes).expect("Wasmtime should compile emitted Wasm");
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &wasm, &[]).expect("module should instantiate");
+    let mut result = [Val::F64(0)];
+    let uncaught = instance
+        .get_func(&mut store, "uncaught")
+        .expect("missing uncaught export");
+    assert!(
+        uncaught.call(&mut store, &[], &mut result).is_err(),
+        "an uncaught private exception result must trap at the public export",
+    );
+    let uncaught_call = instance
+        .get_func(&mut store, "uncaught_call")
+        .expect("missing uncaught_call export");
+    let inputs = [Val::F64(7.0f64.to_bits())];
+    assert!(
+        uncaught_call
+            .call(&mut store, &inputs, &mut result)
+            .is_err(),
+        "an escaping exception from a source call must trap at the public export",
+    );
+}
+
+#[test]
 fn m17_template_literal() {
     let module = compile_module(
         "
@@ -4018,9 +4116,10 @@ fn m17_throw_new_error() {
             }
         ",
     );
-    validate(&module);
-    // The non-throwing path must run; the throwing path traps (jsaw has no catch).
-    assert_executes_in_all_runtimes(&module, "run", &[0.0], 42.0);
+    validate_wasm_only(&module);
+    // The non-throwing path must run; the throwing path traps at the public
+    // Wasm boundary. Mobile emitters reject exception-bearing modules.
+    assert_executes_in_wasm_runtimes(&module, "run", &[0.0], 42.0);
 }
 
 #[test]

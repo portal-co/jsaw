@@ -437,6 +437,19 @@ impl Repr {
         })
     }
 
+    pub(crate) fn exception_result_ty(self) -> Type {
+        ref_sig(self.exception_result)
+    }
+
+    pub(crate) fn exception_result_non_null_ty(self) -> Type {
+        Type::Heap(WithNullable {
+            value: portal_pc_waffle::HeapType::Sig {
+                sig_index: self.exception_result,
+            },
+            nullable: false,
+        })
+    }
+
     pub(crate) fn string_non_null_ty(self) -> Type {
         Type::Heap(WithNullable {
             value: portal_pc_waffle::HeapType::Sig {
@@ -546,7 +559,6 @@ pub(crate) const EXCEPTION_RESULT_FIELD_STATE: usize = 0;
 pub(crate) const EXCEPTION_RESULT_FIELD_PAYLOAD: usize = 1;
 
 /// Exception-result state discriminants. Every other value is invalid.
-pub(crate) const EXCEPTION_RESULT_NORMAL: i32 = 0;
 pub(crate) const EXCEPTION_RESULT_THROWN: i32 = 1;
 
 /// The i31 payload representing JS `null`. The null `anyref` is reserved for

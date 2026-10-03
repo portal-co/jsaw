@@ -169,7 +169,7 @@ fn ensure_module_init(&mut self) -> Result<Func, ConvertError> {
         shared: false,
     });
     let mut body = FunctionBody::new(self.module, sig);
-    let block = body.entry;
+    let mut block = body.entry;
     let context_builder = self.ensure_context_builder()?;
     let context = body.add_op(
         block,
@@ -198,8 +198,9 @@ fn ensure_module_init(&mut self) -> Result<Func, ConvertError> {
     );
     for adapter in self.module_init_bodies.clone() {
         // Run the module body for its side effects (context stores); the
-        // undefined return is discarded.
-        body.add_op(
+        // ordinary undefined return is discarded. An uncaught explicit
+        // throw at module scope preserves the existing trap boundary.
+        let result = body.add_op(
             block,
             Operator::Call {
                 function_index: adapter,
@@ -207,6 +208,34 @@ fn ensure_module_init(&mut self) -> Result<Func, ConvertError> {
             &[context, this, empty_args],
             &[self.repr.value],
         );
+        if self.exceptions_enabled {
+            let is_exception = body.add_op(
+                block,
+                Operator::RefTest {
+                    ty: self.repr.exception_result_non_null_ty(),
+                },
+                &[result],
+                &[Type::I32],
+            );
+            let trap = body.add_block();
+            let normal = body.add_block();
+            body.set_terminator(
+                block,
+                Terminator::CondBr {
+                    cond: is_exception,
+                    if_true: BlockTarget {
+                        block: trap,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: normal,
+                        args: vec![],
+                    },
+                },
+            );
+            body.set_terminator(trap, Terminator::Unreachable);
+            block = normal;
+        }
     }
     body.set_terminator(
         block,

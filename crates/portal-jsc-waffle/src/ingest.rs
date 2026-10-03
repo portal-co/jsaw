@@ -10,8 +10,9 @@ use portal_jsc_swc_cfg::module::CfgModule;
 use portal_jsc_swc_ssa::module::{SModule, SModuleBuilder};
 use portal_jsc_swc_tac::module::TModule;
 use swc_common::{FileName, GLOBALS, Globals, SourceMap, input::SourceFileInput, sync::Lrc};
-use swc_ecma_ast::EsVersion;
+use swc_ecma_ast::{EsVersion, Module, ModuleItem, TryStmt};
 use swc_ecma_parser::{Context, EsSyntax, Lexer, Parser, Syntax, parse_file_as_module};
+use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::{ConvertError, ModuleSet};
 
@@ -41,6 +42,7 @@ pub fn parse_module_source(path: &str, source: &str) -> Result<SModule, ConvertE
             "parse of {path:?} reported diagnostics: {errors:?}"
         )));
     }
+    reject_finally(&module, path)?;
     let cfg = CfgModule::try_from(module).map_err(|error| {
         ConvertError::invalid(format!("CFG lowering of {path:?} failed: {error:?}"))
     })?;
@@ -88,6 +90,7 @@ pub fn parse_module_source_lazy(path: &str, source: &str) -> Result<SModule, Con
         let item = parser.parse_module_item().map_err(|error| {
             ConvertError::invalid(format!("parse of {path:?} failed: {error:?}"))
         })?;
+        reject_finally_item(&item, path)?;
         builder.append(item).map_err(|error| {
             ConvertError::invalid(format!(
                 "incremental lowering of {path:?} failed: {error:?}"
@@ -105,6 +108,38 @@ pub fn parse_module_source_lazy(path: &str, source: &str) -> Result<SModule, Con
             "incremental SSA lowering of {path:?} failed: {error:?}"
         ))
     })
+}
+
+#[derive(Default)]
+struct FinallyDetector(bool);
+
+impl Visit for FinallyDetector {
+    fn visit_try_stmt(&mut self, statement: &TryStmt) {
+        self.0 |= statement.finalizer.is_some();
+        statement.visit_children_with(self);
+    }
+}
+
+fn reject_finally(module: &Module, path: &str) -> Result<(), ConvertError> {
+    let mut detector = FinallyDetector::default();
+    module.visit_with(&mut detector);
+    if detector.0 {
+        return Err(ConvertError::invalid(format!(
+            "finally is not supported by the WasmGC exception protocol in {path:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn reject_finally_item(item: &ModuleItem, path: &str) -> Result<(), ConvertError> {
+    let mut detector = FinallyDetector::default();
+    item.visit_with(&mut detector);
+    if detector.0 {
+        return Err(ConvertError::invalid(format!(
+            "finally is not supported by the WasmGC exception protocol in {path:?}"
+        )));
+    }
+    Ok(())
 }
 
 /// Run `f` with a fresh swc `GLOBALS` scoped TLS installed.
@@ -177,6 +212,23 @@ mod tests {
         .expect("valid source should fingerprint");
         assert_eq!(formatted, comments_and_whitespace);
         assert_ne!(formatted, changed);
+    }
+
+    #[test]
+    fn finally_is_rejected_by_eager_and_lazy_ingestion() {
+        let source = "export function run() { try { throw 1; } finally { sideEffect(); } }";
+        with_globals(|| {
+            let eager = match parse_module_source("finally.js", source) {
+                Ok(_) => panic!("eager ingestion must reject unsupported finally"),
+                Err(error) => error,
+            };
+            let lazy = match parse_module_source_lazy("finally.js", source) {
+                Ok(_) => panic!("lazy ingestion must reject unsupported finally"),
+                Err(error) => error,
+            };
+            assert!(eager.message.contains("finally is not supported"));
+            assert!(lazy.message.contains("finally is not supported"));
+        });
     }
 
     #[test]

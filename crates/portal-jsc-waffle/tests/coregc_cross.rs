@@ -339,8 +339,11 @@ fn dump_descriptor_layouts(module: &Module<'_>) {
 /// (b/c) coregc at both collection thresholds, requiring all observable
 /// outcomes to match. Keeping several exports in one artifact catches
 /// cross-component effects without recompiling the module per call.
-fn cross_test_cases(source: &str, cases: &[(&str, &[f64])]) {
-    let module = compile_module(source);
+fn cross_test_cases(source: &str, cases: &[(&str, &[f64])]) -> Vec<Outcome> {
+    cross_test_compiled(compile_module(source), cases)
+}
+
+fn cross_test_compiled(module: Module<'static>, cases: &[(&str, &[f64])]) -> Vec<Outcome> {
     let native_bytes = portal_pc_waffle::to_wasm_bytes(&module).expect("native encodes");
     if std::env::var("COREGC_CROSS_LAYOUTS").is_ok() {
         dump_descriptor_layouts(&module);
@@ -389,6 +392,7 @@ fn cross_test_cases(source: &str, cases: &[(&str, &[f64])]) {
             execute_with_trace(&traced_bytes, name, args, watch_addr);
         }
     }
+    let mut native_outcomes = Vec::with_capacity(cases.len());
     for &(name, args) in cases {
         let native = execute(&native_bytes, name, args, true);
         let forced = execute(&core_bytes_forced, name, args, false);
@@ -401,17 +405,114 @@ fn cross_test_cases(source: &str, cases: &[(&str, &[f64])]) {
             native, normal,
             "normal-threshold coregc diverges from native for {name:?}"
         );
+        native_outcomes.push(native);
     }
+    native_outcomes
 }
 
 /// Convenience wrapper for the common one-export fixture shape.
-fn cross_test(source: &str, name: &str, args: &[f64]) {
-    cross_test_cases(source, &[(name, args)]);
+fn cross_test(source: &str, name: &str, args: &[f64]) -> Vec<Outcome> {
+    cross_test_cases(source, &[(name, args)])
+}
+
+fn compile_module_set(fixtures: &[(&str, &str)], entry: &str) -> Module<'static> {
+    portal_jsc_waffle::with_globals(|| {
+        let sources = fixtures
+            .iter()
+            .map(|(path, source)| {
+                portal_jsc_waffle::parse_module_source(path, source)
+                    .unwrap_or_else(|error| panic!("{path} source ingestion failed: {error}"))
+            })
+            .collect::<Vec<_>>();
+        let mut set = portal_jsc_waffle::ModuleSet::new();
+        for ((path, _), source) in fixtures.iter().zip(&sources) {
+            set.insert(*path, source)
+                .unwrap_or_else(|error| panic!("{path} module insertion failed: {error}"));
+        }
+        let mut wasm = Module::empty();
+        portal_jsc_waffle::convert_modules(
+            entry,
+            &set,
+            &mut wasm,
+            &portal_jsc_waffle::ConvertOptions::default(),
+        )
+        .expect("WasmGC module-set lowering should succeed");
+        wasm
+    })
+}
+
+fn cross_test_module_set(
+    fixtures: &[(&str, &str)],
+    entry: &str,
+    cases: &[(&str, &[f64])],
+) -> Vec<Outcome> {
+    cross_test_compiled(compile_module_set(fixtures, entry), cases)
 }
 
 // ---------------------------------------------------------------------
 // Fixtures, in increasing Repr-complexity order (§14.3).
 // ---------------------------------------------------------------------
+
+#[test]
+fn source_exceptions_lower_through_coregc_aggregates() {
+    let fixtures: &[(&str, &str)] = &[
+        (
+            "main.mjs",
+            "import { relay_two } from './relay-two.js';\n\
+             import { maybe } from './leaf.js';\n\
+             export function local() { try { throw 41; } catch (error) { return error + 1; } }\n\
+             export function catches_primitive(value) {\n\
+                 try { return relay_two(value); } catch (error) { return error + 1; }\n\
+             }\n\
+             export function catches_object() {\n\
+                 try { relay_two({ value: 40 }); } catch (error) {\n\
+                     let garbage = { next: { next: { next: 1 } } };\n\
+                     return error.value + garbage.next.next.next + 1;\n\
+                 }\n\
+             }\n\
+             export function normal_return() {\n\
+                 try { return maybe(); } catch (error) { return -1; }\n\
+             }\n\
+             export function uncaught() { return relay_two(7); }",
+        ),
+        (
+            "relay-two.js",
+            "import { relay_one } from './relay-one.js';\n\
+             export function relay_two(value) { return relay_one(value); }",
+        ),
+        (
+            "relay-one.js",
+            "import { raise } from './leaf.js';\n\
+             export function relay_one(value) { return raise(value); }",
+        ),
+        (
+            "leaf.js",
+            "export function raise(value) { throw value; }\n\
+             export function maybe() { return 42; }",
+        ),
+    ];
+    let outcomes = cross_test_module_set(
+        fixtures,
+        "main.mjs",
+        &[
+            ("local", &[]),
+            ("catches_primitive", &[41.0]),
+            ("catches_object", &[]),
+            ("normal_return", &[]),
+            ("uncaught", &[]),
+        ],
+    );
+    assert_eq!(
+        outcomes,
+        vec![
+            Outcome::Value(42.0),
+            Outcome::Value(42.0),
+            Outcome::Value(42.0),
+            Outcome::Value(42.0),
+            Outcome::Trap,
+        ],
+    );
+}
 
 #[test]
 fn numeric_arithmetic() {

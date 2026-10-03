@@ -1,7 +1,8 @@
 # Plan: source exceptions as explicit return structs
 
-**Status:** Phase 1 committed (`e9e56fa`); Phase 2 implemented and validated
-for native WasmGC; CoreGC parity and final semantic/preflight work remain.
+**Status:** Phases 1–2 committed (`e9e56fa`, `59fc8b6`); Phase 3 implemented
+and validated through CoreGC with forced collection; final semantic/preflight
+work remains.
 
 ## 1. Goal
 
@@ -241,6 +242,10 @@ Mobile emission rejects these modules; CoreGC parity is Phase 3.
 
 ### Phase 3 — CoreGC parity through generic aggregate lowering
 
+**Implemented and validated.** The exception-result struct lowers through the
+existing aggregate inventory, descriptor, call-flattening, and root-spill
+paths without exception-specific CoreGC code.
+
 1. Compile the same source fixtures through `emit_coregc`; first try the
    existing struct inventory/layout, call flattening, and root-spill logic
    without exception-specific code.
@@ -255,8 +260,10 @@ Mobile emission rejects these modules; CoreGC parity is Phase 3.
 
 **Commit:** `coregc: lower exception results as ordinary structs`.
 
-**Gate:** native/CoreGC outcomes match for all supported fixtures under normal
-and forced collection schedules; existing CoreGC cross tests pass.
+**Gate:** native/CoreGC outcomes match for supported local and multi-module
+throw/catch, multi-call propagation, post-catch object use after allocating,
+normal returns, and uncaught-export traps under normal and forced collection
+schedules; the complete existing CoreGC cross-test suite passes.
 
 ### Phase 4 — semantic regressions and consumer documentation
 

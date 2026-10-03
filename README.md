@@ -14,6 +14,15 @@ Compiler workspace (`jsaw`) related to `jsaw-core`, containing the WasmGC backen
 - `crates/jsaw-wasi-bin` — the whole compiler as a `wasm32-wasip1` binary (JSON manifest on stdin, one JSON result line on stdout), so any host that can run Wasm/WASI can compile JS → WasmGC / Java / Swift.
 - `gradle/jsaw-gradle-plugin` — the `dev.portal.jsaw` Gradle plugin, which runs that compiler wasm inside the build via Chicory (see `docs/gradle-plugin.md`).
 
+## Source exception boundary
+
+The WasmGC backend supports synchronous JavaScript `throw`/`try`-`catch`
+across jsaw source calls. Uncaught throws trap at exported boundaries; the
+internal exception-result value is never exposed. CoreGC uses the same
+internal propagation model. Foreign Wasm-import exceptions, Wasm traps,
+`finally`, and asynchronous exceptions are not caught by this protocol.
+Mobile emitters reject exception-bearing modules.
+
 ## Progress
 - [ ] Workspace setup with backend crates
 

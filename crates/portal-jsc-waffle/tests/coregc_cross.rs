@@ -470,6 +470,13 @@ fn source_exceptions_lower_through_coregc_aggregates() {
                      return error.value + garbage.next.next.next + 1;\n\
                  }\n\
              }\n\
+             export function catches_object_identity() {\n\
+                 let marker = { value: 40 };\n\
+                 try { relay_two(marker); } catch (error) {\n\
+                     let garbage = { next: { next: 1 } };\n\
+                     return error === marker ? garbage.next.next + 41 : 0;\n\
+                 }\n\
+             }\n\
              export function normal_return() {\n\
                  try { return maybe(); } catch (error) { return -1; }\n\
              }\n\
@@ -498,6 +505,7 @@ fn source_exceptions_lower_through_coregc_aggregates() {
             ("local", &[]),
             ("catches_primitive", &[41.0]),
             ("catches_object", &[]),
+            ("catches_object_identity", &[]),
             ("normal_return", &[]),
             ("uncaught", &[]),
         ],
@@ -505,6 +513,7 @@ fn source_exceptions_lower_through_coregc_aggregates() {
     assert_eq!(
         outcomes,
         vec![
+            Outcome::Value(42.0),
             Outcome::Value(42.0),
             Outcome::Value(42.0),
             Outcome::Value(42.0),

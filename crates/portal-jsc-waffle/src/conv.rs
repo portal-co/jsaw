@@ -11,6 +11,7 @@ use portal_pc_waffle::{
     Import, ImportKind, Module, Operator, SignatureData, Table, TableData, Terminator, Type, Value,
     WithNullable,
 };
+use swc_common::SyntaxContext;
 use swc_ecma_ast::{BinaryOp, Id as Ident, Lit, UnaryOp};
 
 use crate::linker::{ImportTarget, ModuleSet};
@@ -275,6 +276,11 @@ pub fn convert_modules<'a, 'wasm>(
                 ImportTarget::WasmHost(_) => false,
             })
         });
+    if converter.exceptions_enabled {
+        for path in set.keys() {
+            converter.collect_module_function_locals(path, set.get(path)?);
+        }
+    }
     // The entry module's top-level body performs the context stores that
     // install hoisted function declarations (`function run(){}` lowers to a
     // `StoreId` of the literal). Walk it first so its assignments participate
@@ -1133,6 +1139,11 @@ struct Converter<'a, 'module, 'wasm> {
     /// name produces a [`LowerValue::FunctionRef`] whose tag check proves
     /// the binding is unchanged at call time. Reset per top-level function.
     function_literal_locals: BTreeMap<Ident, &'a SFunc>,
+    /// Hoisted function declarations owned by each ES module, keyed by the
+    /// original hygienic SWC identifier. Calls may use these native targets
+    /// directly even when the runtime context does not materialize the
+    /// declaration as an ordinary property.
+    module_function_locals: BTreeMap<(String, Ident), &'a SFunc>,
     /// Reverse map from a lowered function's key to the context name its
     /// literal was stored under by the enclosing scope (`function name()`
     /// declarations and single-assignment `let f = function(){}` in the
@@ -1204,6 +1215,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             current_native_returns: ReturnType::Boxed,
             current_return_kinds: ReturnKinds::default(),
             function_literal_locals: BTreeMap::new(),
+            module_function_locals: BTreeMap::new(),
             function_self_names: BTreeMap::new(),
             lowering_function: None,
             lowering_function_key: None,
@@ -1269,6 +1281,25 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         self.collect_shadowed_names_nested(func, visited, false)
     }
 
+    fn collect_module_function_locals(&mut self, module_path: &str, module: &'a SModule) {
+        self.shadowed_names.clear();
+        self.function_literal_locals.clear();
+        let mut visited = BTreeSet::new();
+        self.collect_shadowed_names(&module.body, &mut visited);
+        for function in module.funcs.values() {
+            self.collect_shadowed_names(function, &mut visited);
+        }
+        for (name, function) in &module.funcs {
+            let id = (name.clone(), SyntaxContext::empty());
+            if !self.shadowed_names.contains(&id) {
+                self.module_function_locals
+                    .insert((module_path.to_owned(), id), function);
+            }
+        }
+        self.shadowed_names.clear();
+        self.function_literal_locals.clear();
+    }
+
     fn collect_shadowed_names_nested(
         &mut self,
         func: &'a SFunc,
@@ -1331,7 +1362,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 item: Item::Func { func: literal, .. },
                 ..
             } => Some(literal),
-            // An alias of a function literal also retains the origin.
+            SValue::LoadId(id) => self
+                .module_function_locals
+                .get(&(self.current_module.clone(), id.clone()))
+                .copied(),
+            // An alias of a function literal or a hoisted module function
+            // also retains the origin.
             SValue::Item {
                 item: Item::Just { id },
                 ..
@@ -1340,6 +1376,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     item: Item::Func { func: literal, .. },
                     ..
                 } => Some(literal),
+                SValue::LoadId(id) => self
+                    .module_function_locals
+                    .get(&(self.current_module.clone(), id.clone()))
+                    .copied(),
                 _ => None,
             },
             _ => None,
@@ -3002,6 +3042,49 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                             sfunc.cfg.blocks[sblock].postcedent.catch,
                             SCatch::Just { .. }
                         );
+                        if let Some(info) = self.module_function_info_for_callee(callee)? {
+                            for (block, result) in self.direct_native_call(
+                                body,
+                                continuation.block,
+                                context,
+                                info,
+                                this.clone(),
+                                &continuation.values,
+                                args,
+                            )? {
+                                let LowerValue::CallResult(result) = result else {
+                                    return Err(ConvertError::invalid(
+                                        "module function call lost its exception result",
+                                    ));
+                                };
+                                if catches_here {
+                                    let (normal, value) = self.route_call_result(
+                                        sfunc,
+                                        sblock,
+                                        body,
+                                        &mut blocks,
+                                        &mut pending,
+                                        block,
+                                        &continuation.values,
+                                        result,
+                                    )?;
+                                    body.set_terminator(
+                                        normal,
+                                        Terminator::Return {
+                                            values: vec![value.wasm()?.0],
+                                        },
+                                    );
+                                } else {
+                                    body.set_terminator(
+                                        block,
+                                        Terminator::Return {
+                                            values: vec![result],
+                                        },
+                                    );
+                                }
+                            }
+                            continue;
+                        }
                         if catches_here
                             && let TCallee::Val(value) = callee
                             && let Some(LowerValue::FunctionRef { info, .. }) =
@@ -3544,6 +3627,29 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 } else {
                     self.function_literal_locals.get(&key).copied()
                 };
+                // Hoisted local function declarations are kept as native
+                // function values rather than ordinary context properties;
+                // the module-function table also supplies their stable source
+                // identity for direct calls and single-assignment aliases.
+                if self.exceptions_enabled
+                    && let Some(function) = self
+                        .module_function_locals
+                        .get(&(self.current_module.clone(), id.clone()))
+                        .copied()
+                {
+                    let module = self.current_module.clone();
+                    let info = self.ensure_function(function, &module)?;
+                    let value = self.function_object_from_info(
+                        body,
+                        block,
+                        context,
+                        this.clone(),
+                        info,
+                        false,
+                        true,
+                    )?;
+                    return Ok(vec![(block, value)]);
+                }
                 // Imports are lexical bindings, not context properties. In
                 // particular no module body stores the importing local name
                 // into the shared context. Looking it up first therefore
@@ -3744,6 +3850,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             };
         }
         if let Item::Call { callee, args } = item {
+            if let Some(info) = self.module_function_info_for_callee(callee)? {
+                return self.direct_native_call(body, block, context, info, this, values, args);
+            }
             // Provable primordial call: the callee is `<unshadowed
             // primordial>.<member-with-fast-core>` — skip the lookup, the
             // arguments array, and the `CallRef` dispatch entirely. Proven
@@ -13308,6 +13417,34 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &values,
             &[self.repr.arguments_ty()],
         ))
+    }
+
+    fn module_function_info_for_callee(
+        &mut self,
+        callee: &TCallee<SValueId>,
+    ) -> Result<Option<FunctionInfo>, ConvertError> {
+        if !self.exceptions_enabled {
+            return Ok(None);
+        }
+        let TCallee::Val(value) = callee else {
+            return Ok(None);
+        };
+        let Some(source) = self.lowering_function else {
+            return Ok(None);
+        };
+        let Some(SValue::LoadId(id)) = source.cfg.values.get(*value).map(|value| &value.value)
+        else {
+            return Ok(None);
+        };
+        let module = self.current_module.clone();
+        let Some(function) = self
+            .module_function_locals
+            .get(&(module.clone(), id.clone()))
+            .copied()
+        else {
+            return Ok(None);
+        };
+        self.ensure_function(function, &module).map(Some)
     }
 
     /// Emit the direct dispatch to a function literal's native body: a

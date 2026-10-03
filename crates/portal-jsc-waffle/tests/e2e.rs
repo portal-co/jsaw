@@ -4026,7 +4026,17 @@ fn m17_try_catch_catches_cross_function_throw() {
                  try { rethrow(value); } catch (error) { return error + 1; }\n\
              }\n\
              export function uncaught() { throw 7; }\n\
-             export function uncaught_call(value) { return raise(value); }",
+             export function uncaught_call(value) { return raise(value); }\n\
+             export function run_supported(value) {\n\
+                 if (local() !== 42) return 1;\n\
+                 if (caught(value) !== 42) return 2;\n\
+                 if (catches_normal_return() !== 42) return 3;\n\
+                 if (nested_catch() !== 42) return 4;\n\
+                 if (caught_object() !== 42) return 5;\n\
+                 if (caught_imported_object() !== 42) return 6;\n\
+                 if (catches_rethrow(value) !== 42) return 7;\n\
+                 return 42;\n\
+             }",
         ),
         (
             "thrower.js",
@@ -4041,13 +4051,7 @@ fn m17_try_catch_catches_cross_function_throw() {
     let mobile_error = portal_jsc_mob_emit::audit::audit_module(&module)
         .expect_err("mobile emitters must reject exception-result modules");
     assert!(mobile_error.message.contains("exception-result"));
-    assert_executes_in_wasm_runtimes(&module, "local", &[], 42.0);
-    assert_executes_in_wasm_runtimes(&module, "caught", &[41.0], 42.0);
-    assert_executes_in_wasm_runtimes(&module, "catches_normal_return", &[], 42.0);
-    assert_executes_in_wasm_runtimes(&module, "nested_catch", &[], 42.0);
-    assert_executes_in_wasm_runtimes(&module, "caught_object", &[], 42.0);
-    assert_executes_in_wasm_runtimes(&module, "caught_imported_object", &[], 42.0);
-    assert_executes_in_wasm_runtimes(&module, "catches_rethrow", &[41.0], 42.0);
+    assert_executes_in_wasm_runtimes(&module, "run_supported", &[41.0], 42.0);
     let bytes = wasm_bytes(&module);
 
     let mut config = Config::new();
@@ -4075,6 +4079,87 @@ fn m17_try_catch_catches_cross_function_throw() {
             .is_err(),
         "an escaping exception from a source call must trap at the public export",
     );
+}
+
+#[test]
+fn m17_try_catch_catches_same_module_function_throw() {
+    let module = compile_module(
+        "\
+            function raise(value) { throw value; }\n\
+            function maybe() { return 41; }\n\
+            function recurse(depth) {\n\
+                if (depth === 0) throw 41;\n\
+                return recurse(depth - 1);\n\
+            }\n\
+            function raise_undefined() { throw undefined; }\n\
+            function rethrow(value) {\n\
+                try { throw value; } catch (error) { throw error; }\n\
+            }\n\
+            export function caught(value) {\n\
+                try { return raise(value); } catch (error) { return error + 1; }\n\
+            }\n\
+            export function normal_return() {\n\
+                try { return maybe(); } catch (error) { return -1; }\n\
+            }\n\
+            export function caught_indirect(value) {\n\
+                let indirect = raise;\n\
+                try { return indirect(value); } catch (error) { return error + 1; }\n\
+            }\n\
+            export function caught_recursive() {\n\
+                try { return recurse(3); } catch (error) { return error + 1; }\n\
+            }\n\
+            export function catches_undefined() {\n\
+                try { raise_undefined(); } catch (error) { return error === undefined ? 42 : 0; }\n\
+            }\n\
+            export function catches_same_object() {\n\
+                let marker = { value: 41 };\n\
+                try { throw marker; } catch (error) { return error === marker ? 42 : 0; }\n\
+            }\n\
+            export function catches_object_payload() {\n\
+                try { throw { value: 41 }; } catch (error) { return error.value + 1; }\n\
+            }\n\
+            export function ordinary_object_identity() {\n\
+                let marker = { value: 41 };\n\
+                return marker === marker ? 42 : 0;\n\
+            }\n\
+            export function catch_object_self_identity() {\n\
+                try { throw { value: 41 }; } catch (error) { return error === error ? 42 : 0; }\n\
+            }\n\
+            export function catches_without_binding() {\n\
+                try { throw 41; } catch { return 42; }\n\
+            }\n\
+            export function catches_shadowed_name() {\n\
+                let error = 40;\n\
+                try { throw 1; } catch (error) { return error + 41; }\n\
+            }\n\
+            export function catches_rethrown_object() {\n\
+                let marker = { value: 41 };\n\
+                try { rethrow(marker); } catch (error) { return error === marker ? 42 : 0; }\n\
+            }\n\
+            export function ordinary_envelope_shape() {\n\
+                let ordinary = { state: 1, payload: 41 };\n\
+                try { return ordinary.state + ordinary.payload; } catch (error) { return 0; }\n\
+            }\n\
+            export function run_semantics(value) {\n\
+                if (caught(value) !== 42) return 1;\n\
+                if (normal_return() !== 41) return 2;\n\
+                if (caught_indirect(value) !== 42) return 3;\n\
+                if (caught_recursive() !== 42) return 4;\n\
+                if (catches_undefined() !== 42) return 5;\n\
+                if (ordinary_object_identity() !== 42) return 6;\n\
+                if (catch_object_self_identity() !== 42) return 7;\n\
+                if (catches_same_object() !== 42) return 8;\n\
+                if (catches_object_payload() !== 42) return 9;\n\
+                if (catches_without_binding() !== 42) return 10;\n\
+                if (catches_shadowed_name() !== 42) return 11;\n\
+                if (catches_rethrown_object() !== 42) return 12;\n\
+                if (ordinary_envelope_shape() !== 42) return 13;\n\
+                return 42;\n\
+            }\n\
+        ",
+    );
+    validate_wasm_only(&module);
+    assert_executes_in_wasm_runtimes(&module, "run_semantics", &[41.0], 42.0);
 }
 
 #[test]

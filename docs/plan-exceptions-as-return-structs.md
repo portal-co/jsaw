@@ -1,8 +1,9 @@
 # Plan: source exceptions as explicit return structs
 
-**Status:** Phases 1–2 committed (`e9e56fa`, `59fc8b6`); Phase 3 implemented
-and validated through CoreGC with forced collection; final semantic/preflight
-work remains.
+**Status:** Phases 1–3 are committed (`e9e56fa`, `59fc8b6`, `dfa4d3c`).
+Phase 4 implementation and focused validation are complete; the broad e2e gate
+remains open because the full run was interrupted after extended execution and
+reported unrelated JVM-emitter failures.
 
 ## 1. Goal
 
@@ -267,15 +268,34 @@ schedules; the complete existing CoreGC cross-test suite passes.
 
 ### Phase 4 — semantic regressions and consumer documentation
 
-1. Add boundary and adversarial tests for direct/indirect calls, recursive
+**Implemented.** The native fixture covers same-module direct and
+single-assignment indirect calls, recursive calls, `undefined`, object
+identity (including rethrow), shadowed catch names, optional catch binding,
+and ordinary objects whose fields resemble the envelope. The CoreGC
+multi-module fixture additionally checks thrown-object identity after relay
+calls and handler allocations under forced collection. This exposed stale
+exception-edge values in jsaw-core's TAC-to-SSA conversion: catch shims were
+captured at block entry rather than refreshed after preceding assignments or
+before a potentially-throwing statement. The SSA conversion now refreshes the
+edge at those transfer points.
+
+Focused checks pass: the 3 `m17_try_catch` e2e tests, all 15 `coregc_cross`
+tests, and all 69 `portal-jsc-waffle` library tests. The dedicated SSA
+regression passes; the full `portal-jsc-swc-ssa` suite still has the unrelated
+`test_inline_iifes` failure, reproduced with the exception-edge change removed.
+The broad e2e run exceeded an hour and was interrupted before a final summary;
+its partial log shows many completed tests plus failures, and an isolated
+post-change rerun of `executes_array_instance_methods` still fails in the JVM
+emitter with `split function fell through`. Phase 4's broad-suite gate is not
+claimed complete.
+
+1. [x] Add boundary and adversarial tests for direct/indirect calls, recursive
    calls, `undefined`, object identity, rethrow, shadowed catch names, and
-   ordinary objects whose properties resemble the envelope fields.
-2. Document that uncaught exceptions trap at exported boundaries and that
+   ordinary objects whose properties resemble the envelope.
+2. [x] Document that uncaught exceptions trap at exported boundaries and that
    foreign host throws, Wasm traps, `finally`, async exceptions, and mobile
    emission are not supported by this milestone.
-3. Update the existing host-boundary plan when implementation starts:
-   `docs/plan-wasm-handle-imports-exports.md` §8 currently lists “exception
-   ABI” as a non-goal. Remove or narrow that exclusion so it describes only
+3. [x] Narrow the existing host-boundary plan's “exception ABI” exclusion to
    host-visible exception transport; this plan's internal return-struct
    protocol does not change the handle ABI.
 

@@ -67,6 +67,10 @@ pub(crate) struct Repr {
     pub(crate) multi_ri: Signature,
     pub(crate) multi_if: Signature,
     pub(crate) multi_rif: Signature,
+    /// Private tagged completion envelope returned by source-callable
+    /// functions. It is deliberately not part of the JavaScript object/value
+    /// representation; only exception-aware call lowering may unpack it.
+    pub(crate) exception_result: Signature,
     /// The adapter signature's return type (`anyref`), so call sites can
     /// type a `CallRef`/`ReturnCallRef` to the adapter explicitly.
     pub(crate) adapter_value: Type,
@@ -276,6 +280,10 @@ impl Repr {
             ],
             shared: false,
         });
+        let exception_result = module.signatures.push(SignatureData::Struct {
+            fields: vec![field(Type::I32), field(value)],
+            shared: false,
+        });
         let adapter = module.signatures.push(SignatureData::Func {
             params: vec![ref_sig(object), value, ref_sig(arguments)],
             returns: vec![value],
@@ -369,6 +377,7 @@ impl Repr {
             multi_ri,
             multi_if,
             multi_rif,
+            exception_result,
         }
     }
 
@@ -532,6 +541,14 @@ pub(crate) const SLOT_FLAGS_DEFAULT: i32 = SLOT_WRITABLE | SLOT_ENUMERABLE | SLO
 /// field's declaration in [`Repr::new`]).
 pub(crate) const FUNCTION_FIELD_TAG: usize = 7;
 
+/// Field indexes in the private exception-result struct.
+pub(crate) const EXCEPTION_RESULT_FIELD_STATE: usize = 0;
+pub(crate) const EXCEPTION_RESULT_FIELD_PAYLOAD: usize = 1;
+
+/// Exception-result state discriminants. Every other value is invalid.
+pub(crate) const EXCEPTION_RESULT_NORMAL: i32 = 0;
+pub(crate) const EXCEPTION_RESULT_THROWN: i32 = 1;
+
 /// The i31 payload representing JS `null`. The null `anyref` is reserved for
 /// `undefined`, so `null` needs a distinct representation that is cheap,
 /// identity-comparable via `ref.eq`, and detectable with `ref.test` against
@@ -554,6 +571,29 @@ pub(crate) fn ref_sig(sig_index: Signature) -> Type {
         value: portal_pc_waffle::HeapType::Sig { sig_index },
         nullable: true,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use portal_pc_waffle::{Module, SignatureData, StorageType, Type};
+
+    use super::{EXCEPTION_RESULT_FIELD_PAYLOAD, EXCEPTION_RESULT_FIELD_STATE, Repr};
+
+    #[test]
+    fn exception_result_is_a_private_tagged_aggregate() {
+        let mut module = Module::empty();
+        let repr = Repr::new(&mut module);
+        assert_ne!(repr.exception_result, repr.object);
+
+        let SignatureData::Struct { fields, .. } = &module.signatures[repr.exception_result] else {
+            panic!("exception result must be a struct");
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(EXCEPTION_RESULT_FIELD_STATE, 0);
+        assert_eq!(EXCEPTION_RESULT_FIELD_PAYLOAD, 1);
+        assert!(matches!(fields[0].value, StorageType::Val(Type::I32)));
+        assert!(matches!(fields[1].value, StorageType::Val(Type::Heap(_))));
+    }
 }
 
 /// An actionable lowering error. `convert` never uses `todo!` for user IR:

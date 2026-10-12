@@ -17,7 +17,7 @@ anyhow = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-wasmtime = { version = "47", default-features = false, features = ["cranelift", "runtime"] }
+wasmtime = { version = "47", default-features = false, features = ["cranelift", "gc-null", "runtime"] }
 wasmtime-wasi = { version = "47", default-features = false, features = ["p1"] }
 wasmparser = { version = "0.240", features = ["validate"] }
 # Milestone 15 (dogfood): characterize the wasm-blitz JS the compiler wasm

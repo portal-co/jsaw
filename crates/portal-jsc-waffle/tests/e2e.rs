@@ -424,6 +424,57 @@ fn compiles_objects_functions_and_constructors_end_to_end() {
 }
 
 #[test]
+fn non_tail_self_recursive_call_executes() {
+    // Found via the DreamComp corpus bridge (family
+    // `non_tail_call_self_recursive`): a non-tail self call must not trap.
+    let module = lower_module(
+        "export function sumTo(n) { if (n) { return n + sumTo(n - 1); } return 0; }",
+        &portal_jsc_waffle::ConvertOptions::default(),
+    )
+    .expect("module lowering should succeed");
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "sumTo", &[5.0], 15.0);
+}
+
+#[test]
+fn non_tail_two_saved_call_executes() {
+    // Found via the DreamComp corpus bridge (family
+    // `non_tail_call_two_saved`): two non-tail calls to the same callee,
+    // combining results.
+    let module = lower_module(
+        "function addOne(x) { return x + 1; }\n\
+         export function combine(a, b) { return addOne(a) + addOne(b); }",
+        &portal_jsc_waffle::ConvertOptions::default(),
+    )
+    .expect("module lowering should succeed");
+    validate(&module);
+    if std::env::var_os("JSAW_DUMP_BODY").is_some() {
+        for (func, decl) in module.funcs.entries() {
+            let Some(body) = decl.body() else { continue };
+            println!("=== {} (f{}) ===", decl.name(), func.index());
+            println!("{}", body.display("  ", Some(&module)));
+        }
+    }
+    assert_executes_in_all_runtimes(&module, "combine", &[3.0, 4.0], 9.0);
+}
+
+#[test]
+fn zero_fill_right_shift_widens_unsigned() {
+    // `-1 >>> 0` is ToUint32: the result bits are unsigned, so widening the
+    // raw i32 to the f64 boundary must zero-extend. Sign-extending turns the
+    // result into -1 instead of 4294967295 (found via the DreamComp corpus
+    // bridge, family `shru_unsigned`).
+    let module = lower_module(
+        "export function shru(a, b) { return a >>> b; }",
+        &portal_jsc_waffle::ConvertOptions::default(),
+    )
+    .expect("module lowering should succeed");
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "shru", &[-1.0, 0.0], 4294967295.0);
+    assert_executes_in_all_runtimes(&module, "shru", &[-8.0, 1.0], 2147483644.0);
+}
+
+#[test]
 fn compiles_numeric_operators_and_cfg_with_raw_values() {
     let module = compile(
         "let a = 7, b = 3; \

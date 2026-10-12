@@ -1781,7 +1781,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             Lt | LtEq | Gt | GtEq | EqEq | EqEqEq | NotEq | NotEqEq | InstanceOf | In => {
                 Some(ValueKind::Boolean)
             }
-            BitAnd | BitOr | BitXor | LShift | RShift | ZeroFillRShift => {
+            BitAnd | BitOr | BitXor | LShift | RShift => {
                 // BigInt bitwise ops yield a BigInt; number bitwise ops an i32.
                 let left_kind = self.classify_return_value(root, left);
                 let right_kind = self.classify_return_value(root, right);
@@ -1791,6 +1791,19 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     return Some(ValueKind::BigInt);
                 }
                 Some(ValueKind::Integer)
+            }
+            // `>>>` is ToUint32: results up to 4294967295 do not fit in an
+            // i32, so the return representation is the f64 Number lane, not
+            // the raw i32 Integer lane.
+            ZeroFillRShift => {
+                let left_kind = self.classify_return_value(root, left);
+                let right_kind = self.classify_return_value(root, right);
+                if matches!(left_kind, Some(ValueKind::BigInt))
+                    || matches!(right_kind, Some(ValueKind::BigInt))
+                {
+                    return Some(ValueKind::BigInt);
+                }
+                Some(ValueKind::Number)
             }
             // `**` is ordinary floating-point exponentiation.
             Exp => Some(ValueKind::Number),
@@ -4906,7 +4919,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             EqEq | EqEqEq | NotEq | NotEqEq => {
                 self.equality(body, block, left, right, matches!(op, NotEq | NotEqEq))
             }
-            BitAnd | BitOr | BitXor | LShift | RShift | ZeroFillRShift => {
+            BitAnd | BitOr | BitXor | LShift | RShift => {
                 let left = self.as_i32(body, block, left)?;
                 let right = self.as_i32(body, block, right)?;
                 let operator = match op {
@@ -4915,12 +4928,25 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     BitXor => Operator::I32Xor,
                     LShift => Operator::I32Shl,
                     RShift => Operator::I32ShrS,
-                    ZeroFillRShift => Operator::I32ShrU,
                     _ => unreachable!(),
                 };
                 Ok(LowerValue::Wasm {
                     value: body.add_op(block, operator, &[left, right], &[Type::I32]),
                     kind: ValueKind::Integer,
+                })
+            }
+            ZeroFillRShift => {
+                // `>>>` is ToUint32: the i32 result bits are unsigned, so
+                // widen by zero-extension before converting to f64 —
+                // F64ConvertI32S on the raw bits would sign-extend and turn
+                // e.g. `-1 >>> 0` into -1 instead of 4294967295.
+                let left = self.as_i32(body, block, left)?;
+                let right = self.as_i32(body, block, right)?;
+                let shifted = body.add_op(block, Operator::I32ShrU, &[left, right], &[Type::I32]);
+                let widened = body.add_op(block, Operator::I64ExtendI32U, &[shifted], &[Type::I64]);
+                Ok(LowerValue::Wasm {
+                    value: body.add_op(block, Operator::F64ConvertI64U, &[widened], &[Type::F64]),
+                    kind: ValueKind::Number,
                 })
             }
             LogicalAnd | LogicalOr => {

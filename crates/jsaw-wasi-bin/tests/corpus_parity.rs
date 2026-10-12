@@ -91,33 +91,35 @@ fn dreamcomp_corpus_runs_identically_through_jsaw_wasmbc() {
     let mut unsupported = 0usize;
     let mut unavailable = 0usize;
     for case in &corpus.cases {
-        let started = Instant::now();
-        let report = run_case(case);
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-        match &report.status[..] {
-            "pass" => pass += 1,
-            "fail" => fail += 1,
-            "unsupported" => unsupported += 1,
-            _ => unavailable += 1,
+        for lane in ["wasmbc", "nano_mvp"] {
+            let started = Instant::now();
+            let report = run_case(case, lane);
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            match &report.status[..] {
+                "pass" => pass += 1,
+                "fail" => fail += 1,
+                "unsupported" => unsupported += 1,
+                _ => unavailable += 1,
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "id": case.id,
+                    "name": case.name,
+                    "lane": lane,
+                    "status": report.status,
+                    "expected": case.expected,
+                    "actual": report.actual,
+                    "error": report.error,
+                    "compile_and_run_ms": elapsed_ms,
+                    "alloc_count": serde_json::Value::Null,
+                    "alloc_bytes": serde_json::Value::Null,
+                    "peak_live_bytes": serde_json::Value::Null,
+                    "retained_objects": serde_json::Value::Null,
+                    "metrics_unavailable": ["alloc_count", "alloc_bytes", "peak_live_bytes", "retained_objects"],
+                })
+            );
         }
-        println!(
-            "{}",
-            serde_json::json!({
-                "id": case.id,
-                "name": case.name,
-                "lane": "wasmbc",
-                "status": report.status,
-                "expected": case.expected,
-                "actual": report.actual,
-                "error": report.error,
-                "compile_and_run_ms": elapsed_ms,
-                "alloc_count": serde_json::Value::Null,
-                "alloc_bytes": serde_json::Value::Null,
-                "peak_live_bytes": serde_json::Value::Null,
-                "retained_objects": serde_json::Value::Null,
-                "metrics_unavailable": ["alloc_count", "alloc_bytes", "peak_live_bytes", "retained_objects"],
-            })
-        );
     }
     println!(
         "{}",
@@ -125,7 +127,7 @@ fn dreamcomp_corpus_runs_identically_through_jsaw_wasmbc() {
             "summary": true,
             "lane": "wasmbc",
             "source_fingerprint": corpus.source_fingerprint,
-            "cases": corpus.cases.len(),
+            "cases": corpus.cases.len() * 2,
             "pass": pass,
             "fail": fail,
             "unsupported": unsupported,
@@ -133,11 +135,13 @@ fn dreamcomp_corpus_runs_identically_through_jsaw_wasmbc() {
         })
     );
     assert_eq!(fail, 0, "{fail} corpus case(s) mismatched DreamComp expectations");
+    // Five ~Natives_inlineme families per lane (DreamCompat sentinels are
+    // outside jsaw), nothing else may be unsupported or unavailable.
     assert!(
-        unsupported <= 5,
-        "unexpected unsupported cases: {unsupported} (at most the five ~Natives_inlineme families are allowed)"
+        unsupported <= 10,
+        "unexpected unsupported cases: {unsupported} (at most the five ~Natives_inlineme families per lane are allowed)"
     );
-    assert_eq!(pass + unsupported, corpus.cases.len());
+    assert_eq!(pass + unsupported, corpus.cases.len() * 2);
 }
 
 struct CaseReport {
@@ -146,7 +150,7 @@ struct CaseReport {
     error: Option<String>,
 }
 
-fn run_case(case: &CorpusCase) -> CaseReport {
+fn run_case(case: &CorpusCase, lane: &str) -> CaseReport {
     // Cases exercising DreamComp-native sentinels (`~Natives_*`, e.g. the
     // `inlineme` inlining hint) are outside jsaw's WasmGC lane by design:
     // jsaw has no DreamCompat natives. Report them as explicitly unsupported
@@ -158,7 +162,7 @@ fn run_case(case: &CorpusCase) -> CaseReport {
             error: Some("requires a DreamComp native sentinel, not available in jsaw".into()),
         };
     }
-    match try_case(case) {
+    match try_case(case, lane) {
         Ok(actual) => {
             if actual == case.expected || (actual.is_nan() && case.expected.is_nan()) {
                 CaseReport {
@@ -185,7 +189,7 @@ fn run_case(case: &CorpusCase) -> CaseReport {
     }
 }
 
-fn try_case(case: &CorpusCase) -> anyhow::Result<f64> {
+fn try_case(case: &CorpusCase, lane: &str) -> anyhow::Result<f64> {
     let args: Vec<f64> = case
         .args
         .iter()
@@ -207,7 +211,16 @@ fn try_case(case: &CorpusCase) -> anyhow::Result<f64> {
         &portal_jsc_waffle::ConvertOptions::default(),
     )
     .map_err(|e| anyhow::anyhow!("lowering failed: {e}"))?;
-    let bytes = portal_pc_waffle::to_wasm_bytes(&module)?;
+    let bytes = match lane {
+        "wasmbc" => portal_pc_waffle::to_wasm_bytes(&module)?,
+        "nano_mvp" => {
+            let plan = portal_jsc_waffle::BackendPlan::from_module(&module)
+                .map_err(|d| anyhow::anyhow!("plan diagnostics: {d:?}"))?;
+            portal_jsc_waffle::emit_nano_mvp(&plan)
+                .map_err(|d| anyhow::anyhow!("nano MVP diagnostics: {d:?}"))?
+        }
+        other => anyhow::bail!("unknown lane {other:?}"),
+    };
     run_export(&bytes, &case.export, &args)?
         .ok_or_else(|| anyhow::anyhow!("export did not return an f64"))
 }

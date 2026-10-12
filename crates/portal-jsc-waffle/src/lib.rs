@@ -1,3 +1,4 @@
+pub mod backend_plan;
 pub mod conv;
 pub mod coregc;
 pub mod coregc_emit;
@@ -8,10 +9,20 @@ pub mod coregc_runtime;
 pub mod ingest;
 pub mod linker;
 pub mod nano;
+pub mod nano_native;
 pub mod repr;
 pub mod revision;
+pub mod specialize;
 mod wasm_boundary;
 
+pub use backend_plan::{
+    BACKEND_PLAN_SCHEMA, BackendPlan, BackendPlanDiagnostic, BoundaryAbi, BoundaryDirection,
+    BoundaryRecord, BoundaryTarget, CompletionKind, CompletionShape, DiagnosticKind, PlanArenaOp,
+    PlanBlock, PlanBlockId, PlanCall, PlanCallKind, PlanConst, PlanField, PlanFuncId,
+    PlanFunction, PlanFunctionKind, PlanGlobal, PlanHeapType, PlanInst, PlanLayout, PlanMemory,
+    PlanRefTarget, PlanSigId, PlanSignature, PlanStorage, PlanTable, PlanTarget, PlanTerminator,
+    PlanType, PlanValue, PlanValueDef, PlanValueId, RuntimeRequirements, TypeId,
+};
 pub use conv::{
     ComponentFunctions, ComponentHandle, ConvertOptions, IncrementalConverter, convert,
     convert_module, convert_modules,
@@ -34,7 +45,21 @@ pub use ingest::{
 };
 pub use linker::ModuleSet;
 pub use nano::{ArenaRef, NanoArena, NanoArenaError, NanoLifetime, NanoPlan, NanoValueRepresentation};
+pub use nano_native::{
+    AdapterAbiRecord, CapabilityCheck, InlineBudget, InlineRecord, InliningMode,
+    NANO_NATIVE_SCHEMA, NanoCallDecision, NanoCallStrategy, NanoNativeConfig,
+    NanoNativeDiagnostic, NanoNativeDiagnosticKind, NanoNativeOutcome, NanoNativePlan,
+    ParamElision, RequiredCapabilities, TargetCapabilities, plan_nano_native,
+};
 pub use repr::ConvertError;
+pub use specialize::{
+    AliasClass, BoundaryLiveness, CallSiteParamEnv, CoarseningRecord, CoreGcFacts,
+    CoreGcFastPath, EVAL_STEP_BOUND, EvalReport, FastPathHint, FlattenedFieldFact, FunctionFacts,
+    MAX_ENV_DEPTH, ManifestEntry, MutationClass, Nullability, ObjectFact, SPECIALIZATION_SCHEMA,
+    SpecializationDiagnostic, SpecializationDiagnosticKind, SpecializationKey,
+    SpecializationManifest, SpecializationMode, SpecializationOutcome, Specializer, ValueFact,
+    Variant, VariantBudget, VariantRequest, WaffleIdentity, WrappingArithmetic,
+};
 pub use revision::{
     ActivationError, ActiveRevision, ContentRevisionId, DeltaOperation, DispatchDeltaActivator,
     FragmentCache, FullRevisionReason, MemoryFragmentCache, ModuleDelta, ReinstantiatingActivator,

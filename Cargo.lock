@@ -1709,6 +1709,7 @@ dependencies = [
  "portal-pc-waffle",
  "ryu-js",
  "serde",
+ "serde_json",
  "sha3",
  "swc_atoms",
  "swc_common",

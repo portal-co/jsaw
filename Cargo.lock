@@ -3791,6 +3791,10 @@ name = "vaffle"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "volar-evm-backend"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "volar-ir"
 version = "0.1.0"
 
@@ -3808,6 +3812,10 @@ version = "0.1.0"
 
 [[patch.unused]]
 name = "volar-ir-passes"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-ir-simd"
 version = "0.1.0"
 
 [[patch.unused]]

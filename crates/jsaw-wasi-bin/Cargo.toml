@@ -6,6 +6,7 @@ license = "MPL-2.0"
 description = "jsaw compiler as a wasm32-wasip1 binary: JS module set -> WasmGC / Java / Swift"
 
 [dependencies]
+portal-jsc-common = { workspace = true }
 portal-jsc-waffle = { path = "../portal-jsc-waffle" }
 portal-jsc-jvm-emit = { path = "../mobile/portal-jsc-jvm-emit" }
 portal-jsc-swift-emit = { path = "../mobile/portal-jsc-swift-emit" }

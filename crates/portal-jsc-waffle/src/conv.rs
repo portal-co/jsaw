@@ -69,6 +69,11 @@ pub struct ConvertOptions {
     /// `(context, this, arguments-array) -> value` ABI and is intended only
     /// for embedders that can construct the internal GC values.
     pub gc_export_suffix: Option<String>,
+    /// Resolved named assumptions applied during WasmGC emission. Build with
+    /// `portal_jsc_common::assumptions::AssumptionRegistry`; unresolved or
+    /// invalid requests never reach this field. The default is the empty set,
+    /// preserving legacy behavior.
+    pub assumptions: portal_jsc_common::assumptions::AssumptionSet,
 }
 
 impl Default for ConvertOptions {
@@ -76,7 +81,20 @@ impl Default for ConvertOptions {
         Self {
             numeric_exports: true,
             gc_export_suffix: None,
+            assumptions: portal_jsc_common::assumptions::AssumptionSet::empty(),
         }
+    }
+}
+
+impl ConvertOptions {
+    /// Project the resolved assumptions into the legacy semantic-flags
+    /// configuration consumed by SSA/TAC-level analyses. This is the bridge
+    /// between the canonical assumption set and the existing
+    /// `SemanticCfg`/`SemanticFlags` path.
+    pub fn semantic_cfg(&self) -> portal_jsc_swc_util::SemanticCfg {
+        let mut cfg = portal_jsc_swc_util::SemanticCfg::default();
+        cfg.flags = self.assumptions.semantic_flags();
+        cfg
     }
 }
 
@@ -259,6 +277,7 @@ pub fn convert_modules<'a, 'wasm>(
     // helper bodies.
     let wasm_host_imports = declare_wasm_host_imports(module, &import_tables);
     let mut converter = Converter::new(module);
+    converter.semantic_cfg = options.semantic_cfg();
     converter.import_tables = import_tables;
     converter.wasm_host_imports = wasm_host_imports;
     converter.exceptions_enabled = exported
@@ -1168,6 +1187,10 @@ struct Converter<'a, 'module, 'wasm> {
     /// Module path of the top-level function currently being collected or
     /// lowered. Nested closures inherit it.
     current_module: String,
+    /// Resolved semantic configuration active while this converter emits
+    /// WasmGC, projected from [`ConvertOptions::assumptions`]. Defaults to
+    /// the empty flag set (legacy behavior).
+    semantic_cfg: portal_jsc_swc_util::SemanticCfg,
 }
 
 impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
@@ -1224,11 +1247,21 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             import_tables: BTreeMap::new(),
             module_of_function: BTreeMap::new(),
             current_module: String::new(),
+            semantic_cfg: Default::default(),
         }
     }
 
     fn key(func: &SFunc) -> usize {
         func as *const SFunc as usize
+    }
+
+    /// The resolved semantic configuration active during this emission.
+    ///
+    /// Assumptions are applied while emitting WasmGC (never by selecting a
+    /// replacement compiler module); lowering paths consult these flags
+    /// rather than re-resolving names.
+    pub fn semantic_cfg(&self) -> &portal_jsc_swc_util::SemanticCfg {
+        &self.semantic_cfg
     }
 
     /// Discover every layout whose key set is known without evaluating user

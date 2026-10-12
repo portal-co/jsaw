@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use jsaw_wasi_bin::manifest;
-use jsaw_wasi_bin::{compile_to_outputs, read_sources, write_outputs};
+use jsaw_wasi_bin::{CompileError, compile_to_outputs, read_sources, write_outputs};
 
 fn main() -> ExitCode {
     // Route panics to stderr so a compiler bug fails the task with a
@@ -48,21 +48,26 @@ fn main() -> ExitCode {
     }
     match &result {
         manifest::Result::Ok { .. } => ExitCode::SUCCESS,
-        manifest::Result::Error { .. } => ExitCode::FAILURE,
+        manifest::Result::Error { .. } | manifest::Result::AssumptionError { .. } => {
+            ExitCode::FAILURE
+        }
     }
 }
 
 fn run(src: &std::path::Path, out: &std::path::Path) -> manifest::Result {
     match try_run(src, out) {
-        Ok((exports, outputs)) => manifest::Result::ok(exports, outputs),
-        Err(error) => manifest::Result::error(format!("{error:#}")),
+        Ok((exports, outputs, assumptions)) => manifest::Result::ok(exports, outputs, assumptions),
+        Err(CompileError::Assumptions(diagnostics)) => {
+            manifest::Result::assumption_error(diagnostics)
+        }
+        Err(CompileError::Other(error)) => manifest::Result::error(format!("{error:#}")),
     }
 }
 
 fn try_run(
     src: &std::path::Path,
     out: &std::path::Path,
-) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+) -> Result<(Vec<String>, Vec<String>, manifest::AssumptionReport), CompileError> {
     let mut stdin = String::new();
     std::io::stdin()
         .read_to_string(&mut stdin)
@@ -71,8 +76,8 @@ fn try_run(
         .map_err(|e| anyhow::anyhow!("manifest is not valid JSON: {e}"))?;
 
     let sources = read_sources(src, &manifest)?;
-    let (exports, outputs) = compile_to_outputs(&manifest, &sources)?;
-    write_outputs(out, &outputs)?;
-    let written: Vec<String> = outputs.into_keys().collect();
-    Ok((exports, written))
+    let output = compile_to_outputs(&manifest, &sources)?;
+    write_outputs(out, &output.outputs)?;
+    let written: Vec<String> = output.outputs.into_keys().collect();
+    Ok((output.exports, written, output.assumptions))
 }

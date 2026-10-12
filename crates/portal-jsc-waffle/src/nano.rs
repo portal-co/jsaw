@@ -6,9 +6,44 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-static NEXT_ARENA: AtomicU64 = AtomicU64::new(1);
+/// Owner of arena identity for one artifact instance.
+///
+/// Arena IDs are scoped to their host, not process-global: two artifact
+/// instances in the same process independently start from the same first ID,
+/// and identity never depends on a shared counter. This keeps compiled
+/// artifacts hermetic (no hidden cross-instance coupling) and keeps
+/// `ArenaRef` a per-instance capability.
+///
+/// Hosts are expected to live as long as the arenas they vend; refs from one
+/// host's arenas are invalid in any other host's arenas.
+#[derive(Debug, Default)]
+pub struct NanoArenaHost {
+    next: u64,
+}
+
+impl NanoArenaHost {
+    /// Create a fresh host. The first arena vended gets ID 1, so a zeroed or
+    /// default-constructed value can never collide with a real arena.
+    pub fn new() -> Self {
+        Self { next: 1 }
+    }
+
+    /// Vend a new arena with a host-unique identity.
+    pub fn arena(&mut self, limit: usize) -> NanoArena {
+        let id = self.next;
+        // u64 exhaustion is unreachable in practice (one arena per artifact
+        // per #21); saturating at u64::MAX still keeps IDs distinct for any
+        // real host lifetime.
+        self.next = self.next.saturating_add(1);
+        // The host token is an in-process identity only: it distinguishes
+        // refs from different hosts without any process-global counter. It
+        // is never dereferenced, never serialized, and has no meaning
+        // outside this process.
+        let host = self as *const NanoArenaHost as usize;
+        NanoArena::with_id(host, id, limit)
+    }
+}
 
 /// Errors returned by [`NanoArena`].
 ///
@@ -59,6 +94,9 @@ impl std::error::Error for NanoArenaError {}
 /// particular, serialized data cannot contain the process-local arena id.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ArenaRef {
+    /// In-process identity token of the owning host. Not an address that may
+    /// be used, and never serialized — it only makes cross-host refs invalid.
+    host: usize,
     arena: u64,
     generation: u64,
     slot: u32,
@@ -81,6 +119,7 @@ struct Allocation {
 
 /// A bounded logical arena whose references survive allocation-vector growth.
 pub struct NanoArena {
+    host: usize,
     id: u64,
     generation: u64,
     limit: usize,
@@ -89,13 +128,12 @@ pub struct NanoArena {
 }
 
 impl NanoArena {
-    /// Create an empty arena with the given logical capacity.
-    pub fn new(limit: usize) -> Self {
-        // Arena identity is process-local and never leaves ArenaRef.  The
-        // counter starts at one so that a zeroed/forged value cannot match a
-        // newly-created arena.
-        let id = NEXT_ARENA.fetch_add(1, Ordering::Relaxed);
+    /// Create an arena with a host-assigned identity. Construct via
+    /// [`NanoArenaHost::arena`] so identity is scoped to the owning artifact
+    /// instance rather than a process-global counter.
+    fn with_id(host: usize, id: u64, limit: usize) -> Self {
         Self {
+            host,
             id,
             generation: 1,
             limit,
@@ -167,6 +205,7 @@ impl NanoArena {
         });
         self.used = end;
         Ok(ArenaRef {
+            host: self.host,
             arena: self.id,
             generation: self.generation,
             slot,
@@ -174,7 +213,10 @@ impl NanoArena {
     }
 
     fn get(&self, reference: ArenaRef) -> Result<&Allocation, NanoArenaError> {
-        if reference.arena != self.id || reference.generation != self.generation {
+        if reference.host != self.host
+            || reference.arena != self.id
+            || reference.generation != self.generation
+        {
             return Err(NanoArenaError::InvalidRef);
         }
         self.allocations
@@ -183,7 +225,10 @@ impl NanoArena {
     }
 
     fn get_mut(&mut self, reference: ArenaRef) -> Result<&mut Allocation, NanoArenaError> {
-        if reference.arena != self.id || reference.generation != self.generation {
+        if reference.host != self.host
+            || reference.arena != self.id
+            || reference.generation != self.generation
+        {
             return Err(NanoArenaError::InvalidRef);
         }
         self.allocations
@@ -302,7 +347,8 @@ mod tests {
 
     #[test]
     fn allocation_read_write() {
-        let mut arena = NanoArena::new(32);
+        let mut host = NanoArenaHost::new();
+        let mut arena = host.arena(32);
         let reference = arena.alloc(8, 8).unwrap();
         assert_eq!(arena.len(reference), Ok(8));
 
@@ -316,7 +362,8 @@ mod tests {
 
     #[test]
     fn growth_preserves_logical_refs() {
-        let mut arena = NanoArena::new(128);
+        let mut host = NanoArenaHost::new();
+        let mut arena = host.arena(128);
         let first = arena.alloc(4, 1).unwrap();
         arena.write(first, 0, &[9, 8, 7, 6]).unwrap();
         for _ in 0..16 {
@@ -329,9 +376,10 @@ mod tests {
 
     #[test]
     fn stale_and_cross_arena_refs_fail() {
-        let mut arena = NanoArena::new(16);
+        let mut host = NanoArenaHost::new();
+        let mut arena = host.arena(16);
         let reference = arena.alloc(4, 1).unwrap();
-        let other = NanoArena::new(16);
+        let other = host.arena(16);
         let mut output = [0; 4];
         assert_eq!(arena.reset(), Ok(()));
         assert_eq!(arena.read(reference, 0, &mut output), Err(NanoArenaError::InvalidRef));
@@ -340,7 +388,8 @@ mod tests {
 
     #[test]
     fn exhaustion_and_configuration_cannot_shrink_used_storage() {
-        let mut arena = NanoArena::new(8);
+        let mut host = NanoArenaHost::new();
+        let mut arena = host.arena(8);
         let _ = arena.alloc(4, 1).unwrap();
         assert_eq!(arena.configure(3), Err(NanoArenaError::ConfigurationTooSmall));
         assert_eq!(arena.capacity(), 8);
@@ -350,7 +399,8 @@ mod tests {
 
     #[test]
     fn invalid_alignment_and_bounds_are_typed() {
-        let mut arena = NanoArena::new(16);
+        let mut host = NanoArenaHost::new();
+        let mut arena = host.arena(16);
         assert_eq!(arena.alloc(1, 0), Err(NanoArenaError::Misaligned));
         assert_eq!(arena.alloc(1, 3), Err(NanoArenaError::Misaligned));
         let reference = arena.alloc(4, 1).unwrap();
@@ -364,7 +414,8 @@ mod tests {
 
     #[test]
     fn reset_invalidates_and_restarts_storage() {
-        let mut arena = NanoArena::new(8);
+        let mut host = NanoArenaHost::new();
+        let mut arena = host.arena(8);
         let old = arena.alloc(8, 1).unwrap();
         arena.reset().unwrap();
         let new = arena.alloc(8, 1).unwrap();

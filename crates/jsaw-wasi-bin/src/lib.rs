@@ -3,14 +3,148 @@
 //! compile, write outputs, produce the result JSON.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use portal_jsc_common::assumptions::{
+    AssumptionDiagnostic, AssumptionRegistry, AssumptionRequest, AssumptionSet,
+};
 use portal_jsc_waffle::{ConvertOptions, ModuleSet, convert_modules, module_set_from_sources};
 
 pub mod manifest;
 
+/// The canonical assumption registry, re-exported so hosts and tests can
+/// resolve and verify digests without a second copy of the vocabulary.
+pub use portal_jsc_common::assumptions;
+
 pub use manifest::{Emit, MANIFEST_VERSION, Manifest, Options};
+use manifest::{AssumptionDiagnosticReport, AssumptionEntry, AssumptionReport};
+
+/// Everything a successful compilation produced.
+#[derive(Debug)]
+pub struct CompileOutput {
+    /// Wasm-exported function names of the compiled module.
+    pub exports: Vec<String>,
+    /// Output-root-relative path to bytes.
+    pub outputs: BTreeMap<String, Vec<u8>>,
+    /// Resolved assumption set metadata (present even when empty).
+    pub assumptions: AssumptionReport,
+}
+
+/// Compilation failure, distinguishing fail-closed assumption resolution
+/// (machine-readable diagnostics) from ordinary pipeline errors.
+#[derive(Debug)]
+pub enum CompileError {
+    Assumptions(Vec<AssumptionDiagnosticReport>),
+    Other(anyhow::Error),
+}
+
+impl fmt::Display for CompileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Assumptions(diagnostics) => write!(
+                f,
+                "{} assumption request(s) could not be resolved",
+                diagnostics.len()
+            ),
+            Self::Other(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+impl std::error::Error for CompileError {}
+
+impl From<anyhow::Error> for CompileError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Other(error)
+    }
+}
+
+fn report_entry(request: &AssumptionRequest) -> AssumptionEntry {
+    AssumptionEntry {
+        name: request.name().to_string(),
+        parameter: request.parameter().map(|p| p.as_str().to_string()),
+    }
+}
+
+fn report_diagnostic(diagnostic: &AssumptionDiagnostic) -> AssumptionDiagnosticReport {
+    match diagnostic {
+        AssumptionDiagnostic::Unknown { name, index } => AssumptionDiagnosticReport::Unknown {
+            name: name.clone(),
+            index: *index,
+        },
+        AssumptionDiagnostic::Duplicate {
+            name,
+            index,
+            first_index,
+        } => AssumptionDiagnosticReport::Duplicate {
+            name: name.clone(),
+            index: *index,
+            first_index: *first_index,
+        },
+        AssumptionDiagnostic::Conflict {
+            name,
+            index,
+            conflicts_with,
+            conflict_index,
+            reason,
+        } => AssumptionDiagnosticReport::Conflict {
+            name: name.clone(),
+            index: *index,
+            conflicts_with: conflicts_with.clone(),
+            conflict_index: *conflict_index,
+            reason: reason.clone(),
+        },
+        AssumptionDiagnostic::Unsupported { name, index, reason } => {
+            AssumptionDiagnosticReport::Unsupported {
+                name: name.clone(),
+                index: *index,
+                reason: reason.clone(),
+            }
+        }
+        AssumptionDiagnostic::Unfulfilled { name, index, reason } => {
+            AssumptionDiagnosticReport::Unfulfilled {
+                name: name.clone(),
+                index: *index,
+                reason: reason.clone(),
+            }
+        }
+    }
+}
+
+/// Resolve the manifest's requested assumptions through the canonical
+/// registry. Resolution is fail-closed: any diagnostic rejects the entire
+/// compilation before any lowering runs.
+pub fn resolve_assumptions(
+    manifest: &Manifest,
+) -> Result<(AssumptionSet, AssumptionReport), CompileError> {
+    let registry = AssumptionRegistry::new();
+    let requests: Vec<AssumptionRequest> = manifest
+        .options
+        .assumptions
+        .iter()
+        .map(|input| match input.parameter() {
+            Some(parameter) => {
+                AssumptionRequest::with_parameter(input.name().to_string(), parameter.to_string())
+            }
+            None => AssumptionRequest::new(input.name().to_string()),
+        })
+        .collect();
+    let set = registry.resolve(requests).map_err(|error| {
+        CompileError::Assumptions(
+            error.diagnostics().iter().map(report_diagnostic).collect(),
+        )
+    })?;
+    let report = AssumptionReport {
+        schema_version: registry.schema_version(),
+        registry_version: registry.version(),
+        requested: set.requested().iter().map(report_entry).collect(),
+        effective: set.effective().iter().map(report_entry).collect(),
+        digest: set.digest(),
+    };
+    Ok((set, report))
+}
 
 /// Run a compilation from in-memory sources (no filesystem). This is the
 /// target-independent core: given the manifest and every module's source,
@@ -20,17 +154,26 @@ pub use manifest::{Emit, MANIFEST_VERSION, Manifest, Options};
 pub fn compile_to_outputs(
     manifest: &Manifest,
     sources: &BTreeMap<String, String>,
-) -> Result<(Vec<String>, BTreeMap<String, Vec<u8>>)> {
+) -> Result<CompileOutput, CompileError> {
     if manifest.version != MANIFEST_VERSION {
-        bail!(
+        return Err(anyhow::anyhow!(
             "unsupported manifest version {} (this compiler understands {})",
             manifest.version,
             MANIFEST_VERSION
-        );
+        )
+        .into());
     }
     if !manifest.modules.iter().any(|m| m == &manifest.entry) {
-        bail!("entry module {:?} is not in the module set", manifest.entry);
+        return Err(anyhow::anyhow!(
+            "entry module {:?} is not in the module set",
+            manifest.entry
+        )
+        .into());
     }
+
+    // Resolve assumptions before any heavy work: invalid requests fail the
+    // whole compilation closed, with machine-readable diagnostics.
+    let (assumptions, assumption_report) = resolve_assumptions(manifest)?;
 
     // Feed the sources to the ingestion pipeline in sorted order (the set
     // is a BTreeMap anyway; sorting just keeps diagnostics deterministic).
@@ -47,6 +190,7 @@ pub fn compile_to_outputs(
     let options = ConvertOptions {
         numeric_exports: manifest.options.numeric_exports,
         gc_export_suffix: manifest.options.gc_export_suffix.clone(),
+        assumptions,
     };
     let mut module = portal_pc_waffle::Module::empty();
     convert_modules(&manifest.entry, &set, &mut module, &options)
@@ -82,7 +226,11 @@ pub fn compile_to_outputs(
         }
     }
 
-    Ok((exports, outputs))
+    Ok(CompileOutput {
+        exports,
+        outputs,
+        assumptions: assumption_report,
+    })
 }
 
 /// Join an output-root-relative directory and a file within it using `/`

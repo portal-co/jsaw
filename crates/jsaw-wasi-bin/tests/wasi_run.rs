@@ -126,13 +126,14 @@ fn native_driver_sees_exports() {
     // The same driver that runs under wasip1 must, natively, see the
     // module's exports — this isolates a wasip1-only lowering divergence
     // from a driver bug.
-    let (exports, outputs) =
+    let output =
         jsaw_wasi_bin::compile_to_outputs(&manifest(), &fixture_sources()).expect("native compile");
     assert!(
-        exports.contains(&"run".to_string()),
-        "native exports should contain run: {exports:?}"
+        output.exports.contains(&"run".to_string()),
+        "native exports should contain run: {:?}",
+        output.exports
     );
-    assert!(outputs.contains_key("module.wasm"));
+    assert!(output.outputs.contains_key("module.wasm"));
 }
 
 #[test]
@@ -199,14 +200,14 @@ fn java_and_swift_outputs_match_native_emission_byte_for_byte() {
     let manifest = manifest_with_emit(emit);
 
     // Native emission.
-    let (native_exports, native_outputs) =
+    let native =
         jsaw_wasi_bin::compile_to_outputs(&manifest, &fixture_sources()).expect("native compile");
     assert!(
-        native_outputs.keys().any(|p| p.starts_with("java/")),
+        native.outputs.keys().any(|p| p.starts_with("java/")),
         "native emission should produce java outputs"
     );
     assert!(
-        native_outputs.keys().any(|p| p.starts_with("swift/")),
+        native.outputs.keys().any(|p| p.starts_with("swift/")),
         "native emission should produce swift outputs"
     );
 
@@ -241,7 +242,7 @@ fn java_and_swift_outputs_match_native_emission_byte_for_byte() {
 
     // Byte-for-byte equality on every emitted file, and the same export list.
     assert_eq!(
-        native_outputs, wasip1_outputs,
+        native.outputs, wasip1_outputs,
         "wasip1 and native emission must be byte-identical"
     );
     let wasip1_exports: Vec<String> = result["exports"]
@@ -250,5 +251,5 @@ fn java_and_swift_outputs_match_native_emission_byte_for_byte() {
         .iter()
         .map(|e| e.as_str().unwrap().to_string())
         .collect();
-    assert_eq!(native_exports, wasip1_exports, "export lists must match");
+    assert_eq!(native.exports, wasip1_exports, "export lists must match");
 }

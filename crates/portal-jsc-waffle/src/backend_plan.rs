@@ -240,6 +240,17 @@ pub enum PlanArenaOp {
     Eq,
 }
 
+/// A constant payload for constant operators. All payloads are bit-exact:
+/// integers are stored as their unsigned bit pattern, floats as IEEE bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanConst {
+    I32(u32),
+    I64(u64),
+    F32(u32),
+    F64(u64),
+}
+
 /// One instruction in the flat block-parameter CFG.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanInst {
@@ -251,6 +262,10 @@ pub struct PlanInst {
     pub result_types: Vec<TypeId>,
     pub call: Option<PlanCall>,
     pub arena: Option<PlanArenaOp>,
+    /// Constant payload when the operator is a scalar constant.
+    pub const_value: Option<PlanConst>,
+    /// Proven function identity when the operator is `ref.func`.
+    pub ref_func: Option<PlanFuncId>,
 }
 
 /// A flat block-parameter edge.
@@ -1806,6 +1821,8 @@ impl<'m> Builder<'m> {
         let mut arena = None;
         let mut result_types = Vec::new();
         let mut results = Vec::new();
+        let mut const_value = None;
+        let mut ref_func = None;
         let operator;
 
         match def {
@@ -1841,6 +1858,19 @@ impl<'m> Builder<'m> {
                     results.push(*id);
                 }
                 arena = arena_op(&operator);
+                const_value = match op {
+                    Operator::I32Const { value } => Some(PlanConst::I32(*value)),
+                    Operator::I64Const { value } => Some(PlanConst::I64(*value)),
+                    Operator::F32Const { value } => Some(PlanConst::F32(*value)),
+                    Operator::F64Const { value } => Some(PlanConst::F64(*value)),
+                    _ => None,
+                };
+                ref_func = match op {
+                    Operator::RefFunc { func_index } => {
+                        self.func_ids.get(func_index).copied()
+                    }
+                    _ => None,
+                };
                 call = self.plan_call_operator(
                     func,
                     block,
@@ -1963,6 +1993,8 @@ impl<'m> Builder<'m> {
             result_types,
             call,
             arena,
+            const_value,
+            ref_func,
         }
     }
 

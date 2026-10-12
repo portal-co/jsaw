@@ -251,6 +251,39 @@ pub enum PlanConst {
     F64(u64),
 }
 
+/// A linear-memory access description.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PlanMemArg {
+    pub offset: u64,
+    pub align: u32,
+    pub memory: u32,
+}
+
+/// Structured operator payload beyond the args/results lists. Each field is
+/// present only for the operators that carry it (aggregate field indices,
+/// reference targets, global/table/memory indices, memory descriptors).
+/// Without these the plan's instruction names would not be
+/// emission-complete: an emitter could not reconstruct `struct.get`'s field
+/// or `ref.cast`'s target from the name alone.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PlanPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sig: Option<PlanSigId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heap: Option<PlanHeapType>,
+    /// Nullability of a `RefTest`/`RefCast`/`RefNull` reference type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nullable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memarg: Option<PlanMemArg>,
+}
+
 /// One instruction in the flat block-parameter CFG.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanInst {
@@ -266,6 +299,10 @@ pub struct PlanInst {
     pub const_value: Option<PlanConst>,
     /// Proven function identity when the operator is `ref.func`.
     pub ref_func: Option<PlanFuncId>,
+    /// Structured operator payload (aggregate field indices, reference
+    /// targets, global/table/memory indices and descriptors).
+    #[serde(default)]
+    pub payload: PlanPayload,
 }
 
 /// A flat block-parameter edge.
@@ -1823,6 +1860,7 @@ impl<'m> Builder<'m> {
         let mut results = Vec::new();
         let mut const_value = None;
         let mut ref_func = None;
+        let mut payload = PlanPayload::default();
         let operator;
 
         match def {
@@ -1871,6 +1909,7 @@ impl<'m> Builder<'m> {
                     }
                     _ => None,
                 };
+                payload = self.plan_payload(op);
                 call = self.plan_call_operator(
                     func,
                     block,
@@ -1995,7 +2034,93 @@ impl<'m> Builder<'m> {
             arena,
             const_value,
             ref_func,
+            payload,
         }
+    }
+
+    /// Structured payload extraction for one operator. Only the fields the
+    /// operator actually carries are set; everything else stays `None`.
+    fn plan_payload(&mut self, op: &Operator) -> PlanPayload {
+        let mut payload = PlanPayload::default();
+        let sig = |sig: &Signature| self.sig_ids.get(sig).copied();
+        let heap = |ty: &Type| match raw_type(ty) {
+            RawType::Ref { heap, .. } => Some(self.convert_heap(&heap)),
+            _ => None,
+        };
+        let memarg = |memory: &portal_pc_waffle::MemoryArg| PlanMemArg {
+            offset: memory.offset,
+            align: memory.align,
+            memory: memory.memory.index() as u32,
+        };
+        match op {
+            Operator::StructNew { sig: s }
+            | Operator::StructNewDefault { sig: s }
+            | Operator::ArrayNew { sig: s }
+            | Operator::ArrayNewDefault { sig: s }
+            | Operator::ArrayNewFixed { sig: s, .. }
+            | Operator::ArrayGet { sig: s }
+            | Operator::ArrayGetS { sig: s }
+            | Operator::ArrayGetU { sig: s }
+            | Operator::ArraySet { sig: s }
+            | Operator::ArrayFill { sig: s } => payload.sig = sig(s),
+            Operator::StructGet { sig: s, idx }
+            | Operator::StructGetS { sig: s, idx }
+            | Operator::StructGetU { sig: s, idx }
+            | Operator::StructSet { sig: s, idx } => {
+                payload.sig = sig(s);
+                payload.field = Some(*idx as u32);
+            }
+            Operator::ArrayCopy { dest, src } => {
+                payload.sig = sig(dest);
+                payload.field = sig(src).map(|id| id.0);
+            }
+            Operator::RefTest { ty } | Operator::RefCast { ty } | Operator::RefNull { ty } => {
+                payload.heap = heap(ty);
+                payload.nullable = match raw_type(ty) {
+                    RawType::Ref { nullable, .. } => Some(nullable),
+                    _ => None,
+                };
+            }
+            Operator::GlobalGet { global_index } | Operator::GlobalSet { global_index } => {
+                payload.global = Some(global_index.index() as u32);
+            }
+            Operator::TableGet { table_index }
+            | Operator::TableSet { table_index }
+            | Operator::TableGrow { table_index }
+            | Operator::TableSize { table_index } => {
+                payload.table = Some(table_index.index() as u32);
+            }
+            Operator::CallIndirect { table_index, .. } => {
+                payload.table = Some(table_index.index() as u32);
+            }
+            Operator::I32Load { memory }
+            | Operator::I64Load { memory }
+            | Operator::F32Load { memory }
+            | Operator::F64Load { memory }
+            | Operator::I32Load8S { memory }
+            | Operator::I32Load8U { memory }
+            | Operator::I32Load16S { memory }
+            | Operator::I32Load16U { memory }
+            | Operator::I64Load8S { memory }
+            | Operator::I64Load8U { memory }
+            | Operator::I64Load16S { memory }
+            | Operator::I64Load16U { memory }
+            | Operator::I64Load32S { memory }
+            | Operator::I64Load32U { memory }
+            | Operator::I32Store { memory }
+            | Operator::I64Store { memory }
+            | Operator::F32Store { memory }
+            | Operator::F64Store { memory }
+            | Operator::I32Store8 { memory }
+            | Operator::I32Store16 { memory }
+            | Operator::I64Store8 { memory }
+            | Operator::I64Store16 { memory }
+            | Operator::I64Store32 { memory } => {
+                payload.memarg = Some(memarg(memory));
+            }
+            _ => {}
+        }
+        payload
     }
 
     fn plan_call_operator(

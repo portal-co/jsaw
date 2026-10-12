@@ -9,6 +9,7 @@ pub mod coregc_runtime;
 pub mod ingest;
 pub mod linker;
 pub mod nano;
+pub mod nano_mvp;
 pub mod nano_native;
 pub mod repr;
 pub mod revision;
@@ -44,7 +45,8 @@ pub use ingest::{
     parse_module_source_lazy, with_globals,
 };
 pub use linker::ModuleSet;
-pub use nano::{ArenaRef, NanoArena, NanoArenaError, NanoLifetime, NanoPlan, NanoValueRepresentation};
+pub use nano::{ArenaRef, NanoArena, NanoArenaError, NanoArenaHost, NanoLifetime, NanoPlan, NanoValueRepresentation};
+pub use nano_mvp::{NANO_MVP_SCHEMA, NanoMvpError, emit_nano_mvp, emit_nano_mvp_fingerprint};
 pub use nano_native::{
     AdapterAbiRecord, CapabilityCheck, InlineBudget, InlineRecord, InliningMode,
     NANO_NATIVE_SCHEMA, NanoCallDecision, NanoCallStrategy, NanoNativeConfig,

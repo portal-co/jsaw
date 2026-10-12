@@ -7,6 +7,7 @@ pub mod coregc_roots;
 pub mod coregc_runtime;
 pub mod ingest;
 pub mod linker;
+pub mod nano;
 pub mod repr;
 pub mod revision;
 mod wasm_boundary;
@@ -32,6 +33,7 @@ pub use ingest::{
     parse_module_source_lazy, with_globals,
 };
 pub use linker::ModuleSet;
+pub use nano::{ArenaRef, NanoArena, NanoArenaError, NanoLifetime, NanoPlan, NanoValueRepresentation};
 pub use repr::ConvertError;
 pub use revision::{
     ActivationError, ActiveRevision, ContentRevisionId, DeltaOperation, DispatchDeltaActivator,

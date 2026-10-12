@@ -14,6 +14,7 @@ portal-jsc-swc-util.workspace = true
 
 portal-pc-waffle = { workspace = true, features = ["backend"] }
 sha3.workspace = true
+serde.workspace = true
 ryu-js = "1"
 swc_atoms.workspace = true
 swc_common.workspace = true

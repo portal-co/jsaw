@@ -1707,6 +1707,7 @@ dependencies = [
  "portal-pc-waffle",
  "ryu-js",
  "serde",
+ "serde_json",
  "sha3",
  "swc_atoms",
  "swc_common",
@@ -1765,6 +1766,7 @@ name = "portal-pc-waffle-backend"
 version = "0.6.0-alpha.1"
 dependencies = [
  "anyhow",
+ "foldhash 0.1.5",
  "hashbrown 0.15.5",
  "log",
  "portal-pc-waffle-entity",
@@ -3591,195 +3593,67 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[patch.unused]]
-name = "portal-pc-waffle-copying"
-version = "0.6.0-alpha.1"
-
-[[patch.unused]]
-name = "portal-pc-waffle-copying-passes"
-version = "0.6.0-alpha.1"
-
-[[patch.unused]]
-name = "portal-pc-waffle-fuzzing"
-version = "0.6.0-alpha.1"
-
-[[patch.unused]]
-name = "portal-pc-waffle-hooking"
-version = "0.6.0-alpha.1"
-
-[[patch.unused]]
-name = "portal-pc-waffle-lowering"
-version = "0.6.0-alpha.1"
-
-[[patch.unused]]
 name = "portal-solutions-sdk"
 version = "0.0.2"
 
 [[patch.unused]]
-name = "vaffle"
+name = "rv-asm"
+version = "0.2.1"
+
+[[patch.unused]]
+name = "portal-solutions-blitz-aarch64"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-ir"
+name = "portal-solutions-blitz-arm"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-ir-build"
+name = "portal-solutions-blitz-c"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-ir-common"
+name = "portal-solutions-blitz-common"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-ir-opt"
+name = "portal-solutions-blitz-i686"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-ir-passes"
+name = "portal-solutions-blitz-js"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-lir-test-corpus"
+name = "portal-solutions-blitz-riscv32"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-llvm-ir-import"
+name = "portal-solutions-blitz-x86-64"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-llvm-vaffle-import"
+name = "portal-jit-host-names"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-provenance"
+name = "portal-solutions-asm-aarch64"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-riscv-test-programs"
+name = "portal-solutions-asm-arm"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-vaffle-target"
+name = "portal-solutions-asm-riscv32"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-wasm-circuit-import"
+name = "portal-solutions-asm-writer"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "thin-mcp"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "ephemera"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-build"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-c-backend-spec-tests"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-channel"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-common"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-compiler"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-compiler-common"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-compiler-passes"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-discipline"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-dyn"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-fold"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-iop"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-ir-lir-target"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-ir-tester"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-lir-codegen"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-log"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-macros"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-net"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-oram"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-oram-core"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-primitives"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-riscv-e2e"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-spec"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-spec-dyn"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-verifier-fold"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-verifier-iop-runtime"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "volar-weaver"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "xtask"
+name = "portal-solutions-asm-x86"
 version = "0.1.0"
 
 [[patch.unused]]
@@ -3791,8 +3665,12 @@ name = "vane-riscv"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-jsc-swc-opt-ssa"
-version = "0.8.0-pre.11"
+name = "pit-core"
+version = "0.5.0-alpha.1"
+
+[[patch.unused]]
+name = "portal-jit-host-names"
+version = "0.1.0"
 
 [[patch.unused]]
 name = "os-abi-codegen"
@@ -3911,23 +3789,179 @@ name = "os-unix-wasi"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-solutions-asm-aarch64"
+name = "ephemera"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-solutions-asm-arm"
+name = "volar-build"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-solutions-asm-riscv32"
+name = "volar-c-backend-spec-tests"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-solutions-asm-writer"
+name = "volar-channel"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-solutions-asm-x86"
+name = "volar-common"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-compiler"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-compiler-common"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-compiler-passes"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-discipline"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-dyn"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-fold"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-iop"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-ir-lir-target"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-ir-tester"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-lir-codegen"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-log"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-macros"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-net"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-oram"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-oram-core"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-primitives"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-riscv-e2e"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-spec"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-spec-dyn"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-verifier-fold"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-verifier-iop-runtime"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-weaver"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "xtask"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "pit-lang-generic"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "pit-rust-generic"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-circuit-exec-core"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-llvm-constchain"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-llvm-import-core"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-llvm-jumpthread"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-llvm-pass-build"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "volar-llvm-pass-support"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portal-pc-waffle-copying"
+version = "0.6.0-alpha.1"
+
+[[patch.unused]]
+name = "portal-pc-waffle-copying-passes"
+version = "0.6.0-alpha.1"
+
+[[patch.unused]]
+name = "portal-pc-waffle-fuzzing"
+version = "0.6.0-alpha.1"
+
+[[patch.unused]]
+name = "portal-pc-waffle-hooking"
+version = "0.6.0-alpha.1"
+
+[[patch.unused]]
+name = "portal-pc-waffle-lowering"
+version = "0.6.0-alpha.1"
+
+[[patch.unused]]
+name = "lazy-repo"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "lazy-repo-crypto"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "lazy-repo-std"
 version = "0.1.0"
 
 [[patch.unused]]
@@ -3971,93 +4005,61 @@ name = "lazy-repo-std"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "rv-asm"
-version = "0.2.1"
-
-[[patch.unused]]
-name = "volar-circuit-exec-core"
+name = "thin-mcp"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-llvm-constchain"
+name = "vaffle"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-llvm-import-core"
+name = "volar-ir"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-llvm-jumpthread"
+name = "volar-ir-build"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-llvm-pass-build"
+name = "volar-ir-common"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "volar-llvm-pass-support"
+name = "volar-ir-opt"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-solutions-blitz-aarch64"
+name = "volar-ir-passes"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-solutions-blitz-arm"
+name = "volar-lir-test-corpus"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-solutions-blitz-c"
+name = "volar-llvm-ir-import"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-solutions-blitz-common"
+name = "volar-llvm-vaffle-import"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-solutions-blitz-i686"
+name = "volar-provenance"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-solutions-blitz-js"
+name = "volar-riscv-test-programs"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-solutions-blitz-riscv32"
+name = "volar-vaffle-target"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "portal-solutions-blitz-x86-64"
+name = "volar-wasm-circuit-import"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "pit-core"
-version = "0.5.0-alpha.1"
-
-[[patch.unused]]
-name = "portal-jit-host-names"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "pit-lang-generic"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "pit-rust-generic"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portal-jit-host-names"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "lazy-repo"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "lazy-repo-crypto"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "lazy-repo-std"
-version = "0.1.0"
+name = "portal-jsc-swc-opt-ssa"
+version = "0.8.0-pre.11"

@@ -2270,6 +2270,9 @@ impl<'m> Builder<'m> {
                 PlanTerminator::Return { values: mapped }
             }
             Terminator::ReturnCall { func: callee, args } => {
+                // A tail call forwards the callee's return as this
+                // function's own return completion.
+                completion_kinds.insert(CompletionKind::Return);
                 let arity = args.len();
                 let args = args
                     .iter()
@@ -2312,6 +2315,7 @@ impl<'m> Builder<'m> {
                 }
             }
             Terminator::ReturnCallIndirect { sig, table, args } => {
+                completion_kinds.insert(CompletionKind::Return);
                 let arity = args.len().saturating_sub(1);
                 if args.is_empty() {
                     self.diagnostic(
@@ -2354,6 +2358,7 @@ impl<'m> Builder<'m> {
                 }
             }
             Terminator::ReturnCallRef { sig, args } => {
+                completion_kinds.insert(CompletionKind::Return);
                 let arity = args.len().saturating_sub(1);
                 if args.is_empty() {
                     self.diagnostic(

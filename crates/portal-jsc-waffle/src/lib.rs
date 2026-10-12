@@ -9,6 +9,7 @@ pub mod coregc_runtime;
 pub mod ingest;
 pub mod linker;
 pub mod nano;
+pub mod nano_native;
 pub mod repr;
 pub mod revision;
 pub mod specialize;
@@ -44,6 +45,12 @@ pub use ingest::{
 };
 pub use linker::ModuleSet;
 pub use nano::{ArenaRef, NanoArena, NanoArenaError, NanoLifetime, NanoPlan, NanoValueRepresentation};
+pub use nano_native::{
+    AdapterAbiRecord, CapabilityCheck, InlineBudget, InlineRecord, InliningMode,
+    NANO_NATIVE_SCHEMA, NanoCallDecision, NanoCallStrategy, NanoNativeConfig,
+    NanoNativeDiagnostic, NanoNativeDiagnosticKind, NanoNativeOutcome, NanoNativePlan,
+    ParamElision, RequiredCapabilities, TargetCapabilities, plan_nano_native,
+};
 pub use repr::ConvertError;
 pub use specialize::{
     AliasClass, BoundaryLiveness, CallSiteParamEnv, CoarseningRecord, CoreGcFacts,

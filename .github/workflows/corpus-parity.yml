@@ -1,0 +1,72 @@
+# Generated-corpus parity (DreamComp #28).
+#
+# Runs the vendored DreamComp-generated corpus through both jsaw lanes
+# (WasmGC and nano WASM-MVP), fails on any semantic mismatch, nondeterministic
+# plan fingerprint, stale corpus fingerprint, or unexpected unsupported case,
+# and publishes the machine-readable `jsaw.corpus-parity.v1` report as an
+# artifact.
+name: corpus-parity
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  corpus-parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out jsaw
+        uses: actions/checkout@v4
+        with:
+          path: jsaw
+
+      # The workspace Cargo.toml path-patches these sibling checkouts; CI must
+      # materialize them at the same relative layout.
+      - name: Check out jsaw-core (path-patched sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: portal-co/jsaw-core
+          path: jsaw-core
+      - name: Check out waffle- (path-patched sibling, portal branch)
+        uses: actions/checkout@v4
+        with:
+          repository: portal-co/waffle-
+          ref: portal
+          path: waffle-
+      - name: Check out wasm-blitz (dev-dependency sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: portal-co/wasm-blitz
+          path: wasm-blitz-spectests
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            jsaw/target
+          key: ${{ runner.os }}-cargo-corpus-${{ hashFiles('jsaw/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-corpus-
+
+      - name: Run generated-corpus parity (wasmbc + nano_mvp lanes)
+        working-directory: jsaw
+        env:
+          JSAW_PARITY_REPORT: ${{ github.workspace }}/parity-report.json
+        run: cargo test -p jsaw-wasi-bin --test corpus_parity -- --nocapture
+
+      - name: Upload parity report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-parity-report
+          path: parity-report.json
+          if-no-files-found: warn

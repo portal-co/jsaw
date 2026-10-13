@@ -1078,6 +1078,7 @@ name = "jsaw-wasi-bin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "portal-jsc-common",
  "portal-jsc-jvm-emit",
  "portal-jsc-swift-emit",

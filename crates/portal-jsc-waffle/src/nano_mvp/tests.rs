@@ -192,6 +192,91 @@ fn minimal_plan_with_op(op: &str) -> BackendPlan {
 }
 
 #[test]
+fn instrumentation_tracks_allocations() {
+    let plan = plan_of(
+        "export function makeAndSum(x, y) { const pt = {x: x, y: y}; return pt.x + pt.y; }",
+    );
+    let bytes = emit_nano_mvp_with_config(
+        &plan,
+        &NanoMvpConfig {
+            instrument_alloc: true,
+            max_pages: None,
+        },
+    )
+    .unwrap();
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &bytes).expect("parse");
+    let mut store = wasmtime::Store::new(&engine, ());
+    let linker: wasmtime::Linker<()> = wasmtime::Linker::new(&engine);
+    let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+    let func = instance.get_func(&mut store, "makeAndSum").expect("export");
+    let params = vec![wasmtime::Val::F64(3.0f64.to_bits()), wasmtime::Val::F64(4.0f64.to_bits())];
+    let mut results = vec![wasmtime::Val::F64(0)];
+    func.call(&mut store, &params, &mut results).expect("call");
+
+    let count = match instance.get_global(&mut store, "js_nano_alloc_count") {
+        Some(g) => match g.get(&mut store) {
+            wasmtime::Val::I64(v) => v,
+            ref other => panic!("alloc count global: {other:?}"),
+        },
+        None => panic!("js_nano_alloc_count not exported"),
+    };
+    let alloc_bytes = match instance.get_global(&mut store, "js_nano_alloc_bytes") {
+        Some(g) => match g.get(&mut store) {
+            wasmtime::Val::I64(v) => v,
+            ref other => panic!("alloc bytes global: {other:?}"),
+        },
+        None => panic!("js_nano_alloc_bytes not exported"),
+    };
+    let cursor = match instance.get_global(&mut store, "js_nano_arena_cursor") {
+        Some(g) => match g.get(&mut store) {
+            wasmtime::Val::I32(v) => v as i64,
+            ref other => panic!("arena cursor global: {other:?}"),
+        },
+        None => panic!("js_nano_arena_cursor not exported"),
+    };
+    assert!(count > 0, "allocating program must count allocations");
+    assert!(alloc_bytes > 0, "allocating program must count bytes");
+    assert!(cursor > ARENA_BASE as i64, "cursor must advance past the base");
+    assert!(
+        alloc_bytes <= cursor - ARENA_BASE as i64,
+        "counted bytes ({alloc_bytes}) cannot exceed used arena ({})",
+        cursor - ARENA_BASE as i64
+    );
+}
+
+#[test]
+fn arena_exhaustion_traps_deterministically() {
+    // One-page arena; the loop allocates far more than 64KiB, so the
+    // allocator's memory.grow fails against the cap and traps rather than
+    // silently corrupting.
+    let plan = plan_of(
+        "export function churn(n) { let last = null; for (let i = 0; i < n; i++) { last = {v: i}; } return last === null ? 0 : 1; }",
+    );
+    let bytes = emit_nano_mvp_with_config(
+        &plan,
+        &NanoMvpConfig {
+            instrument_alloc: true,
+            max_pages: Some(1),
+        },
+    )
+    .unwrap();
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &bytes).expect("parse");
+    let mut store = wasmtime::Store::new(&engine, ());
+    let linker: wasmtime::Linker<()> = wasmtime::Linker::new(&engine);
+    let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+    let func = instance.get_func(&mut store, "churn").expect("export");
+    let params = vec![wasmtime::Val::F64(100000.0f64.to_bits())];
+    let mut results = vec![wasmtime::Val::F64(0)];
+    let outcome = func.call(&mut store, &params, &mut results);
+    assert!(
+        outcome.is_err(),
+        "exhausting a 1-page arena must trap, not silently succeed"
+    );
+}
+
+#[test]
 fn unsupported_operators_fail_closed() {
     let errors = emit_nano_mvp(&minimal_plan_with_op("V128Load"))
         .expect_err("a SIMD operator must not emit");

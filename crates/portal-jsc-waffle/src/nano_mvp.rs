@@ -79,7 +79,32 @@ impl std::error::Error for NanoMvpError {}
 
 /// Emit one BackendPlan as a pure core-Wasm module.
 pub fn emit_nano_mvp(plan: &BackendPlan) -> Result<Vec<u8>, Vec<NanoMvpError>> {
+    emit_nano_mvp_with_config(plan, &NanoMvpConfig::default())
+}
+
+/// Emission options for the nano MVP backend.
+#[derive(Clone, Debug, Default)]
+pub struct NanoMvpConfig {
+    /// Maintain allocation counters in exported mutable globals
+    /// (`js_nano_alloc_count`, `js_nano_alloc_bytes`, both `i64`) and export
+    /// the bump cursor as `js_nano_arena_cursor` (`i32`). Used by the parity
+    /// runner to collect allocator metrics; adds three globals plus a few
+    /// instructions per allocation, so it is off by default.
+    pub instrument_alloc: bool,
+    /// Arena memory cap in 64KiB pages. `None` uses the default maximum
+    /// (`MAX_PAGES`); smaller caps let tests exercise the deterministic
+    /// exhaustion trap quickly.
+    pub max_pages: Option<u32>,
+}
+
+/// Emit with explicit configuration.
+pub fn emit_nano_mvp_with_config(
+    plan: &BackendPlan,
+    config: &NanoMvpConfig,
+) -> Result<Vec<u8>, Vec<NanoMvpError>> {
     let mut emitter = Emitter::new(plan);
+    emitter.instrument_alloc = config.instrument_alloc;
+    emitter.max_pages = config.max_pages;
     emitter.emit()
 }
 
@@ -176,6 +201,13 @@ struct Emitter<'p> {
     alloc_signature: Signature,
     /// The boundary between struct and array type ids for generic tests.
     struct_type_max: i32,
+    /// Maintain allocation counters in exported globals.
+    instrument_alloc: bool,
+    /// Arena memory cap in pages.
+    max_pages: Option<u32>,
+    /// Allocation counters (set when `instrument_alloc`).
+    alloc_count_global: Global,
+    alloc_bytes_global: Global,
 }
 
 impl<'p> Emitter<'p> {
@@ -197,6 +229,10 @@ impl<'p> Emitter<'p> {
             trap_stub: Func::invalid(),
             alloc_signature: Signature::invalid(),
             struct_type_max: 0,
+            instrument_alloc: false,
+            max_pages: None,
+            alloc_count_global: Global::invalid(),
+            alloc_bytes_global: Global::invalid(),
         }
     }
 
@@ -521,6 +557,18 @@ impl<'p> Emitter<'p> {
             value: Some(ARENA_BASE as u64),
             mutable: true,
         });
+        if self.instrument_alloc {
+            self.alloc_count_global = module.globals.push(GlobalData {
+                ty: Type::I64,
+                value: Some(0),
+                mutable: true,
+            });
+            self.alloc_bytes_global = module.globals.push(GlobalData {
+                ty: Type::I64,
+                value: Some(0),
+                mutable: true,
+            });
+        }
         for memory in &self.plan.memories {
             module.memories.push(MemoryData {
                 initial_pages: memory.initial_pages as usize,
@@ -533,7 +581,7 @@ impl<'p> Emitter<'p> {
         }
         self.arena_memory = module.memories.push(MemoryData {
             initial_pages: 1,
-            maximum_pages: Some(MAX_PAGES as usize),
+            maximum_pages: Some(self.max_pages.unwrap_or(MAX_PAGES) as usize),
             segments: Vec::new(),
             memory64: false,
             shared: false,
@@ -632,6 +680,18 @@ impl<'p> Emitter<'p> {
         );
         let end32 = body.add_op(ok, Operator::I32WrapI64, &[end], &[Type::I32]);
         body.add_op(ok, Operator::GlobalSet { global_index: bump }, &[end32], &[]);
+        if self.instrument_alloc {
+            let count = self.alloc_count_global;
+            let bytes = self.alloc_bytes_global;
+            let one = body.add_op(ok, Operator::I64Const { value: 1 }, &[], &[Type::I64]);
+            let old_count = body.add_op(ok, Operator::GlobalGet { global_index: count }, &[], &[Type::I64]);
+            let new_count = body.add_op(ok, Operator::I64Add, &[old_count, one], &[Type::I64]);
+            body.add_op(ok, Operator::GlobalSet { global_index: count }, &[new_count], &[]);
+            let used = body.add_op(ok, Operator::I64Sub, &[end, aligned], &[Type::I64]);
+            let old_bytes = body.add_op(ok, Operator::GlobalGet { global_index: bytes }, &[], &[Type::I64]);
+            let new_bytes = body.add_op(ok, Operator::I64Add, &[old_bytes, used], &[Type::I64]);
+            body.add_op(ok, Operator::GlobalSet { global_index: bytes }, &[new_bytes], &[]);
+        }
         let aligned32 = body.add_op(ok, Operator::I32WrapI64, &[aligned], &[Type::I32]);
         body.set_terminator(ok, Terminator::Return { values: vec![aligned32] });
 
@@ -1884,6 +1944,20 @@ impl<'p> Emitter<'p> {
                     // Imports were registered with their functions.
                 }
             }
+        }
+        if self.instrument_alloc {
+            module.exports.push(Export {
+                name: "js_nano_alloc_count".into(),
+                kind: ExportKind::Global(self.alloc_count_global),
+            });
+            module.exports.push(Export {
+                name: "js_nano_alloc_bytes".into(),
+                kind: ExportKind::Global(self.alloc_bytes_global),
+            });
+            module.exports.push(Export {
+                name: "js_nano_arena_cursor".into(),
+                kind: ExportKind::Global(self.bump_global),
+            });
         }
     }
 }

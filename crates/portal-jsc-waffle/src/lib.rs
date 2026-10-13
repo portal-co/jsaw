@@ -46,7 +46,10 @@ pub use ingest::{
 };
 pub use linker::ModuleSet;
 pub use nano::{ArenaRef, NanoArena, NanoArenaError, NanoArenaHost, NanoLifetime, NanoPlan, NanoValueRepresentation};
-pub use nano_mvp::{NANO_MVP_SCHEMA, NanoMvpError, emit_nano_mvp, emit_nano_mvp_fingerprint};
+pub use nano_mvp::{
+    NANO_MVP_SCHEMA, NanoMvpConfig, NanoMvpError, emit_nano_mvp, emit_nano_mvp_fingerprint,
+    emit_nano_mvp_with_config,
+};
 pub use nano_native::{
     AdapterAbiRecord, CapabilityCheck, InlineBudget, InlineRecord, InliningMode,
     NANO_NATIVE_SCHEMA, NanoCallDecision, NanoCallStrategy, NanoNativeConfig,

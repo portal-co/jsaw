@@ -554,6 +554,18 @@ pub(crate) const SLOT_FLAGS_DEFAULT: i32 = SLOT_WRITABLE | SLOT_ENUMERABLE | SLO
 /// field's declaration in [`Repr::new`]).
 pub(crate) const FUNCTION_FIELD_TAG: usize = 7;
 
+/// Index of the prototype field within the `object` struct. The field was
+/// declared as the (never otherwise used) `properties` value slot; it now
+/// carries the JavaScript prototype reference (`null` when the object has
+/// no prototype). Prototype-chain reads start at this field.
+pub(crate) const OBJECT_FIELD_PROTO: usize = 2;
+
+/// Index of the prototype field within the `function` struct — the class
+/// constructor's parent constructor for `extends` (static inheritance), and
+/// `Function.prototype` conceptually for every other function (currently
+/// `null`; no `Function.prototype` primordial exists yet).
+pub(crate) const FUNCTION_FIELD_PROTO: usize = 2;
+
 /// Field indexes in the private exception-result struct.
 pub(crate) const EXCEPTION_RESULT_FIELD_STATE: usize = 0;
 pub(crate) const EXCEPTION_RESULT_FIELD_PAYLOAD: usize = 1;

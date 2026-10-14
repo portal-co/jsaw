@@ -35,7 +35,7 @@ const EXPECTED_SCHEMA_VERSION: u32 = 1;
 /// Stale-corpus tripwire: the source fingerprint of the vendored corpus.
 /// When the corpus is regenerated in DreamComp, update the vendored file and
 /// this pin in the same commit.
-const EXPECTED_SOURCE_FINGERPRINT: &str = "source-06083dfebb9e1e7d";
+const EXPECTED_SOURCE_FINGERPRINT: &str = "source-1243c8d61e5bab03";
 /// DreamComp baseline failures recorded at M0 (docs/jsaw-baselines.md in the
 /// DreamComp repo). They stay visible in the report; they are not jsaw
 /// regressions and they are not silently converted into passes.

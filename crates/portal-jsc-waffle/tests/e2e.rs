@@ -5012,3 +5012,40 @@ fn m18_debug_cross_module_state_no_param() {
     validate(&module);
     assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "run", &[]), 42.0);
 }
+#[test]
+fn class_constructor_and_method_execute() {
+    // DreamComp #31: a class with a constructor and a prototype method.
+    let module = lower_module(
+        "export function make(x, y) { class P { constructor(x, y) { this.x = x; this.y = y; } sum() { return this.x + this.y; } } return new P(x, y).sum(); }",
+        &portal_jsc_waffle::ConvertOptions::default(),
+    )
+    .expect("module lowering should succeed");
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "make", &[3.0, 4.0], 7.0);
+}
+
+#[test]
+fn class_inheritance_super_and_instanceof_execute() {
+    // extends + super() construction + super.method() + instanceof chain.
+    let module = lower_module(
+        "export function f(a, b) { class A { constructor(x) { this.x = x; } get() { return this.x; } } class B extends A { constructor(x, y) { super(x); this.y = y; } get() { return super.get() + this.y; } } const p = new B(a, b); return p.get() + (p instanceof A ? 1 : 0); }",
+        &portal_jsc_waffle::ConvertOptions::default(),
+    )
+    .expect("module lowering should succeed");
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "f", &[3.0, 4.0], 8.0);
+}
+
+#[test]
+fn class_statics_and_accessors_execute() {
+    // Static members inherited through the constructor [[Prototype]];
+    // getter/setter descriptors on the prototype.
+    let module = lower_module(
+        "export function f(a, b) { class A { static twice(x) { return x + x; } get v() { return this.backing; } set v(x) { this.backing = x + 1; } } class B extends A {} const p = new B(); p.v = a; return B.twice(a) + p.v; }",
+        &portal_jsc_waffle::ConvertOptions::default(),
+    )
+    .expect("module lowering should succeed");
+    validate(&module);
+    assert_executes_in_all_runtimes(&module, "f", &[3.0, 4.0], 10.0);
+}
+

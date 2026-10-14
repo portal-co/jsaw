@@ -290,3 +290,44 @@ fn unsupported_operators_fail_closed() {
     plan.functions[0].blocks[0].insts[0].const_value = Some(PlanConst::I32(42));
     emit_nano_mvp(&plan).expect("a constant plan must emit");
 }
+
+#[test]
+fn classes_smoke() {
+    assert_eq!(
+        compile_plan_and_run(
+            "export function make(x, y) { class P { constructor(x, y) { this.x = x; this.y = y; } sum() { return this.x + this.y; } } return new P(x, y).sum(); }",
+            "make",
+            &[3.0, 4.0]
+        ),
+        7.0
+    );
+}
+
+#[test]
+fn class_inheritance_and_super_execute() {
+    // extends, super() construction, and super.method() dispatch through the
+    // prototype chain.
+    assert_eq!(
+        compile_plan_and_run(
+            "export function f(a, b) { class A { constructor(x) { this.x = x; } get() { return this.x; } } class B extends A { constructor(x, y) { super(x); this.y = y; } get() { return super.get() + this.y; } } return new B(a, b).get(); }",
+            "f",
+            &[3.0, 4.0]
+        ),
+        7.0
+    );
+}
+
+#[test]
+fn class_statics_instanceof_and_accessors_execute() {
+    // Static methods (inherited through the constructor's [[Prototype]]),
+    // instanceof over the chain, and getter/setter descriptors on the
+    // prototype.
+    assert_eq!(
+        compile_plan_and_run(
+            "export function f(a, b) { class A { static twice(x) { return x + x; } get v() { return this.backing; } set v(x) { this.backing = x + 1; } } class B extends A {} const p = new B(); p.v = a; return B.twice(a) + p.v + (p instanceof A ? 1 : 0); }",
+            "f",
+            &[3.0, 4.0]
+        ),
+        11.0
+    );
+}

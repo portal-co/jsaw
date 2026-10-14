@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use sha3::{Digest, Sha3_256};
 use portal_jsc_swc_ssa::{SBlockId, SCatch, SFunc, SValue, SValueId, module::SModule};
 use portal_jsc_swc_tac::{Item, LId, PropKey, PropVal, TCallee, TTerm};
 use portal_pc_waffle::{
@@ -36,8 +37,8 @@ pub fn convert<'a, 'wasm>(root: &'a SFunc, module: &mut Module<'wasm>) -> Result
 /// Return whether a source function or one of its nested function literals
 /// contains an explicit `throw`. This pre-scan selects the internal return
 /// protocol before any function signatures are allocated.
-fn source_uses_exceptions(func: &SFunc, visited: &mut BTreeSet<usize>) -> bool {
-    let key = func as *const SFunc as usize;
+fn source_uses_exceptions(func: &SFunc, visited: &mut BTreeSet<u64>) -> bool {
+    let key = Converter::key(func);
     if !visited.insert(key) {
         return false;
     }
@@ -102,7 +103,7 @@ impl ConvertOptions {
 /// [`IncrementalConverter`]. It is valid only for the converter session that
 /// returned it; it is intentionally not a source-domain/revision key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ComponentHandle(usize);
+pub struct ComponentHandle(u64);
 
 /// Stable Waffle function slots owned by one source component. Recompilation
 /// replaces the native body in place and retains these handles so existing
@@ -1037,22 +1038,22 @@ struct Converter<'a, 'module, 'wasm> {
     /// optimized ABI and remain compatible with the other emitters.
     exceptions_enabled: bool,
     repr: Repr,
-    functions: BTreeMap<usize, FunctionInfo>,
+    functions: BTreeMap<u64, FunctionInfo>,
     /// Source body registered for each Waffle native function. The pointer key
     /// is compiler-local only; HCR manifests use source-domain fingerprints.
-    function_sources: BTreeMap<usize, &'a SFunc>,
+    function_sources: BTreeMap<u64, &'a SFunc>,
     /// Callee component -> Wasm-source components which embedded/directly
     /// referenced it while lowering. A callee edit invalidates this reverse
     /// closure because native bodies may have inlined/specialized it.
-    component_dependents: BTreeMap<usize, BTreeSet<usize>>,
+    component_dependents: BTreeMap<u64, BTreeSet<u64>>,
     /// The matching forward relation, used to replace a caller's dependency
     /// edges when its Waffle body is rebuilt in place.
-    component_dependencies: BTreeMap<usize, BTreeSet<usize>>,
+    component_dependencies: BTreeMap<u64, BTreeSet<u64>>,
     /// Set only while lowering one source component. `ensure_function` uses it
     /// to record every nested/imported component pulled into that native body.
-    active_component: Option<usize>,
-    pending: VecDeque<(usize, &'a SFunc)>,
-    lowered: BTreeSet<usize>,
+    active_component: Option<u64>,
+    pending: VecDeque<(u64, &'a SFunc)>,
+    lowered: BTreeSet<u64>,
     /// A declaration-only table makes every adapter legal as a `ref.func`
     /// target under Wasm's typed-function-reference validation rules.
     ref_table: Option<Table>,
@@ -1077,6 +1078,15 @@ struct Converter<'a, 'module, 'wasm> {
     shapes: Vec<ShapeInfo>,
     /// The small deep module shared by static and computed property access.
     property_helpers: Option<PropertyHelpers>,
+    /// The generated prototype-chain lookup (`js_property_chain_lookup`):
+    /// own slot or the first match up the `[[Prototype]]` chain.
+    chain_lookup: Option<Func>,
+    /// Generated default constructors for classes that declare none
+    /// (base and derived variants).
+    default_ctor_base: Option<Func>,
+    default_ctor_derived: Option<Func>,
+    /// The generated `instanceof` chain-walk helper.
+    instanceof_helper: Option<Func>,
     /// Generic JS `ToBoolean` for a value already known to be a reference.
     /// Distinguishes a boxed `false` (falsy) from every other non-null
     /// reference (truthy) — plain null-ness alone isn't enough once a value
@@ -1140,12 +1150,12 @@ struct Converter<'a, 'module, 'wasm> {
     add_helper: Option<Func>,
     /// Memoized static return-representation analysis per source function
     /// (keyed by [`Converter::key`]). See `analyze_return_kinds`.
-    return_kinds: BTreeMap<usize, ReturnKinds>,
+    return_kinds: BTreeMap<u64, ReturnKinds>,
     /// Functions whose return-kind analysis is currently being scanned.
     /// A tail edge back into one of these is a recursion cycle: it
     /// contributes the caller's own kinds, not the (still empty)
     /// placeholder.
-    analysis_in_progress: BTreeSet<usize>,
+    analysis_in_progress: BTreeSet<u64>,
     /// The return representation of the native body currently being
     /// lowered.
     current_native_returns: ReturnType,
@@ -1167,10 +1177,10 @@ struct Converter<'a, 'module, 'wasm> {
     /// literal was stored under by the enclosing scope (`function name()`
     /// declarations and single-assignment `let f = function(){}` in the
     /// top-level scope chain). Used to prove self-recursion sites fresh.
-    function_self_names: BTreeMap<usize, Ident>,
+    function_self_names: BTreeMap<u64, Ident>,
     /// The function currently being lowered (its source), and its key.
     lowering_function: Option<&'a SFunc>,
-    lowering_function_key: Option<usize>,
+    lowering_function_key: Option<u64>,
     /// Deduplicated raw Wasm imports, keyed by module, field, and ABI.
     wasm_host_imports: BTreeMap<WasmImportSpec, Func>,
     /// Generated jsaw callable metadata for every raw host import.
@@ -1183,7 +1193,7 @@ struct Converter<'a, 'module, 'wasm> {
     /// Owning module path per registered function (keyed like
     /// [`Converter::functions`]), so an imported function can be registered
     /// under its declaring module's import table before its body lowers.
-    module_of_function: BTreeMap<usize, String>,
+    module_of_function: BTreeMap<u64, String>,
     /// Module path of the top-level function currently being collected or
     /// lowered. Nested closures inherit it.
     current_module: String,
@@ -1216,6 +1226,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             trie_clone: None,
             shapes: Vec::new(),
             property_helpers: None,
+            chain_lookup: None,
+            default_ctor_base: None,
+            default_ctor_derived: None,
+            instanceof_helper: None,
             truthy_helper: None,
             typeof_helper: None,
             to_bigint_helper: None,
@@ -1251,8 +1265,19 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         }
     }
 
-    fn key(func: &SFunc) -> usize {
-        func as *const SFunc as usize
+    /// Content-hash identity for an SSA function.
+    ///
+    /// Pointer identity (`func as *const SFunc`) is not stable here: the same
+    /// source function can be converted into distinct `SFunc` allocations
+    /// (top-level hoist registration vs. the export/lower path), and two
+    /// identical-but-distinct `SFunc`s must share one compiled body while
+    /// structurally different ones must not collide. Key by the function's
+    /// structural content instead.
+    fn key(func: &SFunc) -> u64 {
+        let mut hasher = Sha3_256::new();
+        hasher.update(b"portal-jsc-sfunc/v1");
+        hasher.update(format!("{func:?}").as_bytes());
+        u64::from_be_bytes(hasher.finalize()[..8].try_into().unwrap())
     }
 
     /// The resolved semantic configuration active during this emission.
@@ -1276,7 +1301,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     fn collect_shapes_from_function(
         &mut self,
         func: &'a SFunc,
-        visited: &mut BTreeSet<usize>,
+        visited: &mut BTreeSet<u64>,
     ) -> Result<(), ConvertError> {
         if !visited.insert(Self::key(func)) {
             return Ok(());
@@ -1310,7 +1335,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     /// nested closures) assigns. A primordial name that is never assigned in
     /// an enclosing scope chain cannot be shadowed, so call sites can skip
     /// the runtime tag check entirely. Collected into `shadowed_names`.
-    fn collect_shadowed_names(&mut self, func: &'a SFunc, visited: &mut BTreeSet<usize>) {
+    fn collect_shadowed_names(&mut self, func: &'a SFunc, visited: &mut BTreeSet<u64>) {
         self.collect_shadowed_names_nested(func, visited, false)
     }
 
@@ -1336,7 +1361,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     fn collect_shadowed_names_nested(
         &mut self,
         func: &'a SFunc,
-        visited: &mut BTreeSet<usize>,
+        visited: &mut BTreeSet<u64>,
         nested: bool,
     ) {
         if !visited.insert(Self::key(func)) {
@@ -2637,9 +2662,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     /// Return every generated Wasm source component that must be rebuilt when
     /// one source component changes. The reverse closure is required because
     /// native bodies can embed/directly specialize component calls.
-    fn invalidated_components(&self, changed: impl IntoIterator<Item = usize>) -> BTreeSet<usize> {
+    fn invalidated_components(&self, changed: impl IntoIterator<Item = u64>) -> BTreeSet<u64> {
         let mut invalidated = BTreeSet::new();
-        let mut pending: VecDeque<usize> = changed.into_iter().collect();
+        let mut pending: VecDeque<u64> = changed.into_iter().collect();
         while let Some(component) = pending.pop_front() {
             if !invalidated.insert(component) {
                 continue;
@@ -2661,8 +2686,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     /// escalate to a complete immutable module revision.
     fn recompile_components_in_place(
         &mut self,
-        replacements: &BTreeMap<usize, &'a SFunc>,
-    ) -> Result<BTreeSet<usize>, ConvertError> {
+        replacements: &BTreeMap<u64, &'a SFunc>,
+    ) -> Result<BTreeSet<u64>, ConvertError> {
         for (component, replacement) in replacements {
             let Some(info) = self.functions.get(component).copied() else {
                 return Err(ConvertError::invalid(format!(
@@ -4193,6 +4218,57 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     .get(class)
                     .ok_or_else(|| ConvertError::invalid("undefined constructor"))?;
                 let receiver = self.new_object(body, block)?;
+                // `new C()`: the receiver's [[Prototype]] is the
+                // constructor's `prototype` property when that is an
+                // object/function, else null (no Object.prototype
+                // primordial exists yet).
+                let mut block = block;
+                {
+                    let (b, prototype) =
+                        self.get_property_value_raw(body, block, &callee.clone(), "prototype")?;
+                    block = b;
+                    let (prototype, _) = prototype.wasm()?;
+                    let proto_is_object = body.add_op(
+                        block,
+                        Operator::RefTest {
+                            ty: self.repr.object_ty(),
+                        },
+                        &[prototype],
+                        &[Type::I32],
+                    );
+                    let proto_is_function = body.add_op(
+                        block,
+                        Operator::RefTest {
+                            ty: self.repr.function_ty(),
+                        },
+                        &[prototype],
+                        &[Type::I32],
+                    );
+                    let proto_ok = body.add_op(
+                        block,
+                        Operator::I32Or,
+                        &[proto_is_object, proto_is_function],
+                        &[Type::I32],
+                    );
+                    let null_proto = body.add_op(
+                        block,
+                        Operator::RefNull {
+                            ty: self.repr.value,
+                        },
+                        &[],
+                        &[self.repr.value],
+                    );
+                    let proto = body.add_op(
+                        block,
+                        Operator::TypedSelect {
+                            ty: self.repr.value,
+                        },
+                        &[prototype, null_proto, proto_ok],
+                        &[self.repr.value],
+                    );
+                    let (receiver_value, _) = receiver.wasm()?;
+                    self.set_object_proto(body, block, receiver_value, proto);
+                }
                 let (ctx, _default_this, code, arrow) =
                     self.callable_parts(body, block, callee, this.clone())?;
                 let is_arrow = arrow;
@@ -4260,7 +4336,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 let object = body.add_op(
                     normal,
                     Operator::RefTest {
-                        ty: self.repr.object_ty(),
+                        // Non-null: `undefined` (the null anyref) must fall
+                        // through to the implicit receiver; the nullable
+                        // variant would treat it as an explicit object
+                        // override and the instance would become null.
+                        ty: self.repr.object_non_null_ty(),
                     },
                     &[result],
                     &[Type::I32],
@@ -4268,7 +4348,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 let function = body.add_op(
                     normal,
                     Operator::RefTest {
-                        ty: self.repr.function_ty(),
+                        ty: self.repr.function_non_null_ty(),
                     },
                     &[result],
                     &[Type::I32],
@@ -4355,9 +4435,13 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 // robustness.
                 self.template_literal(body, block, values, quasis, exprs)?
             }
+            Item::Class(class) => {
+                let (block, class_value) =
+                    self.class_value(body, block, context, this, values, class, span)?;
+                return Ok(vec![(block, class_value)]);
+            }
             Item::PrivateMem { .. }
             | Item::HasPrivateMem { .. }
-            | Item::Class(_)
             | Item::Yield { .. }
             | Item::Await { .. }
             | Item::Asm { .. }
@@ -4990,10 +5074,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     kind: ValueKind::Reference,
                 })
             }
-            Exp | In | InstanceOf => Err(ConvertError::unsupported(
+            Exp | In => Err(ConvertError::unsupported(
                 format!("binary operator {op:?}"),
                 span,
             )),
+            InstanceOf => self.instance_of(body, block, left, right),
         }
     }
 
@@ -12933,16 +13018,41 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         object: &LowerValue,
         key: &str,
     ) -> Result<(Block, LowerValue), ConvertError> {
-        let (block, root) = self.object_and_root(body, block, object)?;
-        let helpers = self.ensure_property_helpers()?;
+        let (value, kind) = object.wasm()?;
+        if kind != ValueKind::Reference {
+            // Primitives answer no own properties; keep the previous
+            // behavior of an unaliased empty-root miss.
+            let (block, root) = self.object_and_root(body, block, object)?;
+            let helpers = self.ensure_property_helpers()?;
+            let key = self.new_string(body, block, key.as_bytes())?;
+            let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+            let slot = body.add_op(
+                block,
+                Operator::Call {
+                    function_index: helpers.lookup,
+                },
+                &[root, key, zero],
+                &[self.repr.slot_ty()],
+            );
+            let (block, value) = self.unwrap_slot(body, block, slot);
+            return Ok((
+                block,
+                LowerValue::Wasm {
+                    value,
+                    kind: ValueKind::Reference,
+                },
+            ));
+        }
+        // Reference receivers go through the prototype-chain lookup (#31):
+        // own slot first, then each [[Prototype]] in order.
         let key = self.new_string(body, block, key.as_bytes())?;
-        let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let chain = self.ensure_chain_lookup()?;
         let slot = body.add_op(
             block,
             Operator::Call {
-                function_index: helpers.lookup,
+                function_index: chain,
             },
-            &[root, key, zero],
+            &[value, key],
             &[self.repr.slot_ty()],
         );
         let (block, value) = self.unwrap_slot(body, block, slot);
@@ -14155,6 +14265,34 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     .map(|(block, callee)| (block, callee, receiver.clone()))
                     .collect()
             }
+            // `super(...)` runs the parent constructor with the receiver the
+            // outer `new` already created (see classes.rs's module comment).
+            // The parent is the hidden `\x01super` binding on the
+            // constructor's context.
+            TCallee::Super => {
+                let callees = self.get_property(body, block, context, "\u{1}super")?;
+                callees
+                    .into_iter()
+                    .map(|(block, callee)| (block, callee, this.clone()))
+                    .collect()
+            }
+            // `super.method(...)`: look the member up starting at the home
+            // object's `[[Prototype]]` (the hidden `\x01home` binding), with
+            // the receiver staying the current `this`.
+            TCallee::SuperMember { member } => {
+                let (b, home) = self.get_property_raw(body, block, context, "\u{1}home")?;
+                let (home_value, _) = home.wasm()?;
+                let (b, start) = self.proto_of(body, b, home_value);
+                let start = LowerValue::Wasm {
+                    value: start,
+                    kind: ValueKind::Reference,
+                };
+                let callees = self.get_property_value(body, b, &start, member)?;
+                callees
+                    .into_iter()
+                    .map(|(block, callee)| (block, callee, this.clone()))
+                    .collect()
+            }
             _ => return Err(ConvertError::unsupported(format!("callee {callee:?}"), ())),
         };
         let mut result = Vec::with_capacity(callees.len());
@@ -14340,6 +14478,10 @@ mod continuation_values_tests {
 // block of its own) so these methods share full access to the existing
 // property/object helpers without a separate crate-visibility surface.
 include!("primordials.rs");
+
+// Classes (prototype chains, super, instanceof): `include!`d as a
+// module-level item (an `impl Converter` block), same as primordials.
+include!("classes.rs");
 
 // Native WasmGC backing storage and the corresponding JavaScript typed-array
 // surface. Kept beside the primordial implementation because constructors and

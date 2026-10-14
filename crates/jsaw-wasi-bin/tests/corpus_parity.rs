@@ -35,7 +35,7 @@ const EXPECTED_SCHEMA_VERSION: u32 = 1;
 /// Stale-corpus tripwire: the source fingerprint of the vendored corpus.
 /// When the corpus is regenerated in DreamComp, update the vendored file and
 /// this pin in the same commit.
-const EXPECTED_SOURCE_FINGERPRINT: &str = "source-1243c8d61e5bab03";
+const EXPECTED_SOURCE_FINGERPRINT: &str = "source-f38db922ba0129c7";
 /// DreamComp baseline failures recorded at M0 (docs/jsaw-baselines.md in the
 /// DreamComp repo). They stay visible in the report; they are not jsaw
 /// regressions and they are not silently converted into passes.
@@ -151,6 +151,14 @@ struct CaseReport {
     error: Option<String>,
     /// (alloc_count, alloc_bytes, peak_live_bytes, retained_objects)
     metrics: Option<(u64, u64, u64, u64)>,
+}
+
+fn semantic_mode(case: &CorpusCase) -> &'static str {
+    match case.name.as_str() {
+        "weakmap_emulated" => "emulated-strong",
+        name if name.starts_with("weakmap_native_intrinsic") => "native-weak-key-slot",
+        _ => "ordinary",
+    }
 }
 
 fn run_case(
@@ -326,6 +334,7 @@ fn dreamcomp_corpus_runs_identically_through_jsaw_wasmbc() {
                 "id": case.id,
                 "name": case.name,
                 "lane": lane,
+                "semantic_mode": semantic_mode(case),
                 "status": report.status,
                 "expected": case.expected,
                 "actual": report.actual,

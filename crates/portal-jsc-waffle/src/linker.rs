@@ -299,6 +299,13 @@ pub(crate) enum ImportTarget<'a> {
     },
     /// A named import from `wasm:<module>` with an explicitly declared ABI.
     WasmHost(WasmImportSpec),
+    /// A compiler-recognized intrinsic module. Intrinsics are call-only:
+    /// they do not have a runtime function object and are intercepted by the
+    /// WasmGC lowering before ordinary call dispatch.
+    Intrinsic {
+        module: String,
+        name: String,
+    },
 }
 
 /// Build one module's import table: every referenced imported binding →
@@ -349,6 +356,27 @@ pub(crate) fn build_import_table<'a>(
             table.insert(
                 id,
                 ImportTarget::WasmHost(wasm_import_spec(host_module, &name)?),
+            );
+            continue;
+        }
+        // `~weakmap` is a compiler intrinsic namespace, not an ES module in
+        // the closed module set. Preserve the lexical binding so call
+        // lowering can intercept it before the normal function path.
+        if specifier == "~weakmap" {
+            let name = match kind {
+                ImportMap::Named { name } => name.to_string(),
+                ImportMap::Default | ImportMap::Star => {
+                    return Err(ConvertError::invalid(format!(
+                        "intrinsic import from {specifier:?} in module {path:?} must be named"
+                    )));
+                }
+            };
+            table.insert(
+                id,
+                ImportTarget::Intrinsic {
+                    module: specifier.clone(),
+                    name,
+                },
             );
             continue;
         }

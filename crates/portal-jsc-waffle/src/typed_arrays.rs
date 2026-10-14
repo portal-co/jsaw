@@ -268,8 +268,27 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[plain],
             &[self.repr.value],
         );
+        let tag = body.add_op(
+            object_block,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 4,
+            },
+            &[plain],
+            &[Type::I32],
+        );
         let null = body.add_op(object_block, Operator::RefIsNull, &[data], &[Type::I32]);
-        let present = body.add_op(object_block, Operator::I32Eqz, &[null], &[Type::I32]);
+        let has_data = body.add_op(object_block, Operator::I32Eqz, &[null], &[Type::I32]);
+        // Ordinary objects such as Map instances also use `typed_data`
+        // (field 3) for their collection backing store. A valid typed-array
+        // tag is the second half of the brand check; without it every
+        // collection's `set` property would dispatch to TypedArray.prototype.
+        let zero = body.add_op(object_block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let max = body.add_op(object_block, Operator::I32Const { value: (TypedArrayKind::ALL.len() - 1) as u32 }, &[], &[Type::I32]);
+        let non_negative = body.add_op(object_block, Operator::I32GeS, &[tag, zero], &[Type::I32]);
+        let in_range = body.add_op(object_block, Operator::I32LeS, &[tag, max], &[Type::I32]);
+        let valid_tag = body.add_op(object_block, Operator::I32And, &[non_negative, in_range], &[Type::I32]);
+        let present = body.add_op(object_block, Operator::I32And, &[has_data, valid_tag], &[Type::I32]);
         body.set_terminator(
             object_block,
             Terminator::Br {
@@ -2797,18 +2816,34 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             &[plain],
             &[self.repr.value],
         );
-        let absent = body.add_op(typed, Operator::RefIsNull, &[data], &[Type::I32]);
+        let tag = body.add_op(
+            typed,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 4,
+            },
+            &[plain],
+            &[Type::I32],
+        );
+        let data_null = body.add_op(typed, Operator::RefIsNull, &[data], &[Type::I32]);
+        let data_present = body.add_op(typed, Operator::I32Eqz, &[data_null], &[Type::I32]);
+        let zero = body.add_op(typed, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let max = body.add_op(typed, Operator::I32Const { value: (TypedArrayKind::ALL.len() - 1) as u32 }, &[], &[Type::I32]);
+        let non_negative = body.add_op(typed, Operator::I32GeS, &[tag, zero], &[Type::I32]);
+        let in_range = body.add_op(typed, Operator::I32LeS, &[tag, max], &[Type::I32]);
+        let valid_tag = body.add_op(typed, Operator::I32And, &[non_negative, in_range], &[Type::I32]);
+        let is_typed_value = body.add_op(typed, Operator::I32And, &[data_present, valid_tag], &[Type::I32]);
         let is_typed = body.add_block();
         body.set_terminator(
             typed,
             Terminator::CondBr {
-                cond: absent,
+                cond: is_typed_value,
                 if_true: BlockTarget {
-                    block: non_object,
+                    block: is_typed,
                     args: vec![],
                 },
                 if_false: BlockTarget {
-                    block: is_typed,
+                    block: non_object,
                     args: vec![],
                 },
             },

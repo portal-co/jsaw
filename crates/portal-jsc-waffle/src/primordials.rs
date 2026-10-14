@@ -41,6 +41,14 @@ fn new_context_with_primordials(
     let object_ns = self.build_object_namespace(body, &mut block)?;
     block = self.set_static_property_value_raw(body, block, &context, "Object", &object_ns)?;
 
+    // Map/Set/WeakMap/WeakSet are ordinary function objects with prototype
+    // methods, installed into the same lexical context as the other globals.
+    let context_value = LowerValue::Wasm {
+        value: context.wasm()?.0,
+        kind: ValueKind::Reference,
+    };
+    block = self.build_collection_primordials(body, block, &context_value)?;
+
     // Typed-array constructors are globals rather than namespace members.
     // Installing them through the ordinary context preserves the same
     // shadowing rules as Math/Array: a later local declaration is just an

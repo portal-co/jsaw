@@ -71,6 +71,10 @@ pub(crate) struct Repr {
     /// functions. It is deliberately not part of the JavaScript object/value
     /// representation; only exception-aware call lowering may unpack it.
     pub(crate) exception_result: Signature,
+    /// A Map/Set/WeakMap/WeakSet entry pair (`key`, `value`), both `anyref`.
+    pub(crate) map_entry: Signature,
+    /// An array of [`Self::map_entry`] pairs — a collection's backing table.
+    pub(crate) map_entries: Signature,
     /// The adapter signature's return type (`anyref`), so call sites can
     /// type a `CallRef`/`ReturnCallRef` to the adapter explicitly.
     pub(crate) adapter_value: Type,
@@ -284,6 +288,14 @@ impl Repr {
             fields: vec![field(Type::I32), field(value)],
             shared: false,
         });
+        let map_entry = module.signatures.push(SignatureData::Struct {
+            fields: vec![field(value), field(value)],
+            shared: false,
+        });
+        let map_entries = module.signatures.push(SignatureData::Array {
+            ty: field(ref_sig(map_entry)),
+            shared: false,
+        });
         let adapter = module.signatures.push(SignatureData::Func {
             params: vec![ref_sig(object), value, ref_sig(arguments)],
             returns: vec![value],
@@ -378,11 +390,21 @@ impl Repr {
             multi_if,
             multi_rif,
             exception_result,
+            map_entry,
+            map_entries,
         }
     }
 
     pub(crate) fn object_ty(self) -> Type {
         ref_sig(self.object)
+    }
+
+    pub(crate) fn map_entry_ty(self) -> Type {
+        ref_sig(self.map_entry)
+    }
+
+    pub(crate) fn map_entries_ty(self) -> Type {
+        ref_sig(self.map_entries)
     }
 
     /// For `RefTest`: `ref.test` against a *nullable* type matches `null`

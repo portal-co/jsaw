@@ -5049,3 +5049,62 @@ fn class_statics_and_accessors_execute() {
     assert_executes_in_all_runtimes(&module, "f", &[3.0, 4.0], 10.0);
 }
 
+#[test]
+fn collections_map_set_and_weakmap_execute() {
+    let cases = [
+        ("export function f(a, b) { const m = new Map(); m.set(1, a); m.set(2, b); return m.get(1) + m.get(2) + (m.has(2) ? 1 : 0) - m.size + 1; }", 7.0),
+        ("export function f(a, b) { const m = new Map(); const k1 = { id: 1 }; const k2 = { id: 1 }; m.set(k1, a); m.set(k2, b); return m.get(k1) + m.get(k2); }", 7.0),
+        ("export function f(a, b) { const m = new Map(); m.set(1, a); m.delete(1); m.set(2, b); return (m.has(1) ? 100 : 0) + m.get(2) + m.size + 4; }", 9.0),
+        ("export function f(a, b) { const s = new Set(); s.add(a); s.add(b); s.add(a); return s.size + (s.has(a) ? 1 : 0) + (s.has(99) ? 100 : 0); }", 3.0),
+        ("export function f(a, b) { const w = new WeakMap(); const k1 = {}; const k2 = {}; w.set(k1, a); w.set(k2, b); return w.get(k1) + w.get(k2) + (w.has(k1) ? 1 : 0) - 1; }", 7.0),
+    ];
+    for (source, expected) in cases {
+        let module = lower_module(source, &portal_jsc_waffle::ConvertOptions::default())
+            .expect("collection lowering should succeed");
+        validate_wasm_only(&module);
+        assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "f", &[3.0, 4.0]), expected);
+    }
+}
+
+#[test]
+fn weakmap_intrinsic_executes_through_native_lowering() {
+    let module = lower_modules(
+        &[
+            ("main.mjs", "import { weakSet, weakGet, weakHas } from \"~weakmap\"; export function f(a, b) { const k1 = {}; const k2 = {}; weakSet(0, k1, a); weakSet(0, k2, b); return weakGet(0, k1) + weakGet(0, k2) + (weakHas(0, k2) ? 1 : 0) - 1; }"),
+            ("weak.js", "export function weakSet(wm, key, value) { wm.set(key, value); } export function weakGet(wm, key) { return wm.get(key); } export function weakHas(wm, key) { return wm.has(key); }"),
+        ],
+        "main.mjs",
+        &portal_jsc_waffle::ConvertOptions::default(),
+    ).expect("intrinsic lowering should succeed");
+    validate_wasm_only(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "f", &[3.0, 4.0]), 7.0);
+}
+
+#[test]
+fn weakmap_intrinsic_handles_are_isolated() {
+    let module = lower_modules(
+        &[
+            ("main.mjs", "import { weakSet, weakGet } from \"~weakmap\"; export function f(a, b) { const k = {}; weakSet(0, k, a); weakSet(1, k, b); return weakGet(0, k) + weakGet(1, k); }"),
+            ("weak.js", "export function weakSet(wm, key, value) { wm.set(key, value); } export function weakGet(wm, key) { return wm.get(key); }"),
+        ],
+        "main.mjs",
+        &portal_jsc_waffle::ConvertOptions::default(),
+    ).expect("intrinsic lowering should succeed");
+    validate_wasm_only(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "f", &[5.0, 6.0]), 11.0);
+}
+
+#[test]
+fn weakmap_intrinsic_delete_removes_native_entry() {
+    let module = lower_modules(
+        &[
+            ("main.mjs", "import { weakSet, weakGet, weakHas, weakDelete } from \"~weakmap\"; export function f(a) { const k = {}; weakSet(0, k, a); const removed = weakDelete(0, k) ? 1 : 0; return removed + (weakHas(0, k) ? 10 : 0) + (weakGet(0, k) === undefined ? 2 : 0); }"),
+            ("weak.js", "export function weakSet(wm, key, value) { wm.set(key, value); } export function weakGet(wm, key) { return wm.get(key); } export function weakHas(wm, key) { return wm.has(key); } export function weakDelete(wm, key) { return wm.delete(key); }"),
+        ],
+        "main.mjs",
+        &portal_jsc_waffle::ConvertOptions::default(),
+    ).expect("intrinsic lowering should succeed");
+    validate_wasm_only(&module);
+    assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "f", &[5.0]), 3.0);
+}
+

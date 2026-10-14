@@ -293,7 +293,7 @@ pub fn convert_modules<'a, 'wasm>(
                 ImportTarget::InternalFunction { function, .. } => {
                     source_uses_exceptions(function, &mut BTreeSet::new())
                 }
-                ImportTarget::WasmHost(_) => false,
+                ImportTarget::WasmHost(_) | ImportTarget::Intrinsic { .. } => false,
             })
         });
     if converter.exceptions_enabled {
@@ -458,6 +458,17 @@ struct FunctionInfo {
 /// User function tags start far above the primordial tag range so the two
 /// tag spaces can never collide.
 const USER_TAG_BASE: i32 = 1 << 20;
+/// Primordial tags below the user base, reserved for the collection
+/// constructors/methods added for DreamComp #32. A guarded fast-core site
+/// distinguishes an unshadowed `Map.get` (etc.) from user code by tag.
+const TAG_MAP_CTOR: i32 = 0x4D00;
+const TAG_MAP_METHOD: i32 = 0x4D01;
+const TAG_SET_CTOR: i32 = 0x4D02;
+const TAG_SET_METHOD: i32 = 0x4D03;
+const TAG_WEAKMAP_CTOR: i32 = 0x4D04;
+const TAG_WEAKMAP_METHOD: i32 = 0x4D05;
+const TAG_WEAKSET_CTOR: i32 = 0x4D06;
+const TAG_WEAKSET_METHOD: i32 = 0x4D07;
 
 /// The set of [`ValueKind`]s a function's returns may produce. Tracked as a
 /// bitset so multi-kind unions (a `Number` path and a `Reference` path) keep
@@ -744,6 +755,22 @@ struct PropertyHelpers {
     trie_lookup: Func,
     set: Func,
     trie_set: Func,
+}
+
+/// The generated collection helper functions (#32). Method dispatchers take
+/// `(ctx, this, args, selector)` where `selector` is the numeric method op
+/// captured in the method function object's context under the hidden
+/// `\u{1}op` binding.
+#[derive(Clone, Copy)]
+struct CollectionHelpers {
+    map_new: Func,
+    map_method: Func,
+    set_new: Func,
+    set_method: Func,
+    weakmap_new: Func,
+    weakmap_method: Func,
+    weakset_new: Func,
+    weakset_method: Func,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1087,6 +1114,15 @@ struct Converter<'a, 'module, 'wasm> {
     default_ctor_derived: Option<Func>,
     /// The generated `instanceof` chain-walk helper.
     instanceof_helper: Option<Func>,
+    /// The generated SameValueZero equality helper (`js_same_value_zero`).
+    same_value_zero: Option<Func>,
+    /// The generated `js_map_find` entry-index helper.
+    map_find_helper: Option<Func>,
+    /// Generated collection constructors and method dispatchers (#32):
+    /// `Map`/`Set`/`WeakMap`/`WeakSet`. Each constructor installs the
+    /// instance's entries array and `[[Prototype]]`; each method dispatcher
+    /// switches on its numeric op selector.
+    collection_helpers: Option<CollectionHelpers>,
     /// Generic JS `ToBoolean` for a value already known to be a reference.
     /// Distinguishes a boxed `false` (falsy) from every other non-null
     /// reference (truthy) — plain null-ness alone isn't enough once a value
@@ -1230,6 +1266,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             default_ctor_base: None,
             default_ctor_derived: None,
             instanceof_helper: None,
+            same_value_zero: None,
+            map_find_helper: None,
+            collection_helpers: None,
             truthy_helper: None,
             typeof_helper: None,
             to_bigint_helper: None,
@@ -2860,6 +2899,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         this.clone(),
                         arguments.clone(),
                         &continuation.values,
+                        stmt,
                         &sfunc.cfg.values[stmt].value,
                     )?;
                     let results = results
@@ -3665,6 +3705,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         this: LowerValue,
         arguments: LowerValue,
         values: &ContinuationValues,
+        source_id: SValueId,
         source: &'a SValue,
     ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
         match source {
@@ -3759,6 +3800,45 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                                 true,
                             )?;
                             return Ok(vec![(block, value)]);
+                        }
+                        ImportTarget::Intrinsic { module, name } => {
+                            // The SSA builder materializes the callee's
+                            // LoadId as a separate statement before the
+                            // Item::Call. Permit exactly that temporary
+                            // value; lower_item intercepts the call itself
+                            // and never consumes the placeholder. Any other
+                            // read remains a named fail-closed diagnostic.
+                            let is_call_callee = self
+                                .lowering_function
+                                .is_some_and(|function| {
+                                    function.cfg.values.iter().any(|(_, value)| {
+                                        matches!(
+                                            &value.value,
+                                            SValue::Item {
+                                                item: Item::Call {
+                                                    callee: TCallee::Val(callee),
+                                                    ..
+                                                },
+                                                ..
+                                            } if *callee == source_id
+                                        )
+                                    })
+                                });
+                            if !is_call_callee {
+                                return Err(ConvertError::invalid(format!(
+                                    "intrinsic import {module:?}/{name:?} is call-only"
+                                )));
+                            }
+                            let value = self.null_ref(body, block);
+                            return Ok(vec![
+                                (
+                                    block,
+                                    LowerValue::Wasm {
+                                        value,
+                                        kind: ValueKind::Reference,
+                                    },
+                                ),
+                            ]);
                         }
                     }
                 }
@@ -3921,6 +4001,33 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             };
         }
         if let Item::Call { callee, args } = item {
+            // `~weakmap` bindings are compiler intrinsics rather than
+            // runtime function objects. Intercept calls before ordinary
+            // direct/provenance/generic dispatch; loading one as a value is
+            // rejected by the lexical LoadId path below.
+            if let TCallee::Val(value) = callee
+                && let Some(source) = self.lowering_function
+                && let Some(SValue::LoadId(id)) = source.cfg.values.get(*value).map(|v| &v.value)
+                && matches!(
+                    self.import_tables
+                        .get(&self.current_module)
+                        .and_then(|table| table.get(id)),
+                    Some(ImportTarget::Intrinsic { module, .. }) if module == "~weakmap"
+                )
+            {
+                let result = self
+                    .try_weakmap_intrinsic_call(
+                        body,
+                        block,
+                        context,
+                        this,
+                        values,
+                        id,
+                        args,
+                    )?
+                    .ok_or_else(|| ConvertError::invalid("weakmap intrinsic was not recognized"))?;
+                return Ok(result);
+            }
             if let Some(info) = self.module_function_info_for_callee(callee)? {
                 return self.direct_native_call(body, block, context, info, this, values, args);
             }
@@ -14482,6 +14589,9 @@ include!("primordials.rs");
 // Classes (prototype chains, super, instanceof): `include!`d as a
 // module-level item (an `impl Converter` block), same as primordials.
 include!("classes.rs");
+
+// Map/Set/WeakMap/WeakSet primordials (#32): `include!`d the same way.
+include!("collections.rs");
 
 // Native WasmGC backing storage and the corresponding JavaScript typed-array
 // surface. Kept beside the primordial implementation because constructors and

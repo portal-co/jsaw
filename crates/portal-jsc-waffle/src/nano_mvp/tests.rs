@@ -331,3 +331,32 @@ fn class_statics_instanceof_and_accessors_execute() {
         11.0
     );
 }
+
+#[test]
+fn private_fields_and_brand_checks_execute() {
+    // Instance private fields with per-instance storage and `#x in obj`
+    // brand checks (same class true, foreign object and other class's
+    // same-named private false).
+    assert_eq!(
+        compile_plan_and_run(
+            "export function f(a, b) { class A { #x; constructor(v) { this.#x = v; } get() { return this.#x; } static has(o) { return #x in o; } } class B { #x = 100; } return new A(a).get() + new A(b).get() + (A.has(new A(0)) ? 1 : 0) + (A.has(new B()) ? 50 : 0); }",
+            "f",
+            &[3.0, 4.0]
+        ),
+        8.0
+    );
+}
+
+#[test]
+fn private_methods_accessors_and_statics_execute() {
+    // Private method calls, a private getter/setter pair, and a static
+    // private field mutated through a static method.
+    assert_eq!(
+        compile_plan_and_run(
+            "export function f(a, b) { class C { static #count = 0; #v = 0; static bump(v) { this.#count += v; return this.#count; } get val() { return this.#v; } set val(x) { this.#v = x; } #twice(v) { return v * 2; } run(v) { return this.#twice(v); } } const c = new C(); c.val = a; return c.run(c.val) + C.bump(b); }",
+            "f",
+            &[3.0, 4.0]
+        ),
+        10.0
+    );
+}

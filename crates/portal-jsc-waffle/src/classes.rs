@@ -1037,6 +1037,38 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 self.function_object_for_native(body, block, ctor_ctx_value, helper)?
             }
         };
+        // Instance private members (#33): when the class declares any, the
+        // class's callable identity becomes a generated wrapper constructor
+        // that installs the hidden slots on the receiver (values staged in
+        // the wrapper's context) before tail-calling the real constructor.
+        let mut private_instance_names: Vec<String> = Vec::new();
+        for (flags, key, _prop) in &class.members {
+            if flags.contains(MemberFlags::STATIC) {
+                continue;
+            }
+            if let PropKey::Lit(sym) = key
+                && let PrivateKind::Private(ctxt) = &sym.ctx
+            {
+                let name = Self::private_slot_name(&sym.sym, *ctxt);
+                if !private_instance_names.contains(&name) {
+                    private_instance_names.push(name);
+                }
+            }
+        }
+        let mut wrapper_ctx: Option<LowerValue> = None;
+        let ctor = if private_instance_names.is_empty() {
+            ctor
+        } else {
+            let wctx = self.new_object(body, block)?;
+            let wctx_value = wctx.wasm()?.0;
+            self.set_object_proto(body, block, wctx_value, context);
+            block =
+                self.set_static_property_value_raw(body, block, &wctx, "\u{1}priv_target", &ctor)?;
+            let wrapper = self.private_ctor_wrapper(&private_instance_names)?;
+            let wrapped = self.function_object_for_native(body, block, wctx_value, wrapper)?;
+            wrapper_ctx = Some(wctx);
+            wrapped
+        };
         let (ctor_value, _) = ctor.clone().wasm()?;
         if let Some(sup) = &superclass {
             let (sup_value, _) = sup.clone().wasm()?;
@@ -1056,14 +1088,30 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             std::collections::BTreeMap::new();
         for (flags, key, prop) in &class.members {
             let is_static = flags.contains(MemberFlags::STATIC);
+            // Private members (#33) resolve to hidden own-slot names derived
+            // from the hygiene pair. Statics install on the constructor (the
+            // wrapper, when one exists); instance members stage their value
+            // in the wrapper's context under `\x01privv<ordinal>`, and the
+            // generated wrapper constructor installs them per receiver. A
+            // getter/setter pair shares one slot name and one ordinal.
+            let mut private_member = false;
             let key_name: Option<String> = match key {
                 PropKey::Lit(sym) => match &sym.ctx {
                     PrivateKind::Public => Some(sym.sym.to_string()),
-                    PrivateKind::Private(_) => {
-                        return Err(ConvertError::unsupported(
-                            "private class members (#33)",
-                            span,
-                        ));
+                    PrivateKind::Private(ctxt) => {
+                        private_member = true;
+                        let hidden = Self::private_slot_name(&sym.sym, *ctxt);
+                        if is_static {
+                            Some(hidden)
+                        } else {
+                            let ordinal = private_instance_names
+                                .iter()
+                                .position(|name| name == &hidden)
+                                .ok_or_else(|| {
+                                    ConvertError::invalid("private member missing from the pre-scan")
+                                })?;
+                            Some(format!("\u{1}privv{ordinal}"))
+                        }
                     }
                 },
                 PropKey::Computed(_) => None,
@@ -1074,7 +1122,15 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     ));
                 }
             };
-            let target = if is_static { &ctor } else { &proto };
+            let target = if private_member && !is_static {
+                wrapper_ctx.as_ref().ok_or_else(|| {
+                    ConvertError::invalid("private member without a wrapper context")
+                })?
+            } else if is_static {
+                &ctor
+            } else {
+                &proto
+            };
             let member_ctx = match prop {
                 PropVal::Method(_) | PropVal::Getter(_) | PropVal::Setter(_) => {
                     let slot = if is_static {
@@ -1195,6 +1251,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         Some(id) => values.get(id).cloned().ok_or_else(|| {
                             ConvertError::invalid("undefined class field initializer")
                         })?,
+                        // A private field without an initializer still
+                        // installs its slot: the slot's presence is the
+                        // brand used by `#x in obj`.
+                        None if private_member => self.undef(body, block),
                         None => continue, // `field;` reads as undefined anyway
                     };
                     block =

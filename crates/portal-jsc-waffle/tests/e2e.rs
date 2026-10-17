@@ -5108,3 +5108,61 @@ fn weakmap_intrinsic_delete_removes_native_entry() {
     assert_eq!(execute_in_wasmtime(&wasm_bytes(&module), "f", &[5.0]), 3.0);
 }
 
+
+#[test]
+fn private_members_execute_in_both_lanes() {
+    let cases: &[(&str, f64)] = &[
+        // Instance field read/write through a method.
+        (
+            "export function f(a, b) { class C { #x = 0; set(v) { this.#x = v; } get() { return this.#x; } } const c = new C(); c.set(a); return c.get() + b; }",
+            7.0,
+        ),
+        // Field initializer installed per instance; two instances are isolated.
+        (
+            "export function f(a, b) { class C { #x; constructor(v) { this.#x = v; } get() { return this.#x; } } return new C(a).get() + new C(b).get(); }",
+            7.0,
+        ),
+        // Brand checks: same class true, foreign object false, other class's same-named slot false.
+        (
+            "export function f(a, b) { class A { #x = 1; static has(o) { return #x in o; } get() { return this.#x; } } class B { #x = 2; } return (A.has(new A()) ? 1 : 0) + (A.has({}) ? 2 : 0) + (A.has(new B()) ? 4 : 0) + new A().get() + a + b - 1; }",
+            8.0,
+        ),
+        // Private method call.
+        (
+            "export function f(a, b) { class C { #m(v) { return v * 2; } run(v) { return this.#m(v); } } return new C().run(a) + b; }",
+            10.0,
+        ),
+        // Private accessor pair.
+        (
+            "export function f(a, b) { class C { #v = 0; get val() { return this.#v; } set val(x) { this.#v = x + 1; } } const c = new C(); c.val = a; return c.val + b; }",
+            8.0,
+        ),
+        // Static private field and method.
+        (
+            "export function f(a, b) { class C { static #count = 0; static bump(v) { this.#count += v; return this.#count; } } C.bump(a); return C.bump(b); }",
+            7.0,
+        ),
+        // Derived class: parent and child privates both installed via super().
+        (
+            "export function f(a, b) { class P { #p = 1; constructor() {} gp() { return this.#p; } } class C extends P { #c = 2; constructor() { super(); } sum() { return this.gp() + this.#c + a + b; } } return new C().sum(); }",
+            10.0,
+        ),
+        // A private method capturing an enclosing parameter: parameter
+        // capture flows through the context (swc-ssa captured-params
+        // routing), and the private slot stays per-instance.
+        (
+            "export function f(a, b) { class C { #scale(v) { return v * a; } run(v) { return this.#scale(v) + b; } } return new C().run(2); }",
+            10.0,
+        ),
+    ];
+    for (source, expected) in cases {
+        let module = lower_module(source, &portal_jsc_waffle::ConvertOptions::default())
+            .expect("private-member lowering should succeed");
+        validate_wasm_only(&module);
+        assert_eq!(
+            execute_in_wasmtime(&wasm_bytes(&module), "f", &[3.0, 4.0]),
+            *expected
+        );
+    }
+}
+

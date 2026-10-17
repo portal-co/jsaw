@@ -1762,11 +1762,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             | Item::Meta { .. } => Some(ValueKind::Reference),
             Item::Mem { .. }
             | Item::PrivateMem { .. }
-            | Item::HasPrivateMem { .. }
             | Item::Yield { .. }
             | Item::Await { .. }
             | Item::Asm { .. }
             | Item::New { .. } => Some(ValueKind::Reference),
+            Item::HasPrivateMem { .. } => Some(ValueKind::Boolean),
             Item::Un { arg, op } => match op {
                 // Numeric coercions keep the raw f64/i32 representations.
                 UnaryOp::Plus | UnaryOp::Minus => self
@@ -3911,6 +3911,16 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                             .map(|block| (block, value.clone()))
                             .collect())
                     }
+                    LId::Private { obj, id } => {
+                        let object = values.get(obj).ok_or_else(|| {
+                            ConvertError::invalid("undefined private assignment object")
+                        })?;
+                        let blocks = self.private_write(body, block, object, id, value)?;
+                        Ok(blocks
+                            .into_iter()
+                            .map(|block| (block, value.clone()))
+                            .collect())
+                    }
                     _ => Err(ConvertError::unsupported("non-member assignment", ())),
                 }
             }
@@ -3977,6 +3987,19 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     .runtime();
                 return self.logical_continuations(body, block, left, right, *op);
             }
+        }
+        if let Item::PrivateMem { obj, mem } = item {
+            let object = values
+                .get(obj)
+                .ok_or_else(|| ConvertError::invalid("undefined private member object"))?;
+            return self.private_read(body, block, object, mem);
+        }
+        if let Item::HasPrivateMem { obj, mem } = item {
+            let object = values
+                .get(obj)
+                .ok_or_else(|| ConvertError::invalid("undefined brand-check object"))?;
+            let (block, brand) = self.private_brand(body, block, object, mem)?;
+            return Ok(vec![(block, brand)]);
         }
         if let Item::Mem { obj, mem } = item {
             let object = values
@@ -4547,12 +4570,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     self.class_value(body, block, context, this, values, class, span)?;
                 return Ok(vec![(block, class_value)]);
             }
-            Item::PrivateMem { .. }
-            | Item::HasPrivateMem { .. }
-            | Item::Yield { .. }
-            | Item::Await { .. }
-            | Item::Asm { .. }
-            | Item::Meta { .. } => {
+            Item::PrivateMem { .. } | Item::HasPrivateMem { .. } => {
+                unreachable!("private member reads were lowered as continuations")
+            }
+            Item::Yield { .. } | Item::Await { .. } | Item::Asm { .. } | Item::Meta { .. } => {
                 return Err(ConvertError::unsupported(format!("{item:?}"), span));
             }
             _ => return Err(ConvertError::unsupported("new item form", span)),
@@ -14400,6 +14421,18 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     .map(|(block, callee)| (block, callee, this.clone()))
                     .collect()
             }
+            // `obj.#m(...)`: the method value lives in the receiver's hidden
+            // own slot (#33); the receiver stays the `this` of the call.
+            TCallee::PrivateMember { func, member } => {
+                let receiver = values
+                    .get(func)
+                    .ok_or_else(|| ConvertError::invalid("undefined private method receiver"))?;
+                let callees = self.private_read(body, block, receiver, member)?;
+                callees
+                    .into_iter()
+                    .map(|(block, callee)| (block, callee, receiver.clone()))
+                    .collect()
+            }
             _ => return Err(ConvertError::unsupported(format!("callee {callee:?}"), ())),
         };
         let mut result = Vec::with_capacity(callees.len());
@@ -14592,6 +14625,10 @@ include!("classes.rs");
 
 // Map/Set/WeakMap/WeakSet primordials (#32): `include!`d the same way.
 include!("collections.rs");
+
+// Private class members (#33): hygiene-keyed hidden own slots, installed by
+// a generated wrapper constructor. `include!`d the same way.
+include!("privates.rs");
 
 // Native WasmGC backing storage and the corresponding JavaScript typed-array
 // surface. Kept beside the primordial implementation because constructors and

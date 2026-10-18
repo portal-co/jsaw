@@ -5166,3 +5166,47 @@ fn private_members_execute_in_both_lanes() {
     }
 }
 
+
+
+#[test]
+fn proxy_traps_execute() {
+    let cases: &[(&str, f64)] = &[
+        // No traps: reads, writes, `in`, calls, and construction forward.
+        ("export function f(a, b) { const t = { x: a }; const p = new Proxy(t, {}); p.y = b; return p.x + p.y; }", 7.0),
+        // The get trap intercepts; other keys forward to the target.
+        ("export function f(a, b) { const p = new Proxy({ y: b }, { get(t, k) { if (k === \"x\") { return a; } return t.y; } }); return p.x + p.y; }", 7.0),
+        // The set trap intercepts and transforms.
+        ("export function f(a, b) { const t = { v: 0 }; const p = new Proxy(t, { set(tt, k, val) { tt.v = val + 1; } }); p.x = a; return t.v + b; }", 8.0),
+        // The has trap drives `in`; a missing key still forwards.
+        ("export function f(a, b) { const p = new Proxy({ z: 1 }, { has(t, k) { return k === \"x\"; } }); return ((\"x\" in p) ? a : 0) + ((\"z\" in p) ? 100 : 0) + ((\"q\" in p) ? 1000 : 0) + b; }", 7.0),
+        // The apply trap wraps the target function.
+        ("export function f(a, b) { const p = new Proxy(function(x) { return x * 2; }, { apply(t, thisArg, args) { return t(args[0]) + b; } }); return p(a); }", 10.0),
+        // The construct trap replaces the instance.
+        ("export function f(a, b) { const p = new Proxy(function(x) { this.x = x; }, { construct(t, args) { return { x: args[0] + b }; } }); const o = new p(a); return o.x; }", 7.0),
+        // Proxy.revocable yields a working proxy and a revoke function.
+        ("export function f(a, b) { const r = Proxy.revocable({ x: a }, {}); return r.proxy.x + b; }", 7.0),
+        // A trap captured from an enclosing scope (#33's capture routing).
+        ("export function f(a, b) { const p = new Proxy({}, { get(t, k) { return a * b; } }); return p.anything; }", 12.0),
+    ];
+    for (source, expected) in cases {
+        let module = lower_module(source, &portal_jsc_waffle::ConvertOptions::default())
+            .expect("proxy lowering should succeed");
+        validate_wasm_only(&module);
+        assert_eq!(
+            execute_in_wasmtime(&wasm_bytes(&module), "f", &[3.0, 4.0]),
+            *expected
+        );
+    }
+}
+
+#[test]
+fn proxy_revocation_traps_on_use() {
+    let module = lower_module(
+        "export function f(a, b) { const r = Proxy.revocable({ x: a }, {}); r.revoke(); return r.proxy.x; }",
+        &portal_jsc_waffle::ConvertOptions::default(),
+    )
+    .expect("proxy lowering should succeed");
+    validate_wasm_only(&module);
+    let outcome = std::panic::catch_unwind(|| execute_in_wasmtime(&wasm_bytes(&module), "f", &[3.0, 4.0]));
+    assert!(outcome.is_err(), "using a revoked proxy must trap");
+}

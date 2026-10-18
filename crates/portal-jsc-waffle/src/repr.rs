@@ -75,6 +75,10 @@ pub(crate) struct Repr {
     pub(crate) map_entry: Signature,
     /// An array of [`Self::map_entry`] pairs — a collection's backing table.
     pub(crate) map_entries: Signature,
+    /// A `Proxy` instance: the wrapped `target`, the trap `handler`, and a
+    /// `revoked` flag. A distinct struct type so `ref.test` is the single
+    /// runtime check separating proxied values from ordinary ones (#34).
+    pub(crate) proxy: Signature,
     /// The adapter signature's return type (`anyref`), so call sites can
     /// type a `CallRef`/`ReturnCallRef` to the adapter explicitly.
     pub(crate) adapter_value: Type,
@@ -296,6 +300,10 @@ impl Repr {
             ty: field(ref_sig(map_entry)),
             shared: false,
         });
+        let proxy = module.signatures.push(SignatureData::Struct {
+            fields: vec![field(value), field(value), field(Type::I32)],
+            shared: false,
+        });
         let adapter = module.signatures.push(SignatureData::Func {
             params: vec![ref_sig(object), value, ref_sig(arguments)],
             returns: vec![value],
@@ -392,6 +400,7 @@ impl Repr {
             exception_result,
             map_entry,
             map_entries,
+            proxy,
         }
     }
 
@@ -401,6 +410,22 @@ impl Repr {
 
     pub(crate) fn map_entry_ty(self) -> Type {
         ref_sig(self.map_entry)
+    }
+
+    pub(crate) fn proxy_ty(self) -> Type {
+        ref_sig(self.proxy)
+    }
+
+    /// For `RefTest`: a nullable `ref.test` matches `null` too, so proxy
+    /// dispatch tests through the non-null variant (same pattern as
+    /// `object_non_null_ty`).
+    pub(crate) fn proxy_non_null_ty(self) -> Type {
+        Type::Heap(WithNullable {
+            value: portal_pc_waffle::HeapType::Sig {
+                sig_index: self.proxy,
+            },
+            nullable: false,
+        })
     }
 
     pub(crate) fn map_entries_ty(self) -> Type {

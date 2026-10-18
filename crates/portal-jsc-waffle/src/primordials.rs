@@ -49,6 +49,10 @@ fn new_context_with_primordials(
     };
     block = self.build_collection_primordials(body, block, &context_value)?;
 
+    // `Proxy` (with `Proxy.revocable`) — an ordinary function object in the
+    // same lexical context, so user shadowing keeps working (#34).
+    block = self.build_proxy_primordial(body, block, &context_value)?;
+
     // Typed-array constructors are globals rather than namespace members.
     // Installing them through the ordinary context preserves the same
     // shadowing rules as Math/Array: a later local declaration is just an

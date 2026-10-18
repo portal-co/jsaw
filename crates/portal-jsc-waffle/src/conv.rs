@@ -1123,6 +1123,8 @@ struct Converter<'a, 'module, 'wasm> {
     /// instance's entries array and `[[Prototype]]`; each method dispatcher
     /// switches on its numeric op selector.
     collection_helpers: Option<CollectionHelpers>,
+    /// Generated `Proxy` primordial and trap-dispatch helpers (#34).
+    proxy_helpers: Option<ProxyHelpers>,
     /// Generic JS `ToBoolean` for a value already known to be a reference.
     /// Distinguishes a boxed `false` (falsy) from every other non-null
     /// reference (truthy) — plain null-ness alone isn't enough once a value
@@ -1269,6 +1271,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             same_value_zero: None,
             map_find_helper: None,
             collection_helpers: None,
+            proxy_helpers: None,
             truthy_helper: None,
             typeof_helper: None,
             to_bigint_helper: None,
@@ -4346,194 +4349,20 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 }
                 let callee = values
                     .get(class)
-                    .ok_or_else(|| ConvertError::invalid("undefined constructor"))?;
-                let receiver = self.new_object(body, block)?;
-                // `new C()`: the receiver's [[Prototype]] is the
-                // constructor's `prototype` property when that is an
-                // object/function, else null (no Object.prototype
-                // primordial exists yet).
-                let mut block = block;
-                {
-                    let (b, prototype) =
-                        self.get_property_value_raw(body, block, &callee.clone(), "prototype")?;
-                    block = b;
-                    let (prototype, _) = prototype.wasm()?;
-                    let proto_is_object = body.add_op(
-                        block,
-                        Operator::RefTest {
-                            ty: self.repr.object_ty(),
-                        },
-                        &[prototype],
-                        &[Type::I32],
-                    );
-                    let proto_is_function = body.add_op(
-                        block,
-                        Operator::RefTest {
-                            ty: self.repr.function_ty(),
-                        },
-                        &[prototype],
-                        &[Type::I32],
-                    );
-                    let proto_ok = body.add_op(
-                        block,
-                        Operator::I32Or,
-                        &[proto_is_object, proto_is_function],
-                        &[Type::I32],
-                    );
-                    let null_proto = body.add_op(
-                        block,
-                        Operator::RefNull {
-                            ty: self.repr.value,
-                        },
-                        &[],
-                        &[self.repr.value],
-                    );
-                    let proto = body.add_op(
-                        block,
-                        Operator::TypedSelect {
-                            ty: self.repr.value,
-                        },
-                        &[prototype, null_proto, proto_ok],
-                        &[self.repr.value],
-                    );
-                    let (receiver_value, _) = receiver.wasm()?;
-                    self.set_object_proto(body, block, receiver_value, proto);
-                }
-                let (ctx, _default_this, code, arrow) =
-                    self.callable_parts(body, block, callee, this.clone())?;
-                let is_arrow = arrow;
-                // A construct of an arrow function is invalid JavaScript. The
-                // generated trap also keeps a dynamic callable from silently
-                // acquiring constructor semantics.
-                let reject = body.add_block();
-                let invoke = body.add_block();
-                let join = body.add_block();
-                let joined = body.add_blockparam(join, self.repr.value);
-                body.set_terminator(
+                    .ok_or_else(|| ConvertError::invalid("undefined constructor"))?
+                    .clone();
+                // A constructor that could be a `Proxy` dispatches through
+                // the `construct` trap (#34); provenance-known constructors
+                // keep the direct path.
+                return self.lower_new_dispatch(
+                    body,
                     block,
-                    Terminator::CondBr {
-                        cond: is_arrow,
-                        if_true: BlockTarget {
-                            block: reject,
-                            args: vec![],
-                        },
-                        if_false: BlockTarget {
-                            block: invoke,
-                            args: vec![],
-                        },
-                    },
+                    callee,
+                    this.clone(),
+                    values,
+                    args,
+                    span,
                 );
-                body.set_terminator(reject, Terminator::Unreachable);
-                let array = self.make_plain_arguments(body, invoke, values, args)?;
-                let receiver_value = self.box_value(body, invoke, &receiver)?;
-                let result = body.add_op(
-                    invoke,
-                    Operator::CallRef {
-                        sig_index: self.repr.adapter,
-                    },
-                    &[ctx, receiver_value, array, code],
-                    &[self.repr.value],
-                );
-                let (normal, exceptional) = if self.exceptions_enabled {
-                    let is_exception = body.add_op(
-                        invoke,
-                        Operator::RefTest {
-                            ty: self.repr.exception_result_non_null_ty(),
-                        },
-                        &[result],
-                        &[Type::I32],
-                    );
-                    let exceptional = body.add_block();
-                    let normal = body.add_block();
-                    body.set_terminator(
-                        invoke,
-                        Terminator::CondBr {
-                            cond: is_exception,
-                            if_true: BlockTarget {
-                                block: exceptional,
-                                args: vec![],
-                            },
-                            if_false: BlockTarget {
-                                block: normal,
-                                args: vec![],
-                            },
-                        },
-                    );
-                    (normal, Some(exceptional))
-                } else {
-                    (invoke, None)
-                };
-                let object = body.add_op(
-                    normal,
-                    Operator::RefTest {
-                        // Non-null: `undefined` (the null anyref) must fall
-                        // through to the implicit receiver; the nullable
-                        // variant would treat it as an explicit object
-                        // override and the instance would become null.
-                        ty: self.repr.object_non_null_ty(),
-                    },
-                    &[result],
-                    &[Type::I32],
-                );
-                let function = body.add_op(
-                    normal,
-                    Operator::RefTest {
-                        ty: self.repr.function_non_null_ty(),
-                    },
-                    &[result],
-                    &[Type::I32],
-                );
-                let override_result =
-                    body.add_op(normal, Operator::I32Or, &[object, function], &[Type::I32]);
-                let explicit = body.add_block();
-                let implicit = body.add_block();
-                body.set_terminator(
-                    normal,
-                    Terminator::CondBr {
-                        cond: override_result,
-                        if_true: BlockTarget {
-                            block: explicit,
-                            args: vec![],
-                        },
-                        if_false: BlockTarget {
-                            block: implicit,
-                            args: vec![],
-                        },
-                    },
-                );
-                body.set_terminator(
-                    explicit,
-                    Terminator::Br {
-                        target: BlockTarget {
-                            block: join,
-                            args: vec![result],
-                        },
-                    },
-                );
-                let receiver_result = self.box_value(body, implicit, &receiver)?;
-                body.set_terminator(
-                    implicit,
-                    Terminator::Br {
-                        target: BlockTarget {
-                            block: join,
-                            args: vec![receiver_result],
-                        },
-                    },
-                );
-                let normal_result = (
-                    join,
-                    LowerValue::Wasm {
-                        value: joined,
-                        kind: ValueKind::Reference,
-                    },
-                );
-                if let Some(exceptional) = exceptional {
-                    return Ok(vec![
-                        (exceptional, LowerValue::CallResult(result)),
-                        normal_result,
-                    ]);
-                }
-                return Ok(vec![normal_result]);
             }
             Item::Bin { left, right, op } => self.binary(
                 body,
@@ -5202,10 +5031,13 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     kind: ValueKind::Reference,
                 })
             }
-            Exp | In => Err(ConvertError::unsupported(
+            Exp => Err(ConvertError::unsupported(
                 format!("binary operator {op:?}"),
                 span,
             )),
+            // `key in obj`: the `has` trap for a proxied object, an
+            // own-or-proto presence walk otherwise (#34).
+            In => self.has_in(body, block, left, right),
             InstanceOf => self.instance_of(body, block, left, right),
         }
     }
@@ -11159,7 +10991,13 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         object: &LowerValue,
         key: &str,
     ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
-        let (block, value) = self.get_property_value_raw(body, block, object, key)?;
+        // A receiver that could be a `Proxy` dispatches through the `get`
+        // trap helper (#34); provenance-known receivers keep the direct path.
+        let (block, value) = if Self::provably_non_proxy(object) {
+            self.get_property_value_raw(body, block, object, key)?
+        } else {
+            self.get_property_value_proxy_aware(body, block, object, key)?
+        };
         self.resolve_property_read(body, block, object, value)
     }
 
@@ -11181,7 +11019,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         object: &LowerValue,
         key: Value,
     ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
-        let (block, value) = self.get_string_member_raw(body, block, object, key)?;
+        let (block, value) = if Self::provably_non_proxy(object) {
+            self.get_string_member_raw(body, block, object, key)?
+        } else {
+            self.get_string_member_proxy_aware(body, block, object, key)?
+        };
         self.resolve_property_read(body, block, object, value)
     }
 
@@ -13201,7 +13043,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         key: &str,
         value: &LowerValue,
     ) -> Result<Vec<Block>, ConvertError> {
-        self.set_property_value(
+        // Context objects are converter-owned and can never be proxies; skip
+        // the #34 dispatch entirely.
+        self.set_property_value_ordinary(
             body,
             block,
             &LowerValue::Wasm {
@@ -13214,6 +13058,23 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn set_property_value(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: &str,
+        value: &LowerValue,
+    ) -> Result<Vec<Block>, ConvertError> {
+        // A receiver that could be a `Proxy` dispatches through the `set`
+        // trap helper (#34); provenance-known receivers keep the direct path.
+        if !Self::provably_non_proxy(object) {
+            return self.set_property_value_proxy_aware(body, block, object, key, value);
+        }
+        self.set_property_value_ordinary(body, block, object, key, value)
+    }
+
+    /// The ordinary (non-proxy) write path: descriptor-aware define/update.
+    fn set_property_value_ordinary(
         &mut self,
         body: &mut FunctionBody,
         block: Block,
@@ -13244,6 +13105,21 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     }
 
     fn set_string_member(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        object: &LowerValue,
+        key: Value,
+        value: &LowerValue,
+    ) -> Result<Vec<Block>, ConvertError> {
+        if !Self::provably_non_proxy(object) {
+            return self.set_string_member_proxy_aware(body, block, object, key, value);
+        }
+        self.set_string_member_ordinary(body, block, object, key, value)
+    }
+
+    /// The ordinary (non-proxy) dynamic-string-key write path.
+    fn set_string_member_ordinary(
         &mut self,
         body: &mut FunctionBody,
         block: Block,
@@ -14437,10 +14313,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         };
         let mut result = Vec::with_capacity(callees.len());
         for (block, callee, receiver) in callees {
-            let (captured_context, effective_this, code, _) =
-                self.callable_parts(body, block, &callee, receiver)?;
-            let array = self.make_arguments(body, block, values, args)?;
-            result.push((block, captured_context, effective_this, array, code));
+            // A callee that could be a `Proxy` dispatches through the `apply`
+            // trap (#34); provenance-known callees keep the direct extraction.
+            result.push(self.call_parts_proxy_aware(body, block, &callee, receiver, values, args)?);
         }
         let _ = context;
         let _ = this;
@@ -14629,6 +14504,10 @@ include!("collections.rs");
 // Private class members (#33): hygiene-keyed hidden own slots, installed by
 // a generated wrapper constructor. `include!`d the same way.
 include!("privates.rs");
+
+// Proxy (#34): a distinct proxy struct, the `Proxy` primordial, and trap
+// dispatch that only runs behind a `ref.test`. `include!`d the same way.
+include!("proxies.rs");
 
 // Native WasmGC backing storage and the corresponding JavaScript typed-array
 // surface. Kept beside the primordial implementation because constructors and

@@ -360,3 +360,28 @@ fn private_methods_accessors_and_statics_execute() {
         10.0
     );
 }
+
+#[test]
+fn proxy_traps_execute_nano() {
+    // get/set/has traps plus forwarding through the nano lane.
+    assert_eq!(
+        compile_plan_and_run(
+            "export function f(a, b) { const p = new Proxy({ y: b }, { get(t, k) { if (k === \"x\") { return a; } return t.y; }, set(t, k, v) { t.z = v + 1; } }); p.q = a; return p.x + p.y + p.z; }",
+            "f",
+            &[3.0, 4.0]
+        ),
+        11.0
+    );
+}
+
+#[test]
+fn proxy_apply_and_construct_execute_nano() {
+    assert_eq!(
+        compile_plan_and_run(
+            "export function f(a, b) { const p = new Proxy(function(x) { return x * 2; }, { apply(t, thisArg, args) { return t(args[0]) + 1; }, construct(t, args) { return { x: args[0] * 10 }; } }); return p(a) + new p(b).x; }",
+            "f",
+            &[3.0, 4.0]
+        ),
+        47.0
+    );
+}

@@ -151,6 +151,8 @@ struct CaseReport {
     error: Option<String>,
     /// (alloc_count, alloc_bytes, peak_live_bytes, retained_objects)
     metrics: Option<(u64, u64, u64, u64)>,
+    /// Emitted artifact size in bytes (the output-size gate metric, #20).
+    artifact_bytes: Option<u64>,
 }
 
 fn semantic_mode(case: &CorpusCase) -> &'static str {
@@ -176,16 +178,18 @@ fn run_case(
             actual: None,
             error: Some("requires a DreamComp native sentinel, not available in jsaw".into()),
             metrics: None,
+            artifact_bytes: None,
         };
     }
     match try_case(case, lane, plan_a) {
-        Ok((actual, metrics)) => {
+        Ok((actual, artifact_bytes, metrics)) => {
             if actual == case.expected || (actual.is_nan() && case.expected.is_nan()) {
                 CaseReport {
                     status: "pass".into(),
                     actual: Some(actual),
                     error: None,
                     metrics,
+                    artifact_bytes: Some(artifact_bytes),
                 }
             } else {
                 CaseReport {
@@ -193,6 +197,7 @@ fn run_case(
                     actual: Some(actual),
                     error: Some(format!("expected {}, got {actual}", case.expected)),
                     metrics,
+                    artifact_bytes: Some(artifact_bytes),
                 }
             }
         }
@@ -201,6 +206,7 @@ fn run_case(
             actual: None,
             error: Some(format!("{error:#}")),
             metrics: None,
+            artifact_bytes: None,
         },
     }
 }
@@ -209,7 +215,7 @@ fn try_case(
     case: &CorpusCase,
     lane: &str,
     plan_a: Option<&portal_jsc_waffle::BackendPlan>,
-) -> anyhow::Result<(f64, Option<(u64, u64, u64, u64)>)> {
+) -> anyhow::Result<(f64, u64, Option<(u64, u64, u64, u64)>)> {
     let args: Vec<f64> = case
         .args
         .iter()
@@ -234,9 +240,10 @@ fn try_case(
     match lane {
         "wasmbc" => {
             let bytes = portal_pc_waffle::to_wasm_bytes(&module)?;
+            let byte_len = bytes.len() as u64;
             let (value, _) = run_export(&bytes, &case.export, &args, lane)?;
             value
-                .map(|v| (v, None))
+                .map(|v| (v, byte_len, None))
                 .ok_or_else(|| anyhow::anyhow!("export did not return an f64"))
         }
         "nano_mvp" => {
@@ -254,9 +261,10 @@ fn try_case(
                 },
             )
             .map_err(|d| anyhow::anyhow!("nano MVP diagnostics: {d:?}"))?;
+            let byte_len = bytes.len() as u64;
             let (value, metrics) = run_export(&bytes, &case.export, &args, lane)?;
             value
-                .map(|v| (v, metrics))
+                .map(|v| (v, byte_len, metrics))
                 .ok_or_else(|| anyhow::anyhow!("export did not return an f64"))
         }
         other => anyhow::bail!("unknown lane {other:?}"),
@@ -341,6 +349,7 @@ fn dreamcomp_corpus_runs_identically_through_jsaw_wasmbc() {
                 "error": report.error,
                 "compile_and_run_ms": elapsed_ms,
                 "plan_fingerprint": plan_a.as_ref().map(|p| p.fingerprint()),
+                "artifact_bytes": report.artifact_bytes,
                 "alloc_count": report.metrics.map(|m| m.0),
                 "alloc_bytes": report.metrics.map(|m| m.1),
                 "peak_live_bytes": report.metrics.map(|m| m.2),

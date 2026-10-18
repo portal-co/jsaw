@@ -51,6 +51,15 @@ struct ProxyHelpers {
     /// the `has` trap for a proxy, the presence walk otherwise. Single-block
     /// at the call site; the dispatch lives inside the generated body.
     value_has: Func,
+    /// `js_proxy_delete(proxy, key) -> i32` — the `deleteProperty` trap or a
+    /// forwarded slot-clear on the target (#35).
+    delete: Option<Func>,
+    /// `js_value_delete(value, key) -> i32` — proxy-aware `deleteProperty`
+    /// (#35).
+    value_delete: Option<Func>,
+    /// `js_construct_value(f, args, new_target) -> value` —
+    /// `Reflect.construct`'s direct form of `new` (#35).
+    construct_value: Option<Func>,
 }
 
 impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
@@ -988,13 +997,15 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     },
                 },
             );
-            body.set_terminator(
+            let walked = body.add_op(
                 forward,
-                Terminator::ReturnCall {
-                    func: chain_has,
-                    args: vec![target, key],
+                Operator::Call {
+                    function_index: chain_has,
                 },
+                &[target, key],
+                &[Type::I32],
             );
+            body.set_terminator(forward, Terminator::Return { values: vec![walked] });
             let trap_fn = body.add_op(
                 invoke,
                 Operator::RefCast {
@@ -1099,20 +1110,27 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 &[value],
                 &[self.repr.proxy_ty()],
             );
-            body.set_terminator(
+            // Plain calls, not tail calls: the mobile trampoline's `Int32`
+            // finish miscasts values that pass through the tail-call set, so
+            // the i32-returning helpers stay out of it.
+            let trapped = body.add_op(
                 proxy_arm,
-                Terminator::ReturnCall {
-                    func: has,
-                    args: vec![proxy, key],
+                Operator::Call {
+                    function_index: has,
                 },
+                &[proxy, key],
+                &[Type::I32],
             );
-            body.set_terminator(
+            body.set_terminator(proxy_arm, Terminator::Return { values: vec![trapped] });
+            let walked = body.add_op(
                 ordinary_arm,
-                Terminator::ReturnCall {
-                    func: chain_has,
-                    args: vec![value, key],
+                Operator::Call {
+                    function_index: chain_has,
                 },
+                &[value, key],
+                &[Type::I32],
             );
+            body.set_terminator(ordinary_arm, Terminator::Return { values: vec![walked] });
             self.module.funcs.push(FuncDecl::Body(
                 signature,
                 format!("js_value_has_{}", self.module.funcs.len()),
@@ -1134,6 +1152,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             has,
             chain_has,
             value_has,
+            delete: None,
+            value_delete: None,
+            construct_value: None,
         };
         self.proxy_helpers = Some(helpers);
         Ok(helpers)
@@ -2115,4 +2136,970 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         Ok(results)
     }
 
+}
+
+// Reflect (#35): the reflective counterparts of the trap operations. The
+// `js_value_delete`/`js_construct_value` helpers give the Reflect natives the
+// same dispatch the Proxy paths use, so the two cannot drift.
+impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
+    /// `js_proxy_delete(proxy, key) -> i32`: the `deleteProperty` trap
+    /// (truthy result), or a forwarded slot-clear on the target.
+    fn ensure_proxy_delete(&mut self) -> Result<Func, ConvertError> {
+        if let Some(func) = self.proxy_helpers.and_then(|h| h.delete) {
+            return Ok(func);
+        }
+        let chain = self.ensure_chain_lookup()?;
+        let property = self.ensure_property_helpers()?;
+        let truthy = self.ensure_truthy_helper()?;
+        let signature = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.proxy_ty(), self.repr.string_ty()],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let proxy = body.blocks[entry].params[0].1;
+        let key = body.blocks[entry].params[1].1;
+        let revoked = body.add_op(
+            entry,
+            Operator::StructGet {
+                sig: self.repr.proxy,
+                idx: 2,
+            },
+            &[proxy],
+            &[Type::I32],
+        );
+        let live = body.add_block();
+        let revoked_arm = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: revoked,
+                if_true: BlockTarget {
+                    block: revoked_arm,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: live,
+                    args: vec![],
+                },
+            },
+        );
+        body.set_terminator(revoked_arm, Terminator::Unreachable);
+        let target = body.add_op(
+            live,
+            Operator::StructGet {
+                sig: self.repr.proxy,
+                idx: 0,
+            },
+            &[proxy],
+            &[self.repr.value],
+        );
+        let handler = body.add_op(
+            live,
+            Operator::StructGet {
+                sig: self.repr.proxy,
+                idx: 1,
+            },
+            &[proxy],
+            &[self.repr.value],
+        );
+        let name = self.new_string(&mut body, live, b"deleteProperty")?;
+        let trap_slot = body.add_op(
+            live,
+            Operator::Call {
+                function_index: chain,
+            },
+            &[handler, name],
+            &[self.repr.slot_ty()],
+        );
+        let (block, trap) = self.unwrap_slot(&mut body, live, trap_slot);
+        let no_trap = body.add_op(block, Operator::RefIsNull, &[trap], &[Type::I32]);
+        let forward = body.add_block();
+        let invoke = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: no_trap,
+                if_true: BlockTarget {
+                    block: forward,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: invoke,
+                    args: vec![],
+                },
+            },
+        );
+        // Forward: clear the target's own slot (mirrors Reflect.deleteProperty
+        // on an ordinary object), reporting success.
+        let is_fn = body.add_op(
+            forward,
+            Operator::RefTest {
+                ty: self.repr.function_non_null_ty(),
+            },
+            &[target],
+            &[Type::I32],
+        );
+        let fn_arm = body.add_block();
+        let not_fn = body.add_block();
+        body.set_terminator(
+            forward,
+            Terminator::CondBr {
+                cond: is_fn,
+                if_true: BlockTarget {
+                    block: fn_arm,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: not_fn,
+                    args: vec![],
+                },
+            },
+        );
+        let null_slot = || self.repr.slot_ty();
+        let clear = |body: &mut FunctionBody, block: Block, root: Value| {
+            let null_slot = body.add_op(
+                block,
+                Operator::RefNull { ty: null_slot() },
+                &[],
+                &[null_slot()],
+            );
+            let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+            body.add_op(
+                block,
+                Operator::Call {
+                    function_index: property.set,
+                },
+                &[root, key, null_slot, zero],
+                &[],
+            );
+            let one = body.add_op(block, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+            body.set_terminator(block, Terminator::Return { values: vec![one] });
+        };
+        let fn_ref = body.add_op(
+            fn_arm,
+            Operator::RefCast {
+                ty: self.repr.function_ty(),
+            },
+            &[target],
+            &[self.repr.function_ty()],
+        );
+        let fn_root = body.add_op(
+            fn_arm,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: 0,
+            },
+            &[fn_ref],
+            &[self.repr.value],
+        );
+        clear(&mut body, fn_arm, fn_root);
+        let is_obj = body.add_op(
+            not_fn,
+            Operator::RefTest {
+                ty: self.repr.object_non_null_ty(),
+            },
+            &[target],
+            &[Type::I32],
+        );
+        let obj_arm = body.add_block();
+        let prim_arm = body.add_block();
+        body.set_terminator(
+            not_fn,
+            Terminator::CondBr {
+                cond: is_obj,
+                if_true: BlockTarget {
+                    block: obj_arm,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: prim_arm,
+                    args: vec![],
+                },
+            },
+        );
+        let obj_ref = body.add_op(
+            obj_arm,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[target],
+            &[self.repr.object_ty()],
+        );
+        let obj_root = body.add_op(
+            obj_arm,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 0,
+            },
+            &[obj_ref],
+            &[self.repr.value],
+        );
+        clear(&mut body, obj_arm, obj_root);
+        // Reflect.deleteProperty on a primitive target throws in JS; the
+        // trapped unreachable is the jsaw analog.
+        body.set_terminator(prim_arm, Terminator::Unreachable);
+        // Invoke the trap: handler.deleteProperty(target, key), truthy-tested.
+        let trap_fn = body.add_op(
+            invoke,
+            Operator::RefCast {
+                ty: self.repr.function_ty(),
+            },
+            &[trap],
+            &[self.repr.function_ty()],
+        );
+        let trap_ctx = body.add_op(
+            invoke,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: 4,
+            },
+            &[trap_fn],
+            &[self.repr.object_ty()],
+        );
+        let trap_code = body.add_op(
+            invoke,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: 3,
+            },
+            &[trap_fn],
+            &[ref_sig(self.repr.adapter)],
+        );
+        let trap_args = body.add_op(
+            invoke,
+            Operator::ArrayNewFixed {
+                sig: self.repr.arguments,
+                num: 2,
+            },
+            &[target, key],
+            &[ref_sig(self.repr.arguments)],
+        );
+        let result = body.add_op(
+            invoke,
+            Operator::CallRef {
+                sig_index: self.repr.adapter,
+            },
+            &[trap_ctx, handler, trap_args, trap_code],
+            &[self.repr.value],
+        );
+        let truth = body.add_op(
+            invoke,
+            Operator::Call {
+                function_index: truthy,
+            },
+            &[result],
+            &[Type::I32],
+        );
+        body.set_terminator(invoke, Terminator::Return { values: vec![truth] });
+        let func = self.module.funcs.push(FuncDecl::Body(
+            signature,
+            format!("js_proxy_delete_{}", self.module.funcs.len()),
+            body,
+        ));
+        let mut helpers = self
+            .proxy_helpers
+            .ok_or_else(|| ConvertError::invalid("proxy helpers not initialized"))?;
+        helpers.delete = Some(func);
+        self.proxy_helpers = Some(helpers);
+        Ok(func)
+    }
+
+    /// `js_value_delete(value, key) -> i32`: proxy-aware `deleteProperty`.
+    fn ensure_value_delete(&mut self) -> Result<Func, ConvertError> {
+        if let Some(func) = self.proxy_helpers.and_then(|h| h.value_delete) {
+            return Ok(func);
+        }
+        let delete = self.ensure_proxy_delete()?;
+        let property = self.ensure_property_helpers()?;
+        let signature = self.module.signatures.push(SignatureData::Func {
+            params: vec![self.repr.value, self.repr.string_ty()],
+            returns: vec![Type::I32],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let value = body.blocks[entry].params[0].1;
+        let key = body.blocks[entry].params[1].1;
+        let is_proxy = body.add_op(
+            entry,
+            Operator::RefTest {
+                ty: self.repr.proxy_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let proxy_arm = body.add_block();
+        let ordinary_arm = body.add_block();
+        body.set_terminator(
+            entry,
+            Terminator::CondBr {
+                cond: is_proxy,
+                if_true: BlockTarget {
+                    block: proxy_arm,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: ordinary_arm,
+                    args: vec![],
+                },
+            },
+        );
+        let proxy = body.add_op(
+            proxy_arm,
+            Operator::RefCast {
+                ty: self.repr.proxy_ty(),
+            },
+            &[value],
+            &[self.repr.proxy_ty()],
+        );
+        // Plain call, not a tail call: the mobile trampoline's `Int32`
+        // finish miscasts values that pass through the tail-call set.
+        let deleted = body.add_op(
+            proxy_arm,
+            Operator::Call {
+                function_index: delete,
+            },
+            &[proxy, key],
+            &[Type::I32],
+        );
+        body.set_terminator(proxy_arm, Terminator::Return { values: vec![deleted] });
+        // Ordinary: clear the own slot of a function/object; a primitive
+        // target traps (the TypeError analog).
+        let is_fn = body.add_op(
+            ordinary_arm,
+            Operator::RefTest {
+                ty: self.repr.function_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let fn_arm = body.add_block();
+        let not_fn = body.add_block();
+        body.set_terminator(
+            ordinary_arm,
+            Terminator::CondBr {
+                cond: is_fn,
+                if_true: BlockTarget {
+                    block: fn_arm,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: not_fn,
+                    args: vec![],
+                },
+            },
+        );
+        let clear = |body: &mut FunctionBody, block: Block, root: Value| {
+            let null_slot = body.add_op(
+                block,
+                Operator::RefNull {
+                    ty: self.repr.slot_ty(),
+                },
+                &[],
+                &[self.repr.slot_ty()],
+            );
+            let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+            body.add_op(
+                block,
+                Operator::Call {
+                    function_index: property.set,
+                },
+                &[root, key, null_slot, zero],
+                &[],
+            );
+            let one = body.add_op(block, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+            body.set_terminator(block, Terminator::Return { values: vec![one] });
+        };
+        let fn_ref = body.add_op(
+            fn_arm,
+            Operator::RefCast {
+                ty: self.repr.function_ty(),
+            },
+            &[value],
+            &[self.repr.function_ty()],
+        );
+        let fn_root = body.add_op(
+            fn_arm,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: 0,
+            },
+            &[fn_ref],
+            &[self.repr.value],
+        );
+        clear(&mut body, fn_arm, fn_root);
+        let is_obj = body.add_op(
+            not_fn,
+            Operator::RefTest {
+                ty: self.repr.object_non_null_ty(),
+            },
+            &[value],
+            &[Type::I32],
+        );
+        let obj_arm = body.add_block();
+        let prim_arm = body.add_block();
+        body.set_terminator(
+            not_fn,
+            Terminator::CondBr {
+                cond: is_obj,
+                if_true: BlockTarget {
+                    block: obj_arm,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: prim_arm,
+                    args: vec![],
+                },
+            },
+        );
+        let obj_ref = body.add_op(
+            obj_arm,
+            Operator::RefCast {
+                ty: self.repr.object_ty(),
+            },
+            &[value],
+            &[self.repr.object_ty()],
+        );
+        let obj_root = body.add_op(
+            obj_arm,
+            Operator::StructGet {
+                sig: self.repr.object,
+                idx: 0,
+            },
+            &[obj_ref],
+            &[self.repr.value],
+        );
+        clear(&mut body, obj_arm, obj_root);
+        body.set_terminator(prim_arm, Terminator::Unreachable);
+        let func = self.module.funcs.push(FuncDecl::Body(
+            signature,
+            format!("js_value_delete_{}", self.module.funcs.len()),
+            body,
+        ));
+        let mut helpers = self
+            .proxy_helpers
+            .ok_or_else(|| ConvertError::invalid("proxy helpers not initialized"))?;
+        helpers.value_delete = Some(func);
+        self.proxy_helpers = Some(helpers);
+        Ok(func)
+    }
+
+    /// `js_construct_value(f, args, new_target) -> value`: `Reflect.
+    /// construct`'s direct form of the `new` operation. Proxies loop through
+    /// the `construct` trap (a forwarded target that is itself a proxy keeps
+    /// dispatching); an ordinary function gets receiver creation, prototype
+    /// wiring from `new_target.prototype`, the constructor call, and the
+    /// object/function/proxy result override — mirroring `Item::New`.
+    fn ensure_construct_value(&mut self) -> Result<Func, ConvertError> {
+        if let Some(func) = self.proxy_helpers.and_then(|h| h.construct_value) {
+            return Ok(func);
+        }
+        let chain = self.ensure_chain_lookup()?;
+        let signature = self.module.signatures.push(SignatureData::Func {
+            params: vec![
+                self.repr.value,
+                ref_sig(self.repr.arguments),
+                self.repr.value,
+            ],
+            returns: vec![self.repr.value],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, signature);
+        let entry = body.entry;
+        let f0 = body.blocks[entry].params[0].1;
+        let args = body.blocks[entry].params[1].1;
+        let new_target = body.blocks[entry].params[2].1;
+
+        // Loop: peel proxies until a plain callable remains or a trap fires.
+        let loop_block = body.add_block();
+        let cur = body.add_blockparam(loop_block, self.repr.value);
+        body.set_terminator(
+            entry,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: loop_block,
+                    args: vec![f0],
+                },
+            },
+        );
+        let is_proxy = body.add_op(
+            loop_block,
+            Operator::RefTest {
+                ty: self.repr.proxy_non_null_ty(),
+            },
+            &[cur],
+            &[Type::I32],
+        );
+        let proxy_arm = body.add_block();
+        let ordinary_arm = body.add_block();
+        body.set_terminator(
+            loop_block,
+            Terminator::CondBr {
+                cond: is_proxy,
+                if_true: BlockTarget {
+                    block: proxy_arm,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: ordinary_arm,
+                    args: vec![],
+                },
+            },
+        );
+        let proxy = body.add_op(
+            proxy_arm,
+            Operator::RefCast {
+                ty: self.repr.proxy_ty(),
+            },
+            &[cur],
+            &[self.repr.proxy_ty()],
+        );
+        let revoked = body.add_op(
+            proxy_arm,
+            Operator::StructGet {
+                sig: self.repr.proxy,
+                idx: 2,
+            },
+            &[proxy],
+            &[Type::I32],
+        );
+        let live = body.add_block();
+        let revoked_arm = body.add_block();
+        body.set_terminator(
+            proxy_arm,
+            Terminator::CondBr {
+                cond: revoked,
+                if_true: BlockTarget {
+                    block: revoked_arm,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: live,
+                    args: vec![],
+                },
+            },
+        );
+        body.set_terminator(revoked_arm, Terminator::Unreachable);
+        let target = body.add_op(
+            live,
+            Operator::StructGet {
+                sig: self.repr.proxy,
+                idx: 0,
+            },
+            &[proxy],
+            &[self.repr.value],
+        );
+        let handler = body.add_op(
+            live,
+            Operator::StructGet {
+                sig: self.repr.proxy,
+                idx: 1,
+            },
+            &[proxy],
+            &[self.repr.value],
+        );
+        let name = self.new_string(&mut body, live, b"construct")?;
+        let trap_slot = body.add_op(
+            live,
+            Operator::Call {
+                function_index: chain,
+            },
+            &[handler, name],
+            &[self.repr.slot_ty()],
+        );
+        let (block, trap) = self.unwrap_slot(&mut body, live, trap_slot);
+        let no_trap = body.add_op(block, Operator::RefIsNull, &[trap], &[Type::I32]);
+        let forward = body.add_block();
+        let invoke = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: no_trap,
+                if_true: BlockTarget {
+                    block: forward,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: invoke,
+                    args: vec![],
+                },
+            },
+        );
+        body.set_terminator(
+            forward,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: loop_block,
+                    args: vec![target],
+                },
+            },
+        );
+        let trap_fn = body.add_op(
+            invoke,
+            Operator::RefCast {
+                ty: self.repr.function_ty(),
+            },
+            &[trap],
+            &[self.repr.function_ty()],
+        );
+        let trap_ctx = body.add_op(
+            invoke,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: 4,
+            },
+            &[trap_fn],
+            &[self.repr.object_ty()],
+        );
+        let trap_code = body.add_op(
+            invoke,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: 3,
+            },
+            &[trap_fn],
+            &[ref_sig(self.repr.adapter)],
+        );
+        let trap_args = body.add_op(
+            invoke,
+            Operator::ArrayNewFixed {
+                sig: self.repr.arguments,
+                num: 3,
+            },
+            &[target, args, new_target],
+            &[ref_sig(self.repr.arguments)],
+        );
+        let result = body.add_op(
+            invoke,
+            Operator::CallRef {
+                sig_index: self.repr.adapter,
+            },
+            &[trap_ctx, handler, trap_args, trap_code],
+            &[self.repr.value],
+        );
+        body.set_terminator(invoke, Terminator::Return { values: vec![result] });
+
+        // Ordinary construct: receiver, prototype from new_target, call,
+        // override.
+        let receiver = self.new_object(&mut body, ordinary_arm)?;
+        let (receiver_v, _) = receiver.wasm()?;
+        let proto_key = self.new_string(&mut body, ordinary_arm, b"prototype")?;
+        let proto_slot = body.add_op(
+            ordinary_arm,
+            Operator::Call {
+                function_index: chain,
+            },
+            &[new_target, proto_key],
+            &[self.repr.slot_ty()],
+        );
+        let (block, prototype) = self.unwrap_slot(&mut body, ordinary_arm, proto_slot);
+        let proto_is_object = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.object_non_null_ty(),
+            },
+            &[prototype],
+            &[Type::I32],
+        );
+        let proto_is_function = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.function_non_null_ty(),
+            },
+            &[prototype],
+            &[Type::I32],
+        );
+        let proto_ok = body.add_op(
+            block,
+            Operator::I32Or,
+            &[proto_is_object, proto_is_function],
+            &[Type::I32],
+        );
+        let null_proto = body.add_op(
+            block,
+            Operator::RefNull {
+                ty: self.repr.value,
+            },
+            &[],
+            &[self.repr.value],
+        );
+        let proto = body.add_op(
+            block,
+            Operator::TypedSelect {
+                ty: self.repr.value,
+            },
+            &[prototype, null_proto, proto_ok],
+            &[self.repr.value],
+        );
+        self.set_object_proto(&mut body, block, receiver_v, proto);
+        let cur_fn = body.add_op(
+            block,
+            Operator::RefCast {
+                ty: self.repr.function_ty(),
+            },
+            &[cur],
+            &[self.repr.function_ty()],
+        );
+        let fctx = body.add_op(
+            block,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: 4,
+            },
+            &[cur_fn],
+            &[self.repr.object_ty()],
+        );
+        let fcode = body.add_op(
+            block,
+            Operator::StructGet {
+                sig: self.repr.function,
+                idx: 3,
+            },
+            &[cur_fn],
+            &[ref_sig(self.repr.adapter)],
+        );
+        let result = body.add_op(
+            block,
+            Operator::CallRef {
+                sig_index: self.repr.adapter,
+            },
+            &[fctx, receiver_v, args, fcode],
+            &[self.repr.value],
+        );
+        let is_object = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.object_non_null_ty(),
+            },
+            &[result],
+            &[Type::I32],
+        );
+        let is_function = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.function_non_null_ty(),
+            },
+            &[result],
+            &[Type::I32],
+        );
+        let is_proxy_result = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.proxy_non_null_ty(),
+            },
+            &[result],
+            &[Type::I32],
+        );
+        let obj_or_fn = body.add_op(block, Operator::I32Or, &[is_object, is_function], &[Type::I32]);
+        let override_result =
+            body.add_op(block, Operator::I32Or, &[obj_or_fn, is_proxy_result], &[Type::I32]);
+        let final_value = body.add_op(
+            block,
+            Operator::TypedSelect {
+                ty: self.repr.value,
+            },
+            &[result, receiver_v, override_result],
+            &[self.repr.value],
+        );
+        body.set_terminator(block, Terminator::Return {
+            values: vec![final_value],
+        });
+        let func = self.module.funcs.push(FuncDecl::Body(
+            signature,
+            format!("js_construct_value_{}", self.module.funcs.len()),
+            body,
+        ));
+        let mut helpers = self
+            .proxy_helpers
+            .ok_or_else(|| ConvertError::invalid("proxy helpers not initialized"))?;
+        helpers.construct_value = Some(func);
+        self.proxy_helpers = Some(helpers);
+        Ok(func)
+    }
+
+    /// `Reflect.apply`'s direct form of the proxy-aware call tuple builder:
+    /// the argument list arrives as an already-built arguments array rather
+    /// than source-level arguments.
+    fn call_parts_proxy_aware_with_array(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        callee: &LowerValue,
+        receiver: LowerValue,
+        array: Value,
+    ) -> Result<(Block, Value, Value, Value, Value), ConvertError> {
+        let (callee_v, kind) = callee.wasm()?;
+        if Self::provably_non_proxy(callee) || kind != ValueKind::Reference {
+            let (captured_context, effective_this, code, _) =
+                self.callable_parts(body, block, callee, receiver)?;
+            return Ok((block, captured_context, effective_this, array, code));
+        }
+        let chain = self.ensure_chain_lookup()?;
+        let is_proxy = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.proxy_non_null_ty(),
+            },
+            &[callee_v],
+            &[Type::I32],
+        );
+        let proxy_arm = body.add_block();
+        let ordinary_arm = body.add_block();
+        let join = body.add_block();
+        let ctx_out = body.add_blockparam(join, ref_sig(self.repr.object));
+        let this_out = body.add_blockparam(join, self.repr.value);
+        let array_out = body.add_blockparam(join, ref_sig(self.repr.arguments));
+        let code_out = body.add_blockparam(join, ref_sig(self.repr.adapter));
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_proxy,
+                if_true: BlockTarget {
+                    block: proxy_arm,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: ordinary_arm,
+                    args: vec![],
+                },
+            },
+        );
+        let proxy = body.add_op(
+            proxy_arm,
+            Operator::RefCast {
+                ty: self.repr.proxy_ty(),
+            },
+            &[callee_v],
+            &[self.repr.proxy_ty()],
+        );
+        let revoked = body.add_op(
+            proxy_arm,
+            Operator::StructGet {
+                sig: self.repr.proxy,
+                idx: 2,
+            },
+            &[proxy],
+            &[Type::I32],
+        );
+        let live = body.add_block();
+        let revoked_arm = body.add_block();
+        body.set_terminator(
+            proxy_arm,
+            Terminator::CondBr {
+                cond: revoked,
+                if_true: BlockTarget {
+                    block: revoked_arm,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: live,
+                    args: vec![],
+                },
+            },
+        );
+        body.set_terminator(revoked_arm, Terminator::Unreachable);
+        let target = body.add_op(
+            live,
+            Operator::StructGet {
+                sig: self.repr.proxy,
+                idx: 0,
+            },
+            &[proxy],
+            &[self.repr.value],
+        );
+        let handler = body.add_op(
+            live,
+            Operator::StructGet {
+                sig: self.repr.proxy,
+                idx: 1,
+            },
+            &[proxy],
+            &[self.repr.value],
+        );
+        let name = self.new_string(body, live, b"apply")?;
+        let trap_slot = body.add_op(
+            live,
+            Operator::Call {
+                function_index: chain,
+            },
+            &[handler, name],
+            &[self.repr.slot_ty()],
+        );
+        let (live, trap) = self.unwrap_slot(body, live, trap_slot);
+        let no_trap = body.add_op(live, Operator::RefIsNull, &[trap], &[Type::I32]);
+        let forward = body.add_block();
+        let invoke = body.add_block();
+        body.set_terminator(
+            live,
+            Terminator::CondBr {
+                cond: no_trap,
+                if_true: BlockTarget {
+                    block: forward,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: invoke,
+                    args: vec![],
+                },
+            },
+        );
+        let target_lv = LowerValue::Wasm {
+            value: target,
+            kind: ValueKind::Reference,
+        };
+        let (fctx, fthis, fcode, _) =
+            self.callable_parts(body, forward, &target_lv, receiver.clone())?;
+        body.set_terminator(
+            forward,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![fctx, fthis, array, fcode],
+                },
+            },
+        );
+        let trap_lv = LowerValue::Wasm {
+            value: trap,
+            kind: ValueKind::Reference,
+        };
+        let handler_lv = LowerValue::Wasm {
+            value: handler,
+            kind: ValueKind::Reference,
+        };
+        let (tctx, tthis, tcode, _) =
+            self.callable_parts(body, invoke, &trap_lv, handler_lv)?;
+        let this_arg = self.box_value(body, invoke, &receiver)?;
+        let trap_args = body.add_op(
+            invoke,
+            Operator::ArrayNewFixed {
+                sig: self.repr.arguments,
+                num: 3,
+            },
+            &[target, this_arg, array],
+            &[ref_sig(self.repr.arguments)],
+        );
+        body.set_terminator(
+            invoke,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![tctx, tthis, trap_args, tcode],
+                },
+            },
+        );
+        let (captured_context, effective_this, code, _) =
+            self.callable_parts(body, ordinary_arm, callee, receiver)?;
+        body.set_terminator(
+            ordinary_arm,
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![captured_context, effective_this, array, code],
+                },
+            },
+        );
+        Ok((join, ctx_out, this_out, array_out, code_out))
+    }
 }

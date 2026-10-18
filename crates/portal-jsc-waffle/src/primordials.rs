@@ -1324,7 +1324,9 @@ fn build_reflect_namespace(
                 value: target_raw,
                 kind: ValueKind::Reference,
             };
-            let (block, raw) = this.get_string_member_raw(body, block, &target, key)?;
+            // Proxy-aware: `Reflect.get` on a proxy fires its `get` trap
+            // (#34/#35 trap mirroring).
+            let (block, raw) = this.get_string_member_proxy_aware(body, block, &target, key)?;
             let (block, resolved) = this.resolve_property_read_join(body, block, &target, raw)?;
             let boxed = this.box_value(body, block, &resolved)?;
             body.set_terminator(
@@ -1389,9 +1391,17 @@ fn build_reflect_namespace(
                 value: target_raw,
                 kind: ValueKind::Reference,
             };
-            let (block, raw) = this.get_string_member_raw(body, block, &target, key)?;
-            let (raw_value, _) = raw.wasm()?;
-            let has = this.is_present(body, block, raw_value);
+            // Proxy-aware chain presence, mirroring the `in` operator
+            // (#34/#35 trap mirroring).
+            let value_has = this.ensure_proxy_helpers()?.value_has;
+            let has = body.add_op(
+                block,
+                Operator::Call {
+                    function_index: value_has,
+                },
+                &[target_raw, key],
+                &[Type::I32],
+            );
             let boxed = this.box_value(
                 body,
                 block,
@@ -1418,35 +1428,22 @@ fn build_reflect_namespace(
         |this, body, entry, _context, _this_val, args| {
             let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
             let (block, key) = this.read_arg_string_key(body, block, args, 1)?;
-            let target = LowerValue::Wasm {
-                value: target_raw,
-                kind: ValueKind::Reference,
-            };
-            let (block, root) = this.object_and_root(body, block, &target)?;
-            let helpers = this.ensure_property_helpers()?;
-            let zero = body.add_op(block, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
-            let null_slot = body.add_op(
-                block,
-                Operator::RefNull {
-                    ty: this.repr.slot_ty(),
-                },
-                &[],
-                &[this.repr.slot_ty()],
-            );
-            body.add_op(
+            // Proxy-aware delete: the `deleteProperty` trap for a proxied
+            // target, the own-slot clear otherwise (#34/#35 trap mirroring).
+            let value_delete = this.ensure_value_delete()?;
+            let deleted = body.add_op(
                 block,
                 Operator::Call {
-                    function_index: helpers.set,
+                    function_index: value_delete,
                 },
-                &[root, key, null_slot, zero],
-                &[],
+                &[target_raw, key],
+                &[Type::I32],
             );
-            let true_value = body.add_op(block, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
             let boxed = this.box_value(
                 body,
                 block,
                 &LowerValue::Wasm {
-                    value: true_value,
+                    value: deleted,
                     kind: ValueKind::Boolean,
                 },
             )?;
@@ -1548,18 +1545,26 @@ fn build_reflect_namespace(
                 value: this_arg_raw,
                 kind: ValueKind::Reference,
             };
-            let (context, call_this, code, _arrow) =
-                this.callable_parts(body, elements_join, &target, this_arg)?;
+            // Proxy-aware: `Reflect.apply` on a proxied function fires the
+            // `apply` trap with the same array (#34/#35 trap mirroring).
+            let (call_block, context, call_this, array, code) = this
+                .call_parts_proxy_aware_with_array(
+                    body,
+                    elements_join,
+                    &target,
+                    this_arg,
+                    elements,
+                )?;
             let result = body.add_op(
-                elements_join,
+                call_block,
                 Operator::CallRef {
                     sig_index: this.repr.adapter,
                 },
-                &[context, call_this, elements, code],
+                &[context, call_this, array, code],
                 &[this.repr.value],
             );
             body.set_terminator(
-                elements_join,
+                call_block,
                 Terminator::Return {
                     values: vec![result],
                 },
@@ -1673,18 +1678,364 @@ fn build_reflect_namespace(
         *block = self.set_static_property_value_raw(body, *block, &reflect, name, &value)?;
     }
 
+    // `Reflect.construct(target, argsArray, newTarget?)` — the direct form
+    // of the `new` operation, including the proxy `construct` trap (#35).
+    let func = self.build_native_adapter(
+        "reflect_construct",
+        |this, body, entry, _context, _this_val, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            let (block, args_array_raw) = this.read_arg_raw(body, block, args, 1);
+            let (block, new_target_raw) = this.read_arg_raw(body, block, args, 2);
+            let is_object = body.add_op(
+                block,
+                Operator::RefTest {
+                    ty: this.repr.object_ty(),
+                },
+                &[args_array_raw],
+                &[Type::I32],
+            );
+            let has_array = body.add_block();
+            let no_array = body.add_block();
+            let elements_join = body.add_block();
+            let elements = body.add_blockparam(elements_join, this.repr.arguments_ty());
+            body.set_terminator(
+                block,
+                Terminator::CondBr {
+                    cond: is_object,
+                    if_true: BlockTarget {
+                        block: has_array,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: no_array,
+                        args: vec![],
+                    },
+                },
+            );
+            let plain = body.add_op(
+                has_array,
+                Operator::RefCast {
+                    ty: this.repr.object_ty(),
+                },
+                &[args_array_raw],
+                &[this.repr.object_ty()],
+            );
+            let found_elements = body.add_op(
+                has_array,
+                Operator::StructGet {
+                    sig: this.repr.object,
+                    idx: 1,
+                },
+                &[plain],
+                &[this.repr.arguments_ty()],
+            );
+            body.set_terminator(
+                has_array,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: elements_join,
+                        args: vec![found_elements],
+                    },
+                },
+            );
+            let empty = body.add_op(
+                no_array,
+                Operator::ArrayNewFixed {
+                    sig: this.repr.arguments,
+                    num: 0,
+                },
+                &[],
+                &[this.repr.arguments_ty()],
+            );
+            body.set_terminator(
+                no_array,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: elements_join,
+                        args: vec![empty],
+                    },
+                },
+            );
+            // `newTarget` defaults to `target`; a null third argument (an
+            // omitted one) selects it.
+            let no_new_target = body.add_op(
+                elements_join,
+                Operator::RefIsNull,
+                &[new_target_raw],
+                &[Type::I32],
+            );
+            let new_target = body.add_op(
+                elements_join,
+                Operator::TypedSelect {
+                    ty: this.repr.value,
+                },
+                &[target_raw, new_target_raw, no_new_target],
+                &[this.repr.value],
+            );
+            let construct = this.ensure_construct_value()?;
+            let result = body.add_op(
+                elements_join,
+                Operator::Call {
+                    function_index: construct,
+                },
+                &[target_raw, elements, new_target],
+                &[this.repr.value],
+            );
+            body.set_terminator(
+                elements_join,
+                Terminator::Return {
+                    values: vec![result],
+                },
+            );
+            Ok(())
+        },
+    )?;
+    let (context, _) = reflect.wasm()?;
+    let value = self.native_function_value(body, *block, context, func)?;
+    *block = self.set_static_property_value_raw(body, *block, &reflect, "construct", &value)?;
+
+    // `Reflect.getPrototypeOf(target)`: the object's `[[Prototype]]` (null
+    // for a base object). A proxy forwards to its target's proto (#35; the
+    // `getPrototypeOf` trap family is not part of the #34 trap set).
     let func = self.build_native_adapter(
         "reflect_get_prototype_of",
-        |this, body, entry, _c, _t, _a| {
-            let undef = body.add_op(
-                entry,
+        |this, body, entry, _c, _t, args| {
+            let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
+            let is_fn = body.add_op(
+                block,
+                Operator::RefTest {
+                    ty: this.repr.function_non_null_ty(),
+                },
+                &[target_raw],
+                &[Type::I32],
+            );
+            let fn_arm = body.add_block();
+            let not_fn = body.add_block();
+            let join = body.add_block();
+            let proto_out = body.add_blockparam(join, this.repr.value);
+            body.set_terminator(
+                block,
+                Terminator::CondBr {
+                    cond: is_fn,
+                    if_true: BlockTarget {
+                        block: fn_arm,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: not_fn,
+                        args: vec![],
+                    },
+                },
+            );
+            let f = body.add_op(
+                fn_arm,
+                Operator::RefCast {
+                    ty: this.repr.function_ty(),
+                },
+                &[target_raw],
+                &[this.repr.function_ty()],
+            );
+            let fproto = body.add_op(
+                fn_arm,
+                Operator::StructGet {
+                    sig: this.repr.function,
+                    idx: 2,
+                },
+                &[f],
+                &[this.repr.value],
+            );
+            body.set_terminator(
+                fn_arm,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![fproto],
+                    },
+                },
+            );
+            // Proxies forward to their target's proto; objects read their
+            // own; anything else yields null.
+            let is_proxy = body.add_op(
+                not_fn,
+                Operator::RefTest {
+                    ty: this.repr.proxy_non_null_ty(),
+                },
+                &[target_raw],
+                &[Type::I32],
+            );
+            let proxy_arm = body.add_block();
+            let not_proxy = body.add_block();
+            body.set_terminator(
+                not_fn,
+                Terminator::CondBr {
+                    cond: is_proxy,
+                    if_true: BlockTarget {
+                        block: proxy_arm,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: not_proxy,
+                        args: vec![],
+                    },
+                },
+            );
+            let p = body.add_op(
+                proxy_arm,
+                Operator::RefCast {
+                    ty: this.repr.proxy_ty(),
+                },
+                &[target_raw],
+                &[this.repr.proxy_ty()],
+            );
+            let ptarget = body.add_op(
+                proxy_arm,
+                Operator::StructGet {
+                    sig: this.repr.proxy,
+                    idx: 0,
+                },
+                &[p],
+                &[this.repr.value],
+            );
+            let ptarget_is_obj = body.add_op(
+                proxy_arm,
+                Operator::RefTest {
+                    ty: this.repr.object_non_null_ty(),
+                },
+                &[ptarget],
+                &[Type::I32],
+            );
+            let pobj = body.add_block();
+            let pnull = body.add_block();
+            body.set_terminator(
+                proxy_arm,
+                Terminator::CondBr {
+                    cond: ptarget_is_obj,
+                    if_true: BlockTarget {
+                        block: pobj,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: pnull,
+                        args: vec![],
+                    },
+                },
+            );
+            let pobj_ref = body.add_op(
+                pobj,
+                Operator::RefCast {
+                    ty: this.repr.object_ty(),
+                },
+                &[ptarget],
+                &[this.repr.object_ty()],
+            );
+            let pobj_proto = body.add_op(
+                pobj,
+                Operator::StructGet {
+                    sig: this.repr.object,
+                    idx: 2,
+                },
+                &[pobj_ref],
+                &[this.repr.value],
+            );
+            body.set_terminator(
+                pobj,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![pobj_proto],
+                    },
+                },
+            );
+            let null_v = body.add_op(
+                pnull,
                 Operator::RefNull {
                     ty: this.repr.value,
                 },
                 &[],
                 &[this.repr.value],
             );
-            body.set_terminator(entry, Terminator::Return { values: vec![undef] });
+            body.set_terminator(
+                pnull,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![null_v],
+                    },
+                },
+            );
+            let is_obj = body.add_op(
+                not_proxy,
+                Operator::RefTest {
+                    ty: this.repr.object_non_null_ty(),
+                },
+                &[target_raw],
+                &[Type::I32],
+            );
+            let obj_arm = body.add_block();
+            let prim_arm = body.add_block();
+            body.set_terminator(
+                not_proxy,
+                Terminator::CondBr {
+                    cond: is_obj,
+                    if_true: BlockTarget {
+                        block: obj_arm,
+                        args: vec![],
+                    },
+                    if_false: BlockTarget {
+                        block: prim_arm,
+                        args: vec![],
+                    },
+                },
+            );
+            let o = body.add_op(
+                obj_arm,
+                Operator::RefCast {
+                    ty: this.repr.object_ty(),
+                },
+                &[target_raw],
+                &[this.repr.object_ty()],
+            );
+            let oproto = body.add_op(
+                obj_arm,
+                Operator::StructGet {
+                    sig: this.repr.object,
+                    idx: 2,
+                },
+                &[o],
+                &[this.repr.value],
+            );
+            body.set_terminator(
+                obj_arm,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![oproto],
+                    },
+                },
+            );
+            let null_v2 = body.add_op(
+                prim_arm,
+                Operator::RefNull {
+                    ty: this.repr.value,
+                },
+                &[],
+                &[this.repr.value],
+            );
+            body.set_terminator(
+                prim_arm,
+                Terminator::Br {
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![null_v2],
+                    },
+                },
+            );
+            body.set_terminator(
+                join,
+                Terminator::Return {
+                    values: vec![proto_out],
+                },
+            );
             Ok(())
         },
     )?;

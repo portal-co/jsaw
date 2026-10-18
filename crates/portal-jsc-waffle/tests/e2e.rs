@@ -5210,3 +5210,37 @@ fn proxy_revocation_traps_on_use() {
     let outcome = std::panic::catch_unwind(|| execute_in_wasmtime(&wasm_bytes(&module), "f", &[3.0, 4.0]));
     assert!(outcome.is_err(), "using a revoked proxy must trap");
 }
+
+#[test]
+fn reflect_trap_mirror_executes() {
+    let cases: &[(&str, f64)] = &[
+        // Reflect.get mirrors a source read, including the get trap.
+        ("export function f(a, b) { const p = new Proxy({ y: b }, { get(t, k) { if (k === \"x\") { return a; } return t.y; } }); return Reflect.get(p, \"x\") + Reflect.get(p, \"y\"); }", 7.0),
+        // Reflect.set mirrors a source write, including the set trap.
+        ("export function f(a, b) { const t = { v: 0 }; const p = new Proxy(t, { set(tt, k, val) { tt.v = val + 1; } }); Reflect.set(p, \"x\", a); return t.v + b; }", 8.0),
+        // Reflect.has mirrors `in`, including the has trap.
+        ("export function f(a, b) { const p = new Proxy({}, { has(t, k) { return k === \"x\"; } }); return (Reflect.has(p, \"x\") ? a : 0) + (Reflect.has(p, \"y\") ? 100 : 0) + b; }", 7.0),
+        // Reflect.deleteProperty fires the deleteProperty trap.
+        ("export function f(a, b) { const t = { x: a }; const p = new Proxy(t, { deleteProperty(tt, k) { return true; } }); return (Reflect.deleteProperty(p, \"x\") ? 1 : 0) + (Reflect.has(t, \"x\") ? a : 0) + b; }", 8.0),
+        // Reflect.apply fires the apply trap.
+        ("export function f(a, b) { const p = new Proxy(function(x) { return x * 2; }, { apply(t, thisArg, args) { return t(args[0]) + b; } }); return Reflect.apply(p, null, [a]); }", 10.0),
+        // Reflect.construct fires the construct trap.
+        ("export function f(a, b) { const p = new Proxy(function(x) { this.x = x; }, { construct(t, args) { return { x: args[0] + b }; } }); return Reflect.construct(p, [a]).x; }", 7.0),
+        // Ordinary targets work through the same natives.
+        ("export function f(a, b) { const o = { x: a }; Reflect.set(o, \"y\", b); return Reflect.get(o, \"x\") + Reflect.get(o, \"y\") + (Reflect.has(o, \"x\") ? 1 : 0) - 1 + (Reflect.deleteProperty(o, \"y\") ? 1 : 0) + (Reflect.has(o, \"y\") ? 100 : 0); }", 8.0),
+        // Reflect.construct without a proxy: receiver + prototype wiring.
+        ("export function f(a, b) { function P(x) { this.x = x; } P.prototype = { get() { return this.x; } }; return Reflect.construct(P, [a]).get() + b; }", 7.0),
+        // Reflect.getPrototypeOf reads the wired prototype.
+        ("export function f(a, b) { function P() {} const proto = { mark: a }; P.prototype = proto; const o = Reflect.construct(P, []); return Reflect.getPrototypeOf(o).mark + b; }", 7.0),
+    ];
+    for (source, expected) in cases {
+        let module = lower_module(source, &portal_jsc_waffle::ConvertOptions::default())
+            .expect("reflect lowering should succeed");
+        validate_wasm_only(&module);
+        assert_eq!(
+            execute_in_wasmtime(&wasm_bytes(&module), "f", &[3.0, 4.0]),
+            *expected
+        );
+    }
+}
+

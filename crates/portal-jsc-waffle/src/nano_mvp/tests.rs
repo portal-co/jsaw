@@ -385,3 +385,28 @@ fn proxy_apply_and_construct_execute_nano() {
         47.0
     );
 }
+
+#[test]
+fn reflect_trap_mirror_executes_nano() {
+    // Reflect.get/set/has mirror the proxy traps through the nano lane.
+    assert_eq!(
+        compile_plan_and_run(
+            "export function f(a, b) { const t = { y: b }; const p = new Proxy(t, { get(tt, k) { if (k === \"x\") { return a; } return tt.y; }, has(tt, k) { return k === \"w\"; } }); return Reflect.get(p, \"x\") + Reflect.get(p, \"y\") + (Reflect.has(p, \"w\") ? 1 : 0); }",
+            "f",
+            &[3.0, 4.0]
+        ),
+        8.0
+    );
+}
+
+#[test]
+fn reflect_apply_construct_execute_nano() {
+    assert_eq!(
+        compile_plan_and_run(
+            "export function f(a, b) { function P(x) { this.x = x; } P.prototype = { get() { return this.x; } }; const p = new Proxy(function(x) { return x * 2; }, { apply(t, thisArg, args) { return t(args[0]) + 1; } }); return Reflect.apply(p, null, [a]) + Reflect.construct(P, [b]).get(); }",
+            "f",
+            &[3.0, 4.0]
+        ),
+        11.0
+    );
+}

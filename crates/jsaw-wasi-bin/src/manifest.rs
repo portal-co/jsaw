@@ -29,6 +29,10 @@ pub struct Manifest {
     pub options: Options,
     #[serde(default)]
     pub emit: Emit,
+    /// The structured host FFI manifest (DreamComp #37): every `wasm:` host
+    /// import and every host-ABI export must be declared here.
+    #[serde(default)]
+    pub ffi: portal_jsc_waffle::FfiManifest,
 }
 
 /// One requested assumption in the manifest. The plain-string form names an

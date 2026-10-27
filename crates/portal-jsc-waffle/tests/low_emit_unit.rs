@@ -126,3 +126,64 @@ fn tail_call_chain_uses_the_step_protocol() {
         "trampoline structural violations"
     );
 }
+
+#[test]
+fn ffi_imports_flow_through_boundary_records_only() {
+    // DreamComp #37 acceptance: the low-level emitter consumes only
+    // BoundaryRecord/PlanFunctionKind::Import — never source strings.
+    let source = "import { add } from 'wasm:env'; export function run(x) { return add(x, 1); }";
+    let mut sources = BTreeMap::new();
+    sources.insert("main.js".to_string(), source.to_string());
+    let set = portal_jsc_waffle::module_set_from_sources(
+        sources.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+    )
+    .expect("ingestion");
+    let mut options = portal_jsc_waffle::ConvertOptions::default();
+    options.ffi.modules.insert(
+        "env".to_string(),
+        portal_jsc_waffle::FfiModule {
+            functions: [(
+                "add".to_string(),
+                portal_jsc_waffle::FfiBoundarySignature {
+                    params: vec![
+                        portal_jsc_waffle::FfiType::I32,
+                        portal_jsc_waffle::FfiType::I32,
+                    ],
+                    result: Some(portal_jsc_waffle::FfiType::I32),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+    );
+    options.ffi.exports.insert(
+        "run".to_string(),
+        portal_jsc_waffle::FfiBoundarySignature {
+            params: vec![portal_jsc_waffle::FfiType::I32],
+            result: Some(portal_jsc_waffle::FfiType::I32),
+        },
+    );
+    let mut module = portal_pc_waffle::Module::empty();
+    portal_jsc_waffle::convert_modules("main.js", &set, &mut module, &options).expect("lowering");
+    let plan = portal_jsc_waffle::BackendPlan::from_module(&module).expect("plan");
+    let low = portal_jsc_waffle::low_emit::emit_low(
+        &plan,
+        &portal_jsc_waffle::low_emit::NanoRepresentation,
+    )
+    .expect("emit");
+    assert!(
+        low.imports
+            .iter()
+            .any(|i| i.module == "env" && i.name == "add"
+                && i.params == [portal_jsc_waffle::low_emit::LeType::I32; 2]
+                && i.results == [portal_jsc_waffle::low_emit::LeType::I32]),
+        "structured import missing: {:?}",
+        low.imports
+    );
+    assert!(
+        low.exports.iter().any(|e| e.name == "run"),
+        "boundary export missing: {:?}",
+        low.exports
+    );
+    assert!(portal_jsc_waffle::low_emit::debug::validate(&low).is_empty());
+}

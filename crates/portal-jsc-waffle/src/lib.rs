@@ -1,5 +1,6 @@
 pub mod backend_plan;
 pub mod conv;
+pub mod ffi;
 pub mod low_emit;
 pub mod coregc;
 pub mod coregc_emit;
@@ -29,6 +30,7 @@ pub use conv::{
     ComponentFunctions, ComponentHandle, ConvertOptions, IncrementalConverter, convert,
     convert_module, convert_modules,
 };
+pub use ffi::{FfiBoundarySignature, FfiManifest, FfiManifestError, FfiModule, FfiType};
 pub use coregc::{
     COREGC_INVENTORY_SCHEMA, CoreGcError, CoreGcInventory, CoreGcOperation, CoreGcStorage,
     CoreGcType, CoreGcTypeId, CoreGcTypeKind,

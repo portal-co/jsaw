@@ -18,7 +18,7 @@ use swc_ecma_ast::{Id as Ident, ImportSpecifier};
 
 use crate::{
     repr::ConvertError,
-    wasm_boundary::{WasmImportSpec, parse_wasm_import_specifier, wasm_import_spec},
+    wasm_boundary::{WasmImportSpec, parse_wasm_import_specifier},
 };
 
 /// A closed set of ES modules that [`convert_modules`](crate::convert_modules)
@@ -319,8 +319,9 @@ pub(crate) fn build_import_table<'a>(
     set: &'a ModuleSet<'a>,
     path: &str,
     module: &'a SModule,
+    ffi: &crate::ffi::FfiManifest,
 ) -> Result<BTreeMap<Ident, ImportTarget<'a>>, ConvertError> {
-    validate_wasm_host_import_declarations(path, module)?;
+    validate_wasm_host_import_declarations(path, module, ffi)?;
     let mut table = BTreeMap::new();
     let mapper = module.import_mapper();
     // Referenced bindings only. Imported bindings are recorded in each
@@ -353,9 +354,51 @@ pub(crate) fn build_import_table<'a>(
                     )));
                 }
             };
+            crate::wasm_boundary::reject_legacy_suffix(&name, "Wasm host import")?;
+            let Some(signature) = ffi.import(host_module, &name) else {
+                return Err(ConvertError::invalid(format!(
+                    "Wasm host import {specifier:?}.{name:?} in module {path:?} has no FFI                      declaration; declare it in the FFI manifest (`ConvertOptions::ffi`)"
+                )));
+            };
             table.insert(
                 id,
-                ImportTarget::WasmHost(wasm_import_spec(host_module, &name)?),
+                ImportTarget::WasmHost(WasmImportSpec {
+                    module: host_module.to_owned(),
+                    field: name,
+                    signature: signature.clone(),
+                }),
+            );
+            continue;
+        }
+        // `~ffi` is the DreamCompat-style FFI factory namespace (DreamComp
+        // #37): `import { ffi, struct, opaque } from "~ffi"`. The bindings
+        // are call-only compiler intrinsics, intercepted before ordinary
+        // call dispatch; using one as a value is rejected by the LoadId
+        // path. `callback`/`contains` are recognized but fail closed at the
+        // call site (jsaw does not implement them yet).
+        if specifier == "~ffi" {
+            let name = match kind {
+                ImportMap::Named { name } => name.to_string(),
+                ImportMap::Default | ImportMap::Star => {
+                    return Err(ConvertError::invalid(format!(
+                        "intrinsic import from {specifier:?} in module {path:?} must be named"
+                    )));
+                }
+            };
+            match name.as_str() {
+                "ffi" | "struct" | "opaque" | "callback" | "contains" => {}
+                other => {
+                    return Err(ConvertError::invalid(format!(
+                        "unknown ~ffi intrinsic {other:?} (expected ffi/struct/opaque/callback/contains)"
+                    )));
+                }
+            }
+            table.insert(
+                id,
+                ImportTarget::Intrinsic {
+                    module: specifier.clone(),
+                    name,
+                },
             );
             continue;
         }
@@ -415,10 +458,37 @@ pub(crate) fn build_import_table<'a>(
 fn validate_wasm_host_import_declarations(
     path: &str,
     module: &SModule,
+    ffi: &crate::ffi::FfiManifest,
 ) -> Result<(), ConvertError> {
-    let mut signatures = BTreeMap::new();
+    let mut signatures: BTreeMap<(String, String), ()> = BTreeMap::new();
     for declaration in &module.imports {
         let specifier = declaration.src.value.to_atom_lossy().to_string();
+        // `~ffi` declarations validate their member names even when unused.
+        if specifier == "~ffi" {
+            for import in &declaration.specifiers {
+                let ImportSpecifier::Named(named) = import else {
+                    return Err(ConvertError::invalid(format!(
+                        "intrinsic import from {specifier:?} in module {path:?} must be named"
+                    )));
+                };
+                let name = named
+                    .imported
+                    .as_ref()
+                    .map(|name| name.atom().to_string())
+                    .unwrap_or_else(|| named.local.sym.to_string());
+                crate::wasm_boundary::reject_legacy_suffix(&name, "intrinsic import")?;
+                match name.as_str() {
+                    "ffi" | "struct" | "opaque" | "callback" | "contains" => {}
+                    other => {
+                        return Err(ConvertError::invalid(format!(
+                            "unknown ~ffi intrinsic {other:?} (expected \
+                             ffi/struct/opaque/callback/contains)"
+                        )));
+                    }
+                }
+            }
+            continue;
+        }
         let Some(host_module) = parse_wasm_import_specifier(&specifier) else {
             continue;
         };
@@ -440,17 +510,14 @@ fn validate_wasm_host_import_declarations(
                 .as_ref()
                 .map(|name| name.atom().to_string())
                 .unwrap_or_else(|| named.local.sym.to_string());
-            let import = wasm_import_spec(host_module, &imported_name)?;
-            let key = (import.module.clone(), import.field.clone());
-            if let Some(previous) = signatures.insert(key.clone(), import.signature.clone())
-                && previous != import.signature
-            {
+            crate::wasm_boundary::reject_legacy_suffix(&imported_name, "Wasm host import")?;
+            if ffi.import(host_module, &imported_name).is_none() {
                 return Err(ConvertError::invalid(format!(
-                    "Wasm host imports in module {path:?} declare incompatible signatures for \
-                     {}.{}",
-                    key.0, key.1
+                    "Wasm host import {specifier:?}.{imported_name:?} in module {path:?} has no \
+                     FFI declaration; declare it in the FFI manifest (`ConvertOptions::ffi`)"
                 )));
             }
+            signatures.insert((host_module.to_string(), imported_name), ());
         }
     }
     Ok(())

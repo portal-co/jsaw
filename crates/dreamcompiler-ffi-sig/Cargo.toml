@@ -1,0 +1,12 @@
+[package]
+name = "dreamcompiler-ffi-sig"
+version = "0.1.0"
+edition = "2024"
+publish = true
+
+# Moved from the DreamComp repo (`crates/compiler/dreamcompiler-ffi-sig`) to
+# jsaw (DreamComp #37): the hybrid FFI signature grammar lives with the jsaw
+# compiler now; DreamComp consumes it from here during the migration.
+
+[dependencies]
+thiserror = "2"

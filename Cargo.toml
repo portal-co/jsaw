@@ -1,5 +1,5 @@
 [workspace]
-members=["crates/jsaw-wasi-bin", "crates/mobile/portal-jsc-jvm-emit", "crates/mobile/portal-jsc-mob-emit", "crates/mobile/portal-jsc-swift-emit", "crates/portal-jsc-waffle",   "crates/swc-batch"]
+members=["crates/dreamcompiler-ffi-sig", "crates/jsaw-wasi-bin", "crates/mobile/portal-jsc-jvm-emit", "crates/mobile/portal-jsc-mob-emit", "crates/mobile/portal-jsc-swift-emit", "crates/portal-jsc-waffle",   "crates/swc-batch"]
 
 # "js-runtime-lib","swc-emit-rust","swc-waffle"
 
@@ -17,6 +17,11 @@ portal-jsc-swc-opt-ssa =  {git="https://github.com/portal-co/jsaw-core.git",vers
 portal-jsc-swc-util =     {git="https://github.com/portal-co/jsaw-core.git",version="^0.8.0-pre.11"}
 
 portal-pc-waffle = {version="^0.6.0-alpha.1",git="https://github.com/portal-co/waffle-.git"}
+
+# The DreamCompat hybrid FFI signature grammar (DreamComp #37). Moved from
+# the DreamComp repo; DreamComp consumes it from this repo during the
+# migration.
+dreamcompiler-ffi-sig = { path = "crates/dreamcompiler-ffi-sig" }
 
 id-arena = "^2.2.1"
 arena-traits = {version="^0.2.3",features=["id-arena"]}

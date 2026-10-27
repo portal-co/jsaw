@@ -2358,16 +2358,57 @@ fn star_exports_do_not_shadow_local_declarations() {
     assert_executes_in_all_runtimes(&module, "pick", &[], 1.0);
 }
 
+/// The FFI manifest for the host-boundary tests (DreamComp #37): `env.add`
+/// as `(i32, i32) -> i32`, plus a boundary export `run: (i32) -> i32`.
+fn test_ffi_manifest() -> portal_jsc_waffle::ConvertOptions {
+    let mut options = portal_jsc_waffle::ConvertOptions::default();
+    options.ffi.modules.insert(
+        "env".to_string(),
+        portal_jsc_waffle::FfiModule {
+            functions: [(
+                "add".to_string(),
+                portal_jsc_waffle::FfiBoundarySignature {
+                    params: vec![
+                        portal_jsc_waffle::FfiType::I32,
+                        portal_jsc_waffle::FfiType::I32,
+                    ],
+                    result: Some(portal_jsc_waffle::FfiType::I32),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+    );
+    options.ffi.exports.insert(
+        "run".to_string(),
+        portal_jsc_waffle::FfiBoundarySignature {
+            params: vec![portal_jsc_waffle::FfiType::I32],
+            result: Some(portal_jsc_waffle::FfiType::I32),
+        },
+    );
+    options
+}
+
 #[test]
 fn reserves_wasm_host_import_syntax_without_module_set_resolution() {
     let fixtures: Fixture<'_> = &[(
         "main.mjs",
-        "import { add$wasm$i32_i32$i32 as add } from 'wasm:env'; export function run(x) { return add(x, 1); }",
+        "import { add } from 'wasm:env'; export function run(x) { return add(x, 1); }",
     )];
-    let module = lower_modules(fixtures, "main.mjs", &Default::default())
+    let module = lower_modules(fixtures, "main.mjs", &test_ffi_manifest())
         .expect("wasm: must bypass ModuleSet resolution and lower as a host import");
     assert_eq!(module.imports.len(), 1);
     assert_eq!(module.imports[0].module, "env");
+
+    // Undeclared host imports fail closed, even with an otherwise-valid
+    // manifest.
+    let fixtures: Fixture<'_> = &[(
+        "main.mjs",
+        "import { mul } from 'wasm:env'; export function run() { return 1; }",
+    )];
+    let error = lower_modules(fixtures, "main.mjs", &test_ffi_manifest())
+        .expect_err("undeclared host import must fail");
+    assert!(error.to_string().contains("FFI declaration"), "{error}");
 
     for (source, needle) in [
         (
@@ -2379,16 +2420,16 @@ fn reserves_wasm_host_import_syntax_without_module_set_resolution() {
             "named import",
         ),
         (
-            "import { add } from 'wasm:env'; export function run() { return add(); }",
-            "$wasm$",
+            "import { add } from 'wasm:' ; export function run() { return add(); }",
+            "empty module",
         ),
         (
-            "import { add$wasm$i32_i32$i64 } from 'wasm:' ; export function run() { return add$wasm$i32_i32$i64(); }",
-            "empty module",
+            "import { add$wasm$i32_i32$i64 as add } from 'wasm:env'; export function run() { return add(1, 2); }",
+            "$wasm$",
         ),
     ] {
         let fixtures: Fixture<'_> = &[("main.mjs", source)];
-        let error = lower_modules(fixtures, "main.mjs", &Default::default())
+        let error = lower_modules(fixtures, "main.mjs", &test_ffi_manifest())
             .expect_err("malformed host import must fail before lowering");
         assert!(error.to_string().contains(needle), "{error}");
     }
@@ -2398,9 +2439,9 @@ fn reserves_wasm_host_import_syntax_without_module_set_resolution() {
 fn emits_and_executes_wasm_host_scalar_imports_and_exports() {
     let fixtures: Fixture<'_> = &[(
         "main.mjs",
-        "import { add$wasm$i32_i32$i32 as add } from 'wasm:env'; export function run$wasm$i32$i32(x) { return add(x, 7); }",
+        "import { add } from 'wasm:env'; export function run(x) { return add(x, 7); }",
     )];
-    let module = lower_modules(fixtures, "main.mjs", &Default::default())
+    let module = lower_modules(fixtures, "main.mjs", &test_ffi_manifest())
         .expect("typed host import and raw export should lower");
     for (_, declaration) in module.funcs.entries() {
         if let FuncDecl::Body(_, _, body) = declaration {
@@ -2440,10 +2481,10 @@ fn emits_and_executes_wasm_host_scalar_imports_and_exports() {
 fn wasm_host_imports_are_deduplicated_across_local_aliases() {
     let fixtures: Fixture<'_> = &[(
         "main.mjs",
-        "import { add$wasm$i32_i32$i32 as first } from 'wasm:env'; import { add$wasm$i32_i32$i32 as second } from 'wasm:env'; export function run$wasm$i32$i32(x) { return first(x, 1) + second(x, 2); }",
+        "import { add as first } from 'wasm:env'; import { add as second } from 'wasm:env'; export function run(x) { return first(x, 1) + second(x, 2); }",
     )];
-    let module = lower_modules(fixtures, "main.mjs", &Default::default())
-        .expect("aliases with the same host ABI should lower");
+    let module = lower_modules(fixtures, "main.mjs", &test_ffi_manifest())
+        .expect("aliases of one declared host import should lower");
     assert_eq!(module.imports.len(), 1, "raw host import is deduplicated");
 }
 
@@ -2453,31 +2494,40 @@ fn validates_wasm_host_imports_even_when_unused() {
         "main.mjs",
         "import { malformed } from 'wasm:env'; export function run() { return 1; }",
     )];
-    let error = lower_modules(fixtures, "main.mjs", &Default::default())
-        .expect_err("unreferenced malformed host imports must still fail");
-    assert!(error.to_string().contains("$wasm$"), "{error}");
+    let error = lower_modules(fixtures, "main.mjs", &test_ffi_manifest())
+        .expect_err("unreferenced undeclared host imports must still fail");
+    assert!(error.to_string().contains("FFI declaration"), "{error}");
 }
 
 #[test]
-fn reserves_stripped_wasm_export_names_and_detects_collisions() {
+fn rejects_legacy_suffix_exports_and_unknown_manifest_exports() {
+    // The removed `$wasm$` suffix grammar fails closed with a migration
+    // diagnostic.
     let fixtures: Fixture<'_> = &[(
         "main.mjs",
-        "export function run$wasm$i32$i32(x) { return x; } export function run() { return 0; }",
+        "export function bad$wasm$i32() { return 0; }",
     )];
     let error = lower_modules(fixtures, "main.mjs", &Default::default())
-        .expect_err("raw Wasm export names must be collision checked before lowering");
+        .expect_err("the $wasm$ suffix grammar must fail closed");
+    assert!(error.to_string().contains("$wasm$"), "{error}");
     assert!(
-        error.to_string().contains("duplicate Wasm export name"),
-        "{error}"
+        error.to_string().contains("FFI manifest"),
+        "{error} should point at the manifest"
     );
 
-    let fixtures: Fixture<'_> = &[("main.mjs", "export function bad$wasm$i32() { return 0; }")];
-    let error = lower_modules(fixtures, "main.mjs", &Default::default())
-        .expect_err("malformed raw Wasm export suffix must fail before lowering");
-    assert!(
-        error.to_string().contains("$wasm$<params>$<result>"),
-        "{error}"
+    // A manifest export naming no source export fails closed.
+    let fixtures: Fixture<'_> = &[("main.mjs", "export function run(x) { return x; }")];
+    let mut options = portal_jsc_waffle::ConvertOptions::default();
+    options.ffi.exports.insert(
+        "nope".to_string(),
+        portal_jsc_waffle::FfiBoundarySignature {
+            params: vec![],
+            result: None,
+        },
     );
+    let error = lower_modules(fixtures, "main.mjs", &options)
+        .expect_err("manifest exports must name real source exports");
+    assert!(error.to_string().contains("nope"), "{error}");
 }
 
 #[test]
@@ -5244,3 +5294,120 @@ fn reflect_trap_mirror_executes() {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// `~ffi` virtual-module factories (DreamComp #37)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ffi_factory_executes_against_host_imports() {
+    let fixtures: Fixture<'_> = &[(
+        "main.mjs",
+        "import { ffi } from '~ffi'; \
+         const lib = ffi('hostbuf', '() -> P<0000000000000000000000000000000000000000000000000000000000000000>; size(i32) -> i32'); \
+         export function run(x) { const b = lib(); return b.size(x); }",
+    )];
+    let module = lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect("ffi factory should lower");
+    let wasm = portal_pc_waffle::to_wasm_bytes(&module).expect("module should encode");
+    let engine = Engine::default();
+    let compiled = WasmtimeModule::new(&engine, &wasm).expect("wasmtime should compile the module");
+    let mut store = Store::new(&engine, ());
+    let mut linker = wasmtime::Linker::new(&engine);
+    linker
+        .func_wrap(
+            "ffi",
+            "hostbuf",
+            |mut caller: wasmtime::Caller<'_, ()>| -> Option<wasmtime::Rooted<wasmtime::AnyRef>> {
+                Some(wasmtime::AnyRef::from_i31(
+                    &mut caller,
+                    wasmtime::I31::wrapping_i32(7),
+                ))
+            },
+        )
+        .expect("host thunk");
+    linker
+        .func_wrap(
+            "ffi",
+            "hostbuf_size",
+            |mut caller: wasmtime::Caller<'_, ()>,
+             handle: Option<wasmtime::Rooted<wasmtime::AnyRef>>,
+             x: i32| {
+                let handle = handle.expect("handle");
+                let handle = handle.unwrap_i31(&mut caller).expect("i31 handle");
+                handle.get_i32() + x
+            },
+        )
+        .expect("host method");
+    let instance = linker
+        .instantiate(&mut store, &compiled)
+        .expect("host imports should instantiate");
+    let run = instance
+        .get_typed_func::<f64, f64>(&mut store, "run")
+        .expect("numeric export");
+    assert_eq!(run.call(&mut store, 2.0).unwrap(), 9.0);
+}
+
+#[test]
+fn struct_factory_builds_plain_objects() {
+    let fixtures: Fixture<'_> = &[(
+        "main.mjs",
+        "import { struct } from '~ffi'; \
+         const Point = struct('extern x: i32, y: i32'); \
+         export function run(a) { const p = Point(a, a + 1); return p.x + p.y; }",
+    )];
+    let module = lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect("struct factory should lower");
+    assert_executes_in_all_runtimes(&module, "run", &[3.0], 7.0);
+}
+
+#[test]
+fn opaque_factory_makes_marker_objects() {
+    let fixtures: Fixture<'_> = &[(
+        "main.mjs",
+        "import { opaque } from '~ffi'; const H = opaque('MyHandle'); \
+         export function run() { return typeof H === 'object' ? 1 : 0; }",
+    )];
+    let module = lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect("opaque factory should lower");
+    assert_executes_in_all_runtimes(&module, "run", &[], 1.0);
+}
+
+#[test]
+fn ffi_factories_fail_closed() {
+    // callback: recognized but not yet implemented (#42).
+    let fixtures: Fixture<'_> = &[(
+        "main.mjs",
+        "import { callback } from '~ffi'; const C = callback('(f64) -> f64'); export function run() { return 0; }",
+    )];
+    let error = lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect_err("callback must fail closed");
+    assert!(error.to_string().contains("callback"), "{error}");
+
+    // Non-literal arguments are rejected.
+    let fixtures: Fixture<'_> = &[(
+        "main.mjs",
+        "import { ffi } from '~ffi'; export function run(s) { return ffi(s, '(i32) -> i32'); }",
+    )];
+    let error = lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect_err("non-literal ffi args must fail");
+    assert!(error.to_string().contains("compile-time string literal"), "{error}");
+
+    // Non-extern structs fail closed.
+    let fixtures: Fixture<'_> = &[(
+        "main.mjs",
+        "import { struct } from '~ffi'; const P = struct('x: i32'); export function run() { return 0; }",
+    )];
+    let error = lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect_err("non-extern struct must fail closed");
+    assert!(error.to_string().contains("extern"), "{error}");
+
+    // Unknown ~ffi members fail closed at link time.
+    let fixtures: Fixture<'_> = &[(
+        "main.mjs",
+        "import { nope } from '~ffi'; export function run() { return 0; }",
+    )];
+    let error = lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect_err("unknown ~ffi import must fail");
+    assert!(error.to_string().contains("nope"), "{error}");
+}

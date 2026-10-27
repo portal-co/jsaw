@@ -75,6 +75,10 @@ pub struct ConvertOptions {
     /// invalid requests never reach this field. The default is the empty set,
     /// preserving legacy behavior.
     pub assumptions: portal_jsc_common::assumptions::AssumptionSet,
+    /// The structured host FFI manifest (DreamComp #37): every `wasm:` host
+    /// import and every host-ABI export must be declared here. The default is
+    /// empty, so any `wasm:` import fails closed.
+    pub ffi: crate::ffi::FfiManifest,
 }
 
 impl Default for ConvertOptions {
@@ -83,6 +87,7 @@ impl Default for ConvertOptions {
             numeric_exports: true,
             gc_export_suffix: None,
             assumptions: portal_jsc_common::assumptions::AssumptionSet::empty(),
+            ffi: crate::ffi::FfiManifest::default(),
         }
     }
 }
@@ -231,6 +236,10 @@ pub fn convert_modules<'a, 'wasm>(
             "the internal GC export suffix must not be empty",
         ));
     }
+    options
+        .ffi
+        .validate()
+        .map_err(|e| ConvertError::invalid(format!("invalid FFI manifest: {}", e.0)))?;
     if !set.contains(entry) {
         return Err(ConvertError::invalid(format!(
             "entry module {entry:?} is not in the module set"
@@ -244,7 +253,7 @@ pub fn convert_modules<'a, 'wasm>(
     let mut import_tables = BTreeMap::new();
     for path in set.keys() {
         let source = set.get(path)?;
-        let table = crate::linker::build_import_table(set, path, source)?;
+        let table = crate::linker::build_import_table(set, path, source, &options.ffi)?;
         import_tables.insert(path.clone(), table);
     }
 
@@ -252,17 +261,28 @@ pub fn convert_modules<'a, 'wasm>(
     declared_names.extend(module.exports.iter().map(|export| export.name.clone()));
     let mut generated_names = BTreeSet::new();
     for export in &exported {
-        let name = boundary_export_name(&export.0)?;
-        if !generated_names.insert(name.clone()) {
+        crate::wasm_boundary::reject_legacy_suffix(&export.0, "Wasm boundary export")?;
+        if !generated_names.insert(export.0.clone()) {
             return Err(ConvertError::invalid(format!(
-                "duplicate Wasm export name {name:?}"
+                "duplicate Wasm export name {:?}",
+                export.0
+            )));
+        }
+    }
+    // Manifest-declared boundary exports must name real source exports.
+    let source_export_names: BTreeSet<&str> =
+        exported.iter().map(|(name, _)| name.as_str()).collect();
+    for name in options.ffi.exports.keys() {
+        if !source_export_names.contains(name.as_str()) {
+            return Err(ConvertError::invalid(format!(
+                "FFI manifest declares export {name:?}, but the module set exports no such \
+                 function"
             )));
         }
     }
     if let Some(suffix) = &options.gc_export_suffix {
         for export in &exported {
-            let base = boundary_export_name(&export.0)?;
-            let name = format!("{base}{suffix}");
+            let name = format!("{}{suffix}", export.0);
             if declared_names.contains(&name) || !generated_names.insert(name.clone()) {
                 return Err(ConvertError::invalid(format!(
                     "internal GC export name {:?} collides with an existing export",
@@ -277,8 +297,14 @@ pub fn convert_modules<'a, 'wasm>(
     // imports before `Converter::new`, whose representation setup emits
     // helper bodies.
     let wasm_host_imports = declare_wasm_host_imports(module, &import_tables);
+    // `~ffi` factories declare their host imports from source-level call
+    // sites, so they need a prescan to keep the import section first.
+    let ffi_plans = prescan_ffi(set, &import_tables)?;
+    let ffi_host_imports = declare_ffi_host_imports(module, &ffi_plans)?;
     let mut converter = Converter::new(module);
+    converter.ffi_host_imports = ffi_host_imports;
     converter.semantic_cfg = options.semantic_cfg();
+    converter.ffi_thunks = ffi_plans;
     converter.import_tables = import_tables;
     converter.wasm_host_imports = wasm_host_imports;
     converter.exceptions_enabled = exported
@@ -330,9 +356,6 @@ pub fn convert_modules<'a, 'wasm>(
     }
     let mut exports = Vec::with_capacity(exported.len());
     for (name, function) in exported {
-        // Parse the declarative raw-host ABI suffix before code generation;
-        // preserve its source spelling until the wrapper is emitted.
-        let _ = boundary_export_signature(&name)?;
         converter.collect_shapes(function)?;
         converter.shadowed_names.clear();
         converter.function_literal_locals.clear();
@@ -343,14 +366,16 @@ pub fn convert_modules<'a, 'wasm>(
     converter.lower_all()?;
 
     for (name, info) in exports {
-        let boundary = boundary_export_signature(&name)?;
+        // A manifest-declared boundary export takes the plain name with its
+        // raw host ABI; the generic numeric export is suppressed for it.
+        let boundary = options.ffi.exports.get(&name).cloned();
         if let Some(signature) = &boundary {
             converter.export_wasm_boundary_function(&name, info, signature)?;
         } else if options.numeric_exports {
             converter.export_numeric_function(&name, info)?;
         }
-        // A suffix-marked export has its own raw host ABI and deliberately
-        // does not grow a second internal-GC adapter export.
+        // A manifest-declared export has its own raw host ABI and
+        // deliberately does not grow a second internal-GC adapter export.
         if boundary.is_none()
             && let Some(suffix) = &options.gc_export_suffix
         {
@@ -416,24 +441,6 @@ fn wasm_boundary_type(ty: WasmBoundaryType) -> Type {
             nullable: true,
         }),
     }
-}
-
-/// Parse a source export boundary name if it opts into the `$wasm$` ABI.
-fn boundary_export_signature(
-    name: &str,
-) -> Result<Option<(String, WasmBoundarySignature)>, ConvertError> {
-    if name.contains("$wasm$") {
-        let spec = crate::wasm_boundary::wasm_export_spec(name)?;
-        Ok(Some((spec.field, spec.signature)))
-    } else {
-        Ok(None)
-    }
-}
-
-/// The eventual Wasm export name, used for collision detection before any
-/// wrapper generation has mutated the module.
-fn boundary_export_name(name: &str) -> Result<String, ConvertError> {
-    Ok(boundary_export_signature(name)?.map_or_else(|| name.to_owned(), |(field, _)| field))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1221,6 +1228,16 @@ struct Converter<'a, 'module, 'wasm> {
     lowering_function_key: Option<u64>,
     /// Deduplicated raw Wasm imports, keyed by module, field, and ABI.
     wasm_host_imports: BTreeMap<WasmImportSpec, Func>,
+    /// `~ffi` thunk plans discovered by the prescan (sym -> parsed sig).
+    ffi_thunks: BTreeMap<String, FfiThunkPlan>,
+    /// Raw host imports declared for ffi thunks: (module, field) -> func.
+    ffi_host_imports: BTreeMap<(String, String), Func>,
+    /// Generated thunk natives per sym.
+    ffi_adapters: BTreeMap<String, Func>,
+    /// Generated method natives per (sym, method).
+    ffi_method_adapters: BTreeMap<(String, String), Func>,
+    /// Generated struct constructors per canonical declaration.
+    ffi_struct_ctors: BTreeMap<String, Func>,
     /// Generated jsaw callable metadata for every raw host import.
     wasm_host_functions: BTreeMap<WasmImportSpec, FunctionInfo>,
     /// Per-module import tables for multi-module ingestion: resolved
@@ -1299,6 +1316,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             lowering_function: None,
             lowering_function_key: None,
             wasm_host_imports: BTreeMap::new(),
+            ffi_thunks: BTreeMap::new(),
+            ffi_host_imports: BTreeMap::new(),
+            ffi_adapters: BTreeMap::new(),
+            ffi_method_adapters: BTreeMap::new(),
+            ffi_struct_ctors: BTreeMap::new(),
             wasm_host_functions: BTreeMap::new(),
             import_tables: BTreeMap::new(),
             module_of_function: BTreeMap::new(),
@@ -2539,9 +2561,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         &mut self,
         source_name: &str,
         info: FunctionInfo,
-        signature: &(String, WasmBoundarySignature),
+        abi: &WasmBoundarySignature,
     ) -> Result<(), ConvertError> {
-        let (field, abi) = signature;
+        let field = source_name;
         let wrapper_sig = self.wasm_boundary_signature(abi);
         let mut body = FunctionBody::new(self.module, wrapper_sig);
         let block = body.entry;
@@ -2629,7 +2651,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             body,
         ));
         self.module.exports.push(Export {
-            name: field.clone(),
+            name: field.to_owned(),
             kind: ExportKind::Func(func),
         });
         let _ = source_name; // retained for future diagnostics/source maps.
@@ -3198,6 +3220,28 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                                 }
                             }
                             continue;
+                        }
+                        // A tail call to a compiler intrinsic inside a `try`
+                        // block would fall through to the generic path and
+                        // trap on the intrinsic's placeholder value; fail
+                        // closed with a named diagnostic instead.
+                        if catches_here
+                            && let TCallee::Val(value) = callee
+                            && let Some(source) = self.lowering_function
+                            && let Some(SValue::LoadId(id)) =
+                                source.cfg.values.get(*value).map(|v| &v.value)
+                            && matches!(
+                                self.import_tables
+                                    .get(&self.current_module)
+                                    .and_then(|table| table.get(id)),
+                                Some(ImportTarget::Intrinsic { .. })
+                            )
+                        {
+                            return Err(ConvertError::invalid(
+                                "intrinsic calls in tail position inside a `try` block are not \
+                                 supported; bind the result first (`const r = f(...); return r;`)"
+                                    .to_string(),
+                            ));
                         }
                         if catches_here
                             && let TCallee::Val(value) = callee
@@ -3811,6 +3855,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                             // value; lower_item intercepts the call itself
                             // and never consumes the placeholder. Any other
                             // read remains a named fail-closed diagnostic.
+                            // The callee reference may feed a plain
+                            // Item::Call or a Tail terminator (`return
+                            // f(...)`); both are intercepted call sites.
                             let is_call_callee = self
                                 .lowering_function
                                 .is_some_and(|function| {
@@ -3822,6 +3869,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                                                     callee: TCallee::Val(callee),
                                                     ..
                                                 },
+                                                ..
+                                            } if *callee == source_id
+                                        )
+                                    }) || function.cfg.blocks.iter().any(|(_, block)| {
+                                        matches!(
+                                            &block.postcedent.term,
+                                            TTerm::Tail {
+                                                callee: TCallee::Val(callee),
                                                 ..
                                             } if *callee == source_id
                                         )
@@ -4027,32 +4082,47 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             };
         }
         if let Item::Call { callee, args } = item {
-            // `~weakmap` bindings are compiler intrinsics rather than
-            // runtime function objects. Intercept calls before ordinary
+            // `~weakmap` and `~ffi` bindings are compiler intrinsics rather
+            // than runtime function objects. Intercept calls before ordinary
             // direct/provenance/generic dispatch; loading one as a value is
             // rejected by the lexical LoadId path below.
             if let TCallee::Val(value) = callee
                 && let Some(source) = self.lowering_function
                 && let Some(SValue::LoadId(id)) = source.cfg.values.get(*value).map(|v| &v.value)
-                && matches!(
-                    self.import_tables
-                        .get(&self.current_module)
-                        .and_then(|table| table.get(id)),
-                    Some(ImportTarget::Intrinsic { module, .. }) if module == "~weakmap"
-                )
             {
-                let result = self
-                    .try_weakmap_intrinsic_call(
-                        body,
-                        block,
-                        context,
-                        this,
-                        values,
-                        id,
-                        args,
-                    )?
-                    .ok_or_else(|| ConvertError::invalid("weakmap intrinsic was not recognized"))?;
-                return Ok(result);
+                let intrinsic = self
+                    .import_tables
+                    .get(&self.current_module)
+                    .and_then(|table| table.get(id))
+                    .and_then(|target| match target {
+                        ImportTarget::Intrinsic { module, name } => {
+                            Some((module.clone(), name.clone()))
+                        }
+                        _ => None,
+                    });
+                if let Some((module, name)) = intrinsic {
+                    if module == "~weakmap" {
+                        let result = self
+                            .try_weakmap_intrinsic_call(
+                                body,
+                                block,
+                                context,
+                                this,
+                                values,
+                                id,
+                                args,
+                            )?
+                            .ok_or_else(|| {
+                                ConvertError::invalid("weakmap intrinsic was not recognized")
+                            })?;
+                        return Ok(result);
+                    }
+                    if module == "~ffi" {
+                        return self.ffi_intrinsic_call(
+                            body, block, context, this, values, &name, args,
+                        );
+                    }
+                }
             }
             if let Some(info) = self.module_function_info_for_callee(callee)? {
                 return self.direct_native_call(body, block, context, info, this, values, args);
@@ -13888,6 +13958,75 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         callee: &TCallee<SValueId>,
         args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
     ) -> Result<Option<()>, ConvertError> {
+        // Intrinsic callees in tail position (`return ffi(...)`) evaluate
+        // to the intrinsic's value directly (DreamComp #37): intercept here,
+        // convert to this caller's return ABI, and `Return`.
+        if !args.iter().any(|arg| arg.is_spread)
+            && let TCallee::Val(value) = callee
+            && let Some(source) = self.lowering_function
+            && let Some(SValue::LoadId(id)) = source.cfg.values.get(*value).map(|v| &v.value)
+        {
+            let intrinsic = self
+                .import_tables
+                .get(&self.current_module)
+                .and_then(|table| table.get(id))
+                .and_then(|target| match target {
+                    ImportTarget::Intrinsic { module, name } => {
+                        Some((module.clone(), name.clone()))
+                    }
+                    _ => None,
+                });
+            if let Some((module, name)) = intrinsic {
+                let results = if module == "~ffi" {
+                    Some(self.ffi_intrinsic_call(
+                        body,
+                        block,
+                        context,
+                        this.clone(),
+                        values,
+                        &name,
+                        args,
+                    )?)
+                } else if module == "~weakmap" {
+                    Some(self
+                        .try_weakmap_intrinsic_call(
+                            body,
+                            block,
+                            context,
+                            this.clone(),
+                            values,
+                            id,
+                            args,
+                        )?
+                        .ok_or_else(|| {
+                            ConvertError::invalid("weakmap intrinsic was not recognized")
+                        })?)
+                } else {
+                    None
+                };
+                if let Some(results) = results {
+                    for (block, value) in results {
+                        let converted = if self.exceptions_enabled {
+                            self.box_value(body, block, &value)?
+                        } else {
+                            self.convert_returned_value(
+                                body,
+                                block,
+                                &value,
+                                self.current_return_kinds,
+                            )?
+                        };
+                        body.set_terminator(
+                            block,
+                            Terminator::Return {
+                                values: vec![converted],
+                            },
+                        );
+                    }
+                    return Ok(Some(()));
+                }
+            }
+        }
         // Only simple (non-spread) calls to provenance-tracked function
         // values can dispatch directly; everything else keeps the generic
         // adapter tail call (its emission sites type-check the caller's
@@ -14508,6 +14647,10 @@ include!("privates.rs");
 // Proxy (#34): a distinct proxy struct, the `Proxy` primordial, and trap
 // dispatch that only runs behind a `ref.test`. `include!`d the same way.
 include!("proxies.rs");
+
+// DreamCompat-style FFI factories via the `~ffi` virtual module (#37):
+// include!d the same way.
+include!("ffi_factory.rs");
 
 // Native WasmGC backing storage and the corresponding JavaScript typed-array
 // surface. Kept beside the primordial implementation because constructors and

@@ -527,6 +527,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd8e701084c37e7ef62d3f9e453b618130cbc0ef3573847785952a3ac3f746bf"
 
 [[package]]
+name = "dreamcompiler-ffi-sig"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "either"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1699,6 +1706,7 @@ dependencies = [
 name = "portal-jsc-waffle"
 version = "0.1.0"
 dependencies = [
+ "dreamcompiler-ffi-sig",
  "portal-jsc-common",
  "portal-jsc-jvm-emit",
  "portal-jsc-mob-emit",
@@ -3692,11 +3700,55 @@ name = "thin-mcp"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "vane"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "vane-aarch64"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "vane-arch"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "vane-cli"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "vane-host"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "vane-meta-gen"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "vane-riscv"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "vane-swap"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "vane-target-core"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "vane-target-js"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "vane-target-wasm"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "vane-web"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "vane-wsdom"
 version = "0.1.0"
 
 [[patch.unused]]
@@ -3909,6 +3961,10 @@ version = "0.1.0"
 
 [[patch.unused]]
 name = "os-linux-wasi"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "os-net"
 version = "0.1.0"
 
 [[patch.unused]]

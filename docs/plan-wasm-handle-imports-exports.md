@@ -1,6 +1,9 @@
 # Plan: host Wasm imports and handle-based CoreGC boundaries
 
-**Status:** planned.
+**Status:** superseded by DreamComp #37 (jsaw `ffi.rs`): the `$wasm$`
+name-suffix grammar described below is removed. Host ABIs are now declared
+structurally in the FFI manifest (`ConvertOptions::ffi`); the `wasm:`
+specifier grammar and the boundary semantics in this document still apply.
 
 ## 1. Goal
 

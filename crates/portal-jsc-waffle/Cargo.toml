@@ -7,6 +7,7 @@ edition = "2024"
 lower_trace = []
 
 [dependencies]
+dreamcompiler-ffi-sig.workspace = true
 portal-jsc-common = { workspace = true }
 portal-jsc-swc-cfg.workspace = true
 portal-jsc-swc-ssa.workspace = true

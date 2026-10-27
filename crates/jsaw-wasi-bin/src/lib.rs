@@ -191,6 +191,7 @@ pub fn compile_to_outputs(
         numeric_exports: manifest.options.numeric_exports,
         gc_export_suffix: manifest.options.gc_export_suffix.clone(),
         assumptions,
+        ffi: manifest.ffi.clone(),
     };
     let mut module = portal_pc_waffle::Module::empty();
     convert_modules(&manifest.entry, &set, &mut module, &options)

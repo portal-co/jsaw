@@ -72,6 +72,8 @@
 //! them. Trap exits abandon the frame; the runtime resets its shadow stack
 //! at the artifact entry boundary.
 
+pub mod c_render;
+pub mod c_runtime;
 pub mod coregc;
 pub mod debug;
 pub mod nano;
@@ -80,6 +82,17 @@ mod skeleton;
 pub use coregc::CoreGcRepresentation;
 pub use nano::NanoRepresentation;
 pub use skeleton::{Emitter, emit_low};
+
+/// Emit a complete C99 translation unit for `plan` under representation `R`
+/// (DreamComp #38): [`emit_low`] plus [`c_render::render_c_file`], combining
+/// the fixed lane runtime with the rendered module glue.
+pub fn emit_c<R: Representation>(
+    plan: &crate::backend_plan::BackendPlan,
+    rep: &R,
+) -> Result<String, Vec<LeDiag>> {
+    let module = emit_low(plan, rep)?;
+    c_render::render_c_file(&module).map_err(|d| vec![d])
+}
 
 use crate::backend_plan::{
     BackendPlan, PlanFuncId, PlanHeapType, PlanSigId, PlanSignature, TypeId,
@@ -562,18 +575,22 @@ pub struct TypeIdTable {
 
 impl TypeIdTable {
     pub fn build(plan: &BackendPlan) -> Self {
+        // Two passes: struct ids are 1..=S in plan order, array ids
+        // S+1..=S+A. (A single pass would hand an array an id a later
+        // struct reuses whenever arrays precede structs in plan order.)
         let mut table = TypeIdTable::default();
         for (index, sig) in plan.signatures.iter().enumerate() {
-            match sig {
-                PlanSignature::Struct { .. } => {
-                    table.struct_count += 1;
-                    table.ids.insert(index as u32, table.struct_count);
-                }
-                PlanSignature::Array { .. } => {
-                    table.array_count += 1;
-                    table.ids.insert(index as u32, table.struct_count + table.array_count);
-                }
-                _ => {}
+            if matches!(sig, PlanSignature::Struct { .. }) {
+                table.struct_count += 1;
+                table.ids.insert(index as u32, table.struct_count);
+            }
+        }
+        for (index, sig) in plan.signatures.iter().enumerate() {
+            if matches!(sig, PlanSignature::Array { .. }) {
+                table.array_count += 1;
+                table
+                    .ids
+                    .insert(index as u32, table.struct_count + table.array_count);
             }
         }
         table
@@ -820,6 +837,21 @@ impl RuntimeSink<'_> {
             body: LeBody::Runtime,
         });
         id
+    }
+}
+
+/// Whether a plan reference type is a *function* word (bare funcref or a
+/// typed `(ref $funcsig)`): funcref words are table-slot indices, not heap
+/// references, so representations lower them as `I64` — never rooted,
+/// scanned, or field-tracked.
+pub(crate) fn plan_heap_is_func_word(plan: &crate::backend_plan::BackendPlan, heap: &crate::backend_plan::PlanHeapType) -> bool {
+    match heap {
+        crate::backend_plan::PlanHeapType::FuncRef | crate::backend_plan::PlanHeapType::NoFunc => true,
+        crate::backend_plan::PlanHeapType::Sig(sig) => matches!(
+            plan.signatures.get(sig.index()),
+            Some(crate::backend_plan::PlanSignature::Func { .. })
+        ),
+        _ => false,
     }
 }
 

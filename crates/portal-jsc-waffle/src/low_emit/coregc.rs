@@ -330,6 +330,14 @@ impl Representation for CoreGcRepresentation {
             Some(crate::backend_plan::PlanType::I64) => Ok(LeType::I64),
             Some(crate::backend_plan::PlanType::F32) => Ok(LeType::F32),
             Some(crate::backend_plan::PlanType::F64) => Ok(LeType::F64),
+            // Funcref words (bare or typed `(ref $funcsig)`) are table-slot
+            // indices, not heap references: they must never be rooted,
+            // scanned, or field-tracked.
+            Some(crate::backend_plan::PlanType::Ref { heap, .. })
+                if super::plan_heap_is_func_word(plan, heap) =>
+            {
+                Ok(LeType::I64)
+            }
             Some(crate::backend_plan::PlanType::Ref { .. }) => Ok(LeType::Ref),
             Some(other) => Err(LeDiag {
                 function: None,
@@ -626,8 +634,12 @@ impl Representation for CoreGcRepresentation {
                 });
             }
         };
+        let raw_ty = match (packed, elem_ty) {
+            (Some(_), LeType::I8 | LeType::I16) => LeType::I32,
+            _ => elem_ty,
+        };
         let raw = cx.assign_temp(
-            LeType::I32,
+            raw_ty,
             LeExpr::Index {
                 layout,
                 base: Box::new(LeExpr::Local(base)),
@@ -640,6 +652,12 @@ impl Representation for CoreGcRepresentation {
             }
             (Some(true), LeType::I16) => {
                 LeExpr::Unary(LeUnOp::I32Extend16S, Box::new(LeExpr::Local(raw)))
+            }
+            (Some(false), LeType::I8) => {
+                LeExpr::Unary(LeUnOp::I32Extend8U, Box::new(LeExpr::Local(raw)))
+            }
+            (Some(false), LeType::I16) => {
+                LeExpr::Unary(LeUnOp::I32Extend16U, Box::new(LeExpr::Local(raw)))
             }
             _ => LeExpr::Local(raw),
         };

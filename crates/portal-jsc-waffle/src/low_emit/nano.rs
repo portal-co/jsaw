@@ -466,6 +466,14 @@ impl Representation for NanoRepresentation {
             Some(crate::backend_plan::PlanType::I64) => Ok(LeType::I64),
             Some(crate::backend_plan::PlanType::F32) => Ok(LeType::F32),
             Some(crate::backend_plan::PlanType::F64) => Ok(LeType::F64),
+            // Funcref words (bare or typed `(ref $funcsig)`) are table-slot
+            // indices, not heap references: they must never be rooted,
+            // scanned, or field-tracked.
+            Some(crate::backend_plan::PlanType::Ref { heap, .. })
+                if super::plan_heap_is_func_word(plan, heap) =>
+            {
+                Ok(LeType::I64)
+            }
             Some(crate::backend_plan::PlanType::Ref { .. }) => Ok(LeType::Ref),
             Some(other) => Err(LeDiag {
                 function: None,
@@ -638,7 +646,7 @@ impl Representation for NanoRepresentation {
             for (i, item) in items.iter().enumerate() {
                 let addr = addr_of(
                     LeExpr::Local(out),
-                    PAYLOAD_OFFSET + (i as u32) << elem_log2,
+                    PAYLOAD_OFFSET + ((i as u32) << elem_log2),
                 );
                 cx.emit(LeStmt::ArenaStore {
                     ty: elem_ty,
@@ -670,8 +678,12 @@ impl Representation for NanoRepresentation {
         let len = self.len_of(LeExpr::Local(base));
         let idx = self.bounds(cx, index, len);
         let addr = self.elem_addr(LeExpr::Local(base), LeExpr::Local(idx), elem_log2);
+        let raw_ty = match (packed, elem_ty) {
+            (Some(_), LeType::I8 | LeType::I16) => LeType::I32,
+            _ => elem_ty,
+        };
         let raw = cx.assign_temp(
-            LeType::I32,
+            raw_ty,
             LeExpr::ArenaLoad {
                 ty: elem_ty,
                 base: Box::new(addr),
@@ -682,11 +694,15 @@ impl Representation for NanoRepresentation {
             (Some(true), LeType::I8) => {
                 LeExpr::Unary(LeUnOp::I32Extend8S, Box::new(LeExpr::Local(raw)))
             }
-            (Some(false), LeType::I8) => LeExpr::Local(raw),
+            (Some(false), LeType::I8) => {
+                LeExpr::Unary(LeUnOp::I32Extend8U, Box::new(LeExpr::Local(raw)))
+            }
             (Some(true), LeType::I16) => {
                 LeExpr::Unary(LeUnOp::I32Extend16S, Box::new(LeExpr::Local(raw)))
             }
-            (Some(false), LeType::I16) => LeExpr::Local(raw),
+            (Some(false), LeType::I16) => {
+                LeExpr::Unary(LeUnOp::I32Extend16U, Box::new(LeExpr::Local(raw)))
+            }
             _ => LeExpr::Local(raw),
         };
         cx.emit(LeStmt::Assign(out, value));

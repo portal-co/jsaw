@@ -201,6 +201,33 @@ impl<'p, R: Representation> Emitter<'p, R> {
             );
         }
 
+        // ---- import placeholders: imports occupy their `LeFuncId` with a
+        // body-less entry so `module.funcs` stays dense-as-documented
+        // (targets emit extern prototypes for them and never a body).
+        for imp in &module.imports {
+            let locals: Vec<(LeLocal, LeType)> = imp
+                .params
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (LeLocal(i as u32), *t))
+                .collect();
+            bodies.insert(
+                imp.func.0,
+                LeFunc {
+                    name: format!("import:{}/{}", imp.module, imp.name),
+                    params: imp
+                        .params
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| (LeLocal(i as u32), *t))
+                        .collect(),
+                    results: imp.results.clone(),
+                    locals,
+                    body: LeBody::Runtime,
+                },
+            );
+        }
+
         // ---- representation runtime (helpers + runtime entry points).
         // Runtime fns are id-dense right after the lazily-created helpers.
         let runtime_base = self.helper_base + helpers.len() as u32;
@@ -653,7 +680,21 @@ impl<'a, R: Representation> InstCx<'a, R> {
 
     fn emit_inst(&mut self, inst: &PlanInst) {
         let name = inst.operator.as_str();
-        let results: Vec<LeLocal> = inst.results.iter().map(|v| self.local_of(*v)).collect();
+        // Waffle gives even void-producing operators (e.g. a call to a
+        // void function) a placeholder `Value`, so `inst.results` can list
+        // one more value than `inst.result_types`; the types are the truth.
+        let results: Vec<LeLocal> = if inst.result_types.len() == inst.results.len() {
+            inst.results.iter().map(|v| self.local_of(*v)).collect()
+        } else if inst.result_types.is_empty() {
+            Vec::new()
+        } else {
+            self.error(format!(
+                "operator {name}: {} result values but {} result types",
+                inst.results.len(),
+                inst.result_types.len()
+            ));
+            Vec::new()
+        };
 
         // Constants.
         if let Some(konst) = &inst.const_value {

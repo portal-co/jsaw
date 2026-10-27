@@ -1,5 +1,6 @@
 pub mod backend_plan;
 pub mod conv;
+pub mod low_emit;
 pub mod coregc;
 pub mod coregc_emit;
 pub mod coregc_layout;

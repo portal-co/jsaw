@@ -8,6 +8,7 @@ lower_trace = []
 
 [dependencies]
 dreamcompiler-ffi-sig.workspace = true
+dreamcompiler-minibc.workspace = true
 portal-jsc-common = { workspace = true }
 portal-jsc-swc-cfg.workspace = true
 portal-jsc-swc-ssa.workspace = true
@@ -28,6 +29,7 @@ swc_ecma_visit.workspace = true
 wasmparser = { version = "0.240", features = ["validate"] }
 
 [dev-dependencies]
+log = "0.4"
 portal-jsc-mob-emit = { path = "../mobile/portal-jsc-mob-emit" }
 portal-jsc-jvm-emit = { path = "../mobile/portal-jsc-jvm-emit" }
 portal-jsc-swift-emit = { path = "../mobile/portal-jsc-swift-emit" }

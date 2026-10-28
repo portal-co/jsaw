@@ -77,6 +77,8 @@ pub mod c_runtime;
 pub mod coregc;
 pub mod debug;
 pub mod exec;
+pub mod minibc_host;
+pub mod minibc_render;
 pub mod nano;
 pub mod rust_render;
 pub mod rust_runtime;

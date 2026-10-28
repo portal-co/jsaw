@@ -24,6 +24,7 @@ struct LayoutInfo {
     ref_offsets: Vec<usize>,
     /// Byte offsets of all struct fields.
     field_offsets: Vec<usize>,
+    field_sizes: Vec<usize>,
     is_array: bool,
 }
 
@@ -38,9 +39,12 @@ fn type_size(ty: LeType) -> usize {
 
 const HEADER_BYTES: usize = 16; // { type_id: u32, flags: u32, len: u32, pad: u32 }
 
-fn layout_info(m: &LeModule) -> BTreeMap<u32, LayoutInfo> {
+/// Returns (by type_id for `COREGC_ALLOC`, by layout index for field/index
+/// access — the IR's `layout` operand is a `LeModule::layouts` index).
+fn layout_info(m: &LeModule) -> (BTreeMap<u32, LayoutInfo>, BTreeMap<u32, LayoutInfo>) {
+    let mut by_idx = BTreeMap::new();
     let mut out = BTreeMap::new();
-    for layout in m.layouts.iter().skip(1) {
+    for (idx, layout) in m.layouts.iter().enumerate().skip(1) {
         let mut off = HEADER_BYTES;
         let mut ref_offsets = Vec::new();
         match &layout.array_element {
@@ -48,21 +52,22 @@ fn layout_info(m: &LeModule) -> BTreeMap<u32, LayoutInfo> {
                 let esz = type_size(*elem);
                 let align = esz;
                 off = off.div_ceil(align) * align;
-                out.insert(
-                    layout.type_id,
-                    LayoutInfo {
-                        size: None,
-                        elem_size: esz,
-                        elem_is_ref: *elem == LeType::Ref,
-                        data_off: off,
-                        ref_offsets: Vec::new(),
-                        field_offsets: Vec::new(),
-                        is_array: true,
-                    },
-                );
+                let li = LayoutInfo {
+                    size: None,
+                    elem_size: esz,
+                    elem_is_ref: *elem == LeType::Ref,
+                    data_off: off,
+                    ref_offsets: Vec::new(),
+                    field_offsets: Vec::new(),
+                    field_sizes: Vec::new(),
+                    is_array: true,
+                };
+                out.insert(layout.type_id, li.clone_meta());
+                by_idx.insert(idx as u32, li);
             }
             None => {
                 let mut fields = Vec::new();
+                let mut fsizes = Vec::new();
                 for f in &layout.fields {
                     let sz = type_size(*f);
                     off = off.div_ceil(sz) * sz;
@@ -70,24 +75,25 @@ fn layout_info(m: &LeModule) -> BTreeMap<u32, LayoutInfo> {
                         ref_offsets.push(off);
                     }
                     fields.push(off);
+                    fsizes.push(sz);
                     off += sz;
                 }
-                out.insert(
-                    layout.type_id,
-                    LayoutInfo {
-                        size: Some(off.max(HEADER_BYTES)),
-                        elem_size: 0,
-                        elem_is_ref: false,
-                        data_off: 0,
-                        ref_offsets,
-                        field_offsets: fields,
-                        is_array: false,
-                    },
-                );
+                let li = LayoutInfo {
+                    size: Some(off.max(HEADER_BYTES)),
+                    elem_size: 0,
+                    elem_is_ref: false,
+                    data_off: 0,
+                    ref_offsets,
+                    field_offsets: fields,
+                    field_sizes: fsizes,
+                    is_array: false,
+                };
+                out.insert(layout.type_id, li.clone_meta());
+                by_idx.insert(idx as u32, li);
             }
         }
     }
-    out
+    (out, by_idx)
 }
 
 struct HostState {
@@ -102,6 +108,7 @@ struct HostState {
     globals: Vec<u64>,
     /// Layouts by type id (coregc).
     layouts: Rc<BTreeMap<u32, LayoutInfo>>,
+    layouts_by_idx: Rc<BTreeMap<u32, LayoutInfo>>,
     /// Bytes allocated since the last collection.
     since_gc: usize,
     gc_threshold: usize,
@@ -187,7 +194,9 @@ pub struct JsawHost {
 impl JsawHost {
     /// Build the host-op table for an artifact's module.
     pub fn new(artifact: &MinibcArtifact, m: &LeModule) -> Self {
-        let layouts = Rc::new(layout_info(m));
+        let (layouts, by_idx) = layout_info(m);
+        let layouts_by_idx = Rc::new(by_idx);
+        let layouts = Rc::new(layouts);
         let state = Rc::new(RefCell::new(HostState {
             arena: Vec::new(),
             objects: Vec::new(),
@@ -195,6 +204,7 @@ impl JsawHost {
             root_frames: Vec::new(),
             globals: m.globals.iter().map(|(_, init)| init.unwrap_or(0)).collect(),
             layouts,
+            layouts_by_idx,
             since_gc: 0,
             gc_threshold: 1 << 20,
         }));
@@ -270,32 +280,30 @@ impl JsawHost {
         });
         // COREGC_FIELD_READ
         h!(|s: &mut HostState, args: &[u64]| {
+            let (off, n) = field_offset(&s.layouts_by_idx, args[1] as u32, args[2] as u32);
             let obj = s.obj(args[0]);
-            let li = &s.layouts[&obj.type_id];
-            let off = field_offset(&s.layouts, args[1] as u32, args[2] as u32);
-            let _ = li;
-            read_word(&obj.data, off)
+            read_sized(&obj.data, off, n)
         });
         // COREGC_FIELD_WRITE
         h!(|s: &mut HostState, args: &[u64]| {
-            let off = field_offset(&s.layouts, args[1] as u32, args[2] as u32);
+            let (off, n) = field_offset(&s.layouts_by_idx, args[1] as u32, args[2] as u32);
             let obj = s.obj_mut(args[0]);
-            write_word(&mut obj.data, off, args[3]);
+            write_sized(&mut obj.data, off, args[3], n);
             0
         });
         // COREGC_INDEX_READ
         h!(|s: &mut HostState, args: &[u64]| {
             let obj = s.obj(args[0]);
-            let li = s.layouts[&(args[1] as u32)].clone_meta();
+            let li = s.layouts_by_idx[&(args[1] as u32)].clone_meta();
             let off = li.data_off + args[2] as usize * li.elem_size;
-            read_word(&obj.data, off)
+            read_sized(&obj.data, off, li.elem_size)
         });
         // COREGC_INDEX_WRITE
         h!(|s: &mut HostState, args: &[u64]| {
-            let li = s.layouts[&(args[1] as u32)].clone_meta();
+            let li = s.layouts_by_idx[&(args[1] as u32)].clone_meta();
             let off = li.data_off + args[2] as usize * li.elem_size;
             let obj = s.obj_mut(args[0]);
-            write_word(&mut obj.data, off, args[3]);
+            write_sized(&mut obj.data, off, args[3], li.elem_size);
             0
         });
         // COREGC_ROOT_ENTER
@@ -353,21 +361,31 @@ impl JsawHost {
 }
 
 fn read_word(data: &[u8], off: usize) -> u64 {
+    read_sized(data, off, 8)
+}
+
+fn read_sized(data: &[u8], off: usize, n: usize) -> u64 {
     let mut b = [0u8; 8];
-    b.copy_from_slice(&data[off..off + 8]);
+    b[..n].copy_from_slice(&data[off..off + n]);
     u64::from_le_bytes(b)
 }
 
 fn write_word(data: &mut [u8], off: usize, v: u64) {
-    data[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    write_sized(data, off, v, 8)
 }
 
-fn field_offset(layouts: &BTreeMap<u32, LayoutInfo>, layout: u32, field: u32) -> usize {
+fn write_sized(data: &mut [u8], off: usize, v: u64, n: usize) {
+    data[off..off + n].copy_from_slice(&v.to_le_bytes()[..n]);
+}
+
+/// Returns (byte offset, byte size). `layout` is a `LeModule::layouts`
+/// index; layout 0 is the 16-byte allocation header (four u32 words).
+fn field_offset(layouts: &BTreeMap<u32, LayoutInfo>, layout: u32, field: u32) -> (usize, usize) {
     if layout == 0 {
-        // header: 4 u32 fields
-        return field as usize * 4;
+        return (field as usize * 4, 4);
     }
-    layouts[&layout].field_offsets[field as usize]
+    let li = &layouts[&layout];
+    (li.field_offsets[field as usize], li.field_sizes[field as usize])
 }
 
 impl LayoutInfo {
@@ -379,6 +397,7 @@ impl LayoutInfo {
             data_off: self.data_off,
             ref_offsets: self.ref_offsets.clone(),
             field_offsets: self.field_offsets.clone(),
+            field_sizes: self.field_sizes.clone(),
             is_array: self.is_array,
         }
     }

@@ -4,6 +4,17 @@
 
 use std::collections::BTreeMap;
 
+struct StderrLog;
+impl log::Log for StderrLog {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+    fn log(&self, r: &log::Record) {
+        eprintln!("{}", r.args());
+    }
+    fn flush(&self) {}
+}
+
 
 
 use dreamcompiler_minibc::interp::MiniInterp;
@@ -33,6 +44,28 @@ fn run_case(source: &str, lane: &str, export: &str, args: &[f64]) -> f64 {
     let artifact = low_emit::minibc_render::render_minibc(&low)
         .map_err(|ds| ds.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("\n"))
         .expect("render_minibc");
+    if std::env::var("MBFUNCS").is_ok() {
+        let mut f: Vec<&(String, u32)> = artifact.func_entries.iter().collect();
+        f.sort_by_key(|(_, p)| *p);
+        for (n, p) in f {
+            eprintln!("func {p}: {n}");
+        }
+    }
+    if let Ok(range) = std::env::var("MBRANGE") {
+        let (a, b) = range.split_once(':').unwrap();
+        let (a, b) = (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap());
+        eprintln!("range {a}..{b}: {:02x?}", &artifact.bytes[a..b]);
+    }
+    if let Ok(pc) = std::env::var("MBPC") {
+        let pc: u32 = pc.parse().unwrap();
+        let mut cand: Vec<&(String, u32)> = artifact
+            .func_entries
+            .iter()
+            .filter(|(_, p)| *p <= pc)
+            .collect();
+        cand.sort_by_key(|(_, p)| *p);
+        eprintln!("pc {pc} is in function {:?}", cand.last());
+    }
     let entry = artifact.exports[export];
     if let Some(start) = artifact.start {
         let mut interp = MiniInterp::new(artifact.store_regs.max(64));
@@ -45,17 +78,41 @@ fn run_case(source: &str, lane: &str, export: &str, args: &[f64]) -> f64 {
     let mut interp = MiniInterp::new(artifact.store_regs.max(64));
     let host = low_emit::minibc_host::JsawHost::new(&artifact, &low);
     host.install(&mut interp);
+    if std::env::var("MBTRACE").is_ok() {
+        let _ = log::set_logger(&StderrLog);
+        log::set_max_level(log::LevelFilter::Trace);
+        interp.set_trace(true);
+    }
     for (i, a) in args.iter().enumerate() {
         interp.set_r4(i * 4, a.to_bits());
     }
-    interp
-        .run(&artifact.bytes, entry as usize)
-        .expect("run");
+    if let Err(e) = interp.run(&artifact.bytes, entry as usize) {
+        let pc = match &e {
+            dreamcompiler_minibc::interp::InterpError::Trapped { pc, .. } => Some(*pc),
+            dreamcompiler_minibc::interp::InterpError::UnknownOpcode { pc, .. } => Some(*pc),
+            dreamcompiler_minibc::interp::InterpError::MalformedBytecode { pc, .. } => {
+                Some(*pc)
+            }
+            _ => None,
+        };
+        if let Some(pc) = pc {
+            let p = pc as usize;
+            eprintln!("err {e:?}");
+            eprintln!("bytes @pc: {:02x?}", &artifact.bytes[p..(p + 24).min(artifact.bytes.len())]);
+            let mut before: Vec<&(String, u32)> = artifact
+                .func_entries
+                .iter()
+                .filter(|(_, q)| *q <= pc as u32)
+                .collect();
+            before.sort_by_key(|(_, q)| *q);
+            eprintln!("in function: {:?}", before.last());
+        }
+        panic!("run failed");
+    }
     f64::from_bits(interp.get_r4(0))
 }
 
 #[test]
-#[ignore = "DreamComp #39 in progress: emitter emits and runs but miscompiles the trampoline/call protocol (see issue)"]
 fn minibc_smoke() {
     for lane in ["nano", "coregc"] {
         assert_eq!(run_case("export function run(x) { return x + 1; }", lane, "run", &[10.0]), 11.0, "{lane}");

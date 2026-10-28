@@ -109,6 +109,7 @@ enum Stock3 {
 enum Stock2 {
     FFloor,
     FTrunc,
+    I64ToF64,
 }
 
 /// Jump target: a plan block (resolved at emission via the block map) or a
@@ -465,21 +466,22 @@ fn lower_expr(cx: &mut FnCx, e: &LeExpr) -> u32 {
             let out_ty = expr_ty(cx, if_true);
             let out = cx.temp(out_ty);
             let pre = cx.close(FlatExit::Next); // exit rewritten below
-            let else_seg = cx.segs.len() - 1;
+            // Arms may split segments (host-op exits / nested Select), so
+            // the arm END segments come from the close() returns.
             let f = lower_expr(cx, if_false);
             cx.mov(f, out);
-            cx.close(FlatExit::Next);
+            let else_end = cx.close(FlatExit::Next);
             let then_seg = cx.segs.len() - 1;
             let t = lower_expr(cx, if_true);
             cx.mov(t, out);
-            cx.close(FlatExit::Next);
+            let then_end = cx.close(FlatExit::Next);
             let done_seg = cx.segs.len() - 1;
             cx.segs[pre].exit = FlatExit::Cond {
                 cond: c,
                 if_true: FlatTarget::Seg(then_seg),
             };
-            cx.segs[else_seg].exit = FlatExit::Jump(FlatTarget::Seg(done_seg));
-            cx.segs[then_seg].exit = FlatExit::Jump(FlatTarget::Seg(done_seg));
+            cx.segs[else_end].exit = FlatExit::Jump(FlatTarget::Seg(done_seg));
+            cx.segs[then_end].exit = FlatExit::Jump(FlatTarget::Seg(done_seg));
             out
         }
         LeExpr::GlobalGet(g) => {
@@ -638,24 +640,26 @@ fn lower_stmt(cx: &mut FnCx, s: &LeStmt) {
         LeStmt::If { cond, then, else_ } => {
             let c = lower_expr(cx, cond);
             let pre = cx.close(FlatExit::Next);
-            // The else arm is physically next (Cond's fallthrough).
-            let else_seg = cx.segs.len() - 1;
+            // The else arm is physically next (Cond's fallthrough). Bodies
+            // may close segments (nested If/Return/host ops), so the arm
+            // END segments come from the close() returns — never touch the
+            // arm's first segment's exit here.
             for s in else_ {
                 lower_stmt(cx, s);
             }
-            cx.close(FlatExit::Next);
+            let else_end = cx.close(FlatExit::Next);
             let then_seg = cx.segs.len() - 1;
             for s in then {
                 lower_stmt(cx, s);
             }
-            cx.close(FlatExit::Next);
+            let then_end = cx.close(FlatExit::Next);
             let done_seg = cx.segs.len() - 1;
             cx.segs[pre].exit = FlatExit::Cond {
                 cond: c,
                 if_true: FlatTarget::Seg(then_seg),
             };
-            cx.segs[else_seg].exit = FlatExit::Jump(FlatTarget::Seg(done_seg));
-            cx.segs[then_seg].exit = FlatExit::Jump(FlatTarget::Seg(done_seg));
+            cx.segs[else_end].exit = FlatExit::Jump(FlatTarget::Seg(done_seg));
+            cx.segs[then_end].exit = FlatExit::Jump(FlatTarget::Seg(done_seg));
         }
         LeStmt::Loop(body) => {
             cx.close(FlatExit::Next);
@@ -768,7 +772,15 @@ fn lower_call(cx: &mut FnCx, callee: &LeCallee, args: Vec<u32>, results: Vec<u32
                 return;
             };
             let table = &cx.m.tables[*table as usize];
-            let idx = lower_expr(cx, index);
+            let idx_raw = lower_expr(cx, index);
+            // StdExtOp::Table reads its discriminant as an f64 JS number;
+            // jsaw funcref words are raw slot indices, so convert.
+            let idx = cx.temp(LeType::F64);
+            cx.push(FlatOp::Stock2 {
+                kind: Stock2::I64ToF64,
+                src: idx_raw,
+                dst: idx,
+            });
             for (i, a) in args.iter().enumerate() {
                 cx.push(FlatOp::WindowStore { run: i as u32, src: *a });
             }
@@ -778,11 +790,18 @@ fn lower_call(cx: &mut FnCx, callee: &LeCallee, args: Vec<u32>, results: Vec<u32
             let pre = cx.close(FlatExit::Next); // rewritten to Table below
             let mut arm_segs = Vec::new();
             for (slot, elem) in table.elems.iter().enumerate() {
-                let arm = cx.close(FlatExit::Next); // arm segment
+                // Push the shim op first, then close — `close` returns the
+                // segment that HOLDS the load.
                 cx.push(FlatOp::FuncAddrLoad { func: elem.0, dst: freg });
+                let arm = cx.close(FlatExit::Next);
                 arm_segs.push((slot as u32, FlatTarget::Seg(arm)));
                 // arm exit patched to the call segment below
             }
+            // Out-of-range indices trap rather than calling with an
+            // uninitialized callee register.
+            let trap_seg = cx.segs.len() - 1;
+            cx.push(FlatOp::Trap);
+            cx.close(FlatExit::Trap);
             let call_seg = cx.segs.len() - 1;
             for (_, arm) in &arm_segs {
                 let FlatTarget::Seg(arm) = *arm else {
@@ -790,16 +809,15 @@ fn lower_call(cx: &mut FnCx, callee: &LeCallee, args: Vec<u32>, results: Vec<u32
                 };
                 cx.segs[arm].exit = FlatExit::Jump(FlatTarget::Seg(call_seg));
             }
-            // The call segment: the Call exit.
+            // The call segment: the Call exit (the continuation is the
+            // physically-next segment).
             let call_idx = cx.close(FlatExit::Call { func_reg: freg });
             cx.calls.push(call_idx);
-            let cont_seg = cx.segs.len() - 1;
             cx.segs[pre].exit = FlatExit::Table {
                 index: idx,
                 arms: arm_segs,
-                default: FlatTarget::Seg(call_seg), // slot 0 is the trap stub
+                default: FlatTarget::Seg(trap_seg),
             };
-            let _ = cont_seg;
             for (i, &r) in results.iter().enumerate() {
                 cx.push(FlatOp::WindowLoad { run: i as u32, dst: r });
             }
@@ -835,6 +853,10 @@ fn flatten_function(m: &LeModule, func: &LeFunc) -> FnFlat {
                 });
             }
             for block in blocks {
+                // Every block starts on a fresh segment so a jump to the
+                // block never lands mid-segment on the previous block's
+                // tail ops.
+                cx.close(FlatExit::Next);
                 cx.block_seg.insert(block.id.0, cx.segs.len() as u32 - 1);
                 for s in &block.body {
                     lower_stmt(&mut cx, s);
@@ -1068,6 +1090,24 @@ fn allocate(flat: &FnFlat, window_runs: u32) -> Result<Alloc, LeDiag> {
     })
 }
 
+/// Debug: dump a function's flat segments, liveness intervals, and physical
+/// allocation (env `MBDUMP_FN`).
+fn dump_flat(name: &str, flat: &FnFlat, alloc: &Alloc) {
+    eprintln!("=== flat dump: {name} ({} segs) ===", flat.segs.len());
+    for (si, seg) in flat.segs.iter().enumerate() {
+        eprintln!("seg {si}:");
+        for op in &seg.ops {
+            eprintln!("    {op:?}");
+        }
+        eprintln!("    exit {:?}", seg.exit);
+        eprintln!("    live_out {:?}", alloc.liveness.live_out[si]);
+    }
+    eprintln!("--- base_of ---");
+    for (l, b) in &alloc.base_of {
+        eprintln!("    local {l} -> base {b}");
+    }
+}
+
 /// A fixup to patch after all segments are positioned.
 #[derive(Clone, Debug)]
 enum Fixup {
@@ -1169,6 +1209,7 @@ fn emit_op(
                 match kind {
                     Stock2::FFloor => MiniOp::FFloor(s, d),
                     Stock2::FTrunc => MiniOp::FTrunc(s, d),
+                    Stock2::I64ToF64 => MiniOp::I64ToF64(s, d),
                 },
                 out,
             );
@@ -1252,8 +1293,10 @@ fn emit_exit(
                 });
                 at += 8;
             }
+            // The default follows the last arm's key directly (no key of
+            // its own), so it is 4 bytes earlier than `at` ended up.
             fixups.push(Fixup::SegPc {
-                at,
+                at: at - 4,
                 func: func_idx,
                 target: *default,
             });
@@ -1305,7 +1348,14 @@ pub fn render_minibc(m: &LeModule) -> Result<MinibcArtifact, Vec<LeDiag>> {
         let flat = flatten_function(m, f);
         diags.extend(flat.diags.iter().cloned());
         match allocate(&flat, window_runs) {
-            Ok(alloc) => flats.push(Some((flat, alloc))),
+            Ok(alloc) => {
+                if let Ok(filter) = std::env::var("MBDUMP_FN") {
+                    if f.name.contains(&filter) {
+                        dump_flat(&f.name, &flat, &alloc);
+                    }
+                }
+                flats.push(Some((flat, alloc)))
+            }
             Err(d) => {
                 diags.push(d);
                 flats.push(None);

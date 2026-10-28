@@ -401,9 +401,14 @@ fn dreamcomp_corpus_runs_identically_through_jsaw_wasmbc() {
     let low_results: std::sync::Mutex<Vec<serde_json::Value>> = std::sync::Mutex::new(Vec::new());
     let low_counts: std::sync::Mutex<(usize, usize, usize, usize)> =
         std::sync::Mutex::new((0, 0, 0, 0));
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
+    let workers = std::env::var("JSAW_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        })
         .min(8);
     let work_root = std::env::temp_dir().join(format!("jsaw_parity_low_{}", std::process::id()));
     std::thread::scope(|scope| {

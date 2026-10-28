@@ -109,6 +109,19 @@ pub fn emit_rust<R: Representation>(
     rust_render::render_rust_file(&module).map_err(|d| vec![d])
 }
 
+/// Emit a MiniBC artifact for `plan` under representation `R` (DreamComp
+/// #39): [`emit_low`] plus [`minibc_render::render_minibc`]. Returns the
+/// module alongside so hosts can build the runtime state (layouts, globals)
+/// without re-emitting.
+pub fn emit_minibc<R: Representation>(
+    plan: &crate::backend_plan::BackendPlan,
+    rep: &R,
+) -> Result<(LeModule, minibc_render::MinibcArtifact), Vec<LeDiag>> {
+    let module = emit_low(plan, rep)?;
+    let artifact = minibc_render::render_minibc(&module)?;
+    Ok((module, artifact))
+}
+
 use crate::backend_plan::{
     BackendPlan, PlanFuncId, PlanHeapType, PlanSigId, PlanSignature, TypeId,
 };

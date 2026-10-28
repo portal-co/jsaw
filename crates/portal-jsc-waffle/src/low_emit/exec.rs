@@ -18,14 +18,18 @@ pub enum LowLane {
     CCoregc,
     RustNano,
     RustCoregc,
+    MinibcNano,
+    MinibcCoregc,
 }
 
 impl LowLane {
-    pub const ALL: [LowLane; 4] = [
+    pub const ALL: [LowLane; 6] = [
         LowLane::CNano,
         LowLane::CCoregc,
         LowLane::RustNano,
         LowLane::RustCoregc,
+        LowLane::MinibcNano,
+        LowLane::MinibcCoregc,
     ];
 
     pub fn name(self) -> &'static str {
@@ -34,24 +38,37 @@ impl LowLane {
             LowLane::CCoregc => "c_coregc",
             LowLane::RustNano => "rust_nano",
             LowLane::RustCoregc => "rust_coregc",
+            LowLane::MinibcNano => "minibc_nano",
+            LowLane::MinibcCoregc => "minibc_coregc",
         }
     }
 
-    /// The toolchain binary this lane needs (fail-closed when absent).
+    /// The toolchain binary this lane needs (fail-closed when absent). The
+    /// MiniBC lanes run in-process under the stock interpreter — no
+    /// external toolchain.
     pub fn toolchain(self) -> &'static str {
         match self {
             LowLane::CNano | LowLane::CCoregc => "cc",
             LowLane::RustNano | LowLane::RustCoregc => "rustc",
+            LowLane::MinibcNano | LowLane::MinibcCoregc => "minibc-interp",
         }
     }
 
     /// Whether the toolchain is invocable.
     pub fn toolchain_available(self) -> bool {
-        std::process::Command::new(self.toolchain())
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        match self {
+            LowLane::MinibcNano | LowLane::MinibcCoregc => true,
+            _ => std::process::Command::new(self.toolchain())
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false),
+        }
+    }
+
+    /// Whether this lane runs MiniBC bytecode in-process.
+    pub fn is_minibc(self) -> bool {
+        matches!(self, LowLane::MinibcNano | LowLane::MinibcCoregc)
     }
 }
 
@@ -74,6 +91,9 @@ pub fn emit_low_artifact(plan: &BackendPlan, lane: LowLane) -> Result<String, St
         LowLane::CCoregc => low_emit::emit_c(plan, &low_emit::CoreGcRepresentation),
         LowLane::RustNano => low_emit::emit_rust(plan, &low_emit::NanoRepresentation),
         LowLane::RustCoregc => low_emit::emit_rust(plan, &low_emit::CoreGcRepresentation),
+        LowLane::MinibcNano | LowLane::MinibcCoregc => {
+            unreachable!("minibc lanes emit bytecode, not source")
+        }
     };
     result.map_err(|ds| {
         ds.iter()
@@ -97,6 +117,9 @@ pub fn run_low_case(
     expected: f64,
     dir: &Path,
 ) -> LowOutcome {
+    if lane.is_minibc() {
+        return run_minibc_case(plan, lane, export, args, expected, dir);
+    }
     if !lane.toolchain_available() {
         return LowOutcome {
             status: "unavailable",
@@ -120,10 +143,12 @@ pub fn run_low_case(
     let (source_file, main_file) = match lane {
         LowLane::CNano | LowLane::CCoregc => ("m.c", "main.c"),
         LowLane::RustNano | LowLane::RustCoregc => ("artifact.rs", "main.rs"),
+        LowLane::MinibcNano | LowLane::MinibcCoregc => unreachable!(),
     };
     std::fs::write(dir.join(source_file), &src).expect("write artifact");
     std::fs::write(dir.join(main_file), main_file_content(lane, export, args)).expect("write main");
     let compile = match lane {
+        LowLane::MinibcNano | LowLane::MinibcCoregc => unreachable!(),
         LowLane::CNano | LowLane::CCoregc => std::process::Command::new(lane.toolchain())
             .args(["-std=c99", "-O0", "-w", "-o"])
             .arg(dir.join("a.out"))
@@ -191,6 +216,95 @@ pub fn run_low_case(
     }
 }
 
+/// Run one case through a MiniBC lane: emit the bytecode artifact, then
+/// execute `start` and the numeric export in one interpreter + host state
+/// under the stock `MiniInterp` (DreamComp #39).
+fn run_minibc_case(
+    plan: &BackendPlan,
+    lane: LowLane,
+    export: &str,
+    args: &[f64],
+    expected: f64,
+    dir: &Path,
+) -> LowOutcome {
+    use dreamcompiler_minibc::interp::MiniInterp;
+    let emit = match lane {
+        LowLane::MinibcNano => low_emit::emit_minibc(plan, &low_emit::NanoRepresentation),
+        LowLane::MinibcCoregc => low_emit::emit_minibc(plan, &low_emit::CoreGcRepresentation),
+        _ => unreachable!(),
+    };
+    let (module, artifact) = match emit {
+        Ok(x) => x,
+        Err(ds) => {
+            return LowOutcome {
+                status: "fail",
+                value_bits: None,
+                artifact_bytes: 0,
+                detail: format!(
+                    "emit: {}",
+                    ds.iter()
+                        .map(|d| d.to_string())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            };
+        }
+    };
+    let artifact_bytes = artifact.bytes.len();
+    std::fs::write(dir.join("artifact.minibc"), &artifact.bytes).expect("write artifact");
+    let Some(&entry) = artifact.exports.get(export) else {
+        return LowOutcome {
+            status: "fail",
+            value_bits: None,
+            artifact_bytes,
+            detail: format!("no export {export:?}"),
+        };
+    };
+    let mut interp = MiniInterp::new(artifact.store_regs.max(64));
+    let host = low_emit::minibc_host::JsawHost::new(&artifact, &module);
+    host.install(&mut interp);
+    if let Some(sp) = artifact.start {
+        if let Err(e) = interp.run(&artifact.bytes, sp as usize) {
+            return LowOutcome {
+                status: "fail",
+                value_bits: None,
+                artifact_bytes,
+                detail: format!("start: {e:?}"),
+            };
+        }
+    }
+    for (i, a) in args.iter().enumerate() {
+        interp.set_r4(i * 4, a.to_bits());
+    }
+    match interp.run(&artifact.bytes, entry as usize) {
+        Ok(()) => {
+            let bits = interp.get_r4(0);
+            let actual = f64::from_bits(bits);
+            if actual == expected || (actual.is_nan() && expected.is_nan()) {
+                LowOutcome {
+                    status: "pass",
+                    value_bits: Some(bits),
+                    artifact_bytes,
+                    detail: String::new(),
+                }
+            } else {
+                LowOutcome {
+                    status: "fail",
+                    value_bits: Some(bits),
+                    artifact_bytes,
+                    detail: format!("expected {expected}, got {actual}"),
+                }
+            }
+        }
+        Err(e) => LowOutcome {
+            status: "fail",
+            value_bits: None,
+            artifact_bytes,
+            detail: format!("run: {e:?}"),
+        },
+    }
+}
+
 fn main_file_content(lane: LowLane, export: &str, args: &[f64]) -> String {
     match lane {
         LowLane::CNano | LowLane::CCoregc => {
@@ -209,6 +323,7 @@ fn main_file_content(lane: LowLane, export: &str, args: &[f64]) -> String {
                 args = exprs.join(", "),
             )
         }
+        LowLane::MinibcNano | LowLane::MinibcCoregc => unreachable!(),
         LowLane::RustNano | LowLane::RustCoregc => {
             let sym = format!("js_export_{}", low_emit::rust_render::rust_ident(export));
             let exprs: Vec<String> = args

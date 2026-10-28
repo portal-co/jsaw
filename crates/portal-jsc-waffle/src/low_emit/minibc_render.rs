@@ -83,7 +83,24 @@ enum FlatOp {
     /// is patched at fixup time.
     FuncAddrLoad { func: u32, dst: u32 },
     Trap,
+    /// Spill-frame store (`slot` ← run at logical `src`, post-allocation
+    /// rewrite only; `src` is a scratch id).
+    SpillStore { slot: u32, src: u32 },
+    /// Spill-frame load (logical `dst` scratch ← `slot`).
+    SpillLoad { slot: u32, dst: u32 },
 }
+
+/// Scratch logical ids for the post-allocation spill rewrite. Physical bases
+/// are assigned (just above the call window) after allocation; the ids are
+/// outside every logical id space.
+pub(crate) const SCRATCH: [u32; 6] = [
+    u32::MAX - 1,
+    u32::MAX - 2,
+    u32::MAX - 3,
+    u32::MAX - 4,
+    u32::MAX - 5,
+    u32::MAX - 6,
+];
 
 /// Stock three-register ops usable with raw-word semantics.
 #[derive(Clone, Copy, Debug)]
@@ -925,6 +942,8 @@ fn op_uses_defs(op: &FlatOp) -> (Vec<u32>, Vec<u32>) {
         FlatOp::WindowLoad { dst, .. } => (vec![], vec![*dst]),
         FlatOp::FuncAddrLoad { dst, .. } => (vec![], vec![*dst]),
         FlatOp::Trap => (vec![], vec![]),
+        FlatOp::SpillStore { src, .. } => (vec![*src], vec![]),
+        FlatOp::SpillLoad { dst, .. } => (vec![], vec![*dst]),
     }
 }
 
@@ -957,6 +976,9 @@ struct Alloc {
     base_of: BTreeMap<u32, u32>,
     liveness: Liveness,
     max_base: u32,
+    /// Spilled local → spill-frame slot.
+    spill: BTreeMap<u32, u32>,
+    window_end: u32,
 }
 
 fn liveness(flat: &FnFlat) -> (Liveness, BTreeMap<u32, ((u32, u32), (u32, u32))>) {
@@ -1062,32 +1084,377 @@ fn allocate(flat: &FnFlat, window_runs: u32) -> Result<Alloc, LeDiag> {
     let mut sorted: Vec<(u32, (u32, u32), (u32, u32))> =
         intervals.iter().map(|(&l, &(s, e))| (l, s, e)).collect();
     sorted.sort_by_key(|&(_, s, _)| s);
-    let mut active: Vec<((u32, u32), u32)> = Vec::new();
-    let mut base_of: BTreeMap<u32, u32> = BTreeMap::new();
-    let mut max_base = window_end;
-    for (l, start, end) in sorted {
-        active.retain(|&(e, _)| e > start);
-        let mut base = window_end;
-        while active.iter().any(|&(_, b)| b == base) {
-            base += 4;
+    let pressure_dump = std::env::var("MBPRESSURE").is_ok();
+    if pressure_dump {
+        // Sweep: max concurrently-live locals.
+        let mut evs: Vec<((u32, u32), bool)> = Vec::new();
+        for (_, st, en) in &sorted {
+            evs.push((*st, false));
+            evs.push((*en, true));
         }
-        if base > 252 {
+        evs.sort();
+        let mut cur = 0usize;
+        let mut max = 0usize;
+        for (_, end) in evs {
+            if end {
+                cur -= 1;
+            } else {
+                cur += 1;
+                max = max.max(cur);
+            }
+        }
+        if max as u32 * 4 + window_end > 252 {
+            eprintln!(
+                "pressure: {} segs, {} locals, max-live {}, window_end {}",
+                flat.segs.len(),
+                sorted.len(),
+                max,
+                window_end
+            );
+        }
+    }
+    // Scratch runs live just above the window zone; locals above them.
+    let zone_start = window_end + 4 * SCRATCH.len() as u32;
+    // Spill safety: the interpreter's spill frame is shared across calls, so
+    // a spilled local must never be live out of a call segment (the callee
+    // could clobber the slot before the caller reloads it).
+    let mut unsafe_to_spill: BTreeSet<u32> = BTreeSet::new();
+    for &cs in &flat.calls {
+        unsafe_to_spill.extend(live.live_out[cs].iter().copied());
+    }
+    let mut active: Vec<((u32, u32), u32, u32)> = Vec::new(); // (end, base, local)
+    let mut base_of: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut spill: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut next_slot: u32 = 0;
+    let mut max_base = zone_start;
+    let mut take_slot = |spill: &mut BTreeMap<u32, u32>, next_slot: &mut u32, victim: u32| -> Result<(), LeDiag> {
+        if *next_slot >= 64 {
             return Err(LeDiag {
                 function: None,
                 block: None,
                 inst: None,
-                message: "minibc: function exceeds the 64-run register file".into(),
+                message: "minibc: spill frame exhausted (64 slots)".into(),
             });
         }
-        active.push((end, base));
+        spill.insert(victim, *next_slot);
+        *next_slot += 1;
+        Ok(())
+    };
+    for (l, start, end) in sorted {
+        active.retain(|&(e, _, _)| e > start);
+        let mut base = zone_start;
+        while active.iter().any(|&(_, b, _)| b == base) {
+            base += 4;
+        }
+        if base > 252 {
+            // Register file full: spill. Prefer the current interval when
+            // safe; otherwise evict the safe active interval with the latest
+            // end and hand its base to the current one.
+            if !unsafe_to_spill.contains(&l) {
+                take_slot(&mut spill, &mut next_slot, l)?;
+                continue;
+            }
+            let Some(victim_ai) = active
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, _, vl))| !unsafe_to_spill.contains(vl))
+                .max_by_key(|(_, (e, _, _))| *e)
+                .map(|(ai, _)| ai)
+            else {
+                return Err(LeDiag {
+                    function: None,
+                    block: None,
+                    inst: None,
+                    message: "minibc: register file exhausted and no spill-safe live interval"
+                        .into(),
+                });
+            };
+            let (_, vbase, victim_l) = active.remove(victim_ai);
+            base_of.remove(&victim_l);
+            take_slot(&mut spill, &mut next_slot, victim_l)?;
+            active.push((end, vbase, l));
+            base_of.insert(l, vbase);
+            continue;
+        }
+        active.push((end, base, l));
         base_of.insert(l, base);
         max_base = max_base.max(base + 4);
+    }
+    // Scratch runs resolve to the reserved zone above the window.
+    for (i, &sc) in SCRATCH.iter().enumerate() {
+        base_of.insert(sc, window_end + 4 * i as u32);
     }
     Ok(Alloc {
         base_of,
         liveness: live,
         max_base,
+        spill,
+        window_end,
     })
+}
+
+/// Rewrite spilled locals to spill-frame traffic on the scratch runs.
+/// Runs after allocation; the flat ops/exits are updated in place.
+fn rewrite_spills(flat: &mut FnFlat, alloc: &Alloc) -> Result<(), LeDiag> {
+    if alloc.spill.is_empty() {
+        return Ok(());
+    }
+    let spill = &alloc.spill;
+    let mut prepends: BTreeMap<usize, Vec<FlatOp>> = BTreeMap::new();
+    for si in 0..flat.segs.len() {
+        let seg = &mut flat.segs[si];
+        let mut new_ops: Vec<FlatOp> = Vec::with_capacity(seg.ops.len());
+        for op in seg.ops.drain(..) {
+            rewrite_op(op, spill, &mut new_ops)?;
+        }
+        seg.ops = new_ops;
+        // Exits: uses get loads appended to the segment's ops; a spilled
+        // HostOp out reg is written to a scratch and stored at the top of
+        // the fallthrough segment.
+        match &mut seg.exit {
+            FlatExit::Cond { cond, .. } => {
+                if let Some(&slot) = spill.get(cond) {
+                    seg.ops.push(FlatOp::SpillLoad {
+                        slot,
+                        dst: SCRATCH[0],
+                    });
+                    *cond = SCRATCH[0];
+                }
+            }
+            FlatExit::Table { index, .. } => {
+                if let Some(&slot) = spill.get(index) {
+                    seg.ops.push(FlatOp::SpillLoad {
+                        slot,
+                        dst: SCRATCH[0],
+                    });
+                    *index = SCRATCH[0];
+                }
+            }
+            FlatExit::Call { func_reg } => {
+                if let Some(&slot) = spill.get(func_reg) {
+                    seg.ops.push(FlatOp::SpillLoad {
+                        slot,
+                        dst: SCRATCH[0],
+                    });
+                    *func_reg = SCRATCH[0];
+                }
+            }
+            FlatExit::HostOp { args, out, .. } => {
+                let mut used = 0usize;
+                for a in args.iter_mut() {
+                    if let Some(&slot) = spill.get(a) {
+                        if used >= SCRATCH.len() {
+                            return Err(LeDiag {
+                                function: None,
+                                block: None,
+                                inst: None,
+                                message: "minibc: too many spilled host-op operands".into(),
+                            });
+                        }
+                        seg.ops.push(FlatOp::SpillLoad {
+                            slot,
+                            dst: SCRATCH[used],
+                        });
+                        *a = SCRATCH[used];
+                        used += 1;
+                    }
+                }
+                if let Some(o) = out {
+                    if let Some(&slot) = spill.get(o) {
+                        *o = SCRATCH[0];
+                        prepends
+                            .entry(si + 1)
+                            .or_default()
+                            .push(FlatOp::SpillStore {
+                                slot,
+                                src: SCRATCH[0],
+                            });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for (si, mut ops) in prepends {
+        let mut merged = ops.clone();
+        ops.clear();
+        merged.append(&mut flat.segs[si].ops);
+        flat.segs[si].ops = merged;
+    }
+    Ok(())
+}
+
+/// Rewrite one flat op, pushing the replacement sequence onto `out`.
+fn rewrite_op(
+    op: FlatOp,
+    spill: &BTreeMap<u32, u32>,
+    out: &mut Vec<FlatOp>,
+) -> Result<(), LeDiag> {
+    // Use-loads for up to two spilled use operands; defs reuse SCRATCH[0]
+    // (every op reads its sources before writing its destination).
+    let mut loads = |uses: &mut [&mut u32], out: &mut Vec<FlatOp>| -> Result<(), LeDiag> {
+        let mut next = 0usize;
+        let mut loaded: BTreeMap<u32, u32> = BTreeMap::new();
+        for u in uses.iter_mut() {
+            if let Some(&slot) = spill.get(u) {
+                let sc = if let Some(&sc) = loaded.get(&**u) {
+                    sc
+                } else {
+                    if next >= 2 {
+                        return Err(LeDiag {
+                            function: None,
+                            block: None,
+                            inst: None,
+                            message: "minibc: op has too many spilled uses".into(),
+                        });
+                    }
+                    let sc = SCRATCH[next];
+                    next += 1;
+                    out.push(FlatOp::SpillLoad { slot, dst: sc });
+                    loaded.insert(**u, sc);
+                    sc
+                };
+                **u = sc;
+            }
+        }
+        Ok(())
+    };
+    match op {
+        FlatOp::LoadConst { dst, bits } => {
+            if spill.contains_key(&dst) {
+                out.push(FlatOp::LoadConst {
+                    dst: SCRATCH[0],
+                    bits,
+                });
+                store_dst(dst, out, spill);
+            } else {
+                out.push(FlatOp::LoadConst { dst, bits });
+            }
+        }
+        FlatOp::FuncAddrLoad { func, dst } => {
+            if spill.contains_key(&dst) {
+                out.push(FlatOp::FuncAddrLoad {
+                    func,
+                    dst: SCRATCH[0],
+                });
+                store_dst(dst, out, spill);
+            } else {
+                out.push(FlatOp::FuncAddrLoad { func, dst });
+            }
+        }
+        FlatOp::Move { src, dst } => match (spill.get(&src), spill.get(&dst)) {
+            (Some(&ss), Some(&sd)) => {
+                out.push(FlatOp::SpillLoad {
+                    slot: ss,
+                    dst: SCRATCH[0],
+                });
+                out.push(FlatOp::SpillStore {
+                    slot: sd,
+                    src: SCRATCH[0],
+                });
+            }
+            (Some(&ss), None) => {
+                out.push(FlatOp::SpillLoad {
+                    slot: ss,
+                    dst: SCRATCH[0],
+                });
+                out.push(FlatOp::Move {
+                    src: SCRATCH[0],
+                    dst,
+                });
+            }
+            (None, Some(&sd)) => {
+                out.push(FlatOp::Move {
+                    src,
+                    dst: SCRATCH[0],
+                });
+                out.push(FlatOp::SpillStore {
+                    slot: sd,
+                    src: SCRATCH[0],
+                });
+            }
+            (None, None) => out.push(FlatOp::Move { src, dst }),
+        },
+        FlatOp::AluRaw { mut a, mut b, dst, sub } => {
+            loads(&mut [&mut a, &mut b], out)?;
+            let d = if spill.contains_key(&dst) {
+                SCRATCH[0]
+            } else {
+                dst
+            };
+            out.push(FlatOp::AluRaw { a, b, dst: d, sub });
+            store_dst(dst, out, spill);
+        }
+        FlatOp::AluUn { mut src, dst, sub } => {
+            loads(&mut [&mut src], out)?;
+            let d = if spill.contains_key(&dst) {
+                SCRATCH[0]
+            } else {
+                dst
+            };
+            out.push(FlatOp::AluUn { src, dst: d, sub });
+            store_dst(dst, out, spill);
+        }
+        FlatOp::Stock3 { kind, mut a, mut b, dst } => {
+            loads(&mut [&mut a, &mut b], out)?;
+            let d = if spill.contains_key(&dst) {
+                SCRATCH[0]
+            } else {
+                dst
+            };
+            out.push(FlatOp::Stock3 { kind, a, b, dst: d });
+            store_dst(dst, out, spill);
+        }
+        FlatOp::Stock2 { kind, mut src, dst } => {
+            loads(&mut [&mut src], out)?;
+            let d = if spill.contains_key(&dst) {
+                SCRATCH[0]
+            } else {
+                dst
+            };
+            out.push(FlatOp::Stock2 { kind, src, dst: d });
+            store_dst(dst, out, spill);
+        }
+        FlatOp::WindowStore { run, src } => {
+            if let Some(&ss) = spill.get(&src) {
+                out.push(FlatOp::SpillLoad {
+                    slot: ss,
+                    dst: SCRATCH[0],
+                });
+                out.push(FlatOp::WindowStore {
+                    run,
+                    src: SCRATCH[0],
+                });
+            } else {
+                out.push(FlatOp::WindowStore { run, src });
+            }
+        }
+        FlatOp::WindowLoad { run, dst } => {
+            if let Some(&sd) = spill.get(&dst) {
+                out.push(FlatOp::WindowLoad {
+                    run,
+                    dst: SCRATCH[0],
+                });
+                out.push(FlatOp::SpillStore {
+                    slot: sd,
+                    src: SCRATCH[0],
+                });
+            } else {
+                out.push(FlatOp::WindowLoad { run, dst });
+            }
+        }
+        other => out.push(other),
+    }
+    Ok(())
+}
+
+fn store_dst(d: u32, out: &mut Vec<FlatOp>, spill: &BTreeMap<u32, u32>) {
+    if let Some(&slot) = spill.get(&d) {
+        out.push(FlatOp::SpillStore {
+            slot,
+            src: SCRATCH[0],
+        });
+    }
 }
 
 /// Debug: dump a function's flat segments, liveness intervals, and physical
@@ -1230,6 +1597,14 @@ fn emit_op(
             ),
             out,
         ),
+        FlatOp::SpillStore { slot, src } => encode_mini(
+            MiniOp::SpillStore(Reg(phys(base_of, *src)), *slot as u8, RegForm::R4),
+            out,
+        ),
+        FlatOp::SpillLoad { slot, dst } => encode_mini(
+            MiniOp::SpillLoad(*slot as u8, Reg(phys(base_of, *dst)), RegForm::R4),
+            out,
+        ),
         FlatOp::FuncAddrLoad { func, dst } => {
             let at = out.len() + 2; // opcode + reg, then the 8-byte payload
             fixups.push(Fixup::FuncAddr { at, func: *func });
@@ -1345,9 +1720,12 @@ pub fn render_minibc(m: &LeModule) -> Result<MinibcArtifact, Vec<LeDiag>> {
             flats.push(None);
             continue;
         }
-        let flat = flatten_function(m, f);
+        let mut flat = flatten_function(m, f);
         diags.extend(flat.diags.iter().cloned());
-        match allocate(&flat, window_runs) {
+        match allocate(&flat, window_runs).and_then(|alloc| {
+            rewrite_spills(&mut flat, &alloc)?;
+            Ok(alloc)
+        }) {
             Ok(alloc) => {
                 if let Ok(filter) = std::env::var("MBDUMP_FN") {
                     if f.name.contains(&filter) {
@@ -1356,7 +1734,8 @@ pub fn render_minibc(m: &LeModule) -> Result<MinibcArtifact, Vec<LeDiag>> {
                 }
                 flats.push(Some((flat, alloc)))
             }
-            Err(d) => {
+            Err(mut d) => {
+                d.message = format!("{}: {}", f.name, d.message);
                 diags.push(d);
                 flats.push(None);
             }
@@ -1387,6 +1766,10 @@ pub fn render_minibc(m: &LeModule) -> Result<MinibcArtifact, Vec<LeDiag>> {
                 // before the Call exit; the continuation (physically next)
                 // begins with the pops, then its own ops.
                 let mut saves: Vec<u32> = alloc.liveness.live_out[si].iter().copied().collect();
+                debug_assert!(
+                    !saves.iter().any(|l| alloc.spill.contains_key(l)),
+                    "spilled local live across a call"
+                );
                 saves.sort();
                 for s in &saves {
                     MiniOp::Push(Reg(phys(&alloc.base_of, *s)), RegForm::R4)

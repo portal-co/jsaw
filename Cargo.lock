@@ -534,12 +534,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "dreamcompiler-log"
+version = "0.1.0"
+
+[[package]]
 name = "dreamcompiler-minibc"
 version = "0.1.0"
 dependencies = [
  "log",
  "num_enum",
  "portal-pc-asm-common 0.1.1",
+]
+
+[[package]]
+name = "dreamcompiler-minibc-c-interp"
+version = "0.1.0"
+dependencies = [
+ "dreamcompiler-log",
+ "dreamcompiler-minibc",
+ "log",
+ "num_enum",
 ]
 
 [[package]]
@@ -1738,6 +1752,7 @@ version = "0.1.0"
 dependencies = [
  "dreamcompiler-ffi-sig",
  "dreamcompiler-minibc",
+ "dreamcompiler-minibc-c-interp",
  "log",
  "portal-jsc-common",
  "portal-jsc-jvm-emit",

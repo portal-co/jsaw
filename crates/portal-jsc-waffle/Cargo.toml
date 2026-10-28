@@ -30,6 +30,7 @@ wasmparser = { version = "0.240", features = ["validate"] }
 
 [dev-dependencies]
 log = "0.4"
+dreamcompiler-minibc-c-interp.workspace = true
 portal-jsc-mob-emit = { path = "../mobile/portal-jsc-mob-emit" }
 portal-jsc-jvm-emit = { path = "../mobile/portal-jsc-jvm-emit" }
 portal-jsc-swift-emit = { path = "../mobile/portal-jsc-swift-emit" }

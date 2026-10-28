@@ -23,6 +23,7 @@ portal-pc-waffle = {version="^0.6.0-alpha.1",git="https://github.com/portal-co/w
 # migration.
 dreamcompiler-ffi-sig = { path = "crates/dreamcompiler-ffi-sig" }
 dreamcompiler-minibc = { git = "https://github.com/portal-co/dreamcomp.git", features = ["interp"] }
+dreamcompiler-minibc-c-interp = { git = "https://github.com/portal-co/dreamcomp.git" }
 
 id-arena = "^2.2.1"
 arena-traits = {version="^0.2.3",features=["id-arena"]}

@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use portal_jsc_waffle::low_emit::{self, exec::{self, LowLane}};
+
 #[derive(Debug, Deserialize)]
 struct Corpus {
     cases: Vec<CorpusCase>,
@@ -54,92 +56,41 @@ fn plan_for(source: &str) -> portal_jsc_waffle::BackendPlan {
     portal_jsc_waffle::BackendPlan::from_module(&module).expect("plan")
 }
 
-fn cc_available(cc: &str) -> bool {
-    std::process::Command::new(cc)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
 struct LaneResult {
     status: &'static str,
     detail: String,
     artifact_bytes: usize,
 }
 
-fn run_lane(
-    case: &CorpusCase,
-    lane: &str,
-    dir: &Path,
-    cc: &str,
-) -> LaneResult {
+fn run_lane(case: &CorpusCase, lane: LowLane, dir: &Path) -> LaneResult {
     let plan = plan_for(&case.module);
-    let emit = |lane: &str| match lane {
-        "nano" => portal_jsc_waffle::low_emit::emit_c(
-            &plan,
-            &portal_jsc_waffle::low_emit::NanoRepresentation,
-        ),
-        _ => portal_jsc_waffle::low_emit::emit_c(
-            &plan,
-            &portal_jsc_waffle::low_emit::CoreGcRepresentation,
-        ),
-    };
-    let c = match emit(lane) {
-        Ok(c) => c,
-        Err(diags) => {
-            return LaneResult {
-                status: "fail",
-                detail: format!(
-                    "emit diags: {}",
-                    diags.iter()
-                        .map(|d| d.to_string())
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                ),
-                artifact_bytes: 0,
-            };
-        }
-    };
     // Deterministic re-emission (acceptance: same plan → byte-identical C).
-    let c2 = emit(lane).expect("re-emit");
-    assert_eq!(c, c2, "{lane} emission is not deterministic");
-
-    // The numeric-ABI runner: the export wrapper must be (f64...) -> f64.
+    let a = exec::emit_low_artifact(&plan, lane).expect("emit");
+    let b = exec::emit_low_artifact(&plan, lane).expect("re-emit");
+    assert_eq!(a, b, "{} emission is not deterministic", lane.name());
+    // Structural IR validation and the numeric-ABI export shape.
     let low = match lane {
-        "nano" => portal_jsc_waffle::low_emit::emit_low(
-            &plan,
-            &portal_jsc_waffle::low_emit::NanoRepresentation,
-        ),
-        _ => portal_jsc_waffle::low_emit::emit_low(
-            &plan,
-            &portal_jsc_waffle::low_emit::CoreGcRepresentation,
-        ),
+        LowLane::CNano => low_emit::emit_low(&plan, &low_emit::NanoRepresentation),
+        _ => low_emit::emit_low(&plan, &low_emit::CoreGcRepresentation),
     }
     .expect("re-emit IR");
-    assert!(
-        portal_jsc_waffle::low_emit::debug::validate(&low).is_empty(),
-        "IR validation failed"
-    );
+    assert!(low_emit::debug::validate(&low).is_empty(), "IR validation failed");
     let Some(export) = low.exports.iter().find(|e| e.name == case.export) else {
         return LaneResult {
             status: "fail",
             detail: format!("export {:?} not in the low-level module", case.export),
-            artifact_bytes: c.len(),
+            artifact_bytes: a.len(),
         };
     };
     let ef = &low.funcs[export.func.0 as usize];
     let numeric = ef.results.len() == 1
-        && ef
-            .params
-            .iter()
-            .chain(std::iter::once(&(portal_jsc_waffle::low_emit::LeLocal(0), ef.results[0])))
-            .all(|(_, t)| *t == portal_jsc_waffle::low_emit::LeType::F64);
+        && ef.params.iter().all(|(_, t)| *t == low_emit::LeType::F64)
+        && ef.results[0] == low_emit::LeType::F64;
     if !numeric {
         return LaneResult {
             status: "unsupported",
             detail: "export is not in the numeric f64 ABI".into(),
-            artifact_bytes: c.len(),
+            artifact_bytes: a.len(),
         };
     }
     if ef.params.len() != case.args.len() {
@@ -150,96 +101,27 @@ fn run_lane(
                 ef.params.len(),
                 case.args.len()
             ),
-            artifact_bytes: c.len(),
+            artifact_bytes: a.len(),
         };
     }
-
-    let sym = format!(
-        "js_export_{}",
-        portal_jsc_waffle::low_emit::c_render::c_ident(&case.export)
-    );
-    let arg_exprs: Vec<String> = case
+    let args: Vec<f64> = case
         .args
         .iter()
-        .map(|a| {
-            let v: f64 = a.trim().parse().expect("arg literal");
-            format!("db(UINT64_C(0x{:016x}))", v.to_bits())
-        })
+        .map(|x| x.trim().parse().expect("arg literal"))
         .collect();
-    let main = format!(
-        "#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n\
-         extern void js_start(void);\nextern double {sym}({params});\n\
-         static double db(uint64_t b){{double d;memcpy(&d,&b,8);return d;}}\n\
-         int main(void){{ js_start(); double r = {sym}({args}); \
-         uint64_t b; memcpy(&b,&r,8); printf(\"%016llx\\n\",(unsigned long long)b); return 0; }}\n",
-        params = vec!["double"; case.args.len()].join(", "),
-        args = arg_exprs.join(", "),
-    );
-    std::fs::write(dir.join("m.c"), &c).expect("write module");
-    std::fs::write(dir.join("main.c"), &main).expect("write main");
-    let out = std::process::Command::new(cc)
-        .args(["-std=c99", "-O0", "-w", "-o"])
-        .arg(dir.join("a.out"))
-        .arg(dir.join("m.c"))
-        .arg(dir.join("main.c"))
-        .arg("-lm")
-        .output()
-        .expect("cc spawn");
-    if !out.status.success() {
-        return LaneResult {
-            status: "fail",
-            detail: format!(
-                "cc failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-                    .lines()
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            ),
-            artifact_bytes: c.len(),
-        };
-    }
-    let run = std::process::Command::new(dir.join("a.out")).output().expect("run");
-    if !run.status.success() {
-        return LaneResult {
-            status: "fail",
-            detail: format!(
-                "artifact exited with {} (trap or crash)",
-                run.status
-            ),
-            artifact_bytes: c.len(),
-        };
-    }
-    let text = String::from_utf8_lossy(&run.stdout).trim().to_string();
-    let Ok(bits) = u64::from_str_radix(&text, 16) else {
-        return LaneResult {
-            status: "fail",
-            detail: format!("unparseable output {text:?}"),
-            artifact_bytes: c.len(),
-        };
-    };
-    let actual = f64::from_bits(bits);
-    if actual == case.expected || (actual.is_nan() && case.expected.is_nan()) {
-        LaneResult {
-            status: "pass",
-            detail: String::new(),
-            artifact_bytes: c.len(),
-        }
-    } else {
-        LaneResult {
-            status: "fail",
-            detail: format!("expected {}, got {actual}", case.expected),
-            artifact_bytes: c.len(),
-        }
+    let outcome = exec::run_low_case(&plan, lane, &case.export, &args, case.expected, dir);
+    LaneResult {
+        status: outcome.status,
+        detail: outcome.detail,
+        artifact_bytes: outcome.artifact_bytes,
     }
 }
 
 #[test]
 fn c_backend_corpus_parity() {
-    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     assert!(
-        cc_available(&cc),
-        "C backend runner prerequisite: no C compiler ({cc:?}) on PATH; \
+        LowLane::CNano.toolchain_available(),
+        "C backend runner prerequisite: no C compiler on PATH; \
          set $CC to one (fail-closed per AGENTS.md)"
     );
     let corpus: Corpus = serde_json::from_str(
@@ -257,13 +139,13 @@ fn c_backend_corpus_parity() {
         if case.module.contains("~Natives_") {
             continue;
         }
-        for lane in ["nano", "coregc"] {
-            let dir = work.join(format!("{}_{lane}", case.name));
+        for lane in [LowLane::CNano, LowLane::CCoregc] {
+            let dir = work.join(format!("{}_{}", case.name, lane.name()));
             std::fs::create_dir_all(&dir).expect("workdir");
-            let r = run_lane(case, lane, &dir, &cc);
+            let r = run_lane(case, lane, &dir);
             report_rows.push(serde_json::json!({
                 "case": case.name,
-                "lane": lane,
+                "lane": lane.name(),
                 "status": r.status,
                 "artifact_bytes": r.artifact_bytes,
             }));
@@ -272,7 +154,7 @@ fn c_backend_corpus_parity() {
                 "unsupported" => unsupported += 1,
                 _ => {
                     fail += 1;
-                    failures.push(format!("{} [{lane}]: {}", case.name, r.detail));
+                    failures.push(format!("{} [{}]: {}", case.name, lane.name(), r.detail));
                 }
             }
             let _ = std::fs::remove_dir_all(&dir);

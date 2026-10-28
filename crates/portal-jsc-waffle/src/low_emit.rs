@@ -76,7 +76,10 @@ pub mod c_render;
 pub mod c_runtime;
 pub mod coregc;
 pub mod debug;
+pub mod exec;
 pub mod nano;
+pub mod rust_render;
+pub mod rust_runtime;
 mod skeleton;
 
 pub use coregc::CoreGcRepresentation;
@@ -92,6 +95,16 @@ pub fn emit_c<R: Representation>(
 ) -> Result<String, Vec<LeDiag>> {
     let module = emit_low(plan, rep)?;
     c_render::render_c_file(&module).map_err(|d| vec![d])
+}
+
+/// Emit a complete stable-Rust crate for `plan` under representation `R`
+/// (DreamComp #40): [`emit_low`] plus [`rust_render::render_rust_file`].
+pub fn emit_rust<R: Representation>(
+    plan: &crate::backend_plan::BackendPlan,
+    rep: &R,
+) -> Result<String, Vec<LeDiag>> {
+    let module = emit_low(plan, rep)?;
+    rust_render::render_rust_file(&module).map_err(|d| vec![d])
 }
 
 use crate::backend_plan::{
@@ -837,6 +850,61 @@ impl RuntimeSink<'_> {
             body: LeBody::Runtime,
         });
         id
+    }
+}
+
+/// Push every expression a statement directly contains onto `stack`.
+pub(crate) fn push_stmt_exprs<'a>(s: &'a LeStmt, stack: &mut Vec<&'a LeExpr>) {
+    match s {
+        LeStmt::Assign(_, e) => stack.push(e),
+        LeStmt::Call { args, .. } => stack.extend(args.iter()),
+        LeStmt::ArenaStore { base, value, .. } => {
+            stack.push(base);
+            stack.push(value);
+        }
+        LeStmt::SetField { base, value, .. } => {
+            stack.push(base);
+            stack.push(value);
+        }
+        LeStmt::SetIndex {
+            base,
+            index,
+            value,
+            ..
+        } => {
+            stack.push(base);
+            stack.push(index);
+            stack.push(value);
+        }
+        LeStmt::GlobalSet(_, e) => stack.push(e),
+        LeStmt::If { cond, .. } => stack.push(cond),
+        LeStmt::Return(values) => stack.extend(values.iter()),
+        _ => {}
+    }
+}
+
+/// Push every direct child expression of `e` onto `stack`.
+pub(crate) fn push_expr_children<'a>(e: &'a LeExpr, stack: &mut Vec<&'a LeExpr>) {
+    match e {
+        LeExpr::Unary(_, x) => stack.push(x),
+        LeExpr::Binary(_, a, b) => {
+            stack.push(a);
+            stack.push(b);
+        }
+        LeExpr::Select(c, t, f) => {
+            stack.push(c);
+            stack.push(t);
+            stack.push(f);
+        }
+        LeExpr::TableElem { index, .. } => stack.push(index),
+        LeExpr::ArenaLoad { base, .. } => stack.push(base),
+        LeExpr::Field { base, .. } => stack.push(base),
+        LeExpr::Index { base, index, .. } => {
+            stack.push(base);
+            stack.push(index);
+        }
+        LeExpr::ToSlot(_, x) | LeExpr::FromSlot(_, x) => stack.push(x),
+        _ => {}
     }
 }
 

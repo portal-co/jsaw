@@ -95,61 +95,6 @@ fn binop_result(op: LeBinOp) -> LeType {
     }
 }
 
-/// Push every expression a statement directly contains onto `stack`.
-fn push_stmt_exprs<'a>(s: &'a LeStmt, stack: &mut Vec<&'a LeExpr>) {
-    match s {
-        LeStmt::Assign(_, e) => stack.push(e),
-        LeStmt::Call { args, .. } => stack.extend(args.iter()),
-        LeStmt::ArenaStore { base, value, .. } => {
-            stack.push(base);
-            stack.push(value);
-        }
-        LeStmt::SetField { base, value, .. } => {
-            stack.push(base);
-            stack.push(value);
-        }
-        LeStmt::SetIndex {
-            base,
-            index,
-            value,
-            ..
-        } => {
-            stack.push(base);
-            stack.push(index);
-            stack.push(value);
-        }
-        LeStmt::GlobalSet(_, e) => stack.push(e),
-        LeStmt::If { cond, .. } => stack.push(cond),
-        LeStmt::Return(values) => stack.extend(values.iter()),
-        _ => {}
-    }
-}
-
-/// Push every direct child expression of `e` onto `stack`.
-fn push_expr_children<'a>(e: &'a LeExpr, stack: &mut Vec<&'a LeExpr>) {
-    match e {
-        LeExpr::Unary(_, x) => stack.push(x),
-        LeExpr::Binary(_, a, b) => {
-            stack.push(a);
-            stack.push(b);
-        }
-        LeExpr::Select(c, t, f) => {
-            stack.push(c);
-            stack.push(t);
-            stack.push(f);
-        }
-        LeExpr::TableElem { index, .. } => stack.push(index),
-        LeExpr::ArenaLoad { base, .. } => stack.push(base),
-        LeExpr::Field { base, .. } => stack.push(base),
-        LeExpr::Index { base, index, .. } => {
-            stack.push(base);
-            stack.push(index);
-        }
-        LeExpr::ToSlot(_, x) | LeExpr::FromSlot(_, x) => stack.push(x),
-        _ => {}
-    }
-}
-
 struct Renderer<'m> {
     m: &'m LeModule,
     /// Import func id → C symbol.
@@ -645,7 +590,7 @@ impl<'m> Renderer<'m> {
                         std::mem::discriminant(s)
                     )));
                 }
-                push_stmt_exprs(s, &mut stack);
+                super::push_stmt_exprs(s, &mut stack);
                 match s {
                     LeStmt::If { then, else_, .. } => {
                         stmts.extend(then.iter());
@@ -667,7 +612,7 @@ impl<'m> Renderer<'m> {
                         std::mem::discriminant(e)
                     )));
                 }
-                push_expr_children(e, &mut stack);
+                super::push_expr_children(e, &mut stack);
             }
         }
         Ok(())

@@ -146,14 +146,24 @@ fn minibc_backend_corpus_parity() {
             .flat_map(|c| {
                 [LowLane::MinibcNano, LowLane::MinibcCoregc]
                     .into_iter()
+                    .filter(|l| {
+                        std::env::var("JSLANE")
+                            .map(|f| l.name() == f)
+                            .unwrap_or(true)
+                    })
                     .map(move |l| (c.clone(), l))
             })
             .collect(),
     );
     let results: Mutex<Vec<(String, LowLane, LaneResult)>> = Mutex::new(Vec::new());
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
+    let workers = std::env::var("JSAW_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        })
         .min(8);
     std::thread::scope(|scope| {
         for _ in 0..workers {

@@ -46,10 +46,12 @@ const DREAMCOMP_BASELINE_FAILURES: [&str; 3] = [
 ];
 /// The wasm lanes every case runs through (unchanged, acceptance #4).
 const LANES: [&str; 2] = ["wasmbc", "nano_mvp"];
-/// The low-level lanes (DreamComp #41): C and Rust backends × both
-/// representations, compiled per case (per-case isolation replaces batch
-/// bisection — see the issue comment) and executed in parallel.
-const LOW_LANES: [portal_jsc_waffle::low_emit::exec::LowLane; 4] =
+/// The low-level lanes (DreamComp #41, extended by #39): C, Rust, and
+/// MiniBC backends × both representations, compiled per case (per-case
+/// isolation replaces batch bisection — see the issue comment) and executed
+/// in parallel. The MiniBC lanes run in-process under the stock
+/// `MiniInterp` (no toolchain).
+const LOW_LANES: [portal_jsc_waffle::low_emit::exec::LowLane; 6] =
     portal_jsc_waffle::low_emit::exec::LowLane::ALL;
 
 #[derive(Debug, Deserialize)]

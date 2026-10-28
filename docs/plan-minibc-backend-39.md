@@ -1,14 +1,18 @@
 # Plan: MiniBC backend over the low_emit skeleton (DreamComp #39)
 
-**Status:** in progress. Landed: the DreamComp format/interp foundations
-(`AluRaw`/`AluUn` raw-word sub-op opcodes `0x74`/`0x75`, `Trap` `0x76`, the
-`0x9B` stateful host-op hook, `MiniInterp`/`StdExtOp` moved into
-`dreamcompiler-minibc` under the `interp` feature) and the jsaw emitter +
-host runtime skeleton (`low_emit/minibc_render.rs`, `minibc_host.rs`,
-`tests/low_minibc_smoke.rs`). The emitter compiles and runs artifacts under
-the stock interpreter, but a miscompilation in the call/window protocol
-remains (smoke test `#[ignore]`d) — see the issue for the current evidence
-and next steps.
+**Status:** complete (jsaw `master`; DreamComp foundations `0ef8b50`/`08d5337`/`3682bbc` + the `AluUn` C-codegen fix). All four acceptance criteria met:
+
+1. **Cross-interpreter**: every corpus case × both lanes runs under the stock Rust `MiniInterp` (`tests/low_minibc_runner.rs`, 88/88) and under the generated C interpreter header via a C host implementing the jsaw `0x9B` host-op family (`low_emit/minibc_c_host.rs`, `tests/low_minibc_c_interp.rs`, 88/88).
+2. **Corpus parity** in both lanes (same runners).
+3. **Artifact bytes** recorded per case/lane (`JSAW_MINIBC_ARTIFACT_REPORT`, schema `jsaw.minibc-artifact-report.v1`).
+4. **Cross-compat**: `tests/low_minibc_crosscompat.rs` runs a jsaw artifact and a DreamComp-emitted program (round-tripped through the DreamComp `Container` format) in one `MiniInterp` instance.
+
+Defects found during bring-up (all fixed):
+
+- **jsaw emitter**: `If`/`Select` lowering overwrote the arm's *first* segment's exit instead of the arm-*end* segment's (clobbering nested `If` Conds and `Ret`/`Trap` exits); Table arm shims recorded the segment *before* the `FuncAddrLoad` (off-by-one through the whole table); the Table default fixup was 4 bytes late (clobbering arm 0's shim); the Table discriminant needed the raw funcref word converted to f64 (the stock `Table` ext-op reads its index as an f64 JS number); the CoreGC host keyed layouts by type-id where the IR passes layout *indices*, and field/index accesses needed per-size read/write (8-byte unconditional writes clobbered packed neighbours).
+- **Allocation**: primordial-init-scale functions exceed the 64-run R4 file; the linear-scan allocator now spills to the stock spill frame (64 slots, jsaw-side scratch runs above the call window), restricted to locals never live across a call (the spill frame is shared across calls).
+- **DreamComp c-interp**: `AluUn`'s C execution wrote to the stale shared `c` operand variable (wire dst is `b`) — caught only by cross-running jsaw artifacts, locked by a regression case; `mn_spill` moved to file scope (spills cross segment dispatches, exactly like `mn_call_stack`).
+- **C host**: root frames stored pointers into a realloc'able buffer (dangling after growth → GC read garbage roots → divergent frees); now offset-based.
 
 `BackendPlan` → MiniBC container via the #36 skeleton, with a jsaw-native
 value model on the shared bytecode format (no NaN-box object model).

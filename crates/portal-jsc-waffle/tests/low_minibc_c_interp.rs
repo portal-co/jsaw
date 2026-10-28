@@ -218,9 +218,14 @@ fn minibc_c_interp_corpus() {
             .collect(),
     );
     let results: Mutex<Vec<(String, LowLane, LaneResult)>> = Mutex::new(Vec::new());
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
+    let workers = std::env::var("JSAW_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        })
         .min(8);
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -234,7 +239,9 @@ fn minibc_c_interp_corpus() {
                 let Some((case, lane)) = next else { break };
                 let dir = work_root.join(format!("{}_{}", case.name, lane.name()));
                 let r = run_case_c_interp(&case, lane, header, cc, &dir);
-                let _ = std::fs::remove_dir_all(&dir);
+                if std::env::var("JSKEEP").is_err() {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
                 results.lock().unwrap().push((case.name.clone(), lane, r));
             });
         }
@@ -256,6 +263,8 @@ fn minibc_c_interp_corpus() {
         }
     }
     eprintln!("minibc C-interp corpus: {pass} pass, {fail} fail, {unsupported} unsupported");
-    let _ = std::fs::remove_dir_all(&work_root);
+    if std::env::var("JSKEEP").is_err() {
+        let _ = std::fs::remove_dir_all(&work_root);
+    }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

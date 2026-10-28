@@ -34,7 +34,7 @@ static uint64_t js_n_objects = 0, js_cap_objects = 0;
 static uint32_t *js_free = NULL;
 static uint64_t js_n_free = 0, js_cap_free = 0;
 
-static uint64_t **js_roots = NULL;      /* frame base pointers */
+static uint64_t *js_roots = NULL;       /* frame base OFFSETS into js_root_bufs */
 static uint64_t *js_root_bufs = NULL;   /* frame storage (contiguous stack) */
 static uint64_t *js_root_counts = NULL;
 static uint64_t js_n_frames = 0, js_cap_frames = 0, js_root_buf_len = 0, js_root_buf_cap = 0;
@@ -70,7 +70,7 @@ static void js_gc_collect(void) {
     } while (0)
     for (uint64_t f = 0; f < js_n_frames; f++)
         for (uint64_t i = 0; i < js_root_counts[f]; i++)
-            JS_PUSH(js_roots[f][i]);
+            JS_PUSH(js_root_bufs[js_roots[f] + i]);
     while (nw) {
         uint64_t w = work[--nw];
         int64_t idx = js_handle_of(w);
@@ -199,7 +199,7 @@ static uint64_t js_host(uint32_t idx, uint64_t *args) {
         uint64_t n = args[0];
         if (js_n_frames == js_cap_frames) {
             js_cap_frames = js_cap_frames ? js_cap_frames * 2 : 64;
-            js_roots = realloc(js_roots, js_cap_frames * sizeof(uint64_t *));
+            js_roots = realloc(js_roots, js_cap_frames * sizeof(uint64_t));
             js_root_counts = realloc(js_root_counts, js_cap_frames * sizeof(uint64_t));
         }
         if (js_root_buf_len + n > js_root_buf_cap) {
@@ -208,17 +208,15 @@ static uint64_t js_host(uint32_t idx, uint64_t *args) {
             js_root_bufs = realloc(js_root_bufs, nc * 8);
             js_root_buf_cap = nc;
         }
-        uint64_t *frame = js_root_bufs + js_root_buf_len;
-        memset(frame, 0, n * 8);
-        js_roots[js_n_frames] = frame;
+        memset(js_root_bufs + js_root_buf_len, 0, n * 8);
+        js_roots[js_n_frames] = js_root_buf_len;
         js_root_counts[js_n_frames] = n;
         js_n_frames++;
         js_root_buf_len += n;
         return 0;
     }
     case 9: { /* COREGC_ROOT_STORE(slot, value) */
-        uint64_t *frame = js_roots[js_n_frames - 1];
-        frame[args[0]] = args[1];
+        js_root_bufs[js_roots[js_n_frames - 1] + args[0]] = args[1];
         return 0;
     }
     case 10: { /* COREGC_ROOT_POP */

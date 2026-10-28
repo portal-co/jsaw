@@ -220,7 +220,17 @@ impl JsawHost {
             ($f:expr) => {{
                 let st = Rc::clone(&host.state);
                 let f = $f;
-                handlers.push(Box::new(move |_interp, args| f(&mut st.borrow_mut(), args)));
+                // Env-gated host-op trace (`MBTRACE_HOST=1`) for
+                // cross-interpreter debugging: args -> result, one line.
+                let my_idx = handlers.len() as u32;
+                handlers.push(Box::new(move |_interp, args| {
+                    let trace = std::env::var("MBTRACE_HOST").is_ok();
+                    let r = f(&mut st.borrow_mut(), args);
+                    if trace {
+                        eprintln!("host: {my_idx} {args:?} -> {r}");
+                    }
+                    r
+                }));
             }};
         }
 

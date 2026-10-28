@@ -33,6 +33,7 @@ fn manifest_with(assumptions: Vec<AssumptionInput>) -> Manifest {
             assumptions,
             ..Default::default()
         },
+        ffi: Default::default(),
         emit: Default::default(),
     }
 }

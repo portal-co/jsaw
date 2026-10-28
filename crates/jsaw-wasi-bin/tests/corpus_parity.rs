@@ -44,8 +44,13 @@ const DREAMCOMP_BASELINE_FAILURES: [&str; 3] = [
     "rpc_recv_fast_ir_tag_emitted",
     "rpc_recv_placeholder_compiles_and_returns_undefined",
 ];
-/// The lanes every case runs through.
+/// The wasm lanes every case runs through (unchanged, acceptance #4).
 const LANES: [&str; 2] = ["wasmbc", "nano_mvp"];
+/// The low-level lanes (DreamComp #41): C and Rust backends × both
+/// representations, compiled per case (per-case isolation replaces batch
+/// bisection — see the issue comment) and executed in parallel.
+const LOW_LANES: [portal_jsc_waffle::low_emit::exec::LowLane; 4] =
+    portal_jsc_waffle::low_emit::exec::LowLane::ALL;
 
 #[derive(Debug, Deserialize)]
 struct Corpus {
@@ -364,15 +369,142 @@ fn dreamcomp_corpus_runs_identically_through_jsaw_wasmbc() {
             case_outcomes.push(outcome);
         }
     }
+    // ---- Phase 2: the low-level lanes (parallel, per-case isolation).
+    // Toolchain-missing lanes report `unavailable` per case (fail-closed).
+    let lane_filter: Option<Vec<String>> = std::env::var("JSAW_PARITY_LANES")
+        .ok()
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).collect());
+    let low_enabled = |lane: &str| {
+        lane_filter
+            .as_ref()
+            .map(|f| f.iter().any(|x| x == lane))
+            .unwrap_or(true)
+    };
+    let low_queue: std::sync::Mutex<Vec<(usize, portal_jsc_waffle::low_emit::exec::LowLane)>> =
+        std::sync::Mutex::new(
+            corpus
+                .cases
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| !c.module.contains("~Natives_"))
+                .flat_map(|(i, _)| {
+                    LOW_LANES
+                        .iter()
+                        .copied()
+                        .filter(move |l| low_enabled(l.name()))
+                        .map(move |l| (i, l))
+                })
+                .collect(),
+        );
+    let low_results: std::sync::Mutex<Vec<serde_json::Value>> = std::sync::Mutex::new(Vec::new());
+    let low_counts: std::sync::Mutex<(usize, usize, usize, usize)> =
+        std::sync::Mutex::new((0, 0, 0, 0));
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8);
+    let work_root = std::env::temp_dir().join(format!("jsaw_parity_low_{}", std::process::id()));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let low_queue = &low_queue;
+            let low_results = &low_results;
+            let low_counts = &low_counts;
+            let corpus = &corpus;
+            let work_root = &work_root;
+            scope.spawn(move || loop {
+                let next = low_queue.lock().unwrap().pop();
+                let Some((case_idx, lane)) = next else { break };
+                let case = &corpus.cases[case_idx];
+                let started = Instant::now();
+                let mut sources: BTreeMap<String, String> = BTreeMap::new();
+                sources.insert("main.js".to_string(), case.module.clone());
+                let set = portal_jsc_waffle::module_set_from_sources(
+                    sources.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+                )
+                .expect("ingestion");
+                let mut module = portal_pc_waffle::Module::empty();
+                portal_jsc_waffle::convert_modules(
+                    "main.js",
+                    &set,
+                    &mut module,
+                    &portal_jsc_waffle::ConvertOptions::default(),
+                )
+                .expect("lowering");
+                let plan = portal_jsc_waffle::BackendPlan::from_module(&module)
+                    .expect("plan diagnostics");
+                let args: Vec<f64> = case
+                    .args
+                    .iter()
+                    .map(|a| a.trim().parse::<f64>())
+                    .collect::<Result<_, _>>()
+                    .expect("arg literal");
+                let dir = work_root.join(format!("{}_{}", case.name, lane.name()));
+                std::fs::create_dir_all(&dir).expect("workdir");
+                let outcome = portal_jsc_waffle::low_emit::exec::run_low_case(
+                    &plan,
+                    lane,
+                    &case.export,
+                    &args,
+                    case.expected,
+                    &dir,
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                {
+                    let mut c = low_counts.lock().unwrap();
+                    match outcome.status {
+                        "pass" => c.0 += 1,
+                        "fail" => c.1 += 1,
+                        "unsupported" => c.2 += 1,
+                        _ => c.3 += 1,
+                    }
+                }
+                low_results.lock().unwrap().push(serde_json::json!({
+                    "id": case.id,
+                    "name": case.name,
+                    "lane": lane.name(),
+                    "semantic_mode": semantic_mode(case),
+                    "status": outcome.status,
+                    "expected": case.expected,
+                    "actual": outcome.value_bits.map(f64::from_bits),
+                    "error": if outcome.detail.is_empty() { None } else { Some(outcome.detail.clone()) },
+                    "compile_and_run_ms": elapsed_ms,
+                    "plan_fingerprint": None::<String>,
+                    "artifact_bytes": outcome.artifact_bytes as u64,
+                    "metrics_unavailable": ["alloc_count", "alloc_bytes", "peak_live_bytes", "retained_objects"],
+                }));
+            });
+        }
+    });
+    let _ = std::fs::remove_dir_all(&work_root);
+    let (low_pass, low_fail, low_unsupported, low_unavailable) =
+        *low_counts.lock().unwrap();
+    let mut low_results = low_results.into_inner().unwrap();
+    low_results.sort_by(|a, b| {
+        (a["name"].as_str(), a["lane"].as_str()).cmp(&(b["name"].as_str(), b["lane"].as_str()))
+    });
+    for row in low_results {
+        println!("{row}");
+        case_outcomes.push(row);
+    }
+
+    let all_lanes: Vec<String> = LANES
+        .iter()
+        .map(|s| s.to_string())
+        .chain(LOW_LANES.iter().map(|l| l.name().to_string()))
+        .collect();
     let summary = serde_json::json!({
         "summary": true,
-        "lanes": LANES,
+        "lanes": all_lanes,
         "source_fingerprint": corpus.source_fingerprint,
-        "case_results": corpus.cases.len() * LANES.len(),
-        "pass": pass,
-        "fail": fail,
-        "unsupported": unsupported,
-        "unavailable": unavailable,
+        "case_results": corpus.cases.len() * LANES.len()
+            + low_pass + low_fail + low_unsupported + low_unavailable,
+        "pass": pass + low_pass,
+        "fail": fail + low_fail,
+        "unsupported": unsupported + low_unsupported,
+        "unavailable": unavailable + low_unavailable,
+        "wasm_lanes": { "pass": pass, "fail": fail, "unsupported": unsupported, "unavailable": unavailable },
+        "low_lanes": { "pass": low_pass, "fail": low_fail, "unsupported": low_unsupported, "unavailable": low_unavailable },
         "dreamcomp_baseline_failures": DREAMCOMP_BASELINE_FAILURES,
         "process_peak_rss_bytes": peak_rss_bytes(),
     });
@@ -380,7 +512,7 @@ fn dreamcomp_corpus_runs_identically_through_jsaw_wasmbc() {
 
     if let Ok(report_path) = std::env::var("JSAW_PARITY_REPORT") {
         let report = serde_json::json!({
-            "schema": "jsaw.corpus-parity.v1",
+            "schema": "jsaw.corpus-parity.v2",
             "corpus": {
                 "source_fingerprint": corpus.source_fingerprint,
                 "schema_version": corpus.schema_version,
@@ -393,12 +525,21 @@ fn dreamcomp_corpus_runs_identically_through_jsaw_wasmbc() {
     }
 
     assert_eq!(fail, 0, "{fail} corpus case(s) mismatched DreamComp expectations");
-    // Five ~Natives_inlineme families per lane (DreamCompat sentinels are
-    // outside jsaw), nothing else may be unsupported or unavailable.
+    // Five ~Natives_inlineme families per wasm lane (DreamCompat sentinels
+    // are outside jsaw), nothing else may be unsupported or unavailable.
     assert!(
         unsupported <= 5 * LANES.len(),
-        "unexpected unsupported cases: {unsupported} (at most the five ~Natives_inlineme families per lane are allowed)"
+        "unexpected unsupported cases: {unsupported} (at most the five ~Natives_inlineme families per wasm lane are allowed)"
     );
     assert_eq!(unavailable, 0);
     assert_eq!(pass + unsupported, corpus.cases.len() * LANES.len());
+    // Low-level lanes (#41): no failures; toolchains must be present
+    // (fail-closed), and nothing may be unsupported outside the ~Natives_
+    // families (which never enter the low-level phase at all).
+    assert_eq!(low_fail, 0, "low-level lane failures (see case rows)");
+    assert_eq!(
+        low_unavailable, 0,
+        "low-level lane toolchain unavailable (fail-closed per AGENTS.md)"
+    );
+    assert_eq!(low_unsupported, 0);
 }

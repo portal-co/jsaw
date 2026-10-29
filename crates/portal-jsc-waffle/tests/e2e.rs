@@ -5374,15 +5374,163 @@ fn opaque_factory_makes_marker_objects() {
 }
 
 #[test]
-fn ffi_factories_fail_closed() {
-    // callback: recognized but not yet implemented (#42).
+fn callback_factory_host_roundtrip() {
+    // The host receives the bound wrapper and calls back into the exported
+    // adapter `js_ffi_cb_0` (DreamComp #42 reverse boundary).
     let fixtures: Fixture<'_> = &[(
         "main.mjs",
-        "import { callback } from '~ffi'; const C = callback('(f64) -> f64'); export function run() { return 0; }",
+        "import { ffi, callback } from '~ffi';          const callit = ffi('callit', '(slot, i32) -> i32');          const C = callback('(i32) -> i32');          export function run(x) { const b = C(function h(v) { return v + 1; }); return callit(b, x); }",
     )];
-    let error = lower_modules(fixtures, "main.mjs", &Default::default())
-        .expect_err("callback must fail closed");
-    assert!(error.to_string().contains("callback"), "{error}");
+    let module = lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect("callback factory should lower");
+    let wasm = portal_pc_waffle::to_wasm_bytes(&module).expect("module should encode");
+    let engine = Engine::default();
+    let compiled = WasmtimeModule::new(&engine, &wasm).expect("wasmtime should compile the module");
+    let mut store = Store::new(&engine, ());
+    let mut linker = wasmtime::Linker::new(&engine);
+    linker
+        .func_wrap(
+            "ffi",
+            "callit",
+            |mut caller: wasmtime::Caller<'_, ()>,
+             wrapper: Option<wasmtime::Rooted<wasmtime::AnyRef>>,
+             x: i32| {
+                let wrapper = wrapper.expect("wrapper");
+                let cb = caller
+                    .get_export("js_ffi_cb_0")
+                    .and_then(|e| e.into_func())
+                    .expect("callback export");
+                let mut results = [wasmtime::Val::I32(0)];
+                cb.call(
+                    &mut caller,
+                    &[wasmtime::Val::AnyRef(Some(wrapper)), wasmtime::Val::I32(x)],
+                    &mut results,
+                )
+                .expect("callback invocation");
+                let wasmtime::Val::I32(r) = results[0] else {
+                    panic!("callback result must be i32")
+                };
+                r
+            },
+        )
+        .expect("host import");
+    let instance = linker
+        .instantiate(&mut store, &compiled)
+        .expect("host imports should instantiate");
+    let run = instance
+        .get_typed_func::<f64, f64>(&mut store, "run")
+        .expect("numeric export");
+    assert_eq!(run.call(&mut store, 41.0).unwrap(), 42.0);
+}
+
+#[test]
+fn template_over_object_with_own_tostring() {
+    let fixtures: Fixture<'_> = &[(
+        "main.mjs",
+        "export function run() { const o = { toString() { return \"xyz\"; } }; return `${o}`.length; }",
+    )];
+    let module = lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect("lowers");
+    assert_executes_in_all_runtimes(&module, "run", &[], 3.0);
+}
+
+
+
+
+
+#[test]
+fn two_struct_factories_one_function_all_runtimes() {
+    let fixtures: Fixture<'_> = &[(
+        "main.mjs",
+        "import { struct } from '~ffi'; export function run(a) { const Bytes = struct('extern data: i32'); const S = struct('extern header: i32, bytes: i32'); const s = S(10, Bytes(2)); return s.header + s.bytes.data; }",
+    )];
+    let module = lower_modules(fixtures, "main.mjs", &Default::default()).expect("lowers");
+    assert_executes_in_all_runtimes(&module, "run", &[5.0], 12.0);
+}
+
+
+#[test]
+fn contains_and_splice_structs_build_plain_objects() {
+    let fixtures: Fixture<'_> = &[(
+        "main.mjs",
+        "import { struct, contains } from '~ffi'; export function run(a) { const Bytes = struct('extern data: i32, len: i32'); const v = { x: a }; const T = contains(v); const S = struct(`extern header: i32, payload: ${T}, bytes: ${Bytes}`); const s = S(10, v, Bytes(2, 3)); return s.header + s.payload.x + s.bytes.len; }",
+    )];
+    let module = lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect("spliced struct should lower");
+    assert_executes_in_all_runtimes(&module, "run", &[5.0], 18.0);
+}
+
+#[test]
+fn method_level_interface_results_wrap_with_the_catalog() {
+    // m() returns P<rid of the lib2 interface>; the wrapper's methods come
+    // from lib2's declaration (the PIT catalog, #42).
+    let fixtures: Fixture<'_> = &[(
+        "main.mjs",
+        "import { ffi } from '~ffi';          const lib2 = ffi('lib2', '() -> P<0000000000000000000000000000000000000000000000000000000000000001>; get(i32) -> i32');          const lib = ffi('lib', '() -> P<0000000000000000000000000000000000000000000000000000000000000000>; m(i32) -> P<0000000000000000000000000000000000000000000000000000000000000001>');          export function run(x) { const a = lib(); const b = a.m(x); return b.get(x); }",
+    )];
+    let module = lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect("method-level P<> should lower");
+    let wasm = portal_pc_waffle::to_wasm_bytes(&module).expect("module should encode");
+    let engine = Engine::default();
+    let compiled = WasmtimeModule::new(&engine, &wasm).expect("wasmtime should compile the module");
+    let mut store = Store::new(&engine, ());
+    let mut linker = wasmtime::Linker::new(&engine);
+    let mk_i31 = |caller: &mut wasmtime::Caller<'_, ()>, v: i32| {
+        wasmtime::AnyRef::from_i31(caller, wasmtime::I31::wrapping_i32(v))
+    };
+    linker
+        .func_wrap("ffi", "lib2", {
+            move |mut caller: wasmtime::Caller<'_, ()>| Some(mk_i31(&mut caller, 7))
+        })
+        .expect("lib2");
+    linker
+        .func_wrap("ffi", "lib", {
+            move |mut caller: wasmtime::Caller<'_, ()>| Some(mk_i31(&mut caller, 100))
+        })
+        .expect("lib");
+    linker
+        .func_wrap(
+            "ffi",
+            "lib_m",
+            |mut caller: wasmtime::Caller<'_, ()>,
+             handle: Option<wasmtime::Rooted<wasmtime::AnyRef>>,
+             x: i32| {
+                let h = handle.expect("h").unwrap_i31(&mut caller).expect("i31").get_i32();
+                Some(wasmtime::AnyRef::from_i31(&mut caller, wasmtime::I31::wrapping_i32(h + x)))
+            },
+        )
+        .expect("lib_m");
+    linker
+        .func_wrap(
+            "ffi",
+            "lib2_get",
+            |mut caller: wasmtime::Caller<'_, ()>,
+             handle: Option<wasmtime::Rooted<wasmtime::AnyRef>>,
+             x: i32| {
+                let h = handle.expect("h").unwrap_i31(&mut caller).expect("i31").get_i32();
+                h + 2 * x
+            },
+        )
+        .expect("lib2_get");
+    let instance = linker
+        .instantiate(&mut store, &compiled)
+        .expect("host imports should instantiate");
+    let run = instance
+        .get_typed_func::<f64, f64>(&mut store, "run")
+        .expect("numeric export");
+    // lib() -> 100; a.m(5) -> 105; b.get(5) -> 105 + 10 = 115
+    assert_eq!(run.call(&mut store, 5.0).unwrap(), 115.0);
+}
+
+#[test]
+fn ffi_factories_fail_closed() {
+    // callback lowers (implemented in #42); a non-literal sig still fails.
+    let fixtures: Fixture<'_> = &[(
+        "main.mjs",
+        "import { callback } from '~ffi'; const C = callback('(i32) -> i32'); export function run() { return 0; }",
+    )];
+    lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect("callback lowers since #42");
 
     // Non-literal arguments are rejected.
     let fixtures: Fixture<'_> = &[(
@@ -5393,14 +5541,13 @@ fn ffi_factories_fail_closed() {
         .expect_err("non-literal ffi args must fail");
     assert!(error.to_string().contains("compile-time string literal"), "{error}");
 
-    // Non-extern structs fail closed.
+    // Non-extern structs are jsaw-owned plain objects (#42).
     let fixtures: Fixture<'_> = &[(
         "main.mjs",
         "import { struct } from '~ffi'; const P = struct('x: i32'); export function run() { return 0; }",
     )];
-    let error = lower_modules(fixtures, "main.mjs", &Default::default())
-        .expect_err("non-extern struct must fail closed");
-    assert!(error.to_string().contains("extern"), "{error}");
+    lower_modules(fixtures, "main.mjs", &Default::default())
+        .expect("non-extern structs lower since #42");
 
     // Unknown ~ffi members fail closed at link time.
     let fixtures: Fixture<'_> = &[(

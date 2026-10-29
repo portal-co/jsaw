@@ -89,6 +89,11 @@ impl<'m> Renderer<'m> {
         frame: &str,
     ) -> anyhow::Result<String> {
         self.broken_to = BTreeSet::new();
+        // Broken-to labels must be known or `stmt_terminates` misreads a
+        // block/If whose body exits through its own label as terminating the
+        // whole sequence, and `render_seq` elides the live remainder (the
+        // non-fragment path collects these in `render_func`).
+        collect_breaks(&sfunc.body, &mut self.broken_to);
         self.locals = sfunc.locals.clone();
         self.current = func;
         self.rets = sfunc.rets.clone();

@@ -38,6 +38,20 @@ fn corpus_path() -> PathBuf {
     })
 }
 
+
+/// jsaw-local corpus extension (merged after the vendored DreamComp corpus).
+fn ext_cases() -> Vec<CorpusCase> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../jsaw-wasi-bin/tests/corpus/jsaw_corpus_ext.json");
+    #[derive(Deserialize)]
+    struct Ext {
+        cases: Vec<CorpusCase>,
+    }
+    serde_json::from_str::<Ext>(&std::fs::read_to_string(path).expect("ext corpus"))
+        .expect("ext corpus parses")
+        .cases
+}
+
 fn plan_for(source: &str) -> portal_jsc_waffle::BackendPlan {
     let mut sources = BTreeMap::new();
     sources.insert("main.js".to_string(), source.to_string());
@@ -138,9 +152,10 @@ fn minibc_backend_corpus_parity() {
     .expect("corpus parses");
 
     let work_root = std::env::temp_dir().join(format!("jsaw_minibc_runner_{}", std::process::id()));
+    let mut all_cases = corpus.cases;
+    all_cases.extend(ext_cases());
     let queue: Mutex<Vec<(CorpusCase, LowLane)>> = Mutex::new(
-        corpus
-            .cases
+        all_cases
             .into_iter()
             .filter(|c| !c.module.contains("~Natives_"))
             .flat_map(|c| {

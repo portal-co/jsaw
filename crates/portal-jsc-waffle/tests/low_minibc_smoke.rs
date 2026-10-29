@@ -126,6 +126,16 @@ fn minibc_smoke() {
             45.0,
             "{lane}"
         );
+        assert_eq!(
+            run_case(
+                "import { struct, contains } from '~ffi'; export function run(a) { const Bytes = struct('extern data: i32, len: i32'); const v = { x: a }; const T = contains(v); const S = struct(`extern header: i32, payload: ${T}, bytes: ${Bytes}`); const s = S(10, v, Bytes(2, 3)); return s.header + s.payload.x + s.bytes.len; }",
+                lane,
+                "run",
+                &[5.0]
+            ),
+            18.0,
+            "{lane}"
+        );
         eprintln!("{lane}: smoke OK");
     }
 }

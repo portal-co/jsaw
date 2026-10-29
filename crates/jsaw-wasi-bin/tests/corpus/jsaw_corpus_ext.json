@@ -1,0 +1,20 @@
+{
+ "schema": "jsaw.corpus-ext.v1",
+ "comment": "jsaw-local corpus cases (DreamComp #42): the vendored corpus is DreamComp-generated and fingerprint-pinned; jsaw-only families (the ~ffi virtual module) live here and are merged at load time by the runners.",
+ "cases": [
+  {
+   "name": "ffi_callback_construct",
+   "module": "import { callback } from '~ffi'; export function run(x) { const C = callback('(i32) -> i32'); const b = C(function h(v) { return v + 1; }); return typeof b === 'object' && typeof C === 'function' ? x + 1 : 0; }",
+   "export": "run",
+   "args": ["41.0"],
+   "expected": 42.0
+  },
+  {
+   "name": "ffi_contains_splice",
+   "module": "import { struct, contains } from '~ffi'; export function run(a) { const Bytes = struct('extern data: i32, len: i32'); const v = { x: a }; const T = contains(v); const S = struct(`extern header: i32, payload: ${T}, bytes: ${Bytes}`); const s = S(10, v, Bytes(2, 3)); return s.header + s.payload.x + s.bytes.len; }",
+   "export": "run",
+   "args": ["5.0"],
+   "expected": 18.0
+  }
+ ]
+}

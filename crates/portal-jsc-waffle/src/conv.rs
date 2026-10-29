@@ -299,12 +299,14 @@ pub fn convert_modules<'a, 'wasm>(
     let wasm_host_imports = declare_wasm_host_imports(module, &import_tables);
     // `~ffi` factories declare their host imports from source-level call
     // sites, so they need a prescan to keep the import section first.
-    let ffi_plans = prescan_ffi(set, &import_tables)?;
-    let ffi_host_imports = declare_ffi_host_imports(module, &ffi_plans)?;
+    let ffi_prescan = prescan_ffi(set, &import_tables)?;
+    let ffi_host_imports = declare_ffi_host_imports(module, &ffi_prescan.thunks)?;
     let mut converter = Converter::new(module);
     converter.ffi_host_imports = ffi_host_imports;
     converter.semantic_cfg = options.semantic_cfg();
-    converter.ffi_thunks = ffi_plans;
+    converter.pit_ifaces = ffi_prescan.pit_ifaces();
+    converter.ffi_callbacks = ffi_prescan.callbacks;
+    converter.ffi_thunks = ffi_prescan.thunks;
     converter.import_tables = import_tables;
     converter.wasm_host_imports = wasm_host_imports;
     converter.exceptions_enabled = exported
@@ -1141,6 +1143,7 @@ struct Converter<'a, 'module, 'wasm> {
     typeof_helper: Option<Func>,
     to_bigint_helper: Option<Func>,
     to_string_helper: Option<Func>,
+    to_string_object_native: Option<Func>,
     /// Native primordial method bodies (`Math.sqrt`, `Reflect.get`, ...),
     /// keyed by the label passed to `build_native_adapter`. A fresh lexical
     /// context is built per exported function, but the underlying Wasm
@@ -1238,6 +1241,15 @@ struct Converter<'a, 'module, 'wasm> {
     ffi_method_adapters: BTreeMap<(String, String), Func>,
     /// Generated struct constructors per canonical declaration.
     ffi_struct_ctors: BTreeMap<String, Func>,
+    /// `callback(sig)` declarations by canonical signature text (DreamComp
+    /// #42).
+    ffi_callbacks: BTreeMap<String, FfiCallableSig>,
+    /// Generated callback constructor adapters per canonical signature text.
+    ffi_callback_ctors: BTreeMap<String, Func>,
+    /// Generated callback export natives per canonical signature text.
+    ffi_callback_exports: BTreeMap<String, Func>,
+    /// PIT interface catalog: rid -> (declaring sym, method table).
+    pit_ifaces: BTreeMap<[u8; 32], (String, Vec<FfiMethodSigRef>)>,
     /// Generated jsaw callable metadata for every raw host import.
     wasm_host_functions: BTreeMap<WasmImportSpec, FunctionInfo>,
     /// Per-module import tables for multi-module ingestion: resolved
@@ -1293,6 +1305,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             typeof_helper: None,
             to_bigint_helper: None,
             to_string_helper: None,
+            to_string_object_native: None,
             native_function_cache: BTreeMap::new(),
             context_builder: None,
             module_init: None,
@@ -1320,6 +1333,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             ffi_host_imports: BTreeMap::new(),
             ffi_adapters: BTreeMap::new(),
             ffi_method_adapters: BTreeMap::new(),
+            ffi_callbacks: BTreeMap::new(),
+            ffi_callback_ctors: BTreeMap::new(),
+            ffi_callback_exports: BTreeMap::new(),
+            pit_ifaces: BTreeMap::new(),
             ffi_struct_ctors: BTreeMap::new(),
             wasm_host_functions: BTreeMap::new(),
             import_tables: BTreeMap::new(),
@@ -4462,7 +4479,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 // coerced to a string. The corpus's templates are constant
                 // (no interpolations), but the general path is handled for
                 // robustness.
-                self.template_literal(body, block, values, quasis, exprs)?
+                self.template_literal(body, block, context, values, quasis, exprs)?
             }
             Item::Class(class) => {
                 let (block, class_value) =
@@ -4647,6 +4664,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         &mut self,
         body: &mut FunctionBody,
         block: Block,
+        context: Value,
         values: &ContinuationValues,
         quasis: &[swc_atoms::Atom],
         exprs: &[SValueId],
@@ -4674,7 +4692,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             let value = values
                 .get(expr)
                 .ok_or_else(|| ConvertError::invalid("undefined template expression"))?;
-            let (block2, string) = self.to_string_value(body, block, value)?;
+            let (block2, string) = self.to_string_value(body, block, context, value)?;
             block = block2;
             current = body.add_op(
                 block,
@@ -4711,6 +4729,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         &mut self,
         body: &mut FunctionBody,
         block: Block,
+        context: Value,
         value: &LowerValue,
     ) -> Result<(Block, Value), ConvertError> {
         match value {
@@ -4723,7 +4742,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     Operator::Call {
                         function_index: helper,
                     },
-                    &[boxed],
+                    &[context, boxed],
                     &[self.repr.string_ty()],
                 );
                 Ok((block, result))
@@ -4740,13 +4759,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             return Ok(func);
         }
         let sig = self.module.signatures.push(SignatureData::Func {
-            params: vec![self.repr.value],
+            params: vec![self.repr.object_ty(), self.repr.value],
             returns: vec![self.repr.string_ty()],
             shared: false,
         });
         let mut body = FunctionBody::new(self.module, sig);
         let entry = body.entry;
-        let value = body.blocks[entry].params[0].1;
+        let context = body.blocks[entry].params[0].1;
+        let value = body.blocks[entry].params[1].1;
 
         // String: pass through.
         let is_string = body.add_op(
@@ -4897,9 +4917,35 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             },
         );
 
-        // BigInt/number/object: outside the corpus's template usage
-        // (constant templates only), so trap rather than mis-format.
-        body.set_terminator(not_null, Terminator::Unreachable);
+        // BigInt/number arms are omitted (outside the corpus's needs);
+        // objects and function objects get the JS-ordinary own-`toString`
+        // path via a native (DreamComp #42: factory markers stringify to
+        // their splice tokens). The native owns the CallRef — plain helper
+        // functions stay CallRef-free for the splitter-based backends.
+        let native = self.ensure_to_string_object_native()?;
+        let empty_args = body.add_op(
+            not_null,
+            Operator::ArrayNewFixed {
+                sig: self.repr.arguments,
+                num: 0,
+            },
+            &[],
+            &[self.repr.arguments_ty()],
+        );
+        let result = body.add_op(
+            not_null,
+            Operator::Call {
+                function_index: native,
+            },
+            &[context, value, empty_args, value],
+            &[self.repr.string_ty()],
+        );
+        body.set_terminator(
+            not_null,
+            Terminator::Return {
+                values: vec![result],
+            },
+        );
 
         let func = self.module.funcs.push(FuncDecl::Body(
             sig,
@@ -4907,6 +4953,102 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             body,
         ));
         self.to_string_helper = Some(func);
+        Ok(func)
+    }
+
+    /// The own-`toString` native behind [`Self::ensure_to_string_helper`]'s
+    /// object arm: source-arity ABI `(context, this, arguments, value) ->
+    /// string`; looks up the value's own `toString`, calls it when callable
+    /// (the CallRef lives here, in a native, so splitter-based backends
+    /// handle it like any other callback), and traps otherwise.
+    fn ensure_to_string_object_native(&mut self) -> Result<Func, ConvertError> {
+        if let Some(func) = self.to_string_object_native {
+            return Ok(func);
+        }
+        let native_sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![
+                self.repr.object_ty(),
+                self.repr.value,
+                self.repr.arguments_ty(),
+                self.repr.value,
+            ],
+            returns: vec![self.repr.string_ty()],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, native_sig);
+        let entry = body.entry;
+        let value = body.blocks[entry].params[3].1;
+        let object_lv = LowerValue::Wasm {
+            value,
+            kind: ValueKind::Reference,
+        };
+        let (block, to_string_prop) =
+            self.get_own_property_value(&mut body, entry, &object_lv, "toString")?;
+        let (ts_raw, _) = to_string_prop.wasm()?;
+        let is_fn = body.add_op(
+            block,
+            Operator::RefTest {
+                ty: self.repr.function_non_null_ty(),
+            },
+            &[ts_raw],
+            &[Type::I32],
+        );
+        let fn_hit = body.add_block();
+        let trap_arm = body.add_block();
+        body.set_terminator(
+            block,
+            Terminator::CondBr {
+                cond: is_fn,
+                if_true: BlockTarget {
+                    block: fn_hit,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: trap_arm,
+                    args: vec![],
+                },
+            },
+        );
+        body.set_terminator(trap_arm, Terminator::Unreachable);
+        let empty_args = body.add_op(
+            fn_hit,
+            Operator::ArrayNewFixed {
+                sig: self.repr.arguments,
+                num: 0,
+            },
+            &[],
+            &[self.repr.arguments_ty()],
+        );
+        let (context, this, code, _arrow) =
+            self.callable_parts(&mut body, fn_hit, &to_string_prop, object_lv)?;
+        let result = body.add_op(
+            fn_hit,
+            Operator::CallRef {
+                sig_index: self.repr.adapter,
+            },
+            &[context, this, empty_args, code],
+            &[self.repr.value],
+        );
+        let result_string = body.add_op(
+            fn_hit,
+            Operator::RefCast {
+                ty: self.repr.string_ty(),
+            },
+            &[result],
+            &[self.repr.string_ty()],
+        );
+        body.set_terminator(
+            fn_hit,
+            Terminator::Return {
+                values: vec![result_string],
+            },
+        );
+        let func = self.module.funcs.push(FuncDecl::Body(
+            native_sig,
+            format!("js_to_string_object_{}", self.module.funcs.len()),
+            body,
+        ));
+        self.to_string_object_native = Some(func);
         Ok(func)
     }
 

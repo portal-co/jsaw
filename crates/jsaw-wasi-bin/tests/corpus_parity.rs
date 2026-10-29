@@ -286,6 +286,23 @@ fn dreamcomp_corpus_runs_identically_through_jsaw_wasmbc() {
             .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display())),
     )
     .expect("corpus JSON must parse");
+    // jsaw-local extension families (~ffi factories, DreamComp #42): merged
+    // after the vendored, fingerprint-pinned DreamComp corpus.
+    #[derive(Deserialize)]
+    struct ExtCorpus {
+        cases: Vec<CorpusCase>,
+    }
+    let ext_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/corpus/jsaw_corpus_ext.json");
+    let ext: ExtCorpus = serde_json::from_str(
+        &std::fs::read_to_string(&ext_path)
+            .unwrap_or_else(|e| panic!("could not read {}: {e}", ext_path.display())),
+    )
+    .expect("ext corpus JSON must parse");
+    let corpus = Corpus {
+        cases: corpus.cases.into_iter().chain(ext.cases).collect(),
+        ..corpus
+    };
     assert_eq!(
         corpus.schema_version, EXPECTED_SCHEMA_VERSION,
         "unsupported corpus schema"

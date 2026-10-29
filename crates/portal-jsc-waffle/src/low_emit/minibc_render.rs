@@ -981,6 +981,150 @@ struct Alloc {
     window_end: u32,
 }
 
+/// A rematerializable constant definition.
+#[derive(Clone, Copy, Debug)]
+enum ConstDef {
+    Bits(u64),
+    FuncAddr(u32),
+}
+
+/// Const rematerialization: a local whose single definition is a constant
+/// (or function-address load) never occupies a register — the constant is
+/// re-emitted at every use. Register machines with byte-sized operands
+/// (string literals lower to per-byte const locals) make this mandatory.
+/// Runs before liveness so const locals never enter intervals at all.
+fn remat_consts(flat: &mut FnFlat) -> Result<(), LeDiag> {
+    // Single-definition scan.
+    let mut def_count: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut def_kind: BTreeMap<u32, ConstDef> = BTreeMap::new();
+    for seg in &flat.segs {
+        for op in &seg.ops {
+            match op {
+                FlatOp::LoadConst { dst, bits } => {
+                    *def_count.entry(*dst).or_insert(0) += 1;
+                    def_kind.insert(*dst, ConstDef::Bits(*bits));
+                }
+                FlatOp::FuncAddrLoad { func, dst } => {
+                    *def_count.entry(*dst).or_insert(0) += 1;
+                    def_kind.insert(*dst, ConstDef::FuncAddr(*func));
+                }
+                _ => {
+                    for d in op_uses_defs(op).1 {
+                        *def_count.entry(d).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        for d in exit_defs(&seg.exit) {
+            *def_count.entry(d).or_insert(0) += 1;
+        }
+    }
+    let const_of: BTreeMap<u32, ConstDef> = def_kind
+        .into_iter()
+        .filter(|(l, _)| def_count.get(l) == Some(&1))
+        .collect();
+    if const_of.is_empty() {
+        return Ok(());
+    }
+    // Emit a materialization of `l` into a scratch, returning its id.
+    fn remat(l: u32, const_of: &BTreeMap<u32, ConstDef>, scratch: u32, out: &mut Vec<FlatOp>) {
+        match const_of[&l] {
+            ConstDef::Bits(bits) => out.push(FlatOp::LoadConst { dst: scratch, bits }),
+            ConstDef::FuncAddr(func) => out.push(FlatOp::FuncAddrLoad { func, dst: scratch }),
+        }
+    }
+    let mut too_many = false;
+    for seg in &mut flat.segs {
+        let mut new_ops: Vec<FlatOp> = Vec::with_capacity(seg.ops.len());
+        for op in seg.ops.drain(..) {
+            // Drop the definition; rewrite uses.
+            let is_const_def = match &op {
+                FlatOp::LoadConst { dst, .. } | FlatOp::FuncAddrLoad { dst, .. } => {
+                    const_of.contains_key(dst)
+                }
+                _ => false,
+            };
+            if is_const_def {
+                continue;
+            }
+            let mut next_scratch = 0usize;
+            let mut loaded: BTreeMap<u32, u32> = BTreeMap::new();
+            let mut rewrite = |u: &mut u32, new_ops: &mut Vec<FlatOp>| {
+                if let Some(sc) = loaded.get(u) {
+                    *u = *sc;
+                    return;
+                }
+                if const_of.contains_key(u) {
+                    if next_scratch >= SCRATCH.len() {
+                        too_many = true;
+                        return;
+                    }
+                    let sc = SCRATCH[next_scratch];
+                    next_scratch += 1;
+                    remat(*u, &const_of, sc, new_ops);
+                    loaded.insert(*u, sc);
+                    *u = sc;
+                }
+            };
+            let mut op = op;
+            match &mut op {
+                FlatOp::Move { src, .. } => rewrite(src, &mut new_ops),
+                FlatOp::AluRaw { a, b, .. } => {
+                    rewrite(a, &mut new_ops);
+                    rewrite(b, &mut new_ops);
+                }
+                FlatOp::AluUn { src, .. } | FlatOp::Stock2 { src, .. } => {
+                    rewrite(src, &mut new_ops)
+                }
+                FlatOp::Stock3 { a, b, .. } => {
+                    rewrite(a, &mut new_ops);
+                    rewrite(b, &mut new_ops);
+                }
+                FlatOp::WindowStore { src, .. } => rewrite(src, &mut new_ops),
+                _ => {}
+            }
+            new_ops.push(op);
+        }
+        // Exit operands rematerialize at the segment end.
+        let mut exit = std::mem::replace(&mut seg.exit, FlatExit::Next);
+        let mut next_scratch = 0usize;
+        let mut load_at_end = |u: &mut u32, ops: &mut Vec<FlatOp>| {
+            if const_of.contains_key(u) {
+                if next_scratch >= SCRATCH.len() {
+                    too_many = true;
+                    return;
+                }
+                let sc = SCRATCH[next_scratch];
+                next_scratch += 1;
+                remat(*u, &const_of, sc, ops);
+                *u = sc;
+            }
+        };
+        match &mut exit {
+            FlatExit::Cond { cond, .. } => load_at_end(cond, &mut new_ops),
+            FlatExit::Table { index, .. } => load_at_end(index, &mut new_ops),
+            FlatExit::Call { func_reg } => load_at_end(func_reg, &mut new_ops),
+            FlatExit::HostOp { args, .. } => {
+                for a in args.iter_mut() {
+                    load_at_end(a, &mut new_ops);
+                }
+            }
+            _ => {}
+        }
+        seg.ops = new_ops;
+        seg.exit = exit;
+    }
+    if too_many {
+        return Err(LeDiag {
+            function: None,
+            block: None,
+            inst: None,
+            message: "minibc: too many const operands in one op/exit to rematerialize".into(),
+        });
+    }
+    Ok(())
+}
+
 fn liveness(flat: &FnFlat) -> (Liveness, BTreeMap<u32, ((u32, u32), (u32, u32))>) {
     let n = flat.segs.len();
 
@@ -1115,13 +1259,10 @@ fn allocate(flat: &FnFlat, window_runs: u32) -> Result<Alloc, LeDiag> {
     }
     // Scratch runs live just above the window zone; locals above them.
     let zone_start = window_end + 4 * SCRATCH.len() as u32;
-    // Spill safety: the interpreter's spill frame is shared across calls, so
-    // a spilled local must never be live out of a call segment (the callee
-    // could clobber the slot before the caller reloads it).
-    let mut unsafe_to_spill: BTreeSet<u32> = BTreeSet::new();
-    for &cs in &flat.calls {
-        unsafe_to_spill.extend(live.live_out[cs].iter().copied());
-    }
+    // Spill slots are saved/restored through the call stack at Call exits
+    // (the interpreter's spill frame is shared across calls), so every
+    // local is spill-eligible.
+    let unsafe_to_spill: BTreeSet<u32> = BTreeSet::new();
     let mut active: Vec<((u32, u32), u32, u32)> = Vec::new(); // (end, base, local)
     let mut base_of: BTreeMap<u32, u32> = BTreeMap::new();
     let mut spill: BTreeMap<u32, u32> = BTreeMap::new();
@@ -1193,6 +1334,22 @@ fn allocate(flat: &FnFlat, window_runs: u32) -> Result<Alloc, LeDiag> {
     })
 }
 
+/// Scratch ids currently occupied by a value list (remat pass runs before
+/// the spill rewrite; a segment's exit may already reference scratches).
+fn scratch_mask_of(ids: &[u32]) -> u32 {
+    let mut mask = 0u32;
+    for id in ids {
+        if let Some(i) = SCRATCH.iter().position(|s| s == id) {
+            mask |= 1 << i;
+        }
+    }
+    mask
+}
+
+fn next_free_scratch(mask: u32) -> Option<usize> {
+    (0..SCRATCH.len()).find(|i| mask & (1 << i) == 0)
+}
+
 /// Rewrite spilled locals to spill-frame traffic on the scratch runs.
 /// Runs after allocation; the flat ops/exits are updated in place.
 fn rewrite_spills(flat: &mut FnFlat, alloc: &Alloc) -> Result<(), LeDiag> {
@@ -1240,23 +1397,25 @@ fn rewrite_spills(flat: &mut FnFlat, alloc: &Alloc) -> Result<(), LeDiag> {
                 }
             }
             FlatExit::HostOp { args, out, .. } => {
-                let mut used = 0usize;
+                // Scratches already assigned by remat (visible in the args)
+                // stay live through the exit; allocate above them.
+                let mut mask = scratch_mask_of(args);
                 for a in args.iter_mut() {
                     if let Some(&slot) = spill.get(a) {
-                        if used >= SCRATCH.len() {
+                        let Some(i) = next_free_scratch(mask) else {
                             return Err(LeDiag {
                                 function: None,
                                 block: None,
                                 inst: None,
                                 message: "minibc: too many spilled host-op operands".into(),
                             });
-                        }
+                        };
+                        mask |= 1 << i;
                         seg.ops.push(FlatOp::SpillLoad {
                             slot,
-                            dst: SCRATCH[used],
+                            dst: SCRATCH[i],
                         });
-                        *a = SCRATCH[used];
-                        used += 1;
+                        *a = SCRATCH[i];
                     }
                 }
                 if let Some(o) = out {
@@ -1293,23 +1452,25 @@ fn rewrite_op(
     // Use-loads for up to two spilled use operands; defs reuse SCRATCH[0]
     // (every op reads its sources before writing its destination).
     let mut loads = |uses: &mut [&mut u32], out: &mut Vec<FlatOp>| -> Result<(), LeDiag> {
-        let mut next = 0usize;
+        // Scratches already holding remat'd consts in this op stay live
+        // through it; allocate spill loads from the complement.
+        let mut mask = scratch_mask_of(&uses.iter().map(|u| **u).collect::<Vec<_>>());
         let mut loaded: BTreeMap<u32, u32> = BTreeMap::new();
         for u in uses.iter_mut() {
             if let Some(&slot) = spill.get(u) {
                 let sc = if let Some(&sc) = loaded.get(&**u) {
                     sc
                 } else {
-                    if next >= 2 {
+                    let Some(i) = next_free_scratch(mask) else {
                         return Err(LeDiag {
                             function: None,
                             block: None,
                             inst: None,
                             message: "minibc: op has too many spilled uses".into(),
                         });
-                    }
-                    let sc = SCRATCH[next];
-                    next += 1;
+                    };
+                    mask |= 1 << i;
+                    let sc = SCRATCH[i];
                     out.push(FlatOp::SpillLoad { slot, dst: sc });
                     loaded.insert(**u, sc);
                     sc
@@ -1466,13 +1627,23 @@ fn dump_flat(name: &str, flat: &FnFlat, alloc: &Alloc) {
         for op in &seg.ops {
             eprintln!("    {op:?}");
         }
-        eprintln!("    exit {:?}", seg.exit);
+        let phys_exit = match &seg.exit {
+            FlatExit::HostOp { idx, args, out } => format!(
+                " [phys args {:?}]",
+                args.iter().map(|a| phys(&alloc.base_of, *a)).collect::<Vec<_>>()
+            ),
+            _ => String::new(),
+        };
+        eprintln!("    exit {:?}{phys_exit}", seg.exit);
         eprintln!("    live_out {:?}", alloc.liveness.live_out[si]);
     }
-    eprintln!("--- base_of ---");
-    for (l, b) in &alloc.base_of {
+    eprintln!("--- base_of (window_end {}) ---", alloc.window_end);
+    let mut entries: Vec<(u32, u32)> = alloc.base_of.iter().map(|(&l, &b)| (l, b)).collect();
+    entries.sort_by_key(|&(_, b)| b);
+    for (l, b) in entries {
         eprintln!("    local {l} -> base {b}");
     }
+    eprintln!("--- spill: {:?} ---", alloc.spill);
 }
 
 /// A fixup to patch after all segments are positioned.
@@ -1712,6 +1883,9 @@ pub fn render_minibc(m: &LeModule) -> Result<MinibcArtifact, Vec<LeDiag>> {
         window_runs = window_runs.max(f.params.len()).max(f.results.len());
     }
     let window_runs = window_runs.max(1) as u32;
+    if std::env::var("MBDUMP_FN").is_ok() {
+        eprintln!("window_runs={window_runs}");
+    }
 
     let import_ids: BTreeSet<u32> = m.imports.iter().map(|i| i.func.0).collect();
     let mut flats: Vec<Option<(FnFlat, Alloc)>> = Vec::new();
@@ -1721,6 +1895,14 @@ pub fn render_minibc(m: &LeModule) -> Result<MinibcArtifact, Vec<LeDiag>> {
             continue;
         }
         let mut flat = flatten_function(m, f);
+        if std::env::var("MB_NOREMAT").is_err() {
+            if let Err(mut d) = remat_consts(&mut flat) {
+                d.message = format!("{}: {}", f.name, d.message);
+                diags.push(d);
+                flats.push(None);
+                continue;
+            }
+        }
         diags.extend(flat.diags.iter().cloned());
         match allocate(&flat, window_runs).and_then(|alloc| {
             rewrite_spills(&mut flat, &alloc)?;
@@ -1764,15 +1946,24 @@ pub fn render_minibc(m: &LeModule) -> Result<MinibcArtifact, Vec<LeDiag>> {
             if let FlatExit::Call { .. } = &seg.exit {
                 // Call saves: push locals live out of this segment right
                 // before the Call exit; the continuation (physically next)
-                // begins with the pops, then its own ops.
+                // begins with the pops, then its own ops. Spilled locals
+                // route through a scratch run: load slot -> scratch -> push;
+                // pop -> scratch -> store slot (the spill frame is shared
+                // across calls).
                 let mut saves: Vec<u32> = alloc.liveness.live_out[si].iter().copied().collect();
-                debug_assert!(
-                    !saves.iter().any(|l| alloc.spill.contains_key(l)),
-                    "spilled local live across a call"
-                );
                 saves.sort();
-                for s in &saves {
+                let (spilled, resident): (Vec<u32>, Vec<u32>) =
+                    saves.into_iter().partition(|l| alloc.spill.contains_key(l));
+                for s in &resident {
                     MiniOp::Push(Reg(phys(&alloc.base_of, *s)), RegForm::R4)
+                        .encode(out.len() as u32, &mut |b| out.push(b));
+                }
+                let scratch = Reg(phys(&alloc.base_of, SCRATCH[5]));
+                for s in &spilled {
+                    let slot = alloc.spill[s] as u8;
+                    MiniOp::SpillLoad(slot, scratch, RegForm::R4)
+                        .encode(out.len() as u32, &mut |b| out.push(b));
+                    MiniOp::Push(scratch, RegForm::R4)
                         .encode(out.len() as u32, &mut |b| out.push(b));
                 }
                 emit_exit(
@@ -1786,7 +1977,14 @@ pub fn render_minibc(m: &LeModule) -> Result<MinibcArtifact, Vec<LeDiag>> {
                 // The continuation segment starts here: record its pc and
                 // emit the pops (its own ops follow in the next iteration).
                 seg_pcs.insert((i as u32, si as u32 + 1), out.len() as u32);
-                for s in saves.iter().rev() {
+                for s in spilled.iter().rev() {
+                    let slot = alloc.spill[s] as u8;
+                    MiniOp::Pop(scratch, RegForm::R4)
+                        .encode(out.len() as u32, &mut |b| out.push(b));
+                    MiniOp::SpillStore(scratch, slot, RegForm::R4)
+                        .encode(out.len() as u32, &mut |b| out.push(b));
+                }
+                for s in resident.iter().rev() {
                     MiniOp::Pop(Reg(phys(&alloc.base_of, *s)), RegForm::R4)
                         .encode(out.len() as u32, &mut |b| out.push(b));
                 }

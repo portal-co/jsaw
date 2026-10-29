@@ -223,8 +223,22 @@ impl JsawHost {
                 // Env-gated host-op trace (`MBTRACE_HOST=1`) for
                 // cross-interpreter debugging: args -> result, one line.
                 let my_idx = handlers.len() as u32;
-                handlers.push(Box::new(move |_interp, args| {
+                handlers.push(Box::new(move |interp, args| {
                     let trace = std::env::var("MBTRACE_HOST").is_ok();
+                    // Bounds-check nano memory ops here so failures carry the
+                    // bytecode pc (the closure body only sees HostState).
+                    if matches!(my_idx, 1 | 2) {
+                        let addr = args[0] as usize;
+                        let n = 1usize.checked_shl(args[1] as u32).unwrap_or(usize::MAX);
+                        let len = st.borrow().arena.len();
+                        if args[1] > 3 || addr + n > len {
+                            panic!(
+                                "nano mem op {my_idx} out of range: addr={addr:#x} size_log2={} arena_len={len:#x} at ext pc {}",
+                                args[1],
+                                interp.current_ext_pc
+                            );
+                        }
+                    }
                     let r = f(&mut st.borrow_mut(), args);
                     if trace {
                         eprintln!("host: {my_idx} {args:?} -> {r}");
@@ -245,6 +259,12 @@ impl JsawHost {
         // NANO_LOAD
         h!(|s: &mut HostState, args: &[u64]| {
             let addr = args[0] as usize;
+            if args[1] > 3 {
+                panic!("NANO_LOAD bad size_log2 {}", args[1]);
+            }
+            if addr + (1usize << (args[1] as u32)) > s.arena.len() {
+                panic!("NANO_LOAD out of range: addr={addr:#x} size_log2={} arena_len={:#x}", args[1], s.arena.len());
+            }
             let n = 1usize << (args[1] as u32);
             let mut b = [0u8; 8];
             b[..n].copy_from_slice(&s.arena[addr..addr + n]);

@@ -23,8 +23,14 @@ pub struct Manifest {
     pub version: u32,
     /// Entry module key; must be one of `modules`.
     pub entry: String,
-    /// Every module in the closed world, as source-root-relative keys.
+    /// Every JavaScript module in the closed world, as
+    /// source-root-relative keys.
     pub modules: Vec<String>,
+    /// Wasm binary members of the closed world (wasm-esm phase 1,
+    /// portal-co/jsaw#14), carried as base64 since the manifest is JSON.
+    /// Keys must end in `.wasm` and must not duplicate `modules` keys.
+    #[serde(default)]
+    pub wasm: Vec<WasmModuleMember>,
     #[serde(default)]
     pub options: Options,
     #[serde(default)]
@@ -151,6 +157,15 @@ fn default_true() -> bool {
     true
 }
 
+/// One Wasm binary module-set member (wasm-esm): `path` is the module-set
+/// key (must end in `.wasm`) and `base64` is the standard-alphabet base64
+/// encoding of the module bytes.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WasmModuleMember {
+    pub path: String,
+    pub base64: String,
+}
+
 /// Emission targets; each absent/`null` target is skipped.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Emit {
@@ -208,7 +223,10 @@ impl Result {
 
     pub fn assumption_error(diagnostics: Vec<AssumptionDiagnosticReport>) -> Self {
         Result::AssumptionError {
-            error: format!("{} assumption request(s) could not be resolved", diagnostics.len()),
+            error: format!(
+                "{} assumption request(s) could not be resolved",
+                diagnostics.len()
+            ),
             diagnostics,
         }
     }

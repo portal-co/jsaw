@@ -36,6 +36,7 @@ fn manifest_with_emit(emit: jsaw_wasi_bin::manifest::Emit) -> jsaw_wasi_bin::man
         version: jsaw_wasi_bin::manifest::MANIFEST_VERSION,
         entry: "index.js".to_string(),
         modules: FIXTURE.iter().map(|(p, _)| p.to_string()).collect(),
+        wasm: vec![],
         options: Default::default(),
         emit,
         ffi: Default::default(),

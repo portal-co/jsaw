@@ -29,6 +29,7 @@ fn manifest_with(assumptions: Vec<AssumptionInput>) -> Manifest {
         version: jsaw_wasi_bin::MANIFEST_VERSION,
         entry: "index.js".to_string(),
         modules: FIXTURE.iter().map(|(p, _)| p.to_string()).collect(),
+        wasm: vec![],
         options: Options {
             assumptions,
             ..Default::default()

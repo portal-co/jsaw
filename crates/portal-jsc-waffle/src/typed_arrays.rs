@@ -1871,7 +1871,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             let last = body.add_op(
                 block,
                 Operator::I32Const {
-                    value: (bytes - 1) as u32,
+                    value: (bytes - 1),
                 },
                 &[],
                 &[Type::I32],
@@ -1996,8 +1996,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             match op {
                 DataViewOp::GetFloat64 | DataViewOp::GetBigUint64 => {
                     let mut acc = {
-                        let b = body.add_op(block, Operator::I64ExtendI32U, &[byte_vals[order[0]]], &[Type::I64]);
-                        b
+                        
+                        body.add_op(block, Operator::I64ExtendI32U, &[byte_vals[order[0]]], &[Type::I64])
                     };
                     for (pos, &idx) in order.iter().enumerate().skip(1) {
                         let shift = body.add_op(

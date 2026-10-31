@@ -128,8 +128,7 @@ pub(crate) fn prescan_ffi(
 ) -> Result<FfiPrescan, ConvertError> {
     let mut plans: BTreeMap<String, FfiThunkPlan> = BTreeMap::new();
     let mut callbacks: BTreeMap<String, FfiCallableSig> = BTreeMap::new();
-    for path in set.keys() {
-        let module = set.get(path)?;
+    for (path, module) in set.js_modules() {
         let Some(table) = import_tables.get(path.as_str()) else {
             continue;
         };
@@ -171,7 +170,7 @@ pub(crate) fn prescan_ffi(
                 }
                 // Literal extraction (compile-time-only rule).
                 let literal = |index: usize| -> Result<String, ConvertError> {
-                    let Some(arg) = args.get(index) else {
+                    let Some(_arg) = args.get(index) else {
                         return Err(ConvertError::invalid(format!(
                             "~ffi {name}() takes {name}-specific string arguments"
                         )));
@@ -413,9 +412,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 "unknown ~ffi intrinsic {other:?}"
             ))),
         }
-        .map(|v| {
+        .inspect(|_v| {
             let _ = this;
-            v
         })
     }
 
@@ -580,7 +578,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             value: this,
             kind: ValueKind::Reference,
         };
-        let (mut block, handle) = {
+        let (block, handle) = {
             let (b, slot) = self.get_own_property_value(&mut body, block, &this_lv, FFI_HANDLE_SLOT)?;
             (b, slot)
         };
@@ -1103,7 +1101,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         for (i, expr) in exprs.iter().enumerate() {
             let token = self.resolve_splice_token(source, *expr)?;
             out.push_str(&token);
-            out.push_str(&quasis[i + 1].to_string());
+            out.push_str(quasis[i + 1].as_ref());
         }
         Ok(out)
     }

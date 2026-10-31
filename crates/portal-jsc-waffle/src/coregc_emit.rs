@@ -184,18 +184,18 @@ pub fn emit_coregc(
                 })
                 .collect::<Vec<_>>()
         };
-        if let FuncDecl::Import(_, field) = decl {
-            if let Some(import) = source.imports.iter().find(
+        if let FuncDecl::Import(_, field) = decl
+            && let Some(import) = source.imports.iter().find(
                 |import| matches!(import.kind, ImportKind::Func(imported) if imported == func),
-            ) {
-                handle_abi.push(CoreGcHandleAbi {
-                    direction: CoreGcHandleDirection::Import,
-                    name: field.clone(),
-                    module: Some(import.module.clone()),
-                    parameters: kinds(params),
-                    result: returns.first().map(|ty| kinds(std::slice::from_ref(ty))[0]),
-                });
-            }
+            )
+        {
+            handle_abi.push(CoreGcHandleAbi {
+                direction: CoreGcHandleDirection::Import,
+                name: field.clone(),
+                module: Some(import.module.clone()),
+                parameters: kinds(params),
+                result: returns.first().map(|ty| kinds(std::slice::from_ref(ty))[0]),
+            });
         }
         if source
             .exports

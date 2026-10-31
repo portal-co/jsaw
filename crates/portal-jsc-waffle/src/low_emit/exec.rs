@@ -180,7 +180,9 @@ pub fn run_low_case(
             ),
         };
     }
-    let run = std::process::Command::new(dir.join("a.out")).output().expect("run");
+    let run = std::process::Command::new(dir.join("a.out"))
+        .output()
+        .expect("run");
     if !run.status.success() {
         return LowOutcome {
             status: "fail",
@@ -263,15 +265,15 @@ fn run_minibc_case(
     let mut interp = MiniInterp::new(artifact.store_regs.max(64));
     let host = low_emit::minibc_host::JsawHost::new(&artifact, &module);
     host.install(&mut interp);
-    if let Some(sp) = artifact.start {
-        if let Err(e) = interp.run(&artifact.bytes, sp as usize) {
-            return LowOutcome {
-                status: "fail",
-                value_bits: None,
-                artifact_bytes,
-                detail: format!("start: {e:?}"),
-            };
-        }
+    if let Some(sp) = artifact.start
+        && let Err(e) = interp.run(&artifact.bytes, sp as usize)
+    {
+        return LowOutcome {
+            status: "fail",
+            value_bits: None,
+            artifact_bytes,
+            detail: format!("start: {e:?}"),
+        };
     }
     for (i, a) in args.iter().enumerate() {
         interp.set_r4(i * 4, a.to_bits());

@@ -382,8 +382,14 @@ mod tests {
         let other = host.arena(16);
         let mut output = [0; 4];
         assert_eq!(arena.reset(), Ok(()));
-        assert_eq!(arena.read(reference, 0, &mut output), Err(NanoArenaError::InvalidRef));
-        assert_eq!(other.read(reference, 0, &mut output), Err(NanoArenaError::InvalidRef));
+        assert_eq!(
+            arena.read(reference, 0, &mut output),
+            Err(NanoArenaError::InvalidRef)
+        );
+        assert_eq!(
+            other.read(reference, 0, &mut output),
+            Err(NanoArenaError::InvalidRef)
+        );
     }
 
     #[test]
@@ -391,7 +397,10 @@ mod tests {
         let mut host = NanoArenaHost::new();
         let mut arena = host.arena(8);
         let _ = arena.alloc(4, 1).unwrap();
-        assert_eq!(arena.configure(3), Err(NanoArenaError::ConfigurationTooSmall));
+        assert_eq!(
+            arena.configure(3),
+            Err(NanoArenaError::ConfigurationTooSmall)
+        );
         assert_eq!(arena.capacity(), 8);
         assert_eq!(arena.alloc(5, 1), Err(NanoArenaError::Exhausted));
         assert!(arena.alloc(4, 1).is_ok());
@@ -405,10 +414,19 @@ mod tests {
         assert_eq!(arena.alloc(1, 3), Err(NanoArenaError::Misaligned));
         let reference = arena.alloc(4, 1).unwrap();
         let mut output = [0; 2];
-        assert_eq!(arena.read(reference, 3, &mut output), Err(NanoArenaError::OutOfBounds));
-        assert_eq!(arena.write(reference, usize::MAX, &[1]), Err(NanoArenaError::OutOfBounds));
+        assert_eq!(
+            arena.read(reference, 3, &mut output),
+            Err(NanoArenaError::OutOfBounds)
+        );
+        assert_eq!(
+            arena.write(reference, usize::MAX, &[1]),
+            Err(NanoArenaError::OutOfBounds)
+        );
         if usize::BITS > 32 {
-            assert_eq!(arena.alloc(u32::MAX as usize + 1, 1), Err(NanoArenaError::SizeOverflow));
+            assert_eq!(
+                arena.alloc(u32::MAX as usize + 1, 1),
+                Err(NanoArenaError::SizeOverflow)
+            );
         }
     }
 

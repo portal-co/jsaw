@@ -34,7 +34,9 @@ fn add_module() -> Module<'static> {
     let b = body.blocks[entry].params[1].1;
     let sum = body.add_op(entry, Operator::I32Add, &[a, b], &[Type::I32]);
     body.set_terminator(entry, Terminator::Return { values: vec![sum] });
-    let func = module.funcs.push(FuncDecl::Body(sig, "add".to_owned(), body));
+    let func = module
+        .funcs
+        .push(FuncDecl::Body(sig, "add".to_owned(), body));
     module.exports.push(portal_pc_waffle::Export {
         name: "add".to_owned(),
         kind: ExportKind::Func(func),
@@ -68,26 +70,29 @@ fn scalars_and_deterministic_fingerprint() {
         "plain function has only a return completion"
     );
     // Layouts: everything scalar.
-    assert!(plan
-        .functions[0]
-        .values
-        .iter()
-        .all(|value| matches!(value.layout, PlanLayout::Scalar { bytes: 4 })));
-    assert!(plan
-        .functions[0]
-        .values
-        .iter()
-        .all(|value| value.representation == NanoValueRepresentation::Scalar));
+    assert!(
+        plan.functions[0]
+            .values
+            .iter()
+            .all(|value| matches!(value.layout, PlanLayout::Scalar { bytes: 4 }))
+    );
+    assert!(
+        plan.functions[0]
+            .values
+            .iter()
+            .all(|value| value.representation == NanoValueRepresentation::Scalar)
+    );
 
     // Determinism: planning twice yields identical JSON and fingerprint.
     let again = BackendPlan::from_module(&module).expect("valid plan");
     assert_eq!(plan.to_json(), again.to_json());
     assert_eq!(plan.fingerprint(), again.fingerprint());
     assert_eq!(plan.fingerprint().len(), 64);
-    assert!(plan
-        .fingerprint()
-        .chars()
-        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    assert!(
+        plan.fingerprint()
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    );
 
     // A fresh but logically identical module (fresh arenas, fresh pointers)
     // produces the identical plan.
@@ -116,7 +121,12 @@ fn aggregates_get_arena_representations_and_layouts() {
     let entry = body.entry;
     let input = body.blocks[entry].params[0].1;
     let zero = body.add_op(entry, Operator::I64Const { value: 0 }, &[], &[Type::I64]);
-    let allocated = body.add_op(entry, Operator::StructNew { sig: pair }, &[input, zero], &[pair_ref]);
+    let allocated = body.add_op(
+        entry,
+        Operator::StructNew { sig: pair },
+        &[input, zero],
+        &[pair_ref],
+    );
     let read = body.add_op(
         entry,
         Operator::StructGet { sig: pair, idx: 0 },
@@ -130,10 +140,15 @@ fn aggregates_get_arena_representations_and_layouts() {
         &[],
     );
     let _ = written;
-    body.set_terminator(entry, Terminator::Return {
-        values: vec![allocated],
-    });
-    module.funcs.push(FuncDecl::Body(sig, "pair".to_owned(), body));
+    body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![allocated],
+        },
+    );
+    module
+        .funcs
+        .push(FuncDecl::Body(sig, "pair".to_owned(), body));
 
     let plan = BackendPlan::from_module(&module).expect("valid plan");
     let function = &plan.functions[0];
@@ -150,7 +165,10 @@ fn aggregates_get_arena_representations_and_layouts() {
         NanoValueRepresentation::ArenaRef
     );
     assert_eq!(aggregate_value.lifetime, NanoLifetime::Artifact);
-    assert!(matches!(aggregate_value.layout, PlanLayout::Aggregate { .. }));
+    assert!(matches!(
+        aggregate_value.layout,
+        PlanLayout::Aggregate { .. }
+    ));
     assert!(plan.runtime.needs_arena);
     // Aggregate signature was interned structurally with both fields.
     let struct_sig = plan
@@ -178,7 +196,12 @@ fn function_references_and_ref_calls() {
     let mut callee_body = FunctionBody::new(&module, callee_sig);
     let entry = callee_body.entry;
     let input = callee_body.blocks[entry].params[0].1;
-    callee_body.set_terminator(entry, Terminator::Return { values: vec![input] });
+    callee_body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![input],
+        },
+    );
     let callee = module
         .funcs
         .push(FuncDecl::Body(callee_sig, "id".to_owned(), callee_body));
@@ -201,9 +224,12 @@ fn function_references_and_ref_calls() {
         &[input, funcref],
         &[Type::I32],
     );
-    body.set_terminator(entry, Terminator::Return {
-        values: vec![result],
-    });
+    body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![result],
+        },
+    );
     module
         .funcs
         .push(FuncDecl::Body(callee_sig, "caller".to_owned(), body));
@@ -235,7 +261,12 @@ fn direct_and_tail_calls_with_matching_results() {
     let mut callee_body = FunctionBody::new(&module, sig);
     let entry = callee_body.entry;
     let input = callee_body.blocks[entry].params[0].1;
-    callee_body.set_terminator(entry, Terminator::Return { values: vec![input] });
+    callee_body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![input],
+        },
+    );
     let callee = module
         .funcs
         .push(FuncDecl::Body(sig, "callee".to_owned(), callee_body));
@@ -244,10 +275,13 @@ fn direct_and_tail_calls_with_matching_results() {
     let mut tail_body = FunctionBody::new(&module, sig);
     let entry = tail_body.entry;
     let input = tail_body.blocks[entry].params[0].1;
-    tail_body.set_terminator(entry, Terminator::ReturnCall {
-        func: callee,
-        args: vec![input],
-    });
+    tail_body.set_terminator(
+        entry,
+        Terminator::ReturnCall {
+            func: callee,
+            args: vec![input],
+        },
+    );
     module
         .funcs
         .push(FuncDecl::Body(sig, "tail".to_owned(), tail_body));
@@ -264,9 +298,12 @@ fn direct_and_tail_calls_with_matching_results() {
         &[input],
         &[Type::I32],
     );
-    direct_body.set_terminator(entry, Terminator::Return {
-        values: vec![result],
-    });
+    direct_body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![result],
+        },
+    );
     module
         .funcs
         .push(FuncDecl::Body(sig, "direct".to_owned(), direct_body));
@@ -284,7 +321,10 @@ fn direct_and_tail_calls_with_matching_results() {
     assert!(plan.runtime.uses_tail_calls);
     // Direct call instruction.
     let direct = &plan.functions[2];
-    let call = direct.blocks[0].insts[0].call.as_ref().expect("call recorded");
+    let call = direct.blocks[0].insts[0]
+        .call
+        .as_ref()
+        .expect("call recorded");
     assert_eq!(
         call.kind,
         PlanCallKind::Direct {
@@ -302,12 +342,17 @@ fn multi_result_calls_project_pick_outputs() {
     let mut producer_body = FunctionBody::new(&module, pair_sig);
     let entry = producer_body.entry;
     let input = producer_body.blocks[entry].params[0].1;
-    producer_body.set_terminator(entry, Terminator::Return {
-        values: vec![input, input],
-    });
-    let producer = module
-        .funcs
-        .push(FuncDecl::Body(pair_sig, "producer".to_owned(), producer_body));
+    producer_body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![input, input],
+        },
+    );
+    let producer = module.funcs.push(FuncDecl::Body(
+        pair_sig,
+        "producer".to_owned(),
+        producer_body,
+    ));
 
     // consumer: sums the two results of producer(x)
     let sig = func_sig(&mut module, vec![Type::I32], vec![Type::I32]);
@@ -365,18 +410,24 @@ fn block_parameters_and_predecessor_args_validate() {
     let counter = body.add_blockparam(header, Type::I32);
     let one = body.add_op(header, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
     let next = body.add_op(header, Operator::I32Add, &[counter, one], &[Type::I32]);
-    body.set_terminator(entry, Terminator::Br {
-        target: BlockTarget {
-            block: header,
-            args: vec![input],
+    body.set_terminator(
+        entry,
+        Terminator::Br {
+            target: BlockTarget {
+                block: header,
+                args: vec![input],
+            },
         },
-    });
-    body.set_terminator(header, Terminator::Br {
-        target: BlockTarget {
-            block: header,
-            args: vec![next],
+    );
+    body.set_terminator(
+        header,
+        Terminator::Br {
+            target: BlockTarget {
+                block: header,
+                args: vec![next],
+            },
         },
-    });
+    );
     module
         .funcs
         .push(FuncDecl::Body(sig, "loop".to_owned(), body));
@@ -400,7 +451,12 @@ fn trap_and_return_completions_are_recorded() {
     let mut body = FunctionBody::new(&module, sig);
     let entry = body.entry;
     let seven = body.add_op(entry, Operator::I32Const { value: 7 }, &[], &[Type::I32]);
-    body.set_terminator(entry, Terminator::Return { values: vec![seven] });
+    body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![seven],
+        },
+    );
     module
         .funcs
         .push(FuncDecl::Body(sig, "ok".to_owned(), body));
@@ -415,27 +471,36 @@ fn trap_and_return_completions_are_recorded() {
     let trap_block = body.add_block();
     let ok_block = body.add_block();
     let ok_param = body.add_blockparam(ok_block, Type::I32);
-    body.set_terminator(entry, Terminator::CondBr {
-        cond: b,
-        if_true: BlockTarget {
-            block: ok_block,
-            args: vec![quotient],
+    body.set_terminator(
+        entry,
+        Terminator::CondBr {
+            cond: b,
+            if_true: BlockTarget {
+                block: ok_block,
+                args: vec![quotient],
+            },
+            if_false: BlockTarget {
+                block: trap_block,
+                args: vec![],
+            },
         },
-        if_false: BlockTarget {
-            block: trap_block,
-            args: vec![],
-        },
-    });
+    );
     body.set_terminator(trap_block, Terminator::Unreachable);
-    body.set_terminator(ok_block, Terminator::Return {
-        values: vec![ok_param],
-    });
+    body.set_terminator(
+        ok_block,
+        Terminator::Return {
+            values: vec![ok_param],
+        },
+    );
     module
         .funcs
         .push(FuncDecl::Body(div_sig, "div".to_owned(), body));
 
     let plan = BackendPlan::from_module(&module).expect("valid plan");
-    assert_eq!(plan.functions[0].completions.kinds, vec![CompletionKind::Return]);
+    assert_eq!(
+        plan.functions[0].completions.kinds,
+        vec![CompletionKind::Return]
+    );
     assert_eq!(
         plan.functions[1].completions.kinds,
         vec![CompletionKind::Return, CompletionKind::Trap]
@@ -473,9 +538,12 @@ fn host_import_and_export_boundaries() {
         &[input],
         &[Type::I32],
     );
-    body.set_terminator(entry, Terminator::Return {
-        values: vec![result],
-    });
+    body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![result],
+        },
+    );
     let caller = module
         .funcs
         .push(FuncDecl::Body(sig, "caller".to_owned(), body));
@@ -571,21 +639,26 @@ fn malformed_block_param_arity_fails_closed() {
     let entry = body.entry;
     let target = body.add_block();
     let _param = body.add_blockparam(target, Type::I32);
-    body.set_terminator(entry, Terminator::Br {
-        target: BlockTarget {
-            block: target,
-            args: vec![], // arity mismatch: one param, zero args
+    body.set_terminator(
+        entry,
+        Terminator::Br {
+            target: BlockTarget {
+                block: target,
+                args: vec![], // arity mismatch: one param, zero args
+            },
         },
-    });
+    );
     body.set_terminator(target, Terminator::Return { values: vec![] });
     module
         .funcs
         .push(FuncDecl::Body(sig, "bad".to_owned(), body));
 
     let diagnostics = BackendPlan::from_module(&module).expect_err("must fail");
-    assert!(diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.kind == DiagnosticKind::BlockParamArity));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == DiagnosticKind::BlockParamArity)
+    );
 }
 
 #[test]
@@ -612,9 +685,11 @@ fn malformed_def_after_use_fails_closed() {
         .push(FuncDecl::Body(sig, "bad".to_owned(), body));
 
     let diagnostics = BackendPlan::from_module(&module).expect_err("must fail");
-    assert!(diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.kind == DiagnosticKind::DefAfterUse));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == DiagnosticKind::DefAfterUse)
+    );
 }
 
 #[test]
@@ -624,7 +699,12 @@ fn malformed_call_shape_fails_closed() {
     let mut callee_body = FunctionBody::new(&module, callee_sig);
     let entry = callee_body.entry;
     let input = callee_body.blocks[entry].params[0].1;
-    callee_body.set_terminator(entry, Terminator::Return { values: vec![input] });
+    callee_body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![input],
+        },
+    );
     let callee = module
         .funcs
         .push(FuncDecl::Body(callee_sig, "callee".to_owned(), callee_body));
@@ -642,17 +722,22 @@ fn malformed_call_shape_fails_closed() {
         &[input],
         &[Type::I32],
     );
-    body.set_terminator(entry, Terminator::Return {
-        values: vec![result],
-    });
+    body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![result],
+        },
+    );
     module
         .funcs
         .push(FuncDecl::Body(sig, "caller".to_owned(), body));
 
     let diagnostics = BackendPlan::from_module(&module).expect_err("must fail");
-    assert!(diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.kind == DiagnosticKind::CallShape));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == DiagnosticKind::CallShape)
+    );
 }
 
 #[test]
@@ -662,9 +747,7 @@ fn malformed_duplicate_export_names_fail_closed() {
     let mut body = FunctionBody::new(&module, sig);
     let entry = body.entry;
     body.set_terminator(entry, Terminator::Return { values: vec![] });
-    let first = module
-        .funcs
-        .push(FuncDecl::Body(sig, "a".to_owned(), body));
+    let first = module.funcs.push(FuncDecl::Body(sig, "a".to_owned(), body));
     module.exports.push(Export {
         name: "dup".to_owned(),
         kind: ExportKind::Func(first),
@@ -675,9 +758,11 @@ fn malformed_duplicate_export_names_fail_closed() {
     });
 
     let diagnostics = BackendPlan::from_module(&module).expect_err("must fail");
-    assert!(diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.kind == DiagnosticKind::BoundaryAbi));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == DiagnosticKind::BoundaryAbi)
+    );
 }
 
 #[test]
@@ -690,9 +775,11 @@ fn malformed_missing_terminator_fails_closed() {
         .push(FuncDecl::Body(sig, "bad".to_owned(), body));
 
     let diagnostics = BackendPlan::from_module(&module).expect_err("must fail");
-    assert!(diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.kind == DiagnosticKind::InvalidTerminator));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == DiagnosticKind::InvalidTerminator)
+    );
 }
 
 #[test]
@@ -717,15 +804,16 @@ fn exception_values_are_ordinary_aggregate_returns() {
     let input = body.blocks[entry].params[0].1;
     let thrown = body.add_op(
         entry,
-        Operator::StructNew {
-            sig: exception,
-        },
+        Operator::StructNew { sig: exception },
         &[input],
         &[exception_ref],
     );
-    body.set_terminator(entry, Terminator::Return {
-        values: vec![thrown],
-    });
+    body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![thrown],
+        },
+    );
     module
         .funcs
         .push(FuncDecl::Body(sig, "thrower".to_owned(), body));
@@ -738,5 +826,8 @@ fn exception_values_are_ordinary_aggregate_returns() {
         plan.types[result_ty.index()],
         PlanType::Ref { .. }
     ));
-    assert_eq!(function.values[1].representation, NanoValueRepresentation::ArenaRef);
+    assert_eq!(
+        function.values[1].representation,
+        NanoValueRepresentation::ArenaRef
+    );
 }

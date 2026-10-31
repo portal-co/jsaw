@@ -7,8 +7,8 @@
 //! [`c_meta_source`] (per-case layout/global/entry tables) this proves the
 //! generated C interpreter runs jsaw artifacts unmodified.
 
-use super::minibc_render::MinibcArtifact;
 use super::LeModule;
+use super::minibc_render::MinibcArtifact;
 use std::fmt::Write as _;
 
 /// The fixed C harness (host state, host ops, GC, ext-op driver loop,
@@ -399,17 +399,29 @@ pub fn c_meta_source(m: &LeModule, artifact: &MinibcArtifact, export: &str) -> S
                 let _ = writeln!(
                     out,
                     "static const uint32_t {fo_name}[] = {{{}}};",
-                    foffs.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")
+                    foffs
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
                 );
                 let _ = writeln!(
                     out,
                     "static const uint32_t {fs_name}[] = {{{}}};",
-                    fsizes.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")
+                    fsizes
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
                 );
                 let _ = writeln!(
                     out,
                     "static const uint32_t {ro_name}[] = {{{}}};",
-                    roffs.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")
+                    roffs
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
                 );
                 layout_inits.push(format!(
                     "{{{size},0,0,0,{nf},{fo_name},{fs_name},{nr},{ro_name}}}",
@@ -427,7 +439,11 @@ pub fn c_meta_source(m: &LeModule, artifact: &MinibcArtifact, export: &str) -> S
     let _ = writeln!(
         out,
         "static const int32_t JS_TYPE_TO_LAYOUT[] = {{{}}};",
-        type_to_layout.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")
+        type_to_layout
+            .iter()
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
     );
     let _ = writeln!(out, "#define JS_N_TYPES {}", type_to_layout.len());
 

@@ -349,7 +349,10 @@ pub enum LeExpr {
     GlobalGet(u32),
     /// The function stored at `index` of module table `table` (table 0:
     /// funcref values; table 1: step dispatch).
-    TableElem { table: u32, index: Box<LeExpr> },
+    TableElem {
+        table: u32,
+        index: Box<LeExpr>,
+    },
     /// Representation-owned arena load (nano only): `ty` load at byte
     /// offset `base + offset` from the arena base.
     ArenaLoad {
@@ -812,7 +815,6 @@ impl<'a, R: Representation> InstCx<'a, R> {
     }
 }
 
-
 /// Module-level sink for [`Representation::emit_runtime`]: registers helper
 /// and runtime functions after all plan functions.
 pub struct RuntimeSink<'a> {
@@ -850,7 +852,12 @@ impl RuntimeSink<'_> {
 
     /// Declare a target-runtime entry point (implemented by the target's
     /// support runtime, not generated).
-    pub fn runtime_fn(&mut self, name: &str, params: Vec<LeType>, results: Vec<LeType>) -> LeFuncId {
+    pub fn runtime_fn(
+        &mut self,
+        name: &str,
+        params: Vec<LeType>,
+        results: Vec<LeType>,
+    ) -> LeFuncId {
         let id = LeFuncId(*self.next_id);
         *self.next_id += 1;
         let locals: Vec<(LeLocal, LeType)> = params
@@ -883,10 +890,7 @@ pub(crate) fn push_stmt_exprs<'a>(s: &'a LeStmt, stack: &mut Vec<&'a LeExpr>) {
             stack.push(value);
         }
         LeStmt::SetIndex {
-            base,
-            index,
-            value,
-            ..
+            base, index, value, ..
         } => {
             stack.push(base);
             stack.push(index);
@@ -928,9 +932,14 @@ pub(crate) fn push_expr_children<'a>(e: &'a LeExpr, stack: &mut Vec<&'a LeExpr>)
 /// typed `(ref $funcsig)`): funcref words are table-slot indices, not heap
 /// references, so representations lower them as `I64` — never rooted,
 /// scanned, or field-tracked.
-pub(crate) fn plan_heap_is_func_word(plan: &crate::backend_plan::BackendPlan, heap: &crate::backend_plan::PlanHeapType) -> bool {
+pub(crate) fn plan_heap_is_func_word(
+    plan: &crate::backend_plan::BackendPlan,
+    heap: &crate::backend_plan::PlanHeapType,
+) -> bool {
     match heap {
-        crate::backend_plan::PlanHeapType::FuncRef | crate::backend_plan::PlanHeapType::NoFunc => true,
+        crate::backend_plan::PlanHeapType::FuncRef | crate::backend_plan::PlanHeapType::NoFunc => {
+            true
+        }
         crate::backend_plan::PlanHeapType::Sig(sig) => matches!(
             plan.signatures.get(sig.index()),
             Some(crate::backend_plan::PlanSignature::Func { .. })
@@ -1220,7 +1229,13 @@ pub(crate) fn scalar_unop(name: &str) -> Option<LeUnOp> {
 pub(crate) fn trapping_unop(name: &str) -> Option<(LeUnOp, LeType, LeType, f64, f64)> {
     use LeUnOp::*;
     Some(match name {
-        "I32TruncF64S" => (I32TruncF64S, LeType::F64, LeType::I32, -2147483649.0, 2147483648.0),
+        "I32TruncF64S" => (
+            I32TruncF64S,
+            LeType::F64,
+            LeType::I32,
+            -2147483649.0,
+            2147483648.0,
+        ),
         "I32TruncF64U" => (I32TruncF64U, LeType::F64, LeType::I32, -1.0, 4294967296.0),
         "I64TruncF64S" => (
             I64TruncF64S,
@@ -1247,7 +1262,7 @@ pub(crate) fn trapping_unop(name: &str) -> Option<(LeUnOp, LeType, LeType, f64, 
 /// non-null non-funcref reference (`any`/`eq`; i31 passes), mode 4 = i31
 /// (odd word).
 pub(crate) fn heap_test_mode(
-    plan: &BackendPlan,
+    _plan: &BackendPlan,
     type_ids: &TypeIdTable,
     heap: &PlanHeapType,
 ) -> Result<(u32, u32), String> {

@@ -31,7 +31,7 @@ use portal_pc_waffle::{
 
 use crate::backend_plan::{
     BackendPlan, PlanCallKind, PlanConst, PlanFuncId, PlanFunction, PlanHeapType, PlanInst,
-    PlanSigId, PlanSignature, PlanStorage, PlanTerminator, PlanType, PlanValueDef, PlanValueId,
+    PlanSignature, PlanStorage, PlanTerminator, PlanType, PlanValueDef, PlanValueId,
 };
 
 /// The emitter schema this module implements.
@@ -236,7 +236,12 @@ impl<'p> Emitter<'p> {
         }
     }
 
-    fn error(&mut self, function: Option<PlanFuncId>, kind: &'static str, detail: impl Into<String>) {
+    fn error(
+        &mut self,
+        function: Option<PlanFuncId>,
+        kind: &'static str,
+        detail: impl Into<String>,
+    ) {
         self.errors.push(NanoMvpError::new(function, kind, detail));
     }
 
@@ -349,8 +354,7 @@ impl<'p> Emitter<'p> {
             else {
                 continue;
             };
-            let Some((elem_size, elem_align)) = field_storage(self.plan, &element.storage)
-            else {
+            let Some((elem_size, elem_align)) = field_storage(self.plan, &element.storage) else {
                 self.error(
                     None,
                     "unsupported_layout",
@@ -605,14 +609,24 @@ impl<'p> Emitter<'p> {
         let size = body.blocks[entry].params[0].1;
         let align_log2 = body.blocks[entry].params[1].1;
 
-        let bump32 = body.add_op(entry, Operator::GlobalGet { global_index: bump }, &[], &[Type::I32]);
+        let bump32 = body.add_op(
+            entry,
+            Operator::GlobalGet { global_index: bump },
+            &[],
+            &[Type::I32],
+        );
         let bump64 = body.add_op(entry, Operator::I64ExtendI32U, &[bump32], &[Type::I64]);
         let one = body.add_op(entry, Operator::I64Const { value: 1 }, &[], &[Type::I64]);
         let align64 = body.add_op(entry, Operator::I64ExtendI32U, &[align_log2], &[Type::I64]);
         let shifted = body.add_op(entry, Operator::I64Shl, &[one, align64], &[Type::I64]);
         let mask = body.add_op(entry, Operator::I64Sub, &[shifted, one], &[Type::I64]);
         let bumped = body.add_op(entry, Operator::I64Add, &[bump64, mask], &[Type::I64]);
-        let all_ones = body.add_op(entry, Operator::I64Const { value: u64::MAX }, &[], &[Type::I64]);
+        let all_ones = body.add_op(
+            entry,
+            Operator::I64Const { value: u64::MAX },
+            &[],
+            &[Type::I64],
+        );
         let not_mask = body.add_op(entry, Operator::I64Xor, &[mask, all_ones], &[Type::I64]);
         let aligned = body.add_op(entry, Operator::I64And, &[bumped, not_mask], &[Type::I64]);
         let size64 = body.add_op(entry, Operator::I64ExtendI32U, &[size], &[Type::I64]);
@@ -650,7 +664,14 @@ impl<'p> Emitter<'p> {
         let needed64 = body.add_op(grow, Operator::I64ShrU, &[deficit, sixteen], &[Type::I64]);
         let needed = body.add_op(grow, Operator::I32WrapI64, &[needed64], &[Type::I32]);
         let grown = body.add_op(grow, Operator::MemoryGrow { mem }, &[needed], &[Type::I32]);
-        let minus_one = body.add_op(grow, Operator::I32Const { value: -1i32 as u32 }, &[], &[Type::I32]);
+        let minus_one = body.add_op(
+            grow,
+            Operator::I32Const {
+                value: -1i32 as u32,
+            },
+            &[],
+            &[Type::I32],
+        );
         let failed = body.add_op(grow, Operator::I32Eq, &[grown, minus_one], &[Type::I32]);
         let ok2 = body.add_block();
         let trap = body.add_block();
@@ -679,23 +700,63 @@ impl<'p> Emitter<'p> {
             },
         );
         let end32 = body.add_op(ok, Operator::I32WrapI64, &[end], &[Type::I32]);
-        body.add_op(ok, Operator::GlobalSet { global_index: bump }, &[end32], &[]);
+        body.add_op(
+            ok,
+            Operator::GlobalSet { global_index: bump },
+            &[end32],
+            &[],
+        );
         if self.instrument_alloc {
             let count = self.alloc_count_global;
             let bytes = self.alloc_bytes_global;
             let one = body.add_op(ok, Operator::I64Const { value: 1 }, &[], &[Type::I64]);
-            let old_count = body.add_op(ok, Operator::GlobalGet { global_index: count }, &[], &[Type::I64]);
+            let old_count = body.add_op(
+                ok,
+                Operator::GlobalGet {
+                    global_index: count,
+                },
+                &[],
+                &[Type::I64],
+            );
             let new_count = body.add_op(ok, Operator::I64Add, &[old_count, one], &[Type::I64]);
-            body.add_op(ok, Operator::GlobalSet { global_index: count }, &[new_count], &[]);
+            body.add_op(
+                ok,
+                Operator::GlobalSet {
+                    global_index: count,
+                },
+                &[new_count],
+                &[],
+            );
             let used = body.add_op(ok, Operator::I64Sub, &[end, aligned], &[Type::I64]);
-            let old_bytes = body.add_op(ok, Operator::GlobalGet { global_index: bytes }, &[], &[Type::I64]);
+            let old_bytes = body.add_op(
+                ok,
+                Operator::GlobalGet {
+                    global_index: bytes,
+                },
+                &[],
+                &[Type::I64],
+            );
             let new_bytes = body.add_op(ok, Operator::I64Add, &[old_bytes, used], &[Type::I64]);
-            body.add_op(ok, Operator::GlobalSet { global_index: bytes }, &[new_bytes], &[]);
+            body.add_op(
+                ok,
+                Operator::GlobalSet {
+                    global_index: bytes,
+                },
+                &[new_bytes],
+                &[],
+            );
         }
         let aligned32 = body.add_op(ok, Operator::I32WrapI64, &[aligned], &[Type::I32]);
-        body.set_terminator(ok, Terminator::Return { values: vec![aligned32] });
+        body.set_terminator(
+            ok,
+            Terminator::Return {
+                values: vec![aligned32],
+            },
+        );
 
-        self.alloc_func = module.funcs.push(FuncDecl::Body(sig, "js_nano_alloc".into(), body));
+        self.alloc_func = module
+            .funcs
+            .push(FuncDecl::Body(sig, "js_nano_alloc".into(), body));
     }
 
     /// The trapping guards, each a small generated function so plan blocks
@@ -717,13 +778,22 @@ impl<'p> Emitter<'p> {
             entry,
             Terminator::CondBr {
                 cond: is_null,
-                if_true: BlockTarget { block: trap, args: vec![] },
-                if_false: BlockTarget { block: ok, args: vec![] },
+                if_true: BlockTarget {
+                    block: trap,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: ok,
+                    args: vec![],
+                },
             },
         );
         body.set_terminator(trap, Terminator::Unreachable);
         body.set_terminator(ok, Terminator::Return { values: vec![addr] });
-        self.deref_func = module.funcs.push(FuncDecl::Body(deref_sig, "js_nano_deref".into(), body));
+        self.deref_func =
+            module
+                .funcs
+                .push(FuncDecl::Body(deref_sig, "js_nano_deref".into(), body));
 
         // __nano_bounds(idx, len) -> idx; traps on idx >= len (unsigned).
         let bounds_sig = module.signatures.push(SignatureData::Func {
@@ -742,13 +812,22 @@ impl<'p> Emitter<'p> {
             entry,
             Terminator::CondBr {
                 cond: oob,
-                if_true: BlockTarget { block: trap, args: vec![] },
-                if_false: BlockTarget { block: ok, args: vec![] },
+                if_true: BlockTarget {
+                    block: trap,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: ok,
+                    args: vec![],
+                },
             },
         );
         body.set_terminator(trap, Terminator::Unreachable);
         body.set_terminator(ok, Terminator::Return { values: vec![idx] });
-        self.bounds_func = module.funcs.push(FuncDecl::Body(bounds_sig, "js_nano_bounds".into(), body));
+        self.bounds_func =
+            module
+                .funcs
+                .push(FuncDecl::Body(bounds_sig, "js_nano_bounds".into(), body));
 
         // __nano_cast(addr, expected, mode, nullable) -> addr.
         // mode 0: header type id == expected; mode 1: 0 < id <= expected
@@ -759,7 +838,7 @@ impl<'p> Emitter<'p> {
             returns: vec![Type::I32],
             shared: false,
         });
-        let struct_max = self.struct_type_max;
+        let _struct_max = self.struct_type_max;
         let mem = self.arena_memory;
         let mut body = FunctionBody::new(module, cast_sig);
         let entry = body.entry;
@@ -777,19 +856,35 @@ impl<'p> Emitter<'p> {
             entry,
             Terminator::CondBr {
                 cond: is_null,
-                if_true: BlockTarget { block: null_arm, args: vec![] },
-                if_false: BlockTarget { block: non_null, args: vec![] },
+                if_true: BlockTarget {
+                    block: null_arm,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: non_null,
+                    args: vec![],
+                },
             },
         );
         body.set_terminator(
             null_arm,
             Terminator::CondBr {
                 cond: nullable,
-                if_true: BlockTarget { block: ok, args: vec![] },
-                if_false: BlockTarget { block: trap, args: vec![] },
+                if_true: BlockTarget {
+                    block: ok,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: trap,
+                    args: vec![],
+                },
             },
         );
-        let memarg = |offset: u64| MemoryArg { align: 0, offset, memory: mem };
+        let memarg = |offset: u64| MemoryArg {
+            align: 0,
+            offset,
+            memory: mem,
+        };
         // mode < 3 reads the header; 3 (any) and 4 (i31 tag) must not load.
         let three = body.add_op(non_null, Operator::I32Const { value: 3 }, &[], &[Type::I32]);
         let needs_header = body.add_op(non_null, Operator::I32LtU, &[mode, three], &[Type::I32]);
@@ -801,49 +896,123 @@ impl<'p> Emitter<'p> {
             non_null,
             Terminator::CondBr {
                 cond: needs_header,
-                if_true: BlockTarget { block: header_path, args: vec![] },
-                if_false: BlockTarget { block: tag_path, args: vec![] },
+                if_true: BlockTarget {
+                    block: header_path,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: tag_path,
+                    args: vec![],
+                },
             },
         );
         // Header path: modes 0 (exact), 1 (struct range), 2 (array range).
-        let header = body.add_op(header_path, Operator::I32Load { memory: memarg(0) }, &[addr], &[Type::I32]);
-        let exact = body.add_op(header_path, Operator::I32Eq, &[header, expected], &[Type::I32]);
-        let zero = body.add_op(header_path, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+        let header = body.add_op(
+            header_path,
+            Operator::I32Load { memory: memarg(0) },
+            &[addr],
+            &[Type::I32],
+        );
+        let exact = body.add_op(
+            header_path,
+            Operator::I32Eq,
+            &[header, expected],
+            &[Type::I32],
+        );
+        let zero = body.add_op(
+            header_path,
+            Operator::I32Const { value: 0 },
+            &[],
+            &[Type::I32],
+        );
         let above_zero = body.add_op(header_path, Operator::I32GtS, &[header, zero], &[Type::I32]);
-        let at_most = body.add_op(header_path, Operator::I32LeS, &[header, expected], &[Type::I32]);
-        let struct_ok = body.add_op(header_path, Operator::I32And, &[above_zero, at_most], &[Type::I32]);
-        let beyond = body.add_op(header_path, Operator::I32GtS, &[header, expected], &[Type::I32]);
+        let at_most = body.add_op(
+            header_path,
+            Operator::I32LeS,
+            &[header, expected],
+            &[Type::I32],
+        );
+        let struct_ok = body.add_op(
+            header_path,
+            Operator::I32And,
+            &[above_zero, at_most],
+            &[Type::I32],
+        );
+        let beyond = body.add_op(
+            header_path,
+            Operator::I32GtS,
+            &[header, expected],
+            &[Type::I32],
+        );
         let is_mode0 = body.add_op(header_path, Operator::I32Eqz, &[mode], &[Type::I32]);
-        let one = body.add_op(header_path, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
+        let one = body.add_op(
+            header_path,
+            Operator::I32Const { value: 1 },
+            &[],
+            &[Type::I32],
+        );
         let is_mode1 = body.add_op(header_path, Operator::I32Eq, &[mode, one], &[Type::I32]);
-        let ok_01 = body.add_op(header_path, Operator::TypedSelect { ty: Type::I32 }, &[struct_ok, exact, is_mode0], &[Type::I32]);
-        let ok_header = body.add_op(header_path, Operator::TypedSelect { ty: Type::I32 }, &[beyond, ok_01, is_mode1], &[Type::I32]);
+        let ok_01 = body.add_op(
+            header_path,
+            Operator::TypedSelect { ty: Type::I32 },
+            &[struct_ok, exact, is_mode0],
+            &[Type::I32],
+        );
+        let ok_header = body.add_op(
+            header_path,
+            Operator::TypedSelect { ty: Type::I32 },
+            &[beyond, ok_01, is_mode1],
+            &[Type::I32],
+        );
         body.set_terminator(
             header_path,
-            Terminator::Br { target: BlockTarget { block: join, args: vec![ok_header] } },
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![ok_header],
+                },
+            },
         );
         // Tag path: mode 3 (any) is always ok; mode 4 checks the i31 tag bit.
         let four = body.add_op(tag_path, Operator::I32Const { value: 4 }, &[], &[Type::I32]);
         let is_tag = body.add_op(tag_path, Operator::I32Eq, &[mode, four], &[Type::I32]);
         let one2 = body.add_op(tag_path, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
         let tagged = body.add_op(tag_path, Operator::I32And, &[addr, one2], &[Type::I32]);
-        let ok_tag = body.add_op(tag_path, Operator::TypedSelect { ty: Type::I32 }, &[tagged, one2, is_tag], &[Type::I32]);
+        let ok_tag = body.add_op(
+            tag_path,
+            Operator::TypedSelect { ty: Type::I32 },
+            &[tagged, one2, is_tag],
+            &[Type::I32],
+        );
         body.set_terminator(
             tag_path,
-            Terminator::Br { target: BlockTarget { block: join, args: vec![ok_tag] } },
+            Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![ok_tag],
+                },
+            },
         );
         let ok_val = join_param;
         body.set_terminator(
             join,
             Terminator::CondBr {
                 cond: ok_val,
-                if_true: BlockTarget { block: ok, args: vec![] },
-                if_false: BlockTarget { block: trap, args: vec![] },
+                if_true: BlockTarget {
+                    block: ok,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: trap,
+                    args: vec![],
+                },
             },
         );
         body.set_terminator(trap, Terminator::Unreachable);
         body.set_terminator(ok, Terminator::Return { values: vec![addr] });
-        self.cast_func = module.funcs.push(FuncDecl::Body(cast_sig, "js_nano_cast".into(), body));
+        self.cast_func = module
+            .funcs
+            .push(FuncDecl::Body(cast_sig, "js_nano_cast".into(), body));
 
         // The trap stub: `unreachable`, so a null-funcref call_indirect into
         // slot 0 traps deterministically.
@@ -931,12 +1100,25 @@ impl<'p> Emitter<'p> {
             for inst in &plan_block.insts {
                 self.emit_inst(body, waffle_block, plan_func, func, inst, &mut values);
             }
-            self.emit_terminator(body, waffle_block, plan_func, func, plan_block, &blocks, &mut values);
+            self.emit_terminator(
+                body,
+                waffle_block,
+                plan_func,
+                func,
+                plan_block,
+                &blocks,
+                &mut values,
+            );
         }
         module.funcs[waffle_func] = decl;
     }
 
-    fn map_value(&mut self, plan_func: PlanFuncId, values: &[Option<Value>], id: PlanValueId) -> Value {
+    fn map_value(
+        &mut self,
+        plan_func: PlanFuncId,
+        values: &[Option<Value>],
+        id: PlanValueId,
+    ) -> Value {
         match values.get(id.index()).copied().flatten() {
             Some(value) => value,
             None => {
@@ -950,11 +1132,23 @@ impl<'p> Emitter<'p> {
         }
     }
 
-    fn map_args(&mut self, plan_func: PlanFuncId, values: &[Option<Value>], ids: &[PlanValueId]) -> Vec<Value> {
-        ids.iter().map(|id| self.map_value(plan_func, values, *id)).collect()
+    fn map_args(
+        &mut self,
+        plan_func: PlanFuncId,
+        values: &[Option<Value>],
+        ids: &[PlanValueId],
+    ) -> Vec<Value> {
+        ids.iter()
+            .map(|id| self.map_value(plan_func, values, *id))
+            .collect()
     }
 
-    fn record_results(&mut self, values: &mut Vec<Option<Value>>, results: &[PlanValueId], value: Value) {
+    fn record_results(
+        &mut self,
+        values: &mut Vec<Option<Value>>,
+        results: &[PlanValueId],
+        value: Value,
+    ) {
         if let Some(result) = results.first() {
             values[result.index()] = Some(value);
         }
@@ -962,7 +1156,13 @@ impl<'p> Emitter<'p> {
 
     // -- arena helpers --------------------------------------------------------
 
-    fn call_alloc(&mut self, body: &mut FunctionBody, block: Block, size: Value, align_log2: u32) -> Value {
+    fn call_alloc(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        size: Value,
+        align_log2: u32,
+    ) -> Value {
         let align = body.add_op(
             block,
             Operator::I32Const { value: align_log2 },
@@ -971,21 +1171,42 @@ impl<'p> Emitter<'p> {
         );
         body.add_op(
             block,
-            Operator::Call { function_index: self.alloc_func },
+            Operator::Call {
+                function_index: self.alloc_func,
+            },
             &[size, align],
             &[Type::I32],
         )
     }
 
     fn const_i32(&mut self, body: &mut FunctionBody, block: Block, value: i32) -> Value {
-        body.add_op(block, Operator::I32Const { value: value as u32 }, &[], &[Type::I32])
+        body.add_op(
+            block,
+            Operator::I32Const {
+                value: value as u32,
+            },
+            &[],
+            &[Type::I32],
+        )
     }
 
     fn memarg(&self, offset: u64) -> MemoryArg {
-        MemoryArg { align: 0, offset, memory: self.arena_memory }
+        MemoryArg {
+            align: 0,
+            offset,
+            memory: self.arena_memory,
+        }
     }
 
-    fn load_at(&mut self, body: &mut FunctionBody, block: Block, addr: Value, offset: u32, ty: Type, signed: Option<bool>) -> Value {
+    fn load_at(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        addr: Value,
+        offset: u32,
+        ty: Type,
+        signed: Option<bool>,
+    ) -> Value {
         let memory = self.memarg(offset as u64);
         let (op, out) = match (ty, signed) {
             (Type::I32, None) => (Operator::I32Load { memory }, Type::I32),
@@ -999,7 +1220,16 @@ impl<'p> Emitter<'p> {
         body.add_op(block, op, &[addr], &[out])
     }
 
-    fn store_at(&mut self, body: &mut FunctionBody, block: Block, addr: Value, offset: u32, value: Value, ty: Type, narrow: bool) {
+    fn store_at(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        addr: Value,
+        offset: u32,
+        value: Value,
+        ty: Type,
+        narrow: bool,
+    ) {
         let memory = self.memarg(offset as u64);
         let op = match (ty, narrow) {
             (Type::I32, false) => Operator::I32Store { memory },
@@ -1012,7 +1242,14 @@ impl<'p> Emitter<'p> {
         body.add_op(block, op, &[addr, value], &[]);
     }
 
-    fn header(&mut self, body: &mut FunctionBody, block: Block, addr: Value, type_id: i32, len: Value) {
+    fn header(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        addr: Value,
+        type_id: i32,
+        len: Value,
+    ) {
         let type_id = self.const_i32(body, block, type_id);
         self.store_at(body, block, addr, 0, type_id, Type::I32, false);
         self.store_at(body, block, addr, 4, len, Type::I32, false);
@@ -1021,7 +1258,9 @@ impl<'p> Emitter<'p> {
     fn deref(&mut self, body: &mut FunctionBody, block: Block, value: Value) -> Value {
         body.add_op(
             block,
-            Operator::Call { function_index: self.deref_func },
+            Operator::Call {
+                function_index: self.deref_func,
+            },
             &[value],
             &[Type::I32],
         )
@@ -1030,7 +1269,9 @@ impl<'p> Emitter<'p> {
     fn bounds(&mut self, body: &mut FunctionBody, block: Block, idx: Value, len: Value) -> Value {
         body.add_op(
             block,
-            Operator::Call { function_index: self.bounds_func },
+            Operator::Call {
+                function_index: self.bounds_func,
+            },
             &[idx, len],
             &[Type::I32],
         )
@@ -1074,7 +1315,10 @@ impl<'p> Emitter<'p> {
                 );
                 return;
             };
-            let Some(ty) = func.values[result.index()].ty.and_then(|ty| self.lower_type(ty.index())) else {
+            let Some(ty) = func.values[result.index()]
+                .ty
+                .and_then(|ty| self.lower_type(ty.index()))
+            else {
                 return;
             };
             let result_value = body.add_value(ValueDef::PickOutput(args[0], *index, ty));
@@ -1088,7 +1332,10 @@ impl<'p> Emitter<'p> {
         }
 
         if inst.arena.is_some()
-            || matches!(name, "RefNull" | "RefIsNull" | "RefEq" | "RefI31" | "I31GetS" | "I31GetU")
+            || matches!(
+                name,
+                "RefNull" | "RefIsNull" | "RefEq" | "RefI31" | "I31GetS" | "I31GetU"
+            )
         {
             self.emit_arena_op(body, block, plan_func, func, inst, values, args);
             return;
@@ -1102,7 +1349,7 @@ impl<'p> Emitter<'p> {
         body: &mut FunctionBody,
         block: Block,
         plan_func: PlanFuncId,
-        func: &PlanFunction,
+        _func: &PlanFunction,
         inst: &PlanInst,
         values: &mut Vec<Option<Value>>,
         args: Vec<Value>,
@@ -1127,11 +1374,20 @@ impl<'p> Emitter<'p> {
                     );
                     return;
                 };
-                (Operator::Call { function_index: target }, args)
+                (
+                    Operator::Call {
+                        function_index: target,
+                    },
+                    args,
+                )
             }
             PlanCallKind::Indirect { table } => {
                 let Some((callee, rest)) = args.split_last() else {
-                    self.error(Some(plan_func), "call_shape", "indirect call has no callee operand");
+                    self.error(
+                        Some(plan_func),
+                        "call_shape",
+                        "indirect call has no callee operand",
+                    );
                     return;
                 };
                 let mut full = rest.to_vec();
@@ -1148,7 +1404,11 @@ impl<'p> Emitter<'p> {
                 // call_ref: the callee is the last operand, and funcrefs are
                 // table indices — emit call_indirect over our table.
                 let Some((callee, rest)) = args.split_last() else {
-                    self.error(Some(plan_func), "call_shape", "call_ref has no callee operand");
+                    self.error(
+                        Some(plan_func),
+                        "call_shape",
+                        "call_ref has no callee operand",
+                    );
                     return;
                 };
                 let mut full = rest.to_vec();
@@ -1172,7 +1432,7 @@ impl<'p> Emitter<'p> {
         body: &mut FunctionBody,
         block: Block,
         plan_func: PlanFuncId,
-        func: &PlanFunction,
+        _func: &PlanFunction,
         inst: &PlanInst,
         values: &mut Vec<Option<Value>>,
         args: Vec<Value>,
@@ -1181,11 +1441,19 @@ impl<'p> Emitter<'p> {
         match name {
             "StructNew" | "StructNewDefault" => {
                 let Some(sig) = inst.payload.sig else {
-                    self.error(Some(plan_func), "layout", format!("{name} has no signature payload"));
+                    self.error(
+                        Some(plan_func),
+                        "layout",
+                        format!("{name} has no signature payload"),
+                    );
                     return;
                 };
                 let Some(layout) = self.layouts.get(&sig.0).cloned() else {
-                    self.error(Some(plan_func), "layout", format!("{name} signature {sig} is not an aggregate"));
+                    self.error(
+                        Some(plan_func),
+                        "layout",
+                        format!("{name} signature {sig} is not an aggregate"),
+                    );
                     return;
                 };
                 let PlanSignature::Struct { fields, .. } = &self.plan.signatures[sig.index()]
@@ -1203,17 +1471,33 @@ impl<'p> Emitter<'p> {
                         self.zero_of(body, block, field)
                     };
                     let (ty, narrow) = self.store_shape(&field.storage);
-                    self.store_at(body, block, addr, layout.field_offsets[i], value, ty, narrow);
+                    self.store_at(
+                        body,
+                        block,
+                        addr,
+                        layout.field_offsets[i],
+                        value,
+                        ty,
+                        narrow,
+                    );
                 }
                 self.record_results(values, &inst.results, addr);
             }
             "StructGet" | "StructGetS" | "StructGetU" => {
                 let (Some(sig), Some(field)) = (inst.payload.sig, inst.payload.field) else {
-                    self.error(Some(plan_func), "layout", format!("{name} has no sig/field payload"));
+                    self.error(
+                        Some(plan_func),
+                        "layout",
+                        format!("{name} has no sig/field payload"),
+                    );
                     return;
                 };
                 let Some(layout) = self.layouts.get(&sig.0).cloned() else {
-                    self.error(Some(plan_func), "layout", format!("{name} signature {sig} is not an aggregate"));
+                    self.error(
+                        Some(plan_func),
+                        "layout",
+                        format!("{name} signature {sig} is not an aggregate"),
+                    );
                     return;
                 };
                 let PlanSignature::Struct { fields, .. } = &self.plan.signatures[sig.index()]
@@ -1222,16 +1506,31 @@ impl<'p> Emitter<'p> {
                 };
                 let (ty, signed) = self.load_shape(&fields[field as usize].storage, name);
                 let addr = self.deref(body, block, args[0]);
-                let result = self.load_at(body, block, addr, layout.field_offsets[field as usize], ty, signed);
+                let result = self.load_at(
+                    body,
+                    block,
+                    addr,
+                    layout.field_offsets[field as usize],
+                    ty,
+                    signed,
+                );
                 self.record_results(values, &inst.results, result);
             }
             "StructSet" => {
                 let (Some(sig), Some(field)) = (inst.payload.sig, inst.payload.field) else {
-                    self.error(Some(plan_func), "layout", format!("{name} has no sig/field payload"));
+                    self.error(
+                        Some(plan_func),
+                        "layout",
+                        format!("{name} has no sig/field payload"),
+                    );
                     return;
                 };
                 let Some(layout) = self.layouts.get(&sig.0).cloned() else {
-                    self.error(Some(plan_func), "layout", format!("{name} signature {sig} is not an aggregate"));
+                    self.error(
+                        Some(plan_func),
+                        "layout",
+                        format!("{name} signature {sig} is not an aggregate"),
+                    );
                     return;
                 };
                 let PlanSignature::Struct { fields, .. } = &self.plan.signatures[sig.index()]
@@ -1240,15 +1539,31 @@ impl<'p> Emitter<'p> {
                 };
                 let (ty, narrow) = self.store_shape(&fields[field as usize].storage);
                 let addr = self.deref(body, block, args[0]);
-                self.store_at(body, block, addr, layout.field_offsets[field as usize], args[1], ty, narrow);
+                self.store_at(
+                    body,
+                    block,
+                    addr,
+                    layout.field_offsets[field as usize],
+                    args[1],
+                    ty,
+                    narrow,
+                );
             }
             "ArrayNewDefault" => {
                 let Some(sig) = inst.payload.sig else {
-                    self.error(Some(plan_func), "layout", format!("{name} has no signature payload"));
+                    self.error(
+                        Some(plan_func),
+                        "layout",
+                        format!("{name} has no signature payload"),
+                    );
                     return;
                 };
                 let Some(layout) = self.layouts.get(&sig.0).cloned() else {
-                    self.error(Some(plan_func), "layout", format!("{name} signature {sig} is not an aggregate"));
+                    self.error(
+                        Some(plan_func),
+                        "layout",
+                        format!("{name} signature {sig} is not an aggregate"),
+                    );
                     return;
                 };
                 let len = args[0];
@@ -1262,7 +1577,9 @@ impl<'p> Emitter<'p> {
                 let bytes = body.add_op(block, Operator::I32Mul, &[len, elem], &[Type::I32]);
                 body.add_op(
                     block,
-                    Operator::MemoryFill { mem: self.arena_memory },
+                    Operator::MemoryFill {
+                        mem: self.arena_memory,
+                    },
                     &[start, zero, bytes],
                     &[],
                 );
@@ -1270,11 +1587,19 @@ impl<'p> Emitter<'p> {
             }
             "ArrayNewFixed" => {
                 let Some(sig) = inst.payload.sig else {
-                    self.error(Some(plan_func), "layout", format!("{name} has no signature payload"));
+                    self.error(
+                        Some(plan_func),
+                        "layout",
+                        format!("{name} has no signature payload"),
+                    );
                     return;
                 };
                 let Some(layout) = self.layouts.get(&sig.0).cloned() else {
-                    self.error(Some(plan_func), "layout", format!("{name} signature {sig} is not an aggregate"));
+                    self.error(
+                        Some(plan_func),
+                        "layout",
+                        format!("{name} signature {sig} is not an aggregate"),
+                    );
                     return;
                 };
                 let PlanSignature::Array { element, .. } = &self.plan.signatures[sig.index()]
@@ -1300,11 +1625,19 @@ impl<'p> Emitter<'p> {
             }
             "ArrayGet" | "ArrayGetS" | "ArrayGetU" => {
                 let Some(sig) = inst.payload.sig else {
-                    self.error(Some(plan_func), "layout", format!("{name} has no signature payload"));
+                    self.error(
+                        Some(plan_func),
+                        "layout",
+                        format!("{name} has no signature payload"),
+                    );
                     return;
                 };
                 let Some(layout) = self.layouts.get(&sig.0).cloned() else {
-                    self.error(Some(plan_func), "layout", format!("{name} signature {sig} is not an aggregate"));
+                    self.error(
+                        Some(plan_func),
+                        "layout",
+                        format!("{name} signature {sig} is not an aggregate"),
+                    );
                     return;
                 };
                 let PlanSignature::Array { element, .. } = &self.plan.signatures[sig.index()]
@@ -1321,11 +1654,19 @@ impl<'p> Emitter<'p> {
             }
             "ArraySet" => {
                 let Some(sig) = inst.payload.sig else {
-                    self.error(Some(plan_func), "layout", format!("{name} has no signature payload"));
+                    self.error(
+                        Some(plan_func),
+                        "layout",
+                        format!("{name} has no signature payload"),
+                    );
                     return;
                 };
                 let Some(layout) = self.layouts.get(&sig.0).cloned() else {
-                    self.error(Some(plan_func), "layout", format!("{name} signature {sig} is not an aggregate"));
+                    self.error(
+                        Some(plan_func),
+                        "layout",
+                        format!("{name} signature {sig} is not an aggregate"),
+                    );
                     return;
                 };
                 let PlanSignature::Array { element, .. } = &self.plan.signatures[sig.index()]
@@ -1342,14 +1683,22 @@ impl<'p> Emitter<'p> {
             "ArrayCopy" => {
                 // args: [dest, dest_idx, src, src_idx, len]
                 let (Some(dest_sig), Some(src_sig)) = (inst.payload.sig, inst.payload.field) else {
-                    self.error(Some(plan_func), "layout", format!("{name} has no sig payload"));
+                    self.error(
+                        Some(plan_func),
+                        "layout",
+                        format!("{name} has no sig payload"),
+                    );
                     return;
                 };
                 let (Some(dest), Some(src)) = (
                     self.layouts.get(&dest_sig.0).cloned(),
                     self.layouts.get(&src_sig).cloned(),
                 ) else {
-                    self.error(Some(plan_func), "layout", format!("{name} signature is not an aggregate"));
+                    self.error(
+                        Some(plan_func),
+                        "layout",
+                        format!("{name} signature is not an aggregate"),
+                    );
                     return;
                 };
                 if dest.elem_size != src.elem_size {
@@ -1368,7 +1717,10 @@ impl<'p> Emitter<'p> {
                 let bytes = body.add_op(block, Operator::I32Mul, &[args[4], elem], &[Type::I32]);
                 body.add_op(
                     block,
-                    Operator::MemoryCopy { dst_mem: self.arena_memory, src_mem: self.arena_memory },
+                    Operator::MemoryCopy {
+                        dst_mem: self.arena_memory,
+                        src_mem: self.arena_memory,
+                    },
                     &[dest_slot, src_slot, bytes],
                     &[],
                 );
@@ -1413,13 +1765,21 @@ impl<'p> Emitter<'p> {
             }
             "RefCast" => {
                 let Some(heap) = inst.payload.heap.clone() else {
-                    self.error(Some(plan_func), "unsupported_operator", "ref.cast has no heap payload");
+                    self.error(
+                        Some(plan_func),
+                        "unsupported_operator",
+                        "ref.cast has no heap payload",
+                    );
                     return;
                 };
                 let (expected, mode) = match &heap {
                     PlanHeapType::Sig(sig) => {
                         let Some(layout) = self.layouts.get(&sig.0) else {
-                            self.error(Some(plan_func), "layout", format!("cast target {sig} is not an aggregate"));
+                            self.error(
+                                Some(plan_func),
+                                "layout",
+                                format!("cast target {sig} is not an aggregate"),
+                            );
                             return;
                         };
                         (layout.type_id, 0)
@@ -1444,10 +1804,13 @@ impl<'p> Emitter<'p> {
                 };
                 let expected = self.const_i32(body, block, expected);
                 let mode = self.const_i32(body, block, mode);
-                let nullable = self.const_i32(body, block, inst.payload.nullable.unwrap_or(false) as i32);
+                let nullable =
+                    self.const_i32(body, block, inst.payload.nullable.unwrap_or(false) as i32);
                 let result = body.add_op(
                     block,
-                    Operator::Call { function_index: self.cast_func },
+                    Operator::Call {
+                        function_index: self.cast_func,
+                    },
                     &[args[0], expected, mode, nullable],
                     &[Type::I32],
                 );
@@ -1475,13 +1838,21 @@ impl<'p> Emitter<'p> {
     ) -> Value {
         let nullable = inst.payload.nullable.unwrap_or(false);
         let Some(heap) = inst.payload.heap.clone() else {
-            self.error(Some(plan_func), "unsupported_operator", "ref.test has no heap payload");
+            self.error(
+                Some(plan_func),
+                "unsupported_operator",
+                "ref.test has no heap payload",
+            );
             return self.const_i32(body, block, 0);
         };
         let (expected, mode) = match &heap {
             PlanHeapType::Sig(sig) => {
                 let Some(layout) = self.layouts.get(&sig.0).cloned() else {
-                    self.error(Some(plan_func), "layout", format!("ref target {sig} is not an aggregate"));
+                    self.error(
+                        Some(plan_func),
+                        "layout",
+                        format!("ref target {sig} is not an aggregate"),
+                    );
                     return self.const_i32(body, block, 0);
                 };
                 (layout.type_id, 0)
@@ -1511,7 +1882,8 @@ impl<'p> Emitter<'p> {
                     let zero = self.const_i32(body, block, 0);
                     let max = self.const_i32(body, block, expected);
                     let above = body.add_op(block, Operator::I32GtS, &[header, zero], &[Type::I32]);
-                    let at_most = body.add_op(block, Operator::I32LeS, &[header, max], &[Type::I32]);
+                    let at_most =
+                        body.add_op(block, Operator::I32LeS, &[header, max], &[Type::I32]);
                     body.add_op(block, Operator::I32And, &[above, at_most], &[Type::I32])
                 }
                 _ => {
@@ -1555,14 +1927,25 @@ impl<'p> Emitter<'p> {
         }
     }
 
-    fn zero_of(&mut self, body: &mut FunctionBody, block: Block, field: &crate::backend_plan::PlanField) -> Value {
+    fn zero_of(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        field: &crate::backend_plan::PlanField,
+    ) -> Value {
         match &field.storage {
             PlanStorage::I8 | PlanStorage::I16 => self.const_i32(body, block, 0),
             PlanStorage::Val(ty) => match &self.plan.types[ty.index()] {
                 PlanType::I32 => self.const_i32(body, block, 0),
-                PlanType::I64 => body.add_op(block, Operator::I64Const { value: 0 }, &[], &[Type::I64]),
-                PlanType::F32 => body.add_op(block, Operator::F32Const { value: 0 }, &[], &[Type::F32]),
-                PlanType::F64 => body.add_op(block, Operator::F64Const { value: 0 }, &[], &[Type::F64]),
+                PlanType::I64 => {
+                    body.add_op(block, Operator::I64Const { value: 0 }, &[], &[Type::I64])
+                }
+                PlanType::F32 => {
+                    body.add_op(block, Operator::F32Const { value: 0 }, &[], &[Type::F32])
+                }
+                PlanType::F64 => {
+                    body.add_op(block, Operator::F64Const { value: 0 }, &[], &[Type::F64])
+                }
                 PlanType::Ref { .. } => self.const_i32(body, block, NULL_OFFSET),
                 PlanType::V128 => self.const_i32(body, block, 0),
             },
@@ -1570,7 +1953,13 @@ impl<'p> Emitter<'p> {
     }
 
     /// `HEADER + len * elem_size` as an allocation size.
-    fn array_size(&mut self, body: &mut FunctionBody, block: Block, elem_size: u32, len: Value) -> Value {
+    fn array_size(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        elem_size: u32,
+        len: Value,
+    ) -> Value {
         let elem = self.const_i32(body, block, elem_size as i32);
         let bytes = body.add_op(block, Operator::I32Mul, &[len, elem], &[Type::I32]);
         let header = self.const_i32(body, block, HEADER_SIZE);
@@ -1579,7 +1968,14 @@ impl<'p> Emitter<'p> {
 
     /// The element slot address for `array[index]` (no bounds/null checks —
     /// callers do those through the guards first).
-    fn array_slot(&mut self, body: &mut FunctionBody, block: Block, array: Value, index: Value, elem_size: u32) -> Value {
+    fn array_slot(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        array: Value,
+        index: Value,
+        elem_size: u32,
+    ) -> Value {
         let elem = self.const_i32(body, block, elem_size as i32);
         let base = self.const_i32(body, block, HEADER_SIZE);
         let off = body.add_op(block, Operator::I32Mul, &[index, elem], &[Type::I32]);
@@ -1594,7 +1990,7 @@ impl<'p> Emitter<'p> {
         body: &mut FunctionBody,
         block: Block,
         plan_func: PlanFuncId,
-        func: &PlanFunction,
+        _func: &PlanFunction,
         inst: &PlanInst,
         values: &mut Vec<Option<Value>>,
         args: Vec<Value>,
@@ -1745,28 +2141,48 @@ impl<'p> Emitter<'p> {
             "Select" => Operator::Select,
             "TypedSelect" => {
                 let Some(ty) = out.first().copied() else {
-                    self.error(Some(plan_func), "call_shape", "typed_select has no result type");
+                    self.error(
+                        Some(plan_func),
+                        "call_shape",
+                        "typed_select has no result type",
+                    );
                     return;
                 };
                 Operator::TypedSelect { ty }
             }
             "GlobalGet" => {
                 let Some(global) = inst.payload.global else {
-                    self.error(Some(plan_func), "boundary", "global.get has no global payload");
+                    self.error(
+                        Some(plan_func),
+                        "boundary",
+                        "global.get has no global payload",
+                    );
                     return;
                 };
-                Operator::GlobalGet { global_index: <Global as EntityRef>::new(global as usize) }
+                Operator::GlobalGet {
+                    global_index: <Global as EntityRef>::new(global as usize),
+                }
             }
             "GlobalSet" => {
                 let Some(global) = inst.payload.global else {
-                    self.error(Some(plan_func), "boundary", "global.set has no global payload");
+                    self.error(
+                        Some(plan_func),
+                        "boundary",
+                        "global.set has no global payload",
+                    );
                     return;
                 };
-                Operator::GlobalSet { global_index: <Global as EntityRef>::new(global as usize) }
+                Operator::GlobalSet {
+                    global_index: <Global as EntityRef>::new(global as usize),
+                }
             }
             "RefFunc" => {
                 let Some(target) = inst.ref_func else {
-                    self.error(Some(plan_func), "boundary", "ref.func has no target payload");
+                    self.error(
+                        Some(plan_func),
+                        "boundary",
+                        "ref.func has no target payload",
+                    );
                     return;
                 };
                 let Some(&index) = self.table_index.get(&target.0) else {
@@ -1811,7 +2227,11 @@ impl<'p> Emitter<'p> {
                     args: self.map_args(plan_func, values, &target.args),
                 },
             },
-            PlanTerminator::CondBr { cond, if_true, if_false } => Terminator::CondBr {
+            PlanTerminator::CondBr {
+                cond,
+                if_true,
+                if_false,
+            } => Terminator::CondBr {
                 cond: self.map_value(plan_func, values, *cond),
                 if_true: BlockTarget {
                     block: blocks[if_true.block.index()],
@@ -1822,7 +2242,11 @@ impl<'p> Emitter<'p> {
                     args: self.map_args(plan_func, values, &if_false.args),
                 },
             },
-            PlanTerminator::Select { value, targets, default } => Terminator::Select {
+            PlanTerminator::Select {
+                value,
+                targets,
+                default,
+            } => Terminator::Select {
                 value: self.map_value(plan_func, values, *value),
                 targets: targets
                     .iter()
@@ -1839,7 +2263,11 @@ impl<'p> Emitter<'p> {
             PlanTerminator::Return { values: returns } => Terminator::Return {
                 values: self.map_args(plan_func, values, returns),
             },
-            PlanTerminator::TailCall { call, signature, args } => {
+            PlanTerminator::TailCall {
+                call,
+                signature,
+                args,
+            } => {
                 let args = self.map_args(plan_func, values, args);
                 let Some(&sig) = self.func_sigs.get(&signature.0) else {
                     self.error(
@@ -1863,7 +2291,11 @@ impl<'p> Emitter<'p> {
                     }
                     PlanCallKind::Indirect { table } => {
                         let Some((callee, rest)) = args.split_last() else {
-                            self.error(Some(plan_func), "call_shape", "indirect tail call has no callee operand");
+                            self.error(
+                                Some(plan_func),
+                                "call_shape",
+                                "indirect tail call has no callee operand",
+                            );
                             return;
                         };
                         let mut full = rest.to_vec();
@@ -1876,7 +2308,11 @@ impl<'p> Emitter<'p> {
                     }
                     PlanCallKind::Ref => {
                         let Some((callee, rest)) = args.split_last() else {
-                            self.error(Some(plan_func), "call_shape", "tail call_ref has no callee operand");
+                            self.error(
+                                Some(plan_func),
+                                "call_shape",
+                                "tail call_ref has no callee operand",
+                            );
                             return;
                         };
                         let mut full = rest.to_vec();

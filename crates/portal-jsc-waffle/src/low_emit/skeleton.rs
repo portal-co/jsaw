@@ -8,15 +8,14 @@
 //! the [`crate::low_emit`] module header for the design contract.
 
 use super::{
-    FnState, InstCx, LeBinOp, LeBlock, LeBlockId, LeBody, LeCallee, LeDiag, LeExport, LeExpr,
-    LeFunc, LeFuncId, LeImport, LeLocal, LeModule, LeStmt, LeTable, LeType, LeUnOp,
-    LOW_EMIT_SCHEMA, Representation, RuntimeSink, Tables, TypeIdTable, scalar_binop, scalar_unop,
+    FnState, InstCx, LOW_EMIT_SCHEMA, LeBinOp, LeBlock, LeBlockId, LeBody, LeCallee, LeDiag,
+    LeExport, LeExpr, LeFunc, LeFuncId, LeImport, LeLocal, LeModule, LeStmt, LeTable, LeType,
+    LeUnOp, Representation, RuntimeSink, Tables, TypeIdTable, scalar_binop, scalar_unop,
     trapping_unop,
 };
 use crate::backend_plan::{
-    BackendPlan, BoundaryDirection, BoundaryTarget, PlanCall, PlanCallKind, PlanConst,
-    PlanFuncId, PlanFunction, PlanFunctionKind, PlanInst, PlanSignature, PlanTarget,
-    PlanTerminator, TypeId,
+    BackendPlan, BoundaryDirection, BoundaryTarget, PlanCall, PlanCallKind, PlanConst, PlanFuncId,
+    PlanFunction, PlanFunctionKind, PlanInst, PlanSignature, PlanTarget, PlanTerminator, TypeId,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -61,7 +60,9 @@ impl<'p, R: Representation> Emitter<'p, R> {
 
     fn func_sig(&self, func: &PlanFunction) -> Result<(Vec<TypeId>, Vec<TypeId>), LeDiag> {
         match &self.plan.signatures[func.signature.index()] {
-            PlanSignature::Func { params, returns, .. } => Ok((params.clone(), returns.clone())),
+            PlanSignature::Func {
+                params, returns, ..
+            } => Ok((params.clone(), returns.clone())),
             _ => Err(LeDiag {
                 function: None,
                 block: None,
@@ -166,7 +167,10 @@ impl<'p, R: Representation> Emitter<'p, R> {
         if let Err(d) = self.rep.declare(self.plan, &mut module) {
             diags.push(d);
         }
-        module.start = self.plan.start.and_then(|f| self.func_ids.get(&f.0).copied());
+        module.start = self
+            .plan
+            .start
+            .and_then(|f| self.func_ids.get(&f.0).copied());
 
         let tables = Tables {
             plan: self.plan,
@@ -312,8 +316,6 @@ impl<'p, R: Representation> Emitter<'p, R> {
     }
 }
 
-
-
 // ---------------------------------------------------------------------------
 // Per-function emission
 // ---------------------------------------------------------------------------
@@ -446,10 +448,7 @@ fn emit_one_function<R: Representation>(
                 for (i, local) in entry_params.iter().enumerate() {
                     let ty = cx.ty_of(*local);
                     let word = t.rep.frame_load(&mut cx, &frame, 1 + i as u32);
-                    cx.emit(LeStmt::Assign(
-                        *local,
-                        LeExpr::FromSlot(ty, Box::new(word)),
-                    ));
+                    cx.emit(LeStmt::Assign(*local, LeExpr::FromSlot(ty, Box::new(word))));
                     cx.root_store(*local);
                 }
             } else {
@@ -521,7 +520,9 @@ fn func_sig_of(
     func: &PlanFunction,
 ) -> Result<(Vec<TypeId>, Vec<TypeId>), LeDiag> {
     match &plan.signatures[func.signature.index()] {
-        PlanSignature::Func { params, returns, .. } => Ok((params.clone(), returns.clone())),
+        PlanSignature::Func {
+            params, returns, ..
+        } => Ok((params.clone(), returns.clone())),
         _ => Err(LeDiag {
             function: None,
             block: None,
@@ -624,10 +625,7 @@ fn build_wrapper<R: Representation>(
     for (i, ty) in state.result_tys.iter().enumerate() {
         let word = t.rep.frame_load(&mut cx, &frame, 1 + i as u32);
         let temp = cx.temp(*ty);
-        cx.emit(LeStmt::Assign(
-            temp,
-            LeExpr::FromSlot(*ty, Box::new(word)),
-        ));
+        cx.emit(LeStmt::Assign(temp, LeExpr::FromSlot(*ty, Box::new(word))));
         results.push(LeExpr::Local(temp));
     }
     if t.collects {
@@ -717,14 +715,14 @@ impl<'a, R: Representation> InstCx<'a, R> {
         // Shared scalar operators.
         if let Some(op) = scalar_binop(name) {
             if args.len() == 2 && results.len() == 1 {
-                let expr = LeExpr::Binary(
-                    op,
-                    Box::new(args[0].clone()),
-                    Box::new(args[1].clone()),
-                );
+                let expr = LeExpr::Binary(op, Box::new(args[0].clone()), Box::new(args[1].clone()));
                 self.assign(results[0], expr);
             } else {
-                self.error(format!("{name} has {} args / {} results", args.len(), results.len()));
+                self.error(format!(
+                    "{name} has {} args / {} results",
+                    args.len(),
+                    results.len()
+                ));
             }
             return;
         }
@@ -733,7 +731,11 @@ impl<'a, R: Representation> InstCx<'a, R> {
                 let expr = LeExpr::Unary(op, Box::new(args[0].clone()));
                 self.assign(results[0], expr);
             } else {
-                self.error(format!("{name} has {} args / {} results", args.len(), results.len()));
+                self.error(format!(
+                    "{name} has {} args / {} results",
+                    args.len(),
+                    results.len()
+                ));
             }
             return;
         }
@@ -920,8 +922,7 @@ impl<'a, R: Representation> InstCx<'a, R> {
                     return;
                 };
                 let rep = self.t.rep;
-                if let Err(d) = rep.struct_set(self, sig, field, args[0].clone(), args[1].clone())
-                {
+                if let Err(d) = rep.struct_set(self, sig, field, args[0].clone(), args[1].clone()) {
                     self.diags.push(d);
                 }
             }
@@ -975,22 +976,18 @@ impl<'a, R: Representation> InstCx<'a, R> {
                     return;
                 };
                 let rep = self.t.rep;
-                if let Err(d) = rep.array_set(
-                    self,
-                    sig,
-                    args[0].clone(),
-                    args[1].clone(),
-                    args[2].clone(),
-                ) {
+                if let Err(d) =
+                    rep.array_set(self, sig, args[0].clone(), args[1].clone(), args[2].clone())
+                {
                     self.diags.push(d);
                 }
             }
             "ArrayLen" => {
                 let rep = self.t.rep;
-                if let [out] = results[..] {
-                    if let Err(d) = rep.array_len(self, args[0].clone(), out) {
-                        self.diags.push(d);
-                    }
+                if let [out] = results[..]
+                    && let Err(d) = rep.array_len(self, args[0].clone(), out)
+                {
+                    self.diags.push(d);
                 }
             }
             "ArrayCopy" => {
@@ -1007,7 +1004,8 @@ impl<'a, R: Representation> InstCx<'a, R> {
                 }
             }
             "RefTest" | "RefCast" => {
-                let (Some(heap), Some(nullable)) = (inst.payload.heap.clone(), inst.payload.nullable)
+                let (Some(heap), Some(nullable)) =
+                    (inst.payload.heap.clone(), inst.payload.nullable)
                 else {
                     self.error(format!("{name} without heap/nullable payload"));
                     return;
@@ -1043,45 +1041,33 @@ impl<'a, R: Representation> InstCx<'a, R> {
         min: f64,
         max: f64,
     ) -> LeFuncId {
-        self.helper(
-            name,
-            vec![LeType::F64],
-            vec![to],
-            move |b, params| {
-                let x = LeExpr::Local(params[0]);
-                let is_nan = LeExpr::Binary(
-                    LeBinOp::F64Ne,
-                    Box::new(x.clone()),
-                    Box::new(x.clone()),
-                );
-                b.emit(LeStmt::If {
-                    cond: is_nan,
-                    then: vec![LeStmt::Trap],
-                    else_: vec![],
-                });
-                let too_low = LeExpr::Binary(
-                    LeBinOp::F64Le,
-                    Box::new(x.clone()),
-                    Box::new(LeExpr::ConstF64(min.to_bits())),
-                );
-                let too_high = LeExpr::Binary(
-                    LeBinOp::F64Ge,
-                    Box::new(x.clone()),
-                    Box::new(LeExpr::ConstF64(max.to_bits())),
-                );
-                let out_of_range = LeExpr::Binary(
-                    LeBinOp::I32Or,
-                    Box::new(too_low),
-                    Box::new(too_high),
-                );
-                b.emit(LeStmt::If {
-                    cond: out_of_range,
-                    then: vec![LeStmt::Trap],
-                    else_: vec![],
-                });
-                b.emit(LeStmt::Return(vec![LeExpr::Unary(op, Box::new(x))]));
-            },
-        )
+        self.helper(name, vec![LeType::F64], vec![to], move |b, params| {
+            let x = LeExpr::Local(params[0]);
+            let is_nan = LeExpr::Binary(LeBinOp::F64Ne, Box::new(x.clone()), Box::new(x.clone()));
+            b.emit(LeStmt::If {
+                cond: is_nan,
+                then: vec![LeStmt::Trap],
+                else_: vec![],
+            });
+            let too_low = LeExpr::Binary(
+                LeBinOp::F64Le,
+                Box::new(x.clone()),
+                Box::new(LeExpr::ConstF64(min.to_bits())),
+            );
+            let too_high = LeExpr::Binary(
+                LeBinOp::F64Ge,
+                Box::new(x.clone()),
+                Box::new(LeExpr::ConstF64(max.to_bits())),
+            );
+            let out_of_range =
+                LeExpr::Binary(LeBinOp::I32Or, Box::new(too_low), Box::new(too_high));
+            b.emit(LeStmt::If {
+                cond: out_of_range,
+                then: vec![LeStmt::Trap],
+                else_: vec![],
+            });
+            b.emit(LeStmt::Return(vec![LeExpr::Unary(op, Box::new(x))]));
+        })
     }
 
     // -- calls ------------------------------------------------------------------
@@ -1355,10 +1341,7 @@ impl<'a, R: Representation> InstCx<'a, R> {
             for (i, ty) in self.f.result_tys.clone().into_iter().enumerate() {
                 let word = rep.frame_load(self, &frame, 1 + i as u32);
                 let temp = self.temp(ty);
-                self.emit(LeStmt::Assign(
-                    temp,
-                    LeExpr::FromSlot(ty, Box::new(word)),
-                ));
+                self.emit(LeStmt::Assign(temp, LeExpr::FromSlot(ty, Box::new(word))));
                 self.root_store(temp);
                 results.push(LeExpr::Local(temp));
             }

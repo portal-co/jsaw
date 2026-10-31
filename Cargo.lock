@@ -1108,6 +1108,7 @@ name = "jsaw-wasi-bin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "libc",
  "portal-jsc-common",
  "portal-jsc-jvm-emit",
@@ -3675,7 +3676,23 @@ name = "portal-solutions-sdk"
 version = "0.0.2"
 
 [[patch.unused]]
+name = "pit-gen"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "pit-js-teavm"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "pit-lang-generic"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "pit-packaging"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "pit-packaging-contrib"
 version = "0.1.0"
 
 [[patch.unused]]

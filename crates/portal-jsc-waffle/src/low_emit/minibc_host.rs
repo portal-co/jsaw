@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use dreamcompiler_minibc::interp::MiniInterp;
 
-use super::minibc_render::{MinibcArtifact, host_idx};
+use super::minibc_render::MinibcArtifact;
 use super::{LeModule, LeType};
 
 /// Per-layout physical info (same natural-alignment math as the C lane).
@@ -149,7 +149,9 @@ impl HostState {
             .collect();
         while let Some(w) = work.pop() {
             let Some(i) = self.handle_of(w) else { continue };
-            let Some(obj) = &mut self.objects[i] else { continue };
+            let Some(obj) = &mut self.objects[i] else {
+                continue;
+            };
             if obj.marked {
                 continue;
             }
@@ -202,7 +204,11 @@ impl JsawHost {
             objects: Vec::new(),
             free_handles: Vec::new(),
             root_frames: Vec::new(),
-            globals: m.globals.iter().map(|(_, init)| init.unwrap_or(0)).collect(),
+            globals: m
+                .globals
+                .iter()
+                .map(|(_, init)| init.unwrap_or(0))
+                .collect(),
             layouts,
             layouts_by_idx,
             since_gc: 0,
@@ -263,7 +269,11 @@ impl JsawHost {
                 panic!("NANO_LOAD bad size_log2 {}", args[1]);
             }
             if addr + (1usize << (args[1] as u32)) > s.arena.len() {
-                panic!("NANO_LOAD out of range: addr={addr:#x} size_log2={} arena_len={:#x}", args[1], s.arena.len());
+                panic!(
+                    "NANO_LOAD out of range: addr={addr:#x} size_log2={} arena_len={:#x}",
+                    args[1],
+                    s.arena.len()
+                );
             }
             let n = 1usize << (args[1] as u32);
             let mut b = [0u8; 8];
@@ -281,7 +291,11 @@ impl JsawHost {
         h!(|s: &mut HostState, args: &[u64]| {
             let type_id = args[0] as u32;
             let len = args[1] as u32;
-            let li = s.layouts.get(&type_id).expect("alloc: unknown type id").clone_meta();
+            let li = s
+                .layouts
+                .get(&type_id)
+                .expect("alloc: unknown type id")
+                .clone_meta();
             let size = if li.is_array {
                 li.data_off + len as usize * li.elem_size
             } else {
@@ -354,10 +368,19 @@ impl JsawHost {
         });
         // COREGC_ARRAY_COPY
         h!(|s: &mut HostState, args: &[u64]| {
-            let (d, di, src, si, len, log2) =
-                (args[0], args[1] as usize, args[2], args[3] as usize, args[4] as usize, args[5] as usize);
+            let (d, di, src, si, len, log2) = (
+                args[0],
+                args[1] as usize,
+                args[2],
+                args[3] as usize,
+                args[4] as usize,
+                args[5] as usize,
+            );
             let li = s.layouts[&s.obj(d).type_id].clone_meta();
-            let (d_off, s_off) = (li.data_off + di * li.elem_size, li.data_off + si * li.elem_size);
+            let (d_off, s_off) = (
+                li.data_off + di * li.elem_size,
+                li.data_off + si * li.elem_size,
+            );
             let nbytes = len * li.elem_size;
             let _ = log2;
             // read source range first (handles overlap)
@@ -374,7 +397,10 @@ impl JsawHost {
         });
         // FFI_CALL — no host imports in the corpus; fail closed.
         h!(|_s: &mut HostState, args: &[u64]| {
-            panic!("jsaw minibc host: FFI_CALL ordinal {} with no host handler", args[0]);
+            panic!(
+                "jsaw minibc host: FFI_CALL ordinal {} with no host handler",
+                args[0]
+            );
         });
 
         let _ = artifact;
@@ -415,7 +441,10 @@ fn field_offset(layouts: &BTreeMap<u32, LayoutInfo>, layout: u32, field: u32) ->
         return (field as usize * 4, 4);
     }
     let li = &layouts[&layout];
-    (li.field_offsets[field as usize], li.field_sizes[field as usize])
+    (
+        li.field_offsets[field as usize],
+        li.field_sizes[field as usize],
+    )
 }
 
 impl LayoutInfo {

@@ -2,8 +2,8 @@
 
 use super::*;
 use crate::backend_plan::{BackendPlan, CompletionKind, PlanFuncId, PlanType};
-use portal_jsc_common::assumptions::AssumptionSet;
 use crate::nano::{NanoLifetime, NanoValueRepresentation};
+use portal_jsc_common::assumptions::AssumptionSet;
 use portal_pc_waffle::{
     EntityRef, Export, ExportKind, FuncDecl, FunctionBody, HeapType, Module, Operator,
     SignatureData, StorageType, Terminator, Type, WithMutablility, WithNullable,
@@ -33,22 +33,25 @@ fn direct_call_module() -> Module<'static> {
     let entry = id_body.entry;
     let x = id_body.blocks[entry].params[0].1;
     id_body.set_terminator(entry, Terminator::Return { values: vec![x] });
-    let id = module.funcs.push(FuncDecl::Body(sig, "id".to_owned(), id_body));
+    let id = module
+        .funcs
+        .push(FuncDecl::Body(sig, "id".to_owned(), id_body));
 
     let mut caller_body = FunctionBody::new(&module, sig);
     let entry = caller_body.entry;
     let x = caller_body.blocks[entry].params[0].1;
     let called = caller_body.add_op(
         entry,
-        Operator::Call {
-            function_index: id,
-        },
+        Operator::Call { function_index: id },
         &[x],
         &[Type::I32],
     );
-    caller_body.set_terminator(entry, Terminator::Return {
-        values: vec![called],
-    });
+    caller_body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![called],
+        },
+    );
     let caller = module
         .funcs
         .push(FuncDecl::Body(sig, "caller".to_owned(), caller_body));
@@ -71,11 +74,13 @@ fn default_configuration_is_the_generic_adapter_everywhere() {
     assert!(!default_outcome.native.native_functions);
     assert_eq!(default_outcome.native.inlining, InliningMode::Off);
     assert!(!default_outcome.native.decisions.is_empty());
-    assert!(default_outcome
-        .native
-        .decisions
-        .iter()
-        .all(|decision| decision.strategy == NanoCallStrategy::GenericAdapter));
+    assert!(
+        default_outcome
+            .native
+            .decisions
+            .iter()
+            .all(|decision| decision.strategy == NanoCallStrategy::GenericAdapter)
+    );
     assert!(default_outcome.native.inline_records.is_empty());
     assert!(default_outcome.native.capability_checks.is_empty());
     // The fixed adapter ABI record is always present and unchanged.
@@ -97,12 +102,14 @@ fn default_configuration_is_the_generic_adapter_everywhere() {
         ..NanoNativeConfig::default()
     };
     let outcome = plan_nano_native(&module, &assumptions(), &native).expect("native mode plans");
-    assert!(outcome
-        .native
-        .decisions
-        .iter()
-        .any(|decision| decision.strategy == NanoCallStrategy::Direct
-            && decision.callee == Some(PlanFuncId(0))));
+    assert!(
+        outcome
+            .native
+            .decisions
+            .iter()
+            .any(|decision| decision.strategy == NanoCallStrategy::Direct
+                && decision.callee == Some(PlanFuncId(0)))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -129,9 +136,12 @@ fn uncertain_and_rebound_references_keep_the_guarded_adapter() {
         &[x, reference],
         &[Type::I32],
     );
-    body.set_terminator(entry, Terminator::Return {
-        values: vec![result],
-    });
+    body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![result],
+        },
+    );
     module
         .funcs
         .push(FuncDecl::Body(caller_sig, "caller".to_owned(), body));
@@ -149,16 +159,17 @@ fn uncertain_and_rebound_references_keep_the_guarded_adapter() {
         Some(NanoCallStrategy::GenericAdapter),
         "the generic adapter path remains available"
     );
-    assert!(outcome
-        .native
-        .diagnostics
-        .iter()
-        .any(|d| d.kind == NanoNativeDiagnosticKind::GuardedFallback));
-    assert!(!outcome
-        .native
-        .decisions
-        .iter()
-        .any(|d| matches!(d.strategy, NanoCallStrategy::Direct | NanoCallStrategy::TailDirect)));
+    assert!(
+        outcome
+            .native
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == NanoNativeDiagnosticKind::GuardedFallback)
+    );
+    assert!(!outcome.native.decisions.iter().any(|d| matches!(
+        d.strategy,
+        NanoCallStrategy::Direct | NanoCallStrategy::TailDirect
+    )));
 }
 
 #[test]
@@ -169,7 +180,9 @@ fn ref_func_provenance_enables_direct_calls() {
     let entry = id_body.entry;
     let x = id_body.blocks[entry].params[0].1;
     id_body.set_terminator(entry, Terminator::Return { values: vec![x] });
-    let id = module.funcs.push(FuncDecl::Body(sig, "id".to_owned(), id_body));
+    let id = module
+        .funcs
+        .push(FuncDecl::Body(sig, "id".to_owned(), id_body));
 
     // caller(x) = call_ref(x, ref.func id): provenance-tracked identity.
     let funcref = Type::Heap(WithNullable {
@@ -186,9 +199,12 @@ fn ref_func_provenance_enables_direct_calls() {
         &[x, reference],
         &[Type::I32],
     );
-    body.set_terminator(entry, Terminator::Return {
-        values: vec![result],
-    });
+    body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![result],
+        },
+    );
     module
         .funcs
         .push(FuncDecl::Body(sig, "caller".to_owned(), body));
@@ -225,15 +241,16 @@ fn recursive_module() -> Module<'static> {
     let decremented = body.add_op(entry, Operator::I32Sub, &[n, one], &[Type::I32]);
     let called = body.add_op(
         entry,
-        Operator::Call {
-            function_index: me,
-        },
+        Operator::Call { function_index: me },
         &[decremented],
         &[Type::I32],
     );
-    body.set_terminator(entry, Terminator::Return {
-        values: vec![called],
-    });
+    body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![called],
+        },
+    );
     module.funcs[me] = FuncDecl::Body(sig, "rec".to_owned(), body);
     module
 }
@@ -249,9 +266,11 @@ fn required_inlining_fails_closed_on_recursion() {
     };
     let errors = plan_nano_native(&module, &assumptions(), &config)
         .expect_err("required recursive inlining fails closed");
-    assert!(errors
-        .iter()
-        .any(|error| error.kind == NanoNativeDiagnosticKind::RecursionProofFailure));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == NanoNativeDiagnosticKind::RecursionProofFailure)
+    );
     // Determinism: the same failure, in the same order, every time.
     let again = plan_nano_native(&module, &assumptions(), &config)
         .expect_err("required recursive inlining fails closed");
@@ -271,12 +290,15 @@ fn required_inlining_fails_closed_on_budget() {
         // Give every function several blocks so the budget trips quickly.
         let header = body.add_block();
         let param = body.add_blockparam(header, Type::I32);
-        body.set_terminator(entry, Terminator::Br {
-            target: portal_pc_waffle::BlockTarget {
-                block: header,
-                args: vec![x],
+        body.set_terminator(
+            entry,
+            Terminator::Br {
+                target: portal_pc_waffle::BlockTarget {
+                    block: header,
+                    args: vec![x],
+                },
             },
-        });
+        );
         let result = match previous {
             Some(callee) => body.add_op(
                 header,
@@ -288,19 +310,21 @@ fn required_inlining_fails_closed_on_budget() {
             ),
             None => param,
         };
-        body.set_terminator(header, Terminator::Return {
-            values: vec![result],
-        });
-        previous = Some(module.funcs.push(FuncDecl::Body(
-            sig,
-            format!("f{index}"),
-            body,
-        )));
+        body.set_terminator(
+            header,
+            Terminator::Return {
+                values: vec![result],
+            },
+        );
+        previous = Some(
+            module
+                .funcs
+                .push(FuncDecl::Body(sig, format!("f{index}"), body)),
+        );
     }
     let _last = previous.expect("chain built");
     // Every callee that is actually called by a site (f0..f4) is required.
-    let required: std::collections::BTreeSet<PlanFuncId> =
-        (0..5).map(PlanFuncId).collect();
+    let required: std::collections::BTreeSet<PlanFuncId> = (0..5).map(PlanFuncId).collect();
     let config = NanoNativeConfig {
         native_functions: true,
         inlining: InliningMode::Required,
@@ -315,9 +339,11 @@ fn required_inlining_fails_closed_on_budget() {
     };
     let errors = plan_nano_native(&module, &assumptions(), &config)
         .expect_err("required inlining over budget fails closed");
-    assert!(errors
-        .iter()
-        .any(|error| error.kind == NanoNativeDiagnosticKind::RequiredInlineBudgetExceeded));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == NanoNativeDiagnosticKind::RequiredInlineBudgetExceeded)
+    );
 }
 
 #[test]
@@ -335,15 +361,19 @@ fn opportunistic_inlining_falls_back_and_records() {
     let decision = &outcome.native.decisions[0];
     assert_eq!(decision.strategy, NanoCallStrategy::Framed);
     assert_eq!(decision.fallback, Some(NanoCallStrategy::Direct));
-    assert!(decision
-        .adaptation
-        .as_deref()
-        .is_some_and(|reason| reason.contains("recursion")));
-    assert!(outcome
-        .native
-        .diagnostics
-        .iter()
-        .any(|d| d.kind == NanoNativeDiagnosticKind::InlineFallback));
+    assert!(
+        decision
+            .adaptation
+            .as_deref()
+            .is_some_and(|reason| reason.contains("recursion"))
+    );
+    assert!(
+        outcome
+            .native
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == NanoNativeDiagnosticKind::InlineFallback)
+    );
 }
 
 #[test]
@@ -360,11 +390,13 @@ fn opportunistic_inlining_records_bounded_inline_schedules() {
     assert_eq!(record.callee, PlanFuncId(0));
     assert_eq!(record.cloned_blocks, 1);
     assert!(!record.required);
-    assert!(outcome
-        .native
-        .decisions
-        .iter()
-        .any(|decision| decision.strategy == NanoCallStrategy::Inline));
+    assert!(
+        outcome
+            .native
+            .decisions
+            .iter()
+            .any(|decision| decision.strategy == NanoCallStrategy::Inline)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -386,10 +418,13 @@ fn tail_call_module() -> Module<'static> {
     let mut caller_body = FunctionBody::new(&module, sig);
     let entry = caller_body.entry;
     let x = caller_body.blocks[entry].params[0].1;
-    caller_body.set_terminator(entry, Terminator::ReturnCall {
-        func: callee,
-        args: vec![x],
-    });
+    caller_body.set_terminator(
+        entry,
+        Terminator::ReturnCall {
+            func: callee,
+            args: vec![x],
+        },
+    );
     module
         .funcs
         .push(FuncDecl::Body(sig, "caller".to_owned(), caller_body));
@@ -417,10 +452,12 @@ fn tail_calls_frame_replace_only_when_abi_and_kinds_match() {
     let outcome = plan_nano_native(&module, &assumptions(), &throwing).expect("plans");
     let decision = &outcome.native.decisions[0];
     assert_eq!(decision.strategy, NanoCallStrategy::Framed);
-    assert!(decision
-        .adaptation
-        .as_deref()
-        .is_some_and(|note| note.contains("completion")));
+    assert!(
+        decision
+            .adaptation
+            .as_deref()
+            .is_some_and(|note| note.contains("completion"))
+    );
     // The caller now transitively exposes Throw at this site.
     assert!(decision.completions.contains(&CompletionKind::Throw));
 }
@@ -464,9 +501,12 @@ fn nested_object_module() -> Module<'static> {
         &[cell_value, incremented],
         &[],
     );
-    body.set_terminator(entry, Terminator::Return {
-        values: vec![cell_value],
-    });
+    body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![cell_value],
+        },
+    );
     let touch = module
         .funcs
         .push(FuncDecl::Body(sig, "touch".to_owned(), body));
@@ -492,9 +532,12 @@ fn nested_object_module() -> Module<'static> {
         &[once],
         &[cell_ref],
     );
-    body.set_terminator(entry, Terminator::Return {
-        values: vec![twice],
-    });
+    body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![twice],
+        },
+    );
     module
         .funcs
         .push(FuncDecl::Body(sig, "outer".to_owned(), body));
@@ -523,11 +566,9 @@ fn nested_exceptions_and_object_writebacks_are_preserved() {
     }
     // Arena handle lifetimes stay artifact-scoped in the plan.
     let outer = &outcome.backend.functions[1];
-    assert!(outer
-        .values
-        .iter()
-        .any(|value| value.representation == NanoValueRepresentation::ArenaRef
-            && value.lifetime == NanoLifetime::Artifact));
+    assert!(outer.values.iter().any(|value| value.representation
+        == NanoValueRepresentation::ArenaRef
+        && value.lifetime == NanoLifetime::Artifact));
 }
 
 // ---------------------------------------------------------------------------
@@ -544,11 +585,10 @@ fn capability_gating_reports_unsupported_targets() {
     };
     let errors = plan_nano_native(&module, &assumptions(), &config)
         .expect_err("wasm-mvp cannot lower tail calls");
-    assert!(errors
-        .iter()
-        .any(|error| error.kind == NanoNativeDiagnosticKind::UnsupportedTargetCombination
-            && error.message.contains("wasm-mvp")
-            && error.message.contains("tail-calls")));
+    assert!(errors.iter().any(|error| error.kind
+        == NanoNativeDiagnosticKind::UnsupportedTargetCombination
+        && error.message.contains("wasm-mvp")
+        && error.message.contains("tail-calls")));
 
     // MiniBC is a parity target: direct calls, tail calls, and multi-result
     // returns are representable, never rejected.
@@ -573,12 +613,12 @@ fn minibc_parity_multi_result_and_direct_calls_are_representable() {
     let mut producer_body = FunctionBody::new(&module, pair_sig);
     let entry = producer_body.entry;
     let x = producer_body.blocks[entry].params[0].1;
-    producer_body.set_terminator(entry, Terminator::Return {
-        values: vec![x, x],
-    });
-    module
-        .funcs
-        .push(FuncDecl::Body(pair_sig, "producer".to_owned(), producer_body));
+    producer_body.set_terminator(entry, Terminator::Return { values: vec![x, x] });
+    module.funcs.push(FuncDecl::Body(
+        pair_sig,
+        "producer".to_owned(),
+        producer_body,
+    ));
     let config = NanoNativeConfig {
         targets: vec![TargetCapabilities::minibc()],
         ..NanoNativeConfig::default()
@@ -598,9 +638,7 @@ fn unused_parameters_are_elided_before_specialization() {
     let entry = body.entry;
     let used = body.blocks[entry].params[0].1;
     body.set_terminator(entry, Terminator::Return { values: vec![used] });
-    module
-        .funcs
-        .push(FuncDecl::Body(sig, "f".to_owned(), body));
+    module.funcs.push(FuncDecl::Body(sig, "f".to_owned(), body));
 
     let native = NanoNativeConfig {
         native_functions: true,

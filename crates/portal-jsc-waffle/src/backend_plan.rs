@@ -182,22 +182,33 @@ pub enum PlanLayout {
     /// A struct/array aggregate handled through the logical arena.
     Aggregate { sig: PlanSigId },
     /// A reference value.
-    Ref { nullable: bool, target: PlanRefTarget },
+    Ref {
+        nullable: bool,
+        target: PlanRefTarget,
+    },
 }
 
 /// How one plan value came to be.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanValueDef {
-    BlockParam { block: PlanBlockId, index: u32 },
-    Operator { block: PlanBlockId, inst: u32 },
+    BlockParam {
+        block: PlanBlockId,
+        index: u32,
+    },
+    Operator {
+        block: PlanBlockId,
+        inst: u32,
+    },
     PickOutput {
         block: PlanBlockId,
         inst: u32,
         source: PlanValueId,
         index: u32,
     },
-    Alias { target: PlanValueId },
+    Alias {
+        target: PlanValueId,
+    },
 }
 
 /// One canonical value with its representation and layout records.
@@ -1198,16 +1209,16 @@ impl<'m> Builder<'m> {
         if let Some(start_func) = self.module.start_func {
             match self.func_ids.get(&start_func).copied() {
                 Some(id) => {
-                    if let Some((params, returns)) = self.func_signature_types(start_func) {
-                        if !params.is_empty() || !returns.is_empty() {
-                            self.diagnostic(
-                                DiagnosticKind::BoundaryAbi,
-                                Some(id),
-                                None,
-                                None,
-                                "start function must have no parameters and no results",
-                            );
-                        }
+                    if let Some((params, returns)) = self.func_signature_types(start_func)
+                        && (!params.is_empty() || !returns.is_empty())
+                    {
+                        self.diagnostic(
+                            DiagnosticKind::BoundaryAbi,
+                            Some(id),
+                            None,
+                            None,
+                            "start function must have no parameters and no results",
+                        );
                     }
                     start = Some(id);
                 }
@@ -1507,10 +1518,8 @@ impl<'m> Builder<'m> {
 
         // Build values with representation and layout records.
         let mut values: Vec<PlanValue> = Vec::new();
-        let mut ordered_values: Vec<(PlanValueId, Value)> = value_ids
-            .iter()
-            .map(|(value, id)| (*id, *value))
-            .collect();
+        let mut ordered_values: Vec<(PlanValueId, Value)> =
+            value_ids.iter().map(|(value, id)| (*id, *value)).collect();
         ordered_values.sort_by_key(|(id, _)| *id);
         for (plan_id, value) in &ordered_values {
             let def = &body.values[*value];
@@ -1586,7 +1595,8 @@ impl<'m> Builder<'m> {
                 }
             };
             let layout = self.layout_for(ty, def);
-            let representation = representation_for(ty.map(|id| self.type_list[id.index()].clone()), &layout);
+            let representation =
+                representation_for(ty.map(|id| self.type_list[id.index()].clone()), &layout);
             let _ = plan_id;
             values.push(PlanValue {
                 ty,
@@ -1904,9 +1914,7 @@ impl<'m> Builder<'m> {
                     _ => None,
                 };
                 ref_func = match op {
-                    Operator::RefFunc { func_index } => {
-                        self.func_ids.get(func_index).copied()
-                    }
+                    Operator::RefFunc { func_index } => self.func_ids.get(func_index).copied(),
                     _ => None,
                 };
                 payload = self.plan_payload(op);
@@ -1971,10 +1979,10 @@ impl<'m> Builder<'m> {
                 if let Some(id) = value_ids.get(&value) {
                     results.push(*id);
                 }
-                if let Some(ty) = def.ty(&body.type_pool) {
-                    if let Some(id) = self.convert_waffle_type(&ty) {
-                        result_types.push(id);
-                    }
+                if let Some(ty) = def.ty(&body.type_pool)
+                    && let Some(id) = self.convert_waffle_type(&ty)
+                {
+                    result_types.push(id);
                 }
             }
             ValueDef::Alias(target) => {
@@ -2186,10 +2194,7 @@ impl<'m> Builder<'m> {
                         Some(func),
                         Some(block),
                         Some(inst_index),
-                        format!(
-                            "call_indirect table {} does not exist",
-                            table_index.index()
-                        ),
+                        format!("call_indirect table {} does not exist", table_index.index()),
                     );
                 }
                 // The last argument is the table index operand.
@@ -2331,7 +2336,15 @@ impl<'m> Builder<'m> {
         };
         match terminator {
             Terminator::Br { target } => {
-                let target = self.map_plan_target(func, block, &target, block_ids, value_ids, uses, use_position);
+                let target = self.map_plan_target(
+                    func,
+                    block,
+                    &target,
+                    block_ids,
+                    value_ids,
+                    uses,
+                    use_position,
+                );
                 PlanTerminator::Br { target }
             }
             Terminator::CondBr {
@@ -2344,10 +2357,24 @@ impl<'m> Builder<'m> {
                     self.undefined_use(func, block, cond);
                     PlanValueId(u32::MAX)
                 });
-                let if_true =
-                    self.map_plan_target(func, block, &if_true, block_ids, value_ids, uses, use_position);
-                let if_false =
-                    self.map_plan_target(func, block, &if_false, block_ids, value_ids, uses, use_position);
+                let if_true = self.map_plan_target(
+                    func,
+                    block,
+                    &if_true,
+                    block_ids,
+                    value_ids,
+                    uses,
+                    use_position,
+                );
+                let if_false = self.map_plan_target(
+                    func,
+                    block,
+                    &if_false,
+                    block_ids,
+                    value_ids,
+                    uses,
+                    use_position,
+                );
                 PlanTerminator::CondBr {
                     cond,
                     if_true,
@@ -2367,11 +2394,26 @@ impl<'m> Builder<'m> {
                 let targets = targets
                     .iter()
                     .map(|target| {
-                        self.map_plan_target(func, block, target, block_ids, value_ids, uses, use_position)
+                        self.map_plan_target(
+                            func,
+                            block,
+                            target,
+                            block_ids,
+                            value_ids,
+                            uses,
+                            use_position,
+                        )
                     })
                     .collect();
-                let default =
-                    self.map_plan_target(func, block, &default, block_ids, value_ids, uses, use_position);
+                let default = self.map_plan_target(
+                    func,
+                    block,
+                    &default,
+                    block_ids,
+                    value_ids,
+                    uses,
+                    use_position,
+                );
                 PlanTerminator::Select {
                     value,
                     targets,
@@ -2467,10 +2509,7 @@ impl<'m> Builder<'m> {
                         Some(func),
                         Some(block),
                         None,
-                        format!(
-                            "tail call_indirect table {} does not exist",
-                            table.index()
-                        ),
+                        format!("tail call_indirect table {} does not exist", table.index()),
                     );
                 }
                 self.check_tail_call(func, block, body, sig, arity);
@@ -2478,7 +2517,11 @@ impl<'m> Builder<'m> {
                     call: PlanCallKind::Indirect {
                         table: table.index() as u32,
                     },
-                    signature: self.sig_ids.get(&sig).copied().unwrap_or(PlanSigId(u32::MAX)),
+                    signature: self
+                        .sig_ids
+                        .get(&sig)
+                        .copied()
+                        .unwrap_or(PlanSigId(u32::MAX)),
                     args,
                 }
             }
@@ -2507,7 +2550,11 @@ impl<'m> Builder<'m> {
                 self.check_tail_call(func, block, body, sig, arity);
                 PlanTerminator::TailCall {
                     call: PlanCallKind::Ref,
-                    signature: self.sig_ids.get(&sig).copied().unwrap_or(PlanSigId(u32::MAX)),
+                    signature: self
+                        .sig_ids
+                        .get(&sig)
+                        .copied()
+                        .unwrap_or(PlanSigId(u32::MAX)),
                     args,
                 }
             }
@@ -2675,18 +2722,17 @@ impl<'m> Builder<'m> {
             PlanType::I64 | PlanType::F64 => PlanLayout::Scalar { bytes: 8 },
             PlanType::V128 => PlanLayout::Scalar { bytes: 16 },
             PlanType::Ref { nullable, heap } => {
-                let target = match &heap {
-                    PlanHeapType::Sig(sig) => match self.signatures.get(sig.index()) {
-                        Some(PlanSignature::Struct { .. }) | Some(PlanSignature::Array { .. }) => {
-                            PlanRefTarget::Aggregate(*sig)
-                        }
-                        Some(PlanSignature::Func { .. }) | Some(PlanSignature::Import { .. }) => {
-                            PlanRefTarget::FuncSig(*sig)
-                        }
-                        _ => PlanRefTarget::Dynamic(heap.clone()),
-                    },
-                    other => PlanRefTarget::Dynamic(other.clone()),
-                };
+                let target =
+                    match &heap {
+                        PlanHeapType::Sig(sig) => match self.signatures.get(sig.index()) {
+                            Some(PlanSignature::Struct { .. })
+                            | Some(PlanSignature::Array { .. }) => PlanRefTarget::Aggregate(*sig),
+                            Some(PlanSignature::Func { .. })
+                            | Some(PlanSignature::Import { .. }) => PlanRefTarget::FuncSig(*sig),
+                            _ => PlanRefTarget::Dynamic(heap.clone()),
+                        },
+                        other => PlanRefTarget::Dynamic(other.clone()),
+                    };
                 match &target {
                     PlanRefTarget::Aggregate(sig) => PlanLayout::Aggregate { sig: *sig },
                     _ => PlanLayout::Ref { nullable, target },
@@ -2722,12 +2768,8 @@ impl<'m> Builder<'m> {
                     }
                 },
                 ImportKind::Table(table) => (BoundaryTarget::Table(table.index() as u32), None),
-                ImportKind::Global(global) => {
-                    (BoundaryTarget::Global(global.index() as u32), None)
-                }
-                ImportKind::Memory(memory) => {
-                    (BoundaryTarget::Memory(memory.index() as u32), None)
-                }
+                ImportKind::Global(global) => (BoundaryTarget::Global(global.index() as u32), None),
+                ImportKind::Memory(memory) => (BoundaryTarget::Memory(memory.index() as u32), None),
                 ImportKind::ControlTag(tag) => {
                     (BoundaryTarget::ControlTag(tag.index() as u32), None)
                 }
@@ -2742,22 +2784,19 @@ impl<'m> Builder<'m> {
                 ),
                 _ => continue,
             };
-            if let BoundaryTarget::Func(id) = target {
-                if !matches!(
-                    functions[id.index()].kind,
-                    PlanFunctionKind::Import { .. }
-                ) {
-                    self.diagnostic(
-                        DiagnosticKind::BoundaryAbi,
-                        Some(id),
-                        None,
-                        None,
-                        format!(
-                            "import {}::{} references a function not declared as an import",
-                            import.module, import.name
-                        ),
-                    );
-                }
+            if let BoundaryTarget::Func(id) = target
+                && !matches!(functions[id.index()].kind, PlanFunctionKind::Import { .. })
+            {
+                self.diagnostic(
+                    DiagnosticKind::BoundaryAbi,
+                    Some(id),
+                    None,
+                    None,
+                    format!(
+                        "import {}::{} references a function not declared as an import",
+                        import.module, import.name
+                    ),
+                );
             }
             boundaries.push(BoundaryRecord {
                 direction: BoundaryDirection::Import,
@@ -2804,12 +2843,8 @@ impl<'m> Builder<'m> {
                     }
                 },
                 ExportKind::Table(table) => (BoundaryTarget::Table(table.index() as u32), None),
-                ExportKind::Global(global) => {
-                    (BoundaryTarget::Global(global.index() as u32), None)
-                }
-                ExportKind::Memory(memory) => {
-                    (BoundaryTarget::Memory(memory.index() as u32), None)
-                }
+                ExportKind::Global(global) => (BoundaryTarget::Global(global.index() as u32), None),
+                ExportKind::Memory(memory) => (BoundaryTarget::Memory(memory.index() as u32), None),
                 ExportKind::ControlTag(tag) => {
                     (BoundaryTarget::ControlTag(tag.index() as u32), None)
                 }
@@ -2854,7 +2889,9 @@ impl<'m> Builder<'m> {
 fn representation_for(ty: Option<PlanType>, layout: &PlanLayout) -> NanoValueRepresentation {
     match (ty, layout) {
         (None, _) => NanoValueRepresentation::InlineAggregate,
-        (Some(PlanType::Ref { .. }), PlanLayout::Aggregate { .. }) => NanoValueRepresentation::ArenaRef,
+        (Some(PlanType::Ref { .. }), PlanLayout::Aggregate { .. }) => {
+            NanoValueRepresentation::ArenaRef
+        }
         (Some(PlanType::Ref { .. }), _) => NanoValueRepresentation::Boundary,
         (Some(_), _) => NanoValueRepresentation::Scalar,
     }
@@ -2974,9 +3011,7 @@ fn arena_op(name: &str) -> Option<PlanArenaOp> {
 }
 
 fn operator_uses_simd(name: &str) -> bool {
-    const SIMD_PREFIXES: [&str; 7] = [
-        "I8x16", "I16x8", "I32x4", "I64x2", "F32x4", "F64x2", "V128",
-    ];
+    const SIMD_PREFIXES: [&str; 7] = ["I8x16", "I16x8", "I32x4", "I64x2", "F32x4", "F64x2", "V128"];
     SIMD_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
 }
 

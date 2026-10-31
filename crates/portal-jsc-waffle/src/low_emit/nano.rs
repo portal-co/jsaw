@@ -15,8 +15,8 @@
 //! return nonzero on exhaustion (the caller then traps deterministically).
 
 use super::{
-    InstCx, LeBinOp, LeCallee, LeDiag, LeExpr, LeFuncId, LeLocal, LeModule, LeStmt, LeType,
-    LeUnOp, Representation, RuntimeSink, heap_test_mode, zero_of,
+    InstCx, LeBinOp, LeCallee, LeDiag, LeExpr, LeFuncId, LeLocal, LeModule, LeStmt, LeType, LeUnOp,
+    Representation, RuntimeSink, heap_test_mode, zero_of,
 };
 use crate::backend_plan::{
     BackendPlan, PlanFuncId, PlanHeapType, PlanSigId, PlanSignature, PlanStorage, TypeId,
@@ -75,11 +75,7 @@ fn is_null(v: LeExpr) -> LeExpr {
 }
 
 fn is_i31(v: LeExpr) -> LeExpr {
-    LeExpr::Binary(
-        LeBinOp::I64Ne,
-        Box::new(and(v, i64(1))),
-        Box::new(i64(0)),
-    )
+    LeExpr::Binary(LeBinOp::I64Ne, Box::new(and(v, i64(1))), Box::new(i64(0)))
 }
 
 /// `base + offset` arena address arithmetic (offsets are words).
@@ -197,18 +193,12 @@ impl NanoRepresentation {
                         Box::new(i64(u64::MAX)),
                     ),
                 );
-                let bumped = b.assign(
-                    LeType::I64,
-                    add(LeExpr::Local(bump_v), LeExpr::Local(mask)),
-                );
+                let bumped = b.assign(LeType::I64, add(LeExpr::Local(bump_v), LeExpr::Local(mask)));
                 let aligned = b.assign(
                     LeType::I64,
                     and(LeExpr::Local(bumped), LeExpr::Local(not_mask)),
                 );
-                let end = b.assign(
-                    LeType::I64,
-                    add(LeExpr::Local(aligned), word(size)),
-                );
+                let end = b.assign(LeType::I64, add(LeExpr::Local(aligned), word(size)));
                 let ok = b.temp(LeType::I32);
                 b.emit(LeStmt::Call {
                     callee: LeCallee::Runtime("js_nano_arena_ensure".into()),
@@ -301,7 +291,11 @@ impl NanoRepresentation {
         let scaled = if elem_log2 == 0 {
             idx
         } else {
-            LeExpr::Binary(LeBinOp::I64Shl, Box::new(idx), Box::new(i64(elem_log2 as u64)))
+            LeExpr::Binary(
+                LeBinOp::I64Shl,
+                Box::new(idx),
+                Box::new(i64(elem_log2 as u64)),
+            )
         };
         add(arr, add(i64(PAYLOAD_OFFSET as u64), scaled))
     }
@@ -362,11 +356,8 @@ impl NanoRepresentation {
                 else_: vec![],
             });
             // i31 (odd word): passes modes 3 (any/eq) and 4 (i31).
-            let mode_ge_3 = LeExpr::Binary(
-                LeBinOp::I32GeU,
-                Box::new(mode.clone()),
-                Box::new(i32c(3)),
-            );
+            let mode_ge_3 =
+                LeExpr::Binary(LeBinOp::I32GeU, Box::new(mode.clone()), Box::new(i32c(3)));
             b.emit(LeStmt::If {
                 cond: is_i31(r.clone()),
                 then: vec![LeStmt::If {
@@ -385,9 +376,8 @@ impl NanoRepresentation {
                     offset: 0,
                 },
             );
-            let is_mode = |m: u32| {
-                LeExpr::Binary(LeBinOp::I32Eq, Box::new(mode.clone()), Box::new(i32c(m)))
-            };
+            let is_mode =
+                |m: u32| LeExpr::Binary(LeBinOp::I32Eq, Box::new(mode.clone()), Box::new(i32c(m)));
             // mode 0: id == expected
             b.emit(LeStmt::If {
                 cond: is_mode(0),
@@ -439,11 +429,7 @@ impl NanoRepresentation {
             // modes 3/4: any non-null header'd reference passes mode 3;
             // mode 4 (i31-only) fails.
             b.emit(LeStmt::If {
-                cond: LeExpr::Binary(
-                    LeBinOp::I32Eq,
-                    Box::new(mode.clone()),
-                    Box::new(i32c(3)),
-                ),
+                cond: LeExpr::Binary(LeBinOp::I32Eq, Box::new(mode.clone()), Box::new(i32c(3))),
                 then: pass,
                 else_: fail,
             });
@@ -498,11 +484,7 @@ impl Representation for NanoRepresentation {
     }
 
     fn emit_runtime(&self, _plan: &BackendPlan, sink: &mut RuntimeSink) -> Result<(), LeDiag> {
-        sink.runtime_fn(
-            "js_nano_arena_ensure",
-            vec![LeType::I64],
-            vec![LeType::I32],
-        );
+        sink.runtime_fn("js_nano_arena_ensure", vec![LeType::I64], vec![LeType::I32]);
         Ok(())
     }
 
@@ -516,12 +498,7 @@ impl Representation for NanoRepresentation {
         out: LeLocal,
     ) -> Result<(), LeDiag> {
         let layout = self.layout(cx, sig)?;
-        self.alloc(
-            cx,
-            i32c(layout.fixed_size),
-            layout.align_log2,
-            out,
-        );
+        self.alloc(cx, i32c(layout.fixed_size), layout.align_log2, out);
         cx.emit(LeStmt::ArenaStore {
             ty: LeType::I32,
             base: LeExpr::Local(out),
@@ -621,10 +598,7 @@ impl Representation for NanoRepresentation {
                 Box::new(i64(elem_log2 as u64)),
             )
         };
-        let size = cx.assign_temp(
-            LeType::I64,
-            add(i64(PAYLOAD_OFFSET as u64), scaled),
-        );
+        let size = cx.assign_temp(LeType::I64, add(i64(PAYLOAD_OFFSET as u64), scaled));
         let size32 = cx.assign_temp(
             LeType::I32,
             LeExpr::Unary(LeUnOp::I32WrapI64, Box::new(LeExpr::Local(size))),
@@ -755,7 +729,13 @@ impl Representation for NanoRepresentation {
         // here.
         let helper = cx.helper(
             "js_nano_array_copy",
-            vec![LeType::Ref, LeType::I32, LeType::Ref, LeType::I32, LeType::I32],
+            vec![
+                LeType::Ref,
+                LeType::I32,
+                LeType::Ref,
+                LeType::I32,
+                LeType::I32,
+            ],
             vec![],
             |b, params| {
                 let dst = LeExpr::Local(params[0]);
@@ -781,14 +761,8 @@ impl Representation for NanoRepresentation {
                         offset: LEN_OFFSET,
                     },
                 );
-                let dend = b.assign(
-                    LeType::I64,
-                    add(word(di.clone()), word(len.clone())),
-                );
-                let send = b.assign(
-                    LeType::I64,
-                    add(word(si.clone()), word(len.clone())),
-                );
+                let dend = b.assign(LeType::I64, add(word(di.clone()), word(len.clone())));
+                let send = b.assign(LeType::I64, add(word(si.clone()), word(len.clone())));
                 b.emit(LeStmt::If {
                     cond: LeExpr::Binary(
                         LeBinOp::I64GtU,
@@ -825,70 +799,63 @@ impl Representation for NanoRepresentation {
                 // Forward when daddr < saddr, else backward (memmove).
                 let i = b.temp(LeType::I32);
                 let one_i32 = i32c(1);
-                let forward = vec![
-                    LeStmt::Loop(vec![
-                        LeStmt::If {
-                            cond: LeExpr::Binary(
-                                LeBinOp::I32GeU,
-                                Box::new(LeExpr::Local(i)),
-                                Box::new(len.clone()),
-                            ),
-                            then: vec![LeStmt::Break],
-                            else_: vec![],
-                        },
-                        LeStmt::ArenaStore {
-                            ty: LeType::I8,
-                            base: add(LeExpr::Local(daddr), word(LeExpr::Local(i))),
-                            offset: 0,
-                            value: LeExpr::ArenaLoad {
-                                ty: LeType::I8,
-                                base: Box::new(add(LeExpr::Local(saddr), word(LeExpr::Local(i)))),
-                                offset: 0,
-                            },
-                        },
-                        LeStmt::Assign(
-                            i,
-                            LeExpr::Binary(
-                                LeBinOp::I32Add,
-                                Box::new(LeExpr::Local(i)),
-                                Box::new(one_i32.clone()),
-                            ),
+                let forward = vec![LeStmt::Loop(vec![
+                    LeStmt::If {
+                        cond: LeExpr::Binary(
+                            LeBinOp::I32GeU,
+                            Box::new(LeExpr::Local(i)),
+                            Box::new(len.clone()),
                         ),
-                    ]),
-                ];
+                        then: vec![LeStmt::Break],
+                        else_: vec![],
+                    },
+                    LeStmt::ArenaStore {
+                        ty: LeType::I8,
+                        base: add(LeExpr::Local(daddr), word(LeExpr::Local(i))),
+                        offset: 0,
+                        value: LeExpr::ArenaLoad {
+                            ty: LeType::I8,
+                            base: Box::new(add(LeExpr::Local(saddr), word(LeExpr::Local(i)))),
+                            offset: 0,
+                        },
+                    },
+                    LeStmt::Assign(
+                        i,
+                        LeExpr::Binary(
+                            LeBinOp::I32Add,
+                            Box::new(LeExpr::Local(i)),
+                            Box::new(one_i32.clone()),
+                        ),
+                    ),
+                ])];
                 // i starts at 0 (forward) or len (backward).
                 b.emit(LeStmt::Assign(i, i32c(0)));
                 let backward_init = vec![LeStmt::Assign(i, len.clone())];
-                let backward = vec![
-                    LeStmt::Loop(vec![
-                        LeStmt::If {
-                            cond: LeExpr::Unary(
-                                LeUnOp::I32Eqz,
-                                Box::new(LeExpr::Local(i)),
-                            ),
-                            then: vec![LeStmt::Break],
-                            else_: vec![],
-                        },
-                        LeStmt::Assign(
-                            i,
-                            LeExpr::Binary(
-                                LeBinOp::I32Sub,
-                                Box::new(LeExpr::Local(i)),
-                                Box::new(i32c(1)),
-                            ),
+                let backward = vec![LeStmt::Loop(vec![
+                    LeStmt::If {
+                        cond: LeExpr::Unary(LeUnOp::I32Eqz, Box::new(LeExpr::Local(i))),
+                        then: vec![LeStmt::Break],
+                        else_: vec![],
+                    },
+                    LeStmt::Assign(
+                        i,
+                        LeExpr::Binary(
+                            LeBinOp::I32Sub,
+                            Box::new(LeExpr::Local(i)),
+                            Box::new(i32c(1)),
                         ),
-                        LeStmt::ArenaStore {
+                    ),
+                    LeStmt::ArenaStore {
+                        ty: LeType::I8,
+                        base: add(LeExpr::Local(daddr), word(LeExpr::Local(i))),
+                        offset: 0,
+                        value: LeExpr::ArenaLoad {
                             ty: LeType::I8,
-                            base: add(LeExpr::Local(daddr), word(LeExpr::Local(i))),
+                            base: Box::new(add(LeExpr::Local(saddr), word(LeExpr::Local(i)))),
                             offset: 0,
-                            value: LeExpr::ArenaLoad {
-                                ty: LeType::I8,
-                                base: Box::new(add(LeExpr::Local(saddr), word(LeExpr::Local(i)))),
-                                offset: 0,
-                            },
                         },
-                    ]),
-                ];
+                    },
+                ])];
                 let backward_full: Vec<LeStmt> =
                     backward_init.into_iter().chain(backward).collect();
                 b.emit(LeStmt::If {
@@ -921,7 +888,8 @@ impl Representation for NanoRepresentation {
         recv: LeExpr,
         out: LeLocal,
     ) -> Result<(), LeDiag> {
-        let (mode, expected) = heap_test_mode(cx.t.plan, cx.t.type_ids, heap).map_err(|m| cx_diag(cx, m))?;
+        let (mode, expected) =
+            heap_test_mode(cx.t.plan, cx.t.type_ids, heap).map_err(|m| cx_diag(cx, m))?;
         let helper = self.cast_helper(cx, true);
         cx.emit(LeStmt::Call {
             callee: LeCallee::Direct(helper),
@@ -939,16 +907,12 @@ impl Representation for NanoRepresentation {
         recv: LeExpr,
         out: LeLocal,
     ) -> Result<(), LeDiag> {
-        let (mode, expected) = heap_test_mode(cx.t.plan, cx.t.type_ids, heap).map_err(|m| cx_diag(cx, m))?;
+        let (mode, expected) =
+            heap_test_mode(cx.t.plan, cx.t.type_ids, heap).map_err(|m| cx_diag(cx, m))?;
         let helper = self.cast_helper(cx, false);
         cx.emit(LeStmt::Call {
             callee: LeCallee::Direct(helper),
-            args: vec![
-                recv,
-                i32c(expected),
-                i32c(mode),
-                i32c(nullable as u32),
-            ],
+            args: vec![recv, i32c(expected), i32c(mode), i32c(nullable as u32)],
             results: vec![out],
         });
         Ok(())

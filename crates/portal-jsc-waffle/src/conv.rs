@@ -4,7 +4,6 @@ use std::{
     sync::Arc,
 };
 
-use sha3::{Digest, Sha3_256};
 use portal_jsc_swc_ssa::{SBlockId, SCatch, SFunc, SValue, SValueId, module::SModule};
 use portal_jsc_swc_tac::{Item, LId, PropKey, PropVal, TCallee, TTerm};
 use portal_pc_waffle::{
@@ -12,6 +11,7 @@ use portal_pc_waffle::{
     Import, ImportKind, Module, Operator, SignatureData, Table, TableData, Terminator, Type, Value,
     WithNullable,
 };
+use sha3::{Digest, Sha3_256};
 use swc_common::SyntaxContext;
 use swc_ecma_ast::{BinaryOp, Id as Ident, Lit, UnaryOp};
 
@@ -251,8 +251,10 @@ pub fn convert_modules<'a, 'wasm>(
     // dangling imports fails with a diagnostic instead of silently reading
     // an undefined binding at runtime.
     let mut import_tables = BTreeMap::new();
-    for path in set.keys() {
-        let source = set.get(path)?;
+    // Only JavaScript members have import tables; a Wasm member's own
+    // imports are resolved at merge time (plan §5.4), and its exports
+    // appear in other modules' tables as `ImportTarget::WasmModule`.
+    for (path, source) in set.js_modules() {
         let table = crate::linker::build_import_table(set, path, source, &options.ffi)?;
         import_tables.insert(path.clone(), table);
     }
@@ -321,12 +323,14 @@ pub fn convert_modules<'a, 'wasm>(
                 ImportTarget::InternalFunction { function, .. } => {
                     source_uses_exceptions(function, &mut BTreeSet::new())
                 }
-                ImportTarget::WasmHost(_) | ImportTarget::Intrinsic { .. } => false,
+                ImportTarget::WasmHost(_)
+                | ImportTarget::Intrinsic { .. }
+                | ImportTarget::WasmModule(_) => false,
             })
         });
     if converter.exceptions_enabled {
-        for path in set.keys() {
-            converter.collect_module_function_locals(path, set.get(path)?);
+        for (path, source) in set.js_modules() {
+            converter.collect_module_function_locals(path, source);
         }
     }
     // The entry module's top-level body performs the context stores that
@@ -341,8 +345,11 @@ pub fn convert_modules<'a, 'wasm>(
     // them with the shared context, installing hoisted declarations and
     // top-level `let`/`var` bindings. Imported (non-entry) modules first,
     // then the entry, mirroring ES dependency-before-importer evaluation.
+    // Wasm members have no top-level body to initialize; only JavaScript
+    // modules participate in module-body initialization order.
     let mut init_order: Vec<String> = set
-        .keys()
+        .js_modules()
+        .map(|(path, _)| path)
         .filter(|path| path.as_str() != entry)
         .cloned()
         .collect();
@@ -1689,7 +1696,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         .get(&current)
                         .is_some_and(|name| name == id)
                 });
-                let resolved = if is_self_name {
+
+                if is_self_name {
                     self.lowering_function
                 } else if let Some(literal) = self.function_literal_locals.get(id).copied() {
                     Some(literal)
@@ -1701,8 +1709,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     Some(*function)
                 } else {
                     None
-                };
-                resolved
+                }
             }
             _ => None,
         };
@@ -2707,7 +2714,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 continue;
             }
             done += 1;
-            if progress && done % 100 == 0 {
+            if progress && done.is_multiple_of(100) {
                 eprintln!("JSAW_LOWER_ALL_PROGRESS: lowered {done} functions");
             }
             // Imports resolve against the module that *declares* the
@@ -2911,11 +2918,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             // receiver, and original argument array. Source SSA parameters
             // begin after those ABI-only parameters in the entry shim.
             let target_params = body.blocks[original_block].params.iter();
-            let target_params = if sblock == sfunc.entry {
-                target_params.skip(3)
-            } else {
-                target_params.skip(0)
-            };
+            let target_params = target_params.skip(if sblock == sfunc.entry { 3 } else { 0 });
             for (((source, _), (_, wasm)), kind) in sfunc.cfg.blocks[sblock]
                 .params
                 .iter()
@@ -3865,6 +3868,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                             )?;
                             return Ok(vec![(block, value)]);
                         }
+                        ImportTarget::WasmModule(spec) => {
+                            return Err(ConvertError::invalid(format!(
+                                "Wasm module import {:?} from {:?} is linked but calls into Wasm \
+                                 module-set members are not yet lowered (wasm-esm phase 1; see \
+                                 docs/plan-wasm-esm-modules.md)",
+                                spec.export, spec.path
+                            )));
+                        }
                         ImportTarget::Intrinsic { module, name } => {
                             // The SSA builder materializes the callee's
                             // LoadId as a separate statement before the
@@ -3875,45 +3886,41 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                             // The callee reference may feed a plain
                             // Item::Call or a Tail terminator (`return
                             // f(...)`); both are intercepted call sites.
-                            let is_call_callee = self
-                                .lowering_function
-                                .is_some_and(|function| {
-                                    function.cfg.values.iter().any(|(_, value)| {
-                                        matches!(
-                                            &value.value,
-                                            SValue::Item {
-                                                item: Item::Call {
-                                                    callee: TCallee::Val(callee),
-                                                    ..
-                                                },
-                                                ..
-                                            } if *callee == source_id
-                                        )
-                                    }) || function.cfg.blocks.iter().any(|(_, block)| {
-                                        matches!(
-                                            &block.postcedent.term,
-                                            TTerm::Tail {
+                            let is_call_callee = self.lowering_function.is_some_and(|function| {
+                                function.cfg.values.iter().any(|(_, value)| {
+                                    matches!(
+                                        &value.value,
+                                        SValue::Item {
+                                            item: Item::Call {
                                                 callee: TCallee::Val(callee),
                                                 ..
-                                            } if *callee == source_id
-                                        )
-                                    })
-                                });
+                                            },
+                                            ..
+                                        } if *callee == source_id
+                                    )
+                                }) || function.cfg.blocks.iter().any(|(_, block)| {
+                                    matches!(
+                                        &block.postcedent.term,
+                                        TTerm::Tail {
+                                            callee: TCallee::Val(callee),
+                                            ..
+                                        } if *callee == source_id
+                                    )
+                                })
+                            });
                             if !is_call_callee {
                                 return Err(ConvertError::invalid(format!(
                                     "intrinsic import {module:?}/{name:?} is call-only"
                                 )));
                             }
                             let value = self.null_ref(body, block);
-                            return Ok(vec![
-                                (
-                                    block,
-                                    LowerValue::Wasm {
-                                        value,
-                                        kind: ValueKind::Reference,
-                                    },
-                                ),
-                            ]);
+                            return Ok(vec![(
+                                block,
+                                LowerValue::Wasm {
+                                    value,
+                                    kind: ValueKind::Reference,
+                                },
+                            )]);
                         }
                     }
                 }
@@ -4045,23 +4052,23 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 .runtime();
             return self.select_continuations(body, block, cond, then, otherwise);
         }
-        if let Item::Bin { left, right, op } = item {
-            if matches!(
+        if let Item::Bin { left, right, op } = item
+            && matches!(
                 op,
                 BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::NullishCoalescing
-            ) {
-                let left = values
-                    .get(left)
-                    .cloned()
-                    .ok_or_else(|| ConvertError::invalid("undefined binary lhs"))?
-                    .runtime();
-                let right = values
-                    .get(right)
-                    .cloned()
-                    .ok_or_else(|| ConvertError::invalid("undefined binary rhs"))?
-                    .runtime();
-                return self.logical_continuations(body, block, left, right, *op);
-            }
+            )
+        {
+            let left = values
+                .get(left)
+                .cloned()
+                .ok_or_else(|| ConvertError::invalid("undefined binary lhs"))?
+                .runtime();
+            let right = values
+                .get(right)
+                .cloned()
+                .ok_or_else(|| ConvertError::invalid("undefined binary rhs"))?
+                .runtime();
+            return self.logical_continuations(body, block, left, right, *op);
         }
         if let Item::PrivateMem { obj, mem } = item {
             let object = values
@@ -4121,13 +4128,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     if module == "~weakmap" {
                         let result = self
                             .try_weakmap_intrinsic_call(
-                                body,
-                                block,
-                                context,
-                                this,
-                                values,
-                                id,
-                                args,
+                                body, block, context, this, values, id, args,
                             )?
                             .ok_or_else(|| {
                                 ConvertError::invalid("weakmap intrinsic was not recognized")
@@ -4135,9 +4136,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         return Ok(result);
                     }
                     if module == "~ffi" {
-                        return self.ffi_intrinsic_call(
-                            body, block, context, this, values, &name, args,
-                        );
+                        return self
+                            .ffi_intrinsic_call(body, block, context, this, values, &name, args);
                     }
                 }
             }
@@ -4149,14 +4149,13 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             // arguments array, and the `CallRef` dispatch entirely. Proven
             // sites produce one raw-representation continuation; guarded
             // sites split into raw-fast and boxed-slow continuations.
-            if let TCallee::Member { func, member } = callee {
-                if let Some(receiver) = values.get(func)
-                    && let Some(key) = values.get(member)
-                    && let Some(result) =
-                        self.try_provable_primordial_call(body, block, receiver, key, values, args)?
-                {
-                    return Ok(result);
-                }
+            if let TCallee::Member { func, member } = callee
+                && let Some(receiver) = values.get(func)
+                && let Some(key) = values.get(member)
+                && let Some(result) =
+                    self.try_provable_primordial_call(body, block, receiver, key, values, args)?
+            {
+                return Ok(result);
             }
             // A bare call to an unshadowed `Number`/`BigInt` global is a
             // value conversion, not a property lookup: `Number(x)` is
@@ -14130,8 +14129,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         args,
                     )?)
                 } else if module == "~weakmap" {
-                    Some(self
-                        .try_weakmap_intrinsic_call(
+                    Some(
+                        self.try_weakmap_intrinsic_call(
                             body,
                             block,
                             context,
@@ -14142,7 +14141,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         )?
                         .ok_or_else(|| {
                             ConvertError::invalid("weakmap intrinsic was not recognized")
-                        })?)
+                        })?,
+                    )
                 } else {
                     None
                 };
@@ -14183,27 +14183,26 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         // Without this the member callee (e.g. `BigInt`, which has no context
         // object) falls through to the generic adapter path and traps on a
         // null receiver.
-        if let TCallee::Member { func, member } = callee {
-            if let Some(receiver) = values.get(func)
-                && let Some(key) = values.get(member)
-                && let Some(results) =
-                    self.try_provable_primordial_call(body, block, receiver, key, values, args)?
-            {
-                for (block, value) in results {
-                    let converted = if self.exceptions_enabled {
-                        self.box_value(body, block, &value)?
-                    } else {
-                        self.convert_returned_value(body, block, &value, self.current_return_kinds)?
-                    };
-                    body.set_terminator(
-                        block,
-                        Terminator::Return {
-                            values: vec![converted],
-                        },
-                    );
-                }
-                return Ok(Some(()));
+        if let TCallee::Member { func, member } = callee
+            && let Some(receiver) = values.get(func)
+            && let Some(key) = values.get(member)
+            && let Some(results) =
+                self.try_provable_primordial_call(body, block, receiver, key, values, args)?
+        {
+            for (block, value) in results {
+                let converted = if self.exceptions_enabled {
+                    self.box_value(body, block, &value)?
+                } else {
+                    self.convert_returned_value(body, block, &value, self.current_return_kinds)?
+                };
+                body.set_terminator(
+                    block,
+                    Terminator::Return {
+                        values: vec![converted],
+                    },
+                );
             }
+            return Ok(Some(()));
         }
         // Bare `Number(x)` / `BigInt(x)` conversion calls are also valid in
         // tail position.  The ordinary item lowering recognizes these before

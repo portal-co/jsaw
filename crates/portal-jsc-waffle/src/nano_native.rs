@@ -156,7 +156,11 @@ impl TargetCapabilities {
         };
         check(self.direct_calls, required.direct_calls, "direct-calls");
         check(self.tail_calls, required.tail_calls, "tail-calls");
-        check(self.indirect_calls, required.indirect_calls, "indirect-calls");
+        check(
+            self.indirect_calls,
+            required.indirect_calls,
+            "indirect-calls",
+        );
         check(self.ref_calls, required.ref_calls, "ref-calls");
         check(self.multi_result, required.multi_result, "multi-result");
         check(self.adapter_calls, required.adapter_calls, "adapter-calls");
@@ -387,10 +391,10 @@ fn transitive_completions(
         let mut callees = BTreeSet::new();
         for block in &func.blocks {
             for inst in &block.insts {
-                if let Some(call) = &inst.call {
-                    if let PlanCallKind::Direct { callee } = call.kind {
-                        callees.insert(callee);
-                    }
+                if let Some(call) = &inst.call
+                    && let PlanCallKind::Direct { callee } = call.kind
+                {
+                    callees.insert(callee);
                 }
             }
             if let PlanTerminator::TailCall {
@@ -442,10 +446,10 @@ fn direct_call_edges(plan: &BackendPlan) -> BTreeMap<PlanFuncId, BTreeSet<PlanFu
         let mut callees = BTreeSet::new();
         for block in &func.blocks {
             for inst in &block.insts {
-                if let Some(call) = &inst.call {
-                    if let PlanCallKind::Direct { callee } = call.kind {
-                        callees.insert(callee);
-                    }
+                if let Some(call) = &inst.call
+                    && let PlanCallKind::Direct { callee } = call.kind
+                {
+                    callees.insert(callee);
                 }
             }
         }
@@ -911,7 +915,12 @@ pub fn plan_nano_native(
             .iter()
             .flat_map(|func| &func.blocks)
             .flat_map(|block| &block.insts)
-            .any(|inst| matches!(inst.call.as_ref().map(|call| call.kind), Some(PlanCallKind::Direct { .. }))),
+            .any(|inst| {
+                matches!(
+                    inst.call.as_ref().map(|call| call.kind),
+                    Some(PlanCallKind::Direct { .. })
+                )
+            }),
         tail_calls: plan.runtime.uses_tail_calls,
         indirect_calls: plan.runtime.uses_indirect_calls,
         ref_calls: plan.runtime.uses_ref_calls,

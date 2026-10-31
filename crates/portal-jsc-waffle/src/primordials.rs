@@ -1387,7 +1387,7 @@ fn build_reflect_namespace(
         |this, body, entry, _context, _this_val, args| {
             let (block, target_raw) = this.read_arg_raw(body, entry, args, 0);
             let (block, key) = this.read_arg_string_key(body, block, args, 1)?;
-            let target = LowerValue::Wasm {
+            let _target = LowerValue::Wasm {
                 value: target_raw,
                 kind: ValueKind::Reference,
             };

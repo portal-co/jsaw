@@ -219,12 +219,12 @@ pub(crate) fn build(
             ),
         });
     }
-    if options.worklist_bytes < 8 || options.worklist_bytes % 8 != 0 {
+    if options.worklist_bytes < 8 || !options.worklist_bytes.is_multiple_of(8) {
         return Err(CoreGcError {
             message: "coregc worklist_bytes must be a nonzero multiple of 8".to_owned(),
         });
     }
-    if options.handle_table_bytes < 16 || options.handle_table_bytes % 16 != 0 {
+    if options.handle_table_bytes < 16 || !options.handle_table_bytes.is_multiple_of(16) {
         return Err(CoreGcError {
             message: "coregc handle_table_bytes must be a nonzero multiple of 16".to_owned(),
         });

@@ -127,9 +127,7 @@ fn unused_parameters_are_elided_before_key_formation() {
     let entry = body.entry;
     let used = body.blocks[entry].params[0].1;
     body.set_terminator(entry, Terminator::Return { values: vec![used] });
-    module
-        .funcs
-        .push(FuncDecl::Body(sig, "f".to_owned(), body));
+    module.funcs.push(FuncDecl::Body(sig, "f".to_owned(), body));
     let plan = BackendPlan::from_module(&module).expect("valid plan");
 
     let facts = analyze_function(
@@ -301,7 +299,11 @@ fn nested_call_chain() -> (Module<'static>, BackendPlan) {
         let ten = body.add_op(entry, Operator::I32Const { value: 10 }, &[], &[Type::I32]);
         let sum = body.add_op(entry, Operator::I32Add, &[x, ten], &[Type::I32]);
         body.set_terminator(entry, Terminator::Return { values: vec![sum] });
-        funcs.push(module.funcs.push(FuncDecl::Body(sig, "f3".to_owned(), body)));
+        funcs.push(
+            module
+                .funcs
+                .push(FuncDecl::Body(sig, "f3".to_owned(), body)),
+        );
     }
     for (name, addend) in [("f2", 100_u32), ("f1", 1000), ("f0", 10000)] {
         let callee = *funcs.last().unwrap();
@@ -316,10 +318,19 @@ fn nested_call_chain() -> (Module<'static>, BackendPlan) {
             &[x],
             &[Type::I32],
         );
-        let extra = body.add_op(entry, Operator::I32Const { value: addend }, &[], &[Type::I32]);
+        let extra = body.add_op(
+            entry,
+            Operator::I32Const { value: addend },
+            &[],
+            &[Type::I32],
+        );
         let sum = body.add_op(entry, Operator::I32Add, &[called, extra], &[Type::I32]);
         body.set_terminator(entry, Terminator::Return { values: vec![sum] });
-        funcs.push(module.funcs.push(FuncDecl::Body(sig, name.to_owned(), body)));
+        funcs.push(
+            module
+                .funcs
+                .push(FuncDecl::Body(sig, name.to_owned(), body)),
+        );
     }
     let plan = BackendPlan::from_module(&module).expect("valid plan");
     (module, plan)
@@ -373,12 +384,17 @@ fn evaluator_depth_bound_fails_closed() {
             ),
             None => x,
         };
-        body.set_terminator(entry, Terminator::Return { values: vec![result] });
-        previous = Some(module.funcs.push(FuncDecl::Body(
-            sig,
-            format!("depth{depth}"),
-            body,
-        )));
+        body.set_terminator(
+            entry,
+            Terminator::Return {
+                values: vec![result],
+            },
+        );
+        previous = Some(
+            module
+                .funcs
+                .push(FuncDecl::Body(sig, format!("depth{depth}"), body)),
+        );
     }
     let plan = BackendPlan::from_module(&module).expect("valid plan");
     let mut root: BTreeMap<u32, ValueFact> = BTreeMap::new();
@@ -404,7 +420,9 @@ fn wrapping_arithmetic_requires_the_explicit_flag() {
     let entry = body.entry;
     let max = body.add_op(
         entry,
-        Operator::I32Const { value: i32::MAX as u32 },
+        Operator::I32Const {
+            value: i32::MAX as u32,
+        },
         &[],
         &[Type::I32],
     );
@@ -458,26 +476,35 @@ fn evaluator_cycles_and_join_disagreement_are_unknown() {
     let next = body.add_op(header, Operator::I32Add, &[counter, one], &[Type::I32]);
     let exit = body.add_block();
     let exit_param = body.add_blockparam(exit, Type::I32);
-    body.set_terminator(entry, Terminator::Br {
-        target: BlockTarget {
-            block: header,
-            args: vec![input],
+    body.set_terminator(
+        entry,
+        Terminator::Br {
+            target: BlockTarget {
+                block: header,
+                args: vec![input],
+            },
         },
-    });
-    body.set_terminator(header, Terminator::CondBr {
-        cond: input,
-        if_true: BlockTarget {
-            block: exit,
-            args: vec![next],
+    );
+    body.set_terminator(
+        header,
+        Terminator::CondBr {
+            cond: input,
+            if_true: BlockTarget {
+                block: exit,
+                args: vec![next],
+            },
+            if_false: BlockTarget {
+                block: header,
+                args: vec![next],
+            },
         },
-        if_false: BlockTarget {
-            block: header,
-            args: vec![next],
+    );
+    body.set_terminator(
+        exit,
+        Terminator::Return {
+            values: vec![exit_param],
         },
-    });
-    body.set_terminator(exit, Terminator::Return {
-        values: vec![exit_param],
-    });
+    );
     module
         .funcs
         .push(FuncDecl::Body(sig, "loop".to_owned(), body));
@@ -509,32 +536,44 @@ fn evaluator_cycles_and_join_disagreement_are_unknown() {
     let merged = body.add_blockparam(join, Type::I32);
     let one = body.add_op(left, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
     let two = body.add_op(right, Operator::I32Const { value: 2 }, &[], &[Type::I32]);
-    body.set_terminator(entry, Terminator::CondBr {
-        cond,
-        if_true: BlockTarget {
-            block: left,
-            args: vec![],
+    body.set_terminator(
+        entry,
+        Terminator::CondBr {
+            cond,
+            if_true: BlockTarget {
+                block: left,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: right,
+                args: vec![],
+            },
         },
-        if_false: BlockTarget {
-            block: right,
-            args: vec![],
+    );
+    body.set_terminator(
+        left,
+        Terminator::Br {
+            target: BlockTarget {
+                block: join,
+                args: vec![one],
+            },
         },
-    });
-    body.set_terminator(left, Terminator::Br {
-        target: BlockTarget {
-            block: join,
-            args: vec![one],
+    );
+    body.set_terminator(
+        right,
+        Terminator::Br {
+            target: BlockTarget {
+                block: join,
+                args: vec![two],
+            },
         },
-    });
-    body.set_terminator(right, Terminator::Br {
-        target: BlockTarget {
-            block: join,
-            args: vec![two],
+    );
+    body.set_terminator(
+        join,
+        Terminator::Return {
+            values: vec![merged],
         },
-    });
-    body.set_terminator(join, Terminator::Return {
-        values: vec![merged],
-    });
+    );
     module
         .funcs
         .push(FuncDecl::Body(sig, "join".to_owned(), body));
@@ -566,9 +605,12 @@ fn evaluator_step_bound_and_unsupported_values_fail_closed() {
         let one = body.add_op(entry, Operator::I32Const { value: 1 }, &[], &[Type::I32]);
         current = body.add_op(entry, Operator::I32Add, &[current, one], &[Type::I32]);
     }
-    body.set_terminator(entry, Terminator::Return {
-        values: vec![current],
-    });
+    body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![current],
+        },
+    );
     module
         .funcs
         .push(FuncDecl::Body(sig, "chain".to_owned(), body));
@@ -612,9 +654,12 @@ fn evaluator_step_bound_and_unsupported_values_fail_closed() {
         &[address],
         &[Type::I32],
     );
-    body.set_terminator(entry, Terminator::Return {
-        values: vec![loaded],
-    });
+    body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![loaded],
+        },
+    );
     module
         .funcs
         .push(FuncDecl::Body(sig, "load".to_owned(), body));
@@ -691,9 +736,11 @@ fn variant_budgets_are_bounded_deterministic_and_coarsen() {
         "variants stay bounded: {}",
         variants.len()
     );
-    assert!(diagnostics
-        .iter()
-        .any(|d| d.kind == SpecializationDiagnosticKind::BudgetExceeded));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.kind == SpecializationDiagnosticKind::BudgetExceeded)
+    );
     assert_eq!(coarsenings.len(), 1, "coarsening is observable");
     assert_eq!(usage.coarsened_requests, 1);
     assert!(variants.iter().any(|variant| variant.generic));
@@ -750,10 +797,12 @@ fn coregc_keeps_facts_without_forced_variants() {
     // The constant `1` in the body is a fact CoreGC may use as a runtime
     // fast-path hint.
     let coregc = CoreGcFacts::from_facts(&outcome.facts);
-    assert!(coregc
-        .fast_paths
-        .iter()
-        .any(|hint| hint.hint == FastPathHint::Constant(PlanConst::I32(1))));
+    assert!(
+        coregc
+            .fast_paths
+            .iter()
+            .any(|hint| hint.hint == FastPathHint::Constant(PlanConst::I32(1)))
+    );
 
     // Variant requests in facts-only mode never materialize variants.
     let mut specializer = Specializer::new(
@@ -781,9 +830,11 @@ fn coregc_keeps_facts_without_forced_variants() {
     assert!(specializer.generic_variant(PlanFuncId(0)).is_none());
     let (variants, diagnostics, _, _) = specializer.finish();
     assert!(variants.is_empty(), "CoreGC never materializes variants");
-    assert!(diagnostics
-        .iter()
-        .any(|d| d.kind == SpecializationDiagnosticKind::GenericFallback));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.kind == SpecializationDiagnosticKind::GenericFallback)
+    );
 }
 
 #[test]
@@ -807,9 +858,12 @@ fn dynamic_function_references_stay_generic() {
         &[x, reference],
         &[Type::I32],
     );
-    body.set_terminator(entry, Terminator::Return {
-        values: vec![result],
-    });
+    body.set_terminator(
+        entry,
+        Terminator::Return {
+            values: vec![result],
+        },
+    );
     module
         .funcs
         .push(FuncDecl::Body(caller_sig, "caller".to_owned(), body));

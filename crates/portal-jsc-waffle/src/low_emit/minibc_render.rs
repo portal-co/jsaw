@@ -17,13 +17,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use dreamcompiler_minibc::interp::StdExtOp;
 use dreamcompiler_minibc::ext_op::EncodeExtOp;
-use dreamcompiler_minibc::{AluRawOp, AluUnOp, Encode, MiniBc, MiniOp, Reg, RegForm};
+use dreamcompiler_minibc::interp::StdExtOp;
+use dreamcompiler_minibc::{AluRawOp, AluUnOp, Encode, MiniOp, Reg, RegForm};
 
-use super::{
-    LeBinOp, LeBlock, LeCallee, LeDiag, LeExpr, LeFunc, LeLocal, LeModule, LeStmt, LeType, LeUnOp,
-};
+use super::{LeBinOp, LeCallee, LeDiag, LeExpr, LeFunc, LeModule, LeStmt, LeType, LeUnOp};
 
 /// jsaw host-op family table indices (ext-op tag `0x9B`; see the plan doc).
 pub mod host_idx {
@@ -65,29 +63,68 @@ fn size_log2(ty: LeType) -> u64 {
 /// only at emission; ids are u32 throughout the flat form.
 #[derive(Clone, Debug)]
 enum FlatOp {
-    LoadConst { dst: u32, bits: u64 },
-    Move { src: u32, dst: u32 },
+    LoadConst {
+        dst: u32,
+        bits: u64,
+    },
+    Move {
+        src: u32,
+        dst: u32,
+    },
     /// Raw-ALU three-register op.
-    AluRaw { a: u32, b: u32, dst: u32, sub: AluRawOp },
+    AluRaw {
+        a: u32,
+        b: u32,
+        dst: u32,
+        sub: AluRawOp,
+    },
     /// Raw-ALU unary op.
-    AluUn { src: u32, dst: u32, sub: AluUnOp },
+    AluUn {
+        src: u32,
+        dst: u32,
+        sub: AluUnOp,
+    },
     /// A stock three-register op (see `Stock3`).
-    Stock3 { kind: Stock3, a: u32, b: u32, dst: u32 },
+    Stock3 {
+        kind: Stock3,
+        a: u32,
+        b: u32,
+        dst: u32,
+    },
     /// A stock two-register op (see `Stock2`).
-    Stock2 { kind: Stock2, src: u32, dst: u32 },
+    Stock2 {
+        kind: Stock2,
+        src: u32,
+        dst: u32,
+    },
     /// Move logical reg → call-window run.
-    WindowStore { run: u32, src: u32 },
+    WindowStore {
+        run: u32,
+        src: u32,
+    },
     /// Move call-window run → logical reg.
-    WindowLoad { run: u32, dst: u32 },
+    WindowLoad {
+        run: u32,
+        dst: u32,
+    },
     /// Load a function's entry pc (f64 bits) into a logical reg — the payload
     /// is patched at fixup time.
-    FuncAddrLoad { func: u32, dst: u32 },
+    FuncAddrLoad {
+        func: u32,
+        dst: u32,
+    },
     Trap,
     /// Spill-frame store (`slot` ← run at logical `src`, post-allocation
     /// rewrite only; `src` is a scratch id).
-    SpillStore { slot: u32, src: u32 },
+    SpillStore {
+        slot: u32,
+        src: u32,
+    },
     /// Spill-frame load (logical `dst` scratch ← `slot`).
-    SpillLoad { slot: u32, dst: u32 },
+    SpillLoad {
+        slot: u32,
+        dst: u32,
+    },
 }
 
 /// Scratch logical ids for the post-allocation spill rewrite. Physical bases
@@ -143,7 +180,10 @@ enum FlatExit {
     Next,
     Jump(FlatTarget),
     /// `Cond`: taken → `if_true`; not taken → physically-next segment.
-    Cond { cond: u32, if_true: FlatTarget },
+    Cond {
+        cond: u32,
+        if_true: FlatTarget,
+    },
     /// Table dispatch on a funcref word to per-slot arm segments.
     Table {
         index: u32,
@@ -161,7 +201,9 @@ enum FlatExit {
     /// entry pc as f64 bits (LoadConst64 with a fixup). For imports the call
     /// is lowered as a `HostOp` at flatten time, so this arm is only
     /// `Direct`.
-    Call { func_reg: u32 },
+    Call {
+        func_reg: u32,
+    },
     /// Return from the current function (window already loaded).
     Ret,
     /// Deterministic trap (preceded by the `Trap` MiniOp).
@@ -419,8 +461,16 @@ fn lower_expr(cx: &mut FnCx, e: &LeExpr) -> u32 {
                 cx.push(FlatOp::AluUn { src, dst, sub });
             } else {
                 match op {
-                    LeUnOp::F64Floor => cx.push(FlatOp::Stock2 { kind: Stock2::FFloor, src, dst }),
-                    LeUnOp::F64Trunc => cx.push(FlatOp::Stock2 { kind: Stock2::FTrunc, src, dst }),
+                    LeUnOp::F64Floor => cx.push(FlatOp::Stock2 {
+                        kind: Stock2::FFloor,
+                        src,
+                        dst,
+                    }),
+                    LeUnOp::F64Trunc => cx.push(FlatOp::Stock2 {
+                        kind: Stock2::FTrunc,
+                        src,
+                        dst,
+                    }),
                     // Reinterpretations are verbatim R4 moves.
                     LeUnOp::F64ReinterpretI64
                     | LeUnOp::I64ReinterpretF64
@@ -702,10 +752,7 @@ fn lower_stmt(cx: &mut FnCx, s: &LeStmt) {
         LeStmt::Return(values) => {
             for (i, v) in values.iter().enumerate() {
                 let src = lower_expr(cx, v);
-                cx.push(FlatOp::WindowStore {
-                    run: i as u32,
-                    src,
-                });
+                cx.push(FlatOp::WindowStore { run: i as u32, src });
             }
             cx.close(FlatExit::Ret);
         }
@@ -757,12 +804,11 @@ fn lower_call(cx: &mut FnCx, callee: &LeCallee, args: Vec<u32>, results: Vec<u32
         LeCallee::Direct(id) => {
             // Import call: no control transfer — an FFI host op.
             if cx.m.imports.iter().any(|i| i.func.0 == id.0) {
-                let ordinal = cx
-                    .m
-                    .imports
-                    .iter()
-                    .position(|i| i.func.0 == id.0)
-                    .expect("import") as u64;
+                let ordinal =
+                    cx.m.imports
+                        .iter()
+                        .position(|i| i.func.0 == id.0)
+                        .expect("import") as u64;
                 let ord = cx.const64(ordinal, LeType::I32);
                 let mut call_args = vec![ord];
                 call_args.extend(args);
@@ -770,17 +816,26 @@ fn lower_call(cx: &mut FnCx, callee: &LeCallee, args: Vec<u32>, results: Vec<u32
                 return;
             }
             let freg = cx.temp(LeType::I64);
-            cx.push(FlatOp::FuncAddrLoad { func: id.0, dst: freg });
+            cx.push(FlatOp::FuncAddrLoad {
+                func: id.0,
+                dst: freg,
+            });
             // Shuffle args into the window.
             for (i, a) in args.iter().enumerate() {
-                cx.push(FlatOp::WindowStore { run: i as u32, src: *a });
+                cx.push(FlatOp::WindowStore {
+                    run: i as u32,
+                    src: *a,
+                });
             }
             let seg = cx.close(FlatExit::Call { func_reg: freg });
             cx.calls.push(seg);
             // Continuation: pop saves (emitted post-liveness) and move
             // results out of the window.
             for (i, &r) in results.iter().enumerate() {
-                cx.push(FlatOp::WindowLoad { run: i as u32, dst: r });
+                cx.push(FlatOp::WindowLoad {
+                    run: i as u32,
+                    dst: r,
+                });
             }
         }
         LeCallee::Ptr(target) => {
@@ -799,7 +854,10 @@ fn lower_call(cx: &mut FnCx, callee: &LeCallee, args: Vec<u32>, results: Vec<u32
                 dst: idx,
             });
             for (i, a) in args.iter().enumerate() {
-                cx.push(FlatOp::WindowStore { run: i as u32, src: *a });
+                cx.push(FlatOp::WindowStore {
+                    run: i as u32,
+                    src: *a,
+                });
             }
             let freg = cx.temp(LeType::I64);
             // Table dispatch into per-slot arm shims that load the entry pc
@@ -809,7 +867,10 @@ fn lower_call(cx: &mut FnCx, callee: &LeCallee, args: Vec<u32>, results: Vec<u32
             for (slot, elem) in table.elems.iter().enumerate() {
                 // Push the shim op first, then close — `close` returns the
                 // segment that HOLDS the load.
-                cx.push(FlatOp::FuncAddrLoad { func: elem.0, dst: freg });
+                cx.push(FlatOp::FuncAddrLoad {
+                    func: elem.0,
+                    dst: freg,
+                });
                 let arm = cx.close(FlatExit::Next);
                 arm_segs.push((slot as u32, FlatTarget::Seg(arm)));
                 // arm exit patched to the call segment below
@@ -836,7 +897,10 @@ fn lower_call(cx: &mut FnCx, callee: &LeCallee, args: Vec<u32>, results: Vec<u32
                 default: FlatTarget::Seg(trap_seg),
             };
             for (i, &r) in results.iter().enumerate() {
-                cx.push(FlatOp::WindowLoad { run: i as u32, dst: r });
+                cx.push(FlatOp::WindowLoad {
+                    run: i as u32,
+                    dst: r,
+                });
             }
         }
     }
@@ -1155,7 +1219,9 @@ fn liveness(flat: &FnFlat) -> (Liveness, BTreeMap<u32, ((u32, u32), (u32, u32))>
         }
         for d in exit_defs(&seg.exit) {
             def_set[i].insert(d);
-            first_pos.entry(d).or_insert((i as u32, seg.ops.len() as u32));
+            first_pos
+                .entry(d)
+                .or_insert((i as u32, seg.ops.len() as u32));
             last_pos.insert(d, (i as u32, seg.ops.len() as u32));
         }
     }
@@ -1268,19 +1334,20 @@ fn allocate(flat: &FnFlat, window_runs: u32) -> Result<Alloc, LeDiag> {
     let mut spill: BTreeMap<u32, u32> = BTreeMap::new();
     let mut next_slot: u32 = 0;
     let mut max_base = zone_start;
-    let mut take_slot = |spill: &mut BTreeMap<u32, u32>, next_slot: &mut u32, victim: u32| -> Result<(), LeDiag> {
-        if *next_slot >= 64 {
-            return Err(LeDiag {
-                function: None,
-                block: None,
-                inst: None,
-                message: "minibc: spill frame exhausted (64 slots)".into(),
-            });
-        }
-        spill.insert(victim, *next_slot);
-        *next_slot += 1;
-        Ok(())
-    };
+    let take_slot =
+        |spill: &mut BTreeMap<u32, u32>, next_slot: &mut u32, victim: u32| -> Result<(), LeDiag> {
+            if *next_slot >= 64 {
+                return Err(LeDiag {
+                    function: None,
+                    block: None,
+                    inst: None,
+                    message: "minibc: spill frame exhausted (64 slots)".into(),
+                });
+            }
+            spill.insert(victim, *next_slot);
+            *next_slot += 1;
+            Ok(())
+        };
     for (l, start, end) in sorted {
         active.retain(|&(e, _, _)| e > start);
         let mut base = zone_start;
@@ -1418,17 +1485,17 @@ fn rewrite_spills(flat: &mut FnFlat, alloc: &Alloc) -> Result<(), LeDiag> {
                         *a = SCRATCH[i];
                     }
                 }
-                if let Some(o) = out {
-                    if let Some(&slot) = spill.get(o) {
-                        *o = SCRATCH[0];
-                        prepends
-                            .entry(si + 1)
-                            .or_default()
-                            .push(FlatOp::SpillStore {
-                                slot,
-                                src: SCRATCH[0],
-                            });
-                    }
+                if let Some(o) = out
+                    && let Some(&slot) = spill.get(o)
+                {
+                    *o = SCRATCH[0];
+                    prepends
+                        .entry(si + 1)
+                        .or_default()
+                        .push(FlatOp::SpillStore {
+                            slot,
+                            src: SCRATCH[0],
+                        });
                 }
             }
             _ => {}
@@ -1444,14 +1511,10 @@ fn rewrite_spills(flat: &mut FnFlat, alloc: &Alloc) -> Result<(), LeDiag> {
 }
 
 /// Rewrite one flat op, pushing the replacement sequence onto `out`.
-fn rewrite_op(
-    op: FlatOp,
-    spill: &BTreeMap<u32, u32>,
-    out: &mut Vec<FlatOp>,
-) -> Result<(), LeDiag> {
+fn rewrite_op(op: FlatOp, spill: &BTreeMap<u32, u32>, out: &mut Vec<FlatOp>) -> Result<(), LeDiag> {
     // Use-loads for up to two spilled use operands; defs reuse SCRATCH[0]
     // (every op reads its sources before writing its destination).
-    let mut loads = |uses: &mut [&mut u32], out: &mut Vec<FlatOp>| -> Result<(), LeDiag> {
+    let loads = |uses: &mut [&mut u32], out: &mut Vec<FlatOp>| -> Result<(), LeDiag> {
         // Scratches already holding remat'd consts in this op stay live
         // through it; allocate spill loads from the complement.
         let mut mask = scratch_mask_of(&uses.iter().map(|u| **u).collect::<Vec<_>>());
@@ -1536,7 +1599,12 @@ fn rewrite_op(
             }
             (None, None) => out.push(FlatOp::Move { src, dst }),
         },
-        FlatOp::AluRaw { mut a, mut b, dst, sub } => {
+        FlatOp::AluRaw {
+            mut a,
+            mut b,
+            dst,
+            sub,
+        } => {
             loads(&mut [&mut a, &mut b], out)?;
             let d = if spill.contains_key(&dst) {
                 SCRATCH[0]
@@ -1556,7 +1624,12 @@ fn rewrite_op(
             out.push(FlatOp::AluUn { src, dst: d, sub });
             store_dst(dst, out, spill);
         }
-        FlatOp::Stock3 { kind, mut a, mut b, dst } => {
+        FlatOp::Stock3 {
+            kind,
+            mut a,
+            mut b,
+            dst,
+        } => {
             loads(&mut [&mut a, &mut b], out)?;
             let d = if spill.contains_key(&dst) {
                 SCRATCH[0]
@@ -1628,9 +1701,15 @@ fn dump_flat(name: &str, flat: &FnFlat, alloc: &Alloc) {
             eprintln!("    {op:?}");
         }
         let phys_exit = match &seg.exit {
-            FlatExit::HostOp { idx, args, out } => format!(
+            FlatExit::HostOp {
+                idx: _,
+                args,
+                out: _,
+            } => format!(
                 " [phys args {:?}]",
-                args.iter().map(|a| phys(&alloc.base_of, *a)).collect::<Vec<_>>()
+                args.iter()
+                    .map(|a| phys(&alloc.base_of, *a))
+                    .collect::<Vec<_>>()
             ),
             _ => String::new(),
         };
@@ -1686,15 +1765,13 @@ fn encode_mini(op: MiniOp, out: &mut Vec<u8>) {
     op.encode(out.len() as u32, &mut |b| out.push(b));
 }
 
-fn emit_op(
-    op: &FlatOp,
-    base_of: &BTreeMap<u32, u32>,
-    out: &mut Vec<u8>,
-    fixups: &mut Vec<Fixup>,
-) {
+fn emit_op(op: &FlatOp, base_of: &BTreeMap<u32, u32>, out: &mut Vec<u8>, fixups: &mut Vec<Fixup>) {
     match op {
         FlatOp::LoadConst { dst, bits } => {
-            encode_mini(MiniOp::LoadConst64(Reg(phys(base_of, *dst)), bits.to_le_bytes()), out);
+            encode_mini(
+                MiniOp::LoadConst64(Reg(phys(base_of, *dst)), bits.to_le_bytes()),
+                out,
+            );
         }
         FlatOp::Move { src, dst } => encode_mini(
             MiniOp::Move(
@@ -1779,10 +1856,7 @@ fn emit_op(
         FlatOp::FuncAddrLoad { func, dst } => {
             let at = out.len() + 2; // opcode + reg, then the 8-byte payload
             fixups.push(Fixup::FuncAddr { at, func: *func });
-            encode_mini(
-                MiniOp::LoadConst64(Reg(phys(base_of, *dst)), [0; 8]),
-                out,
-            );
+            encode_mini(MiniOp::LoadConst64(Reg(phys(base_of, *dst)), [0; 8]), out);
         }
         FlatOp::Trap => encode_mini(MiniOp::Trap, out),
     }
@@ -1810,7 +1884,9 @@ fn emit_exit(
                 func: func_idx,
                 target,
             });
-            StdExtOp::encode_ext_op(&StdExtOp::Jump { target: 0 }, out.len() as u32, &mut |b| out.push(b));
+            StdExtOp::encode_ext_op(&StdExtOp::Jump { target: 0 }, out.len() as u32, &mut |b| {
+                out.push(b)
+            });
         }
         FlatExit::Cond { cond, if_true } => {
             let at = out.len() + 2; // tag + cond_reg, then the target field
@@ -1819,10 +1895,14 @@ fn emit_exit(
                 func: func_idx,
                 target: *if_true,
             });
-            StdExtOp::encode_ext_op(&StdExtOp::Cond {
-                cond_reg: phys(base_of, *cond),
-                target: 0,
-            }, out.len() as u32, &mut |b| out.push(b));
+            StdExtOp::encode_ext_op(
+                &StdExtOp::Cond {
+                    cond_reg: phys(base_of, *cond),
+                    target: 0,
+                },
+                out.len() as u32,
+                &mut |b| out.push(b),
+            );
         }
         FlatExit::Table {
             index,
@@ -1846,13 +1926,21 @@ fn emit_exit(
                 func: func_idx,
                 target: *default,
             });
-            StdExtOp::encode_ext_op(&StdExtOp::Table {
-                index_reg: phys(base_of, *index),
-                arms: arms.iter().map(|(k, _)| (*k, 0)).collect(),
-                default_offset: 0,
-            }, out.len() as u32, &mut |b| out.push(b));
+            StdExtOp::encode_ext_op(
+                &StdExtOp::Table {
+                    index_reg: phys(base_of, *index),
+                    arms: arms.iter().map(|(k, _)| (*k, 0)).collect(),
+                    default_offset: 0,
+                },
+                out.len() as u32,
+                &mut |b| out.push(b),
+            );
         }
-        FlatExit::HostOp { idx, args, out: out_reg } => {
+        FlatExit::HostOp {
+            idx,
+            args,
+            out: out_reg,
+        } => {
             out.push(0x9B);
             out.push(*idx as u8);
             out.push(if out_reg.is_some() { 1 } else { 0 });
@@ -1863,14 +1951,20 @@ fn emit_exit(
             out.push(phys(base_of, out_reg.unwrap_or(0)));
         }
         FlatExit::Call { func_reg } => {
-            StdExtOp::encode_ext_op(&StdExtOp::Call {
-                func_reg: phys(base_of, *func_reg),
-            }, out.len() as u32, &mut |b| out.push(b));
+            StdExtOp::encode_ext_op(
+                &StdExtOp::Call {
+                    func_reg: phys(base_of, *func_reg),
+                },
+                out.len() as u32,
+                &mut |b| out.push(b),
+            );
         }
         FlatExit::Ret | FlatExit::Trap => {
             let at = out.len() + 1;
             fixups.push(Fixup::End { at });
-            StdExtOp::encode_ext_op(&StdExtOp::Jump { target: 0 }, out.len() as u32, &mut |b| out.push(b));
+            StdExtOp::encode_ext_op(&StdExtOp::Jump { target: 0 }, out.len() as u32, &mut |b| {
+                out.push(b)
+            });
         }
     }
 }
@@ -1895,13 +1989,13 @@ pub fn render_minibc(m: &LeModule) -> Result<MinibcArtifact, Vec<LeDiag>> {
             continue;
         }
         let mut flat = flatten_function(m, f);
-        if std::env::var("MB_NOREMAT").is_err() {
-            if let Err(mut d) = remat_consts(&mut flat) {
-                d.message = format!("{}: {}", f.name, d.message);
-                diags.push(d);
-                flats.push(None);
-                continue;
-            }
+        if std::env::var("MB_NOREMAT").is_err()
+            && let Err(mut d) = remat_consts(&mut flat)
+        {
+            d.message = format!("{}: {}", f.name, d.message);
+            diags.push(d);
+            flats.push(None);
+            continue;
         }
         diags.extend(flat.diags.iter().cloned());
         match allocate(&flat, window_runs).and_then(|alloc| {
@@ -1909,10 +2003,10 @@ pub fn render_minibc(m: &LeModule) -> Result<MinibcArtifact, Vec<LeDiag>> {
             Ok(alloc)
         }) {
             Ok(alloc) => {
-                if let Ok(filter) = std::env::var("MBDUMP_FN") {
-                    if f.name.contains(&filter) {
-                        dump_flat(&f.name, &flat, &alloc);
-                    }
+                if let Ok(filter) = std::env::var("MBDUMP_FN")
+                    && f.name.contains(&filter)
+                {
+                    dump_flat(&f.name, &flat, &alloc);
                 }
                 flats.push(Some((flat, alloc)))
             }
@@ -1932,14 +2026,18 @@ pub fn render_minibc(m: &LeModule) -> Result<MinibcArtifact, Vec<LeDiag>> {
     let mut func_entry: BTreeMap<u32, u32> = BTreeMap::new();
     let mut fixups: Vec<Fixup> = Vec::new();
     let mut store_regs = (window_runs * 4) as usize;
-    for (i, f) in m.funcs.iter().enumerate() {
-        let Some((flat, alloc)) = &flats[i] else { continue };
+    for (i, _f) in m.funcs.iter().enumerate() {
+        let Some((flat, alloc)) = &flats[i] else {
+            continue;
+        };
         func_entry.insert(i as u32, out.len() as u32);
         store_regs = store_regs.max(alloc.max_base as usize);
         for (si, seg) in flat.segs.iter().enumerate() {
             // A Call's pops splice may already have recorded this segment's
             // pc (the continuation includes the pops).
-            seg_pcs.entry((i as u32, si as u32)).or_insert(out.len() as u32);
+            seg_pcs
+                .entry((i as u32, si as u32))
+                .or_insert(out.len() as u32);
             for op in &seg.ops {
                 emit_op(op, &alloc.base_of, &mut out, &mut fixups);
             }

@@ -13,9 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use super::rust_runtime::{RUST_PRELUDE, RUST_RUNTIME_COREGC, RUST_RUNTIME_NANO};
-use super::{
-    LeBinOp, LeBlock, LeCallee, LeDiag, LeExpr, LeFunc, LeLocal, LeModule, LeStmt, LeType, LeUnOp,
-};
+use super::{LeBinOp, LeCallee, LeDiag, LeExpr, LeFunc, LeModule, LeStmt, LeType, LeUnOp};
 
 /// Sanitize an arbitrary name into a Rust identifier (deterministic).
 pub fn rust_ident(s: &str) -> String {
@@ -306,7 +304,10 @@ impl<'m> Renderer<'m> {
         const HEADER_FIELDS: [&str; 4] = ["type_id", "flags", "len", "pad"];
         let ptr = if mutable { "*mut" } else { "*const" };
         if layout == 0 {
-            format!("(*(({base}) as {ptr} JsHd)).{}", HEADER_FIELDS[field as usize])
+            format!(
+                "(*(({base}) as {ptr} JsHd)).{}",
+                HEADER_FIELDS[field as usize]
+            )
         } else {
             format!("(*(({base}) as {ptr} JsL{layout})).f{field}")
         }
@@ -378,7 +379,10 @@ impl<'m> Renderer<'m> {
                 layout,
                 field,
                 base,
-            } => format!("unsafe {{ {} }}", self.field_access(*layout, *field, &self.expr(f, base), false)),
+            } => format!(
+                "unsafe {{ {} }}",
+                self.field_access(*layout, *field, &self.expr(f, base), false)
+            ),
             LeExpr::Index {
                 layout,
                 base,
@@ -431,9 +435,9 @@ impl<'m> Renderer<'m> {
             let last = i + 1 == stmts.len();
             if !last {
                 if matches!(s, LeStmt::Goto(_)) {
-                    return Err(self.diag(
-                        "Rust backend: Goto in a non-tail statement position".into(),
-                    ));
+                    return Err(
+                        self.diag("Rust backend: Goto in a non-tail statement position".into())
+                    );
                 }
                 self.stmt(f, s, depth, out)?;
                 continue;
@@ -466,13 +470,7 @@ impl<'m> Renderer<'m> {
         Ok(())
     }
 
-    fn stmt(
-        &self,
-        f: &LeFunc,
-        s: &LeStmt,
-        depth: usize,
-        out: &mut String,
-    ) -> Result<(), LeDiag> {
+    fn stmt(&self, f: &LeFunc, s: &LeStmt, depth: usize, out: &mut String) -> Result<(), LeDiag> {
         let pad = "  ".repeat(depth);
         match s {
             LeStmt::Assign(l, e) => {
@@ -506,9 +504,7 @@ impl<'m> Renderer<'m> {
                     .map(|(i, a)| {
                         let rendered = self.expr(f, a);
                         match param_tys.and_then(|p| p.get(i)) {
-                            Some(&expected) => {
-                                self.coerce(expected, self.expr_ty(f, a), rendered)
-                            }
+                            Some(&expected) => self.coerce(expected, self.expr_ty(f, a), rendered),
                             None => rendered,
                         }
                     })
@@ -611,11 +607,8 @@ impl<'m> Renderer<'m> {
             }
             LeStmt::GlobalSet(g, e) => {
                 let rendered = self.expr(f, e);
-                let coerced = self.coerce(
-                    self.m.globals[*g as usize].0,
-                    self.expr_ty(f, e),
-                    rendered,
-                );
+                let coerced =
+                    self.coerce(self.m.globals[*g as usize].0, self.expr_ty(f, e), rendered);
                 writeln!(out, "{pad}unsafe {{ JS_G{g} = {coerced}; }}").unwrap();
             }
             LeStmt::If { cond, then, else_ } => {
@@ -644,15 +637,11 @@ impl<'m> Renderer<'m> {
                 writeln!(out, "{pad}}}").unwrap();
             }
             LeStmt::Break => writeln!(out, "{pad}break;").unwrap(),
-                LeStmt::Return(values) => match values.len() {
+            LeStmt::Return(values) => match values.len() {
                 0 => writeln!(out, "{pad}return;").unwrap(),
                 1 => {
                     let rendered = self.expr(f, &values[0]);
-                    let coerced = self.coerce(
-                        f.results[0],
-                        self.expr_ty(f, &values[0]),
-                        rendered,
-                    );
+                    let coerced = self.coerce(f.results[0], self.expr_ty(f, &values[0]), rendered);
                     writeln!(out, "{pad}return {coerced};").unwrap()
                 }
                 n => {
@@ -807,7 +796,11 @@ fn render_module(m: &LeModule) -> Result<String, LeDiag> {
     let mut import_syms = BTreeMap::new();
     let mut taken = BTreeSet::new();
     for imp in &m.imports {
-        let sym = format!("js_imp_{}_{}", rust_ident(&imp.module), rust_ident(&imp.name));
+        let sym = format!(
+            "js_imp_{}_{}",
+            rust_ident(&imp.module),
+            rust_ident(&imp.name)
+        );
         if !taken.insert(sym.clone()) {
             return Err(LeDiag {
                 function: None,
@@ -895,11 +888,7 @@ fn render_module(m: &LeModule) -> Result<String, LeDiag> {
                     )
                 }
             };
-            writeln!(
-                out,
-                "  static LI_{i}: JsLayoutInfo = {info};"
-            )
-            .unwrap();
+            writeln!(out, "  static LI_{i}: JsLayoutInfo = {info};").unwrap();
         }
         writeln!(out, "  match type_id {{").unwrap();
         for (i, layout) in m.layouts.iter().enumerate() {
@@ -914,7 +903,13 @@ fn render_module(m: &LeModule) -> Result<String, LeDiag> {
     // Statics.
     for s in &m.statics {
         writeln!(out, "// static {:?}", s.name).unwrap();
-        write!(out, "static JS_S_{}: [u8; {}] = [", rust_ident(&s.name).to_uppercase(), s.bytes.len()).unwrap();
+        write!(
+            out,
+            "static JS_S_{}: [u8; {}] = [",
+            rust_ident(&s.name).to_uppercase(),
+            s.bytes.len()
+        )
+        .unwrap();
         for b in &s.bytes {
             write!(out, "{b},").unwrap();
         }
@@ -944,11 +939,19 @@ fn render_module(m: &LeModule) -> Result<String, LeDiag> {
                 }
                 writeln!(out, "static mut JS_G{i}: JsRef = 0;").unwrap();
             }
-            LeType::I32 => {
-                writeln!(out, "static mut JS_G{i}: i32 = (0x{:x}u32) as i32;", bits as u32).unwrap()
-            }
-            t => writeln!(out, "static mut JS_G{i}: {} = (0x{bits:x}u64) as {};", rty(*t), rty(*t))
-                .unwrap(),
+            LeType::I32 => writeln!(
+                out,
+                "static mut JS_G{i}: i32 = (0x{:x}u32) as i32;",
+                bits as u32
+            )
+            .unwrap(),
+            t => writeln!(
+                out,
+                "static mut JS_G{i}: {} = (0x{bits:x}u64) as {};",
+                rty(*t),
+                rty(*t)
+            )
+            .unwrap(),
         }
     }
 
@@ -967,8 +970,14 @@ fn render_module(m: &LeModule) -> Result<String, LeDiag> {
                 .enumerate()
                 .map(|(k, t)| format!("a{k}: {}", rty(*t)))
                 .collect();
-            writeln!(out, "  fn {}({}){};", r.import_syms[&imp.func.0], params.join(", "), ret)
-                .unwrap();
+            writeln!(
+                out,
+                "  fn {}({}){};",
+                r.import_syms[&imp.func.0],
+                params.join(", "),
+                ret
+            )
+            .unwrap();
         }
         writeln!(out, "}}").unwrap();
     }
@@ -1008,7 +1017,12 @@ fn render_module(m: &LeModule) -> Result<String, LeDiag> {
             .enumerate()
             .map(|(k, (_, t))| format!("a{k}: {}", rty(*t)))
             .collect();
-        let args: Vec<String> = f.params.iter().enumerate().map(|(k, _)| format!("a{k}")).collect();
+        let args: Vec<String> = f
+            .params
+            .iter()
+            .enumerate()
+            .map(|(k, _)| format!("a{k}"))
+            .collect();
         writeln!(
             out,
             "#[no_mangle]\npub extern \"C\" fn {sym}({}){ret} {{",

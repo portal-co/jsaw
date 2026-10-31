@@ -1,7 +1,7 @@
 use super::*;
 
+use crate::{BACKEND_PLAN_SCHEMA, PlanBlockId, PlanSigId};
 use portal_pc_waffle::Module;
-use crate::{BACKEND_PLAN_SCHEMA, PlanBlockId};
 
 /// Lower JS to a BackendPlan (through the ordinary WasmGC converter), emit
 /// the nano MVP module, validate it as pure core Wasm (GC off), and execute
@@ -36,12 +36,16 @@ fn compile_plan_and_run(source: &str, export: &str, args: &[f64]) -> f64 {
     let module = wasmtime::Module::new(&engine, &bytes).expect("parse");
     let mut store = wasmtime::Store::new(&engine, ());
     let linker: wasmtime::Linker<()> = wasmtime::Linker::new(&engine);
-    let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .expect("instantiate");
     let func = instance
         .get_func(&mut store, export)
         .unwrap_or_else(|| panic!("export {export:?}"));
-    let params: Vec<wasmtime::Val> =
-        args.iter().map(|a| wasmtime::Val::F64(a.to_bits())).collect();
+    let params: Vec<wasmtime::Val> = args
+        .iter()
+        .map(|a| wasmtime::Val::F64(a.to_bits()))
+        .collect();
     let mut results = vec![wasmtime::Val::F64(0)];
     func.call(&mut store, &params, &mut results).expect("call");
     match results[0] {
@@ -66,11 +70,19 @@ fn plan_of(source: &str) -> BackendPlan {
 #[test]
 fn scalar_arithmetic_executes() {
     assert_eq!(
-        compile_plan_and_run("export function add(a, b) { return a + b; }", "add", &[3.0, 4.0]),
+        compile_plan_and_run(
+            "export function add(a, b) { return a + b; }",
+            "add",
+            &[3.0, 4.0]
+        ),
         7.0
     );
     assert_eq!(
-        compile_plan_and_run("export function sub(a, b) { return a - b; }", "sub", &[10.0, 3.0]),
+        compile_plan_and_run(
+            "export function sub(a, b) { return a - b; }",
+            "sub",
+            &[10.0, 3.0]
+        ),
         7.0
     );
 }
@@ -168,7 +180,9 @@ fn minimal_plan_with_op(op: &str) -> BackendPlan {
                     ref_func: None,
                     payload: Default::default(),
                 }],
-                terminator: PlanTerminator::Return { values: vec![PlanValueId(0)] },
+                terminator: PlanTerminator::Return {
+                    values: vec![PlanValueId(0)],
+                },
             }],
             values: vec![crate::backend_plan::PlanValue {
                 ty: Some(crate::backend_plan::TypeId(0)),
@@ -208,9 +222,14 @@ fn instrumentation_tracks_allocations() {
     let module = wasmtime::Module::new(&engine, &bytes).expect("parse");
     let mut store = wasmtime::Store::new(&engine, ());
     let linker: wasmtime::Linker<()> = wasmtime::Linker::new(&engine);
-    let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .expect("instantiate");
     let func = instance.get_func(&mut store, "makeAndSum").expect("export");
-    let params = vec![wasmtime::Val::F64(3.0f64.to_bits()), wasmtime::Val::F64(4.0f64.to_bits())];
+    let params = vec![
+        wasmtime::Val::F64(3.0f64.to_bits()),
+        wasmtime::Val::F64(4.0f64.to_bits()),
+    ];
     let mut results = vec![wasmtime::Val::F64(0)];
     func.call(&mut store, &params, &mut results).expect("call");
 
@@ -237,7 +256,10 @@ fn instrumentation_tracks_allocations() {
     };
     assert!(count > 0, "allocating program must count allocations");
     assert!(alloc_bytes > 0, "allocating program must count bytes");
-    assert!(cursor > ARENA_BASE as i64, "cursor must advance past the base");
+    assert!(
+        cursor > ARENA_BASE as i64,
+        "cursor must advance past the base"
+    );
     assert!(
         alloc_bytes <= cursor - ARENA_BASE as i64,
         "counted bytes ({alloc_bytes}) cannot exceed used arena ({})",
@@ -265,7 +287,9 @@ fn arena_exhaustion_traps_deterministically() {
     let module = wasmtime::Module::new(&engine, &bytes).expect("parse");
     let mut store = wasmtime::Store::new(&engine, ());
     let linker: wasmtime::Linker<()> = wasmtime::Linker::new(&engine);
-    let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .expect("instantiate");
     let func = instance.get_func(&mut store, "churn").expect("export");
     let params = vec![wasmtime::Val::F64(100000.0f64.to_bits())];
     let mut results = vec![wasmtime::Val::F64(0)];

@@ -113,7 +113,10 @@ pub enum ValueFact {
     /// A bit-exact constant.
     Constant(PlanConst),
     /// Inclusive integer range (signed interpretation, i64 domain).
-    Range { lo: i64, hi: i64 },
+    Range {
+        lo: i64,
+        hi: i64,
+    },
     /// Nullability of a reference value.
     Null(Nullability),
     /// Object shape/alias/mutation/arena facts.
@@ -141,7 +144,9 @@ impl ValueFact {
 /// Liveness of the jsaw adapter boundary slots (`context`, `this`,
 /// `arguments`). Unused boundary values are elided from keys just like
 /// ordinary unused parameters.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub struct BoundaryLiveness {
     pub context: bool,
     pub this: bool,
@@ -351,7 +356,10 @@ impl EvalState {
 
 /// Predecessor edges of a block: (predecessor block, argument list) pairs in
 /// canonical order.
-fn predecessor_edges(plan: &BackendPlan, function: PlanFuncId) -> BTreeMap<u32, Vec<(u32, Vec<PlanValueId>)>> {
+fn predecessor_edges(
+    plan: &BackendPlan,
+    function: PlanFuncId,
+) -> BTreeMap<u32, Vec<(u32, Vec<PlanValueId>)>> {
     let mut edges: BTreeMap<u32, Vec<(u32, Vec<PlanValueId>)>> = BTreeMap::new();
     let Some(func) = plan.functions.get(function.index()) else {
         return edges;
@@ -524,28 +532,26 @@ fn eval_inst(
         return ValueFact::FuncIdentity(callee);
     }
     // Bounded integer arithmetic.
-    if matches!(inst.operator.as_str(), "I32Add" | "I32Sub" | "I32Mul" | "I64Add" | "I64Sub" | "I64Mul") {
+    if matches!(
+        inst.operator.as_str(),
+        "I32Add" | "I32Sub" | "I32Mul" | "I64Add" | "I64Sub" | "I64Mul"
+    ) {
         let mut arg_facts = Vec::new();
         for arg in &inst.args {
-            arg_facts.push(eval_value(plan, function, *arg, env, preds, wrapping, state));
+            arg_facts.push(eval_value(
+                plan, function, *arg, env, preds, wrapping, state,
+            ));
         }
         return eval_arith(&inst.operator, &arg_facts, wrapping);
     }
     // Nested call-site parameter propagation for direct calls.
     if let Some(call) = &inst.call {
-        if let PlanCallKind::Direct { callee } = call.kind {
-            if let Some(fact) = eval_nested_call(
-                plan,
-                callee,
-                &inst.args,
-                function,
-                env,
-                preds,
-                wrapping,
-                state,
-            ) {
-                return fact;
-            }
+        if let PlanCallKind::Direct { callee } = call.kind
+            && let Some(fact) = eval_nested_call(
+                plan, callee, &inst.args, function, env, preds, wrapping, state,
+            )
+        {
+            return fact;
         }
         state.unsupported += 1;
         return ValueFact::Unknown;
@@ -771,11 +777,14 @@ fn used_parameters(plan: &BackendPlan, function: PlanFuncId) -> Vec<u32> {
         changed = false;
         for block in &func.blocks {
             for inst in &block.insts {
-                if inst.operator == "alias" && inst.results.len() == 1 && inst.args.len() == 1 {
-                    if used.contains(&inst.results[0]) && !used.contains(&inst.args[0]) {
-                        used.insert(inst.args[0]);
-                        changed = true;
-                    }
+                if inst.operator == "alias"
+                    && inst.results.len() == 1
+                    && inst.args.len() == 1
+                    && used.contains(&inst.results[0])
+                    && !used.contains(&inst.args[0])
+                {
+                    used.insert(inst.args[0]);
+                    changed = true;
                 }
             }
         }
@@ -815,7 +824,10 @@ pub fn analyze_function(
                 .iter()
                 .enumerate()
                 .map(|(index, _)| {
-                    root_env.get(&(index as u32)).cloned().unwrap_or(ValueFact::Unknown)
+                    root_env
+                        .get(&(index as u32))
+                        .cloned()
+                        .unwrap_or(ValueFact::Unknown)
                 })
                 .collect()
         })
@@ -825,7 +837,15 @@ pub fn analyze_function(
     let preds = predecessor_edges(plan, function);
     let mut state = EvalState::new();
     for (index, _) in func.values.iter().enumerate() {
-        let fact = eval_value(plan, function, PlanValueId(index as u32), &env, &preds, wrapping, &mut state);
+        let fact = eval_value(
+            plan,
+            function,
+            PlanValueId(index as u32),
+            &env,
+            &preds,
+            wrapping,
+            &mut state,
+        );
         facts.values.insert(index as u32, fact);
     }
     facts.eval = state.report();
@@ -833,12 +853,12 @@ pub fn analyze_function(
     // Proven callees: direct calls and ref.func identities.
     for (block_index, block) in func.blocks.iter().enumerate() {
         for (inst_index, inst) in block.insts.iter().enumerate() {
-            if let Some(call) = &inst.call {
-                if let PlanCallKind::Direct { callee } = call.kind {
-                    facts
-                        .proven_callees
-                        .insert((block_index as u32, inst_index as u32), callee);
-                }
+            if let Some(call) = &inst.call
+                && let PlanCallKind::Direct { callee } = call.kind
+            {
+                facts
+                    .proven_callees
+                    .insert((block_index as u32, inst_index as u32), callee);
             }
         }
     }
@@ -1175,7 +1195,11 @@ impl<'p> Specializer<'p> {
             });
             return Ok(VariantRequest::Coarsened { generic });
         }
-        Ok(VariantRequest::Created(self.materialize(key.function, key, false)))
+        Ok(VariantRequest::Created(self.materialize(
+            key.function,
+            key,
+            false,
+        )))
     }
 
     /// Finish, producing variants, diagnostics, usage, and coarsening records.

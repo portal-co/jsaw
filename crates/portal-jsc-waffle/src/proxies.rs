@@ -1550,7 +1550,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             let array = self.make_arguments(body, block, values, args)?;
             return Ok((block, captured_context, effective_this, array, code));
         }
-        let helpers = self.ensure_proxy_helpers()?;
+        let _helpers = self.ensure_proxy_helpers()?;
         let chain = self.ensure_chain_lookup()?;
         let is_proxy = body.add_op(
             block,
@@ -1737,7 +1737,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         this: LowerValue,
         values: &ContinuationValues,
         args: &[SValueId],
-        span: &impl std::fmt::Debug,
+        _span: &impl std::fmt::Debug,
     ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
                 let receiver = self.new_object(body, block)?;
                 // `new C()`: the receiver's [[Prototype]] is the
@@ -1937,7 +1937,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         normal_result,
                     ]);
                 }
-                return Ok(vec![normal_result]);
+                Ok(vec![normal_result])
     }
 
     /// `new` dispatch with proxy awareness: a proxied constructor runs the

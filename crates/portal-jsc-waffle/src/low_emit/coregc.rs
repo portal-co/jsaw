@@ -37,8 +37,8 @@
 //! values are rooted via the step's own locals.
 
 use super::{
-    InstCx, LeBinOp, LeCallee, LeDiag, LeExpr, LeFuncId, LeLayout, LeLocal, LeModule, LeStatic,
-    LeStmt, LeType, LeUnOp, Representation, RuntimeSink, heap_test_mode, zero_of,
+    InstCx, LeBinOp, LeCallee, LeDiag, LeExpr, LeLayout, LeLocal, LeModule, LeStatic, LeStmt,
+    LeType, LeUnOp, Representation, RuntimeSink, heap_test_mode, zero_of,
 };
 use crate::backend_plan::{
     BackendPlan, PlanFuncId, PlanHeapType, PlanSigId, PlanSignature, PlanStorage, TypeId,
@@ -69,7 +69,11 @@ fn is_null(v: LeExpr) -> LeExpr {
 fn is_i31(v: LeExpr) -> LeExpr {
     LeExpr::Binary(
         LeBinOp::I64Ne,
-        Box::new(LeExpr::Binary(LeBinOp::I64And, Box::new(v), Box::new(i64(1)))),
+        Box::new(LeExpr::Binary(
+            LeBinOp::I64And,
+            Box::new(v),
+            Box::new(i64(1)),
+        )),
         Box::new(i64(0)),
     )
 }
@@ -249,9 +253,8 @@ impl CoreGcRepresentation {
                     base: Box::new(r.clone()),
                 },
             );
-            let is_mode = |m: u32| {
-                LeExpr::Binary(LeBinOp::I32Eq, Box::new(mode.clone()), Box::new(i32c(m)))
-            };
+            let is_mode =
+                |m: u32| LeExpr::Binary(LeBinOp::I32Eq, Box::new(mode.clone()), Box::new(i32c(m)));
             b.emit(LeStmt::If {
                 cond: is_mode(0),
                 then: vec![LeStmt::If {
@@ -460,7 +463,11 @@ impl Representation for CoreGcRepresentation {
             vec![LeType::Ref],
         );
         sink.runtime_fn("js_coregc_root_enter", vec![LeType::I32], vec![]);
-        sink.runtime_fn("js_coregc_root_store", vec![LeType::I32, LeType::Ref], vec![]);
+        sink.runtime_fn(
+            "js_coregc_root_store",
+            vec![LeType::I32, LeType::Ref],
+            vec![],
+        );
         sink.runtime_fn("js_coregc_root_pop", vec![], vec![]);
         sink.runtime_fn(
             "js_coregc_array_copy",
@@ -730,12 +737,13 @@ impl Representation for CoreGcRepresentation {
         recv: LeExpr,
         out: LeLocal,
     ) -> Result<(), LeDiag> {
-        let (mode, expected) = heap_test_mode(cx.t.plan, cx.t.type_ids, heap).map_err(|m| LeDiag {
-            function: cx.at.0,
-            block: cx.at.1,
-            inst: cx.at.2,
-            message: m,
-        })?;
+        let (mode, expected) =
+            heap_test_mode(cx.t.plan, cx.t.type_ids, heap).map_err(|m| LeDiag {
+                function: cx.at.0,
+                block: cx.at.1,
+                inst: cx.at.2,
+                message: m,
+            })?;
         let helper = self.cast_helper(cx, true);
         cx.emit(LeStmt::Call {
             callee: LeCallee::Direct(helper),
@@ -753,12 +761,13 @@ impl Representation for CoreGcRepresentation {
         recv: LeExpr,
         out: LeLocal,
     ) -> Result<(), LeDiag> {
-        let (mode, expected) = heap_test_mode(cx.t.plan, cx.t.type_ids, heap).map_err(|m| LeDiag {
-            function: cx.at.0,
-            block: cx.at.1,
-            inst: cx.at.2,
-            message: m,
-        })?;
+        let (mode, expected) =
+            heap_test_mode(cx.t.plan, cx.t.type_ids, heap).map_err(|m| LeDiag {
+                function: cx.at.0,
+                block: cx.at.1,
+                inst: cx.at.2,
+                message: m,
+            })?;
         let helper = self.cast_helper(cx, false);
         cx.emit(LeStmt::Call {
             callee: LeCallee::Direct(helper),

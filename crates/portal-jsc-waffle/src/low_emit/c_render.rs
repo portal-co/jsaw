@@ -9,9 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use super::c_runtime::{C_PRELUDE, C_RUNTIME_COREGC, C_RUNTIME_NANO};
-use super::{
-    LeBinOp, LeBlock, LeCallee, LeDiag, LeExpr, LeFunc, LeLocal, LeModule, LeStmt, LeType, LeUnOp,
-};
+use super::{LeBinOp, LeBlock, LeCallee, LeDiag, LeExpr, LeFunc, LeModule, LeStmt, LeType, LeUnOp};
 
 /// Sanitize an arbitrary name into a C identifier (deterministic).
 pub fn c_ident(s: &str) -> String {
@@ -343,13 +341,7 @@ impl<'m> Renderer<'m> {
         }
     }
 
-    fn stmt(
-        &self,
-        f: &LeFunc,
-        s: &LeStmt,
-        depth: usize,
-        out: &mut String,
-    ) -> Result<(), LeDiag> {
+    fn stmt(&self, f: &LeFunc, s: &LeStmt, depth: usize, out: &mut String) -> Result<(), LeDiag> {
         let pad = "  ".repeat(depth);
         match s {
             LeStmt::Assign(l, e) => {
@@ -377,10 +369,8 @@ impl<'m> Renderer<'m> {
                             None => "void",
                             Some(l) => c_ty(f.locals[l.0 as usize].1),
                         };
-                        let params: Vec<&str> = args
-                            .iter()
-                            .map(|a| c_ty(self.expr_ty(f, a)))
-                            .collect();
+                        let params: Vec<&str> =
+                            args.iter().map(|a| c_ty(self.expr_ty(f, a))).collect();
                         format!(
                             "(({ret} (*)({params}))({target}))({args})",
                             params = params.join(", "),
@@ -517,17 +507,18 @@ impl<'m> Renderer<'m> {
                 f.results.len()
             )));
         }
-        let ret = f
-            .results
-            .first()
-            .map(|t| c_ty(*t))
-            .unwrap_or("void");
+        let ret = f.results.first().map(|t| c_ty(*t)).unwrap_or("void");
         let params: Vec<String> = f
             .params
             .iter()
             .map(|(l, t)| format!("{} v{}", c_ty(*t), l.0))
             .collect();
-        writeln!(out, "static {ret} js_f{id}({params}) {{", params = params.join(", ")).unwrap();
+        writeln!(
+            out,
+            "static {ret} js_f{id}({params}) {{",
+            params = params.join(", ")
+        )
+        .unwrap();
         let param_ids: BTreeSet<u32> = f.params.iter().map(|(l, _)| l.0).collect();
         for (l, t) in &f.locals {
             if !param_ids.contains(&l.0) {
@@ -785,20 +776,26 @@ fn render_module(m: &LeModule) -> Result<String, LeDiag> {
                 writeln!(out, "static js_ref js_g{i} = 0;").unwrap();
             }
             LeType::I64 | LeType::Slot => {
-                writeln!(out, "static int64_t js_g{i} = (int64_t)UINT64_C(0x{bits:016x});").unwrap();
+                writeln!(
+                    out,
+                    "static int64_t js_g{i} = (int64_t)UINT64_C(0x{bits:016x});"
+                )
+                .unwrap();
             }
-            t => writeln!(out, "static {} js_g{i} = ({})0x{:x}u;", c_ty(*t), c_ty(*t), bits as u32)
-                .unwrap(),
+            t => writeln!(
+                out,
+                "static {} js_g{i} = ({})0x{:x}u;",
+                c_ty(*t),
+                c_ty(*t),
+                bits as u32
+            )
+            .unwrap(),
         }
     }
 
     // Import prototypes.
     for imp in &m.imports {
-        let ret = imp
-            .results
-            .first()
-            .map(|t| c_ty(*t))
-            .unwrap_or("void");
+        let ret = imp.results.first().map(|t| c_ty(*t)).unwrap_or("void");
         let params: Vec<&str> = imp.params.iter().map(|t| c_ty(*t)).collect();
         writeln!(
             out,
@@ -870,7 +867,12 @@ fn render_module(m: &LeModule) -> Result<String, LeDiag> {
             .enumerate()
             .map(|(k, (_, t))| format!("{} a{k}", c_ty(*t)))
             .collect();
-        let args: Vec<String> = f.params.iter().enumerate().map(|(k, _)| format!("a{k}")).collect();
+        let args: Vec<String> = f
+            .params
+            .iter()
+            .enumerate()
+            .map(|(k, _)| format!("a{k}"))
+            .collect();
         writeln!(out, "{ret} {sym}({params}) {{", params = params.join(", ")).unwrap();
         writeln!(out, "  js_boundary_reset();").unwrap();
         if f.results.is_empty() {

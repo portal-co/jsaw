@@ -177,14 +177,14 @@ impl CoreGcInventory {
         for (function, declaration) in module.funcs.entries() {
             if let FuncDecl::Body(_, _, body) = declaration {
                 for (value, definition) in body.values.entries() {
-                    if let ValueDef::Operator(operator, _, _) = definition {
-                        if let Some(name) = gc_operator_name(operator) {
-                            inventory.gc_operations.push(CoreGcOperation {
-                                function_index: function.index(),
-                                value_index: value.index(),
-                                name,
-                            });
-                        }
+                    if let ValueDef::Operator(operator, _, _) = definition
+                        && let Some(name) = gc_operator_name(operator)
+                    {
+                        inventory.gc_operations.push(CoreGcOperation {
+                            function_index: function.index(),
+                            value_index: value.index(),
+                            name,
+                        });
                     }
                 }
             }

@@ -982,7 +982,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         body: &mut FunctionBody,
         mut block: Block,
         context: Value,
-        this: LowerValue,
+        _this: LowerValue,
         values: &ContinuationValues,
         class: &'a portal_jsc_swc_tac::TClass<SValueId, SFunc>,
         span: &impl std::fmt::Debug,

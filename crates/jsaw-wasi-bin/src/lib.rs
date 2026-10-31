@@ -18,8 +18,8 @@ pub mod manifest;
 /// resolve and verify digests without a second copy of the vocabulary.
 pub use portal_jsc_common::assumptions;
 
-pub use manifest::{Emit, MANIFEST_VERSION, Manifest, Options};
 use manifest::{AssumptionDiagnosticReport, AssumptionEntry, AssumptionReport};
+pub use manifest::{Emit, MANIFEST_VERSION, Manifest, Options};
 
 /// Everything a successful compilation produced.
 #[derive(Debug)]
@@ -96,20 +96,24 @@ fn report_diagnostic(diagnostic: &AssumptionDiagnostic) -> AssumptionDiagnosticR
             conflict_index: *conflict_index,
             reason: reason.clone(),
         },
-        AssumptionDiagnostic::Unsupported { name, index, reason } => {
-            AssumptionDiagnosticReport::Unsupported {
-                name: name.clone(),
-                index: *index,
-                reason: reason.clone(),
-            }
-        }
-        AssumptionDiagnostic::Unfulfilled { name, index, reason } => {
-            AssumptionDiagnosticReport::Unfulfilled {
-                name: name.clone(),
-                index: *index,
-                reason: reason.clone(),
-            }
-        }
+        AssumptionDiagnostic::Unsupported {
+            name,
+            index,
+            reason,
+        } => AssumptionDiagnosticReport::Unsupported {
+            name: name.clone(),
+            index: *index,
+            reason: reason.clone(),
+        },
+        AssumptionDiagnostic::Unfulfilled {
+            name,
+            index,
+            reason,
+        } => AssumptionDiagnosticReport::Unfulfilled {
+            name: name.clone(),
+            index: *index,
+            reason: reason.clone(),
+        },
     }
 }
 
@@ -132,9 +136,7 @@ pub fn resolve_assumptions(
         })
         .collect();
     let set = registry.resolve(requests).map_err(|error| {
-        CompileError::Assumptions(
-            error.diagnostics().iter().map(report_diagnostic).collect(),
-        )
+        CompileError::Assumptions(error.diagnostics().iter().map(report_diagnostic).collect())
     })?;
     let report = AssumptionReport {
         schema_version: registry.schema_version(),
@@ -164,11 +166,9 @@ pub fn compile_to_outputs(
         .into());
     }
     if !manifest.modules.iter().any(|m| m == &manifest.entry) {
-        return Err(anyhow::anyhow!(
-            "entry module {:?} is not in the module set",
-            manifest.entry
-        )
-        .into());
+        return Err(
+            anyhow::anyhow!("entry module {:?} is not in the module set", manifest.entry).into(),
+        );
     }
 
     // Resolve assumptions before any heavy work: invalid requests fail the
@@ -184,8 +184,19 @@ pub fn compile_to_outputs(
             .with_context(|| format!("module {key:?} listed in the manifest has no source"))?;
         pairs.push((key.as_str(), source.as_str()));
     }
-    let set: ModuleSet<'_> = module_set_from_sources(pairs)
+    let mut set: ModuleSet<'_> = module_set_from_sources(pairs)
         .map_err(|error| anyhow::anyhow!("ingestion failed: {error}"))?;
+
+    // Wasm binary members ride in the manifest as base64 (the manifest is
+    // JSON); each becomes a closed-world member under its `.wasm` key.
+    for member in &manifest.wasm {
+        let bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &member.base64)
+                .with_context(|| format!("Wasm member {:?} is not valid base64", member.path))?;
+        set.insert_wasm(&member.path, &bytes).map_err(|error| {
+            anyhow::anyhow!("Wasm member {:?} was rejected: {error}", member.path)
+        })?;
+    }
 
     let options = ConvertOptions {
         numeric_exports: manifest.options.numeric_exports,
@@ -209,8 +220,7 @@ pub fn compile_to_outputs(
     let mut outputs: BTreeMap<String, Vec<u8>> = BTreeMap::new();
 
     if let Some(wasm_path) = &manifest.emit.wasm {
-        let bytes = portal_pc_waffle::to_wasm_bytes(&module)
-            .context("Wasm emission failed")?;
+        let bytes = portal_pc_waffle::to_wasm_bytes(&module).context("Wasm emission failed")?;
         outputs.insert(wasm_path.clone(), bytes);
     }
     if let Some(java_dir) = &manifest.emit.java {
@@ -286,4 +296,71 @@ fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    /// `(module (func (export "add") (param i32 i32) (result i32) ...))`
+    fn add_module_base64() -> String {
+        let mut bytes = b"\0asm\x01\0\0\0".to_vec();
+        bytes.extend([0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f]);
+        bytes.extend([0x03, 0x02, 0x01, 0x00]);
+        bytes.extend([0x07, 0x07, 0x01, 0x03, b'a', b'd', b'd', 0x00, 0x00]);
+        bytes.extend([
+            0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b,
+        ]);
+        STANDARD.encode(bytes)
+    }
+
+    fn manifest(source: &str) -> (Manifest, BTreeMap<String, String>) {
+        let manifest: Manifest = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "entry": "main.js",
+            "modules": ["main.js"],
+            "wasm": [{ "path": "math.wasm", "base64": add_module_base64() }],
+        }))
+        .expect("manifest JSON");
+        let sources = BTreeMap::from([("main.js".to_string(), source.to_string())]);
+        (manifest, sources)
+    }
+
+    #[test]
+    fn manifest_wasm_members_join_the_closed_set() {
+        let (manifest, sources) =
+            manifest("import { add } from './math.wasm'; export function run() { return 1; }");
+        compile_to_outputs(&manifest, &sources)
+            .expect("an uncalled wasm import must not fail compilation");
+    }
+
+    #[test]
+    fn manifest_wasm_calls_fail_closed_in_phase_1() {
+        let (manifest, sources) = manifest(
+            "import { add } from './math.wasm'; export function run(a, b) { return add(a, b); }",
+        );
+        let error = compile_to_outputs(&manifest, &sources)
+            .expect_err("calls into wasm members are phase-2 work");
+        assert!(format!("{error}").contains("not yet lowered"), "{error}");
+    }
+
+    #[test]
+    fn manifest_rejects_bad_base64() {
+        let manifest: Manifest = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "entry": "main.js",
+            "modules": ["main.js"],
+            "wasm": [{ "path": "math.wasm", "base64": "!!! not base64 !!!" }],
+        }))
+        .expect("manifest JSON");
+        let sources = BTreeMap::from([(
+            "main.js".to_string(),
+            "export function run() { return 1; }".to_string(),
+        )]);
+        let error =
+            compile_to_outputs(&manifest, &sources).expect_err("invalid base64 must be rejected");
+        assert!(format!("{error:#}").contains("base64"), "{error}");
+    }
 }

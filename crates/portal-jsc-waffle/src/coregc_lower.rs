@@ -722,7 +722,7 @@ fn copy_source_table(
         None => None,
     };
     let lowered_table = out.tables.push(TableData {
-        ty: source_table.ty.clone(),
+        ty: source_table.ty,
         initial: source_table.initial,
         max: source_table.max,
         func_elements: remapped_elements,
@@ -1037,7 +1037,7 @@ fn reject(func: Func, value: Value, what: &str) -> CoreGcError {
 
 fn validate_operator(
     source: &Module<'_>,
-    inventory: &CoreGcInventory,
+    _inventory: &CoreGcInventory,
     functions: &BTreeMap<Func, FunctionPlan>,
     op: &Operator,
     func: Func,
@@ -1863,7 +1863,7 @@ impl<'a> FunctionLowering<'a> {
             }
             Operator::StructGet { sig, idx } => {
                 let (type_id, layout) = self.descriptor(*sig)?;
-                let slot = layout.slots.get(*idx as usize).ok_or_else(|| CoreGcError {
+                let slot = layout.slots.get(*idx).ok_or_else(|| CoreGcError {
                     message: format!(
                         "coregc lowering: struct.get field {idx} is outside descriptor type {}",
                         type_id.get()
@@ -1882,7 +1882,7 @@ impl<'a> FunctionLowering<'a> {
             }
             Operator::StructSet { sig, idx } => {
                 let (type_id, layout) = self.descriptor(*sig)?;
-                let slot = layout.slots.get(*idx as usize).ok_or_else(|| CoreGcError {
+                let slot = layout.slots.get(*idx).ok_or_else(|| CoreGcError {
                     message: format!(
                         "coregc lowering: struct.set field {idx} is outside descriptor type {}",
                         type_id.get()
@@ -1995,7 +1995,7 @@ impl<'a> FunctionLowering<'a> {
             }
             Operator::StructGetS { sig, idx } | Operator::StructGetU { sig, idx } => {
                 let (type_id, layout) = self.descriptor(*sig)?;
-                let slot = layout.slots.get(*idx as usize).ok_or_else(|| CoreGcError {
+                let slot = layout.slots.get(*idx).ok_or_else(|| CoreGcError {
                     message: format!(
                         "coregc lowering: struct.get_s/u field {idx} is outside descriptor type {}",
                         type_id.get()
@@ -2113,7 +2113,7 @@ impl<'a> FunctionLowering<'a> {
                 )?))
             }
             Operator::ArrayFill { sig } => {
-                let (type_id, layout) = self.descriptor(*sig)?;
+                let (_type_id, layout) = self.descriptor(*sig)?;
                 let stride = layout.array_stride.expect("array descriptor has a stride");
                 let element_slot = CoreGcSlotLayout {
                     offset: 0,
@@ -2738,10 +2738,10 @@ impl<'a> FunctionLowering<'a> {
                     None => vec![],
                 };
                 if tys.is_empty() {
-                    emit.op(op.clone(), &scalar_args, &[]);
+                    emit.op(*op, &scalar_args, &[]);
                     Ok(None)
                 } else {
-                    let value = emit.op(op.clone(), &scalar_args, &tys);
+                    let value = emit.op(*op, &scalar_args, &tys);
                     Ok(Some(Lowered::Scalar(value)))
                 }
             }
@@ -2967,19 +2967,19 @@ fn lower_function(
     // function) prints each function's shadow-frame slot assignments plus
     // its checkpoint/tail-call liveness requirements, e.g. to diagnose an
     // under-rooted value. Not read in production; safe to leave compiled in.
-    if let Ok(filter) = std::env::var("COREGC_SPILL_DUMP") {
-        if filter == "1" || name.contains(&filter) {
-            eprintln!("{name}: {} spilled values", spilled.len());
-            for (value, slot) in &slot_of {
-                let plan = value_plan.get(value);
-                eprintln!("  slot[{slot}] = value {value:?} plan {plan:?}");
-            }
-            for (checkpoint, required) in &computed.checkpoint_live {
-                eprintln!("  checkpoint {checkpoint:?}: required {required:?}");
-            }
-            for (block, required) in &computed.tail_call_live {
-                eprintln!("  tail_call in {block:?}: required {required:?}");
-            }
+    if let Ok(filter) = std::env::var("COREGC_SPILL_DUMP")
+        && (filter == "1" || name.contains(&filter))
+    {
+        eprintln!("{name}: {} spilled values", spilled.len());
+        for (value, slot) in &slot_of {
+            let plan = value_plan.get(value);
+            eprintln!("  slot[{slot}] = value {value:?} plan {plan:?}");
+        }
+        for (checkpoint, required) in &computed.checkpoint_live {
+            eprintln!("  checkpoint {checkpoint:?}: required {required:?}");
+        }
+        for (block, required) in &computed.tail_call_live {
+            eprintln!("  tail_call in {block:?}: required {required:?}");
         }
     }
 

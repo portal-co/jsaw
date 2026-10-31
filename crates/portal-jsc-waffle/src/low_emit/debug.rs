@@ -6,9 +6,7 @@
 //! twice, compare). This is NOT a target backend; it performs no validation
 //! beyond what emission already did.
 
-use super::{
-    LeBinOp, LeBlock, LeBody, LeCallee, LeExpr, LeFunc, LeModule, LeStmt, LeUnOp,
-};
+use super::{LeBinOp, LeBlock, LeBody, LeCallee, LeExpr, LeFunc, LeModule, LeStmt, LeUnOp};
 use std::fmt::Write as _;
 
 /// Render the module as stable debug text.
@@ -415,7 +413,7 @@ pub fn validate(module: &LeModule) -> Vec<String> {
     }
     for (fid, func) in module.funcs.iter().enumerate() {
         let local_count = func.locals.len() as u32;
-        let mut check_expr = |e: &LeExpr, errors: &mut Vec<String>| {
+        let check_expr = |e: &LeExpr, errors: &mut Vec<String>| {
             let mut stack = vec![e];
             while let Some(e) = stack.pop() {
                 match e {
@@ -446,7 +444,7 @@ pub fn validate(module: &LeModule) -> Vec<String> {
                 }
             }
         };
-        let mut check_callee = |c: &LeCallee, errors: &mut Vec<String>| match c {
+        let check_callee = |c: &LeCallee, errors: &mut Vec<String>| match c {
             LeCallee::Direct(f) => {
                 if f.0 >= func_count {
                     errors.push(format!("f{fid}: call to out-of-range function {}", f.0));
@@ -459,7 +457,7 @@ pub fn validate(module: &LeModule) -> Vec<String> {
                 }
             }
         };
-        let mut visit = |stmts: &[LeStmt], errors: &mut Vec<String>| {
+        let visit = |stmts: &[LeStmt], errors: &mut Vec<String>| {
             let mut stack: Vec<&LeStmt> = stmts.iter().collect();
             while let Some(s) = stack.pop() {
                 match s {
@@ -493,10 +491,7 @@ pub fn validate(module: &LeModule) -> Vec<String> {
                         check_expr(value, errors);
                     }
                     LeStmt::SetIndex {
-                        base,
-                        index,
-                        value,
-                        ..
+                        base, index, value, ..
                     } => {
                         check_expr(base, errors);
                         check_expr(index, errors);
@@ -514,10 +509,8 @@ pub fn validate(module: &LeModule) -> Vec<String> {
                             check_expr(v, errors);
                         }
                     }
-                    LeStmt::RootStore { value, .. } => {
-                        if value.0 >= local_count {
-                            errors.push(format!("f{fid}: root store of out-of-range v{}", value.0));
-                        }
+                    LeStmt::RootStore { value, .. } if value.0 >= local_count => {
+                        errors.push(format!("f{fid}: root store of out-of-range v{}", value.0));
                     }
                     _ => {}
                 }

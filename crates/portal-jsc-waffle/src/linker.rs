@@ -19,7 +19,17 @@ use swc_ecma_ast::{Id as Ident, ImportSpecifier};
 use crate::{
     repr::ConvertError,
     wasm_boundary::{WasmImportSpec, parse_wasm_import_specifier},
+    wasm_esm::{WasmModuleImportSpec, WasmModulePlan, WasmProfile},
 };
+
+/// One member of the closed module set: a JavaScript ES module lowered to
+/// SSA, or a validated Wasm binary module (wasm-esm, portal-co/jsaw#14).
+pub(crate) enum ModuleMember<'s> {
+    /// A normal JavaScript module.
+    Js(&'s SModule),
+    /// A Wasm binary module; its type section is the ABI declaration.
+    Wasm(WasmModulePlan),
+}
 
 /// A closed set of ES modules that [`convert_modules`](crate::convert_modules)
 /// can link together into one WasmGC module.
@@ -27,12 +37,14 @@ use crate::{
 /// Keys are module paths as provided by the embedder (e.g. `"src/main.js"`).
 /// Relative import specifiers resolve against the importing module's key:
 /// `import … from './lib.js'` in `src/main.js` looks up `src/lib.js`.
+/// Keys ending in `.wasm` name Wasm binary members (see
+/// [`ModuleSet::insert_wasm`]).
 ///
 /// Deterministic ordering ([`BTreeMap`]) keeps lowering and generated Wasm
 /// reproducible regardless of insertion order.
 #[derive(Default)]
 pub struct ModuleSet<'s> {
-    modules: BTreeMap<String, &'s SModule>,
+    modules: BTreeMap<String, ModuleMember<'s>>,
 }
 
 impl<'s> ModuleSet<'s> {
@@ -42,15 +54,65 @@ impl<'s> ModuleSet<'s> {
         }
     }
 
-    /// Insert a module under `path`. Duplicate paths are a
-    /// [`ConvertError`].
+    /// Insert a JavaScript module under `path`. Duplicate paths are a
+    /// [`ConvertError`]. `.wasm` keys are reserved for Wasm binary members
+    /// and must go through [`ModuleSet::insert_wasm`], keeping the member
+    /// sum explicit.
     pub fn insert(
         &mut self,
         path: impl Into<String>,
         module: &'s SModule,
     ) -> Result<(), ConvertError> {
         let path = path.into();
-        if self.modules.insert(path.clone(), module).is_some() {
+        if path.ends_with(".wasm") {
+            return Err(ConvertError::invalid(format!(
+                "module path {path:?} ends in .wasm: Wasm binary members must be inserted with \
+                 `ModuleSet::insert_wasm` (wasm-esm, portal-co/jsaw#14)"
+            )));
+        }
+        if self
+            .modules
+            .insert(path.clone(), ModuleMember::Js(module))
+            .is_some()
+        {
+            return Err(ConvertError::invalid(format!(
+                "duplicate module path {path:?} in the module set"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Insert a Wasm binary module under `path`, validated at the MVP
+    /// profile ceiling (plan §3.3). The binary's type section becomes the
+    /// ABI declaration for named imports from JavaScript.
+    pub fn insert_wasm(
+        &mut self,
+        path: impl Into<String>,
+        bytes: &[u8],
+    ) -> Result<(), ConvertError> {
+        self.insert_wasm_with_profile(path, bytes, WasmProfile::Mvp)
+    }
+
+    /// [`ModuleSet::insert_wasm`] with an explicit profile ceiling.
+    pub fn insert_wasm_with_profile(
+        &mut self,
+        path: impl Into<String>,
+        bytes: &[u8],
+        ceiling: WasmProfile,
+    ) -> Result<(), ConvertError> {
+        let path = path.into();
+        if !path.ends_with(".wasm") {
+            return Err(ConvertError::invalid(format!(
+                "Wasm binary member {path:?} must use a .wasm module-set key so relative \
+                 specifiers classify unambiguously"
+            )));
+        }
+        let plan = crate::wasm_esm::parse_wasm_module(&path, bytes, ceiling)?;
+        if self
+            .modules
+            .insert(path.clone(), ModuleMember::Wasm(plan))
+            .is_some()
+        {
             return Err(ConvertError::invalid(format!(
                 "duplicate module path {path:?} in the module set"
             )));
@@ -62,14 +124,45 @@ impl<'s> ModuleSet<'s> {
     /// accepts.
     pub fn single(path: impl Into<String>, module: &'s SModule) -> Self {
         let mut set = Self::new();
-        set.modules.insert(path.into(), module);
+        set.modules.insert(path.into(), ModuleMember::Js(module));
         set
     }
 
+    /// The JavaScript module under `path`. A Wasm binary member under the
+    /// same key is a distinct error: callers that iterate every key must
+    /// use [`ModuleSet::js_modules`] instead of assuming all members are
+    /// JavaScript.
     pub(crate) fn get(&self, path: &str) -> Result<&'s SModule, ConvertError> {
-        self.modules.get(path).copied().ok_or_else(|| {
-            ConvertError::invalid(format!("module {path:?} is not in the module set"))
-        })
+        match self.modules.get(path) {
+            Some(ModuleMember::Js(module)) => Ok(module),
+            Some(ModuleMember::Wasm(_)) => Err(ConvertError::invalid(format!(
+                "module {path:?} is a Wasm binary member of the module set, not a JavaScript \
+                 module"
+            ))),
+            None => Err(ConvertError::invalid(format!(
+                "module {path:?} is not in the module set"
+            ))),
+        }
+    }
+
+    /// The Wasm binary member under `path`, if any.
+    pub(crate) fn get_wasm(&self, path: &str) -> Option<&WasmModulePlan> {
+        match self.modules.get(path) {
+            Some(ModuleMember::Wasm(plan)) => Some(plan),
+            _ => None,
+        }
+    }
+
+    /// Every JavaScript member, in deterministic key order. Wasm binary
+    /// members have no SSA body and are skipped; lowering code that only
+    /// knows how to walk `SModule`s must iterate this rather than `keys()`.
+    pub(crate) fn js_modules(&self) -> impl Iterator<Item = (&String, &'s SModule)> {
+        self.modules
+            .iter()
+            .filter_map(|(path, member)| match member {
+                ModuleMember::Js(module) => Some((path, *module)),
+                ModuleMember::Wasm(_) => None,
+            })
     }
 
     pub(crate) fn contains(&self, path: &str) -> bool {
@@ -125,9 +218,9 @@ pub(crate) fn resolve_specifier_target<'a>(
     set: &'a ModuleSet<'a>,
     importer: &str,
     specifier: &str,
-) -> Result<(&'a str, &'a SModule), ConvertError> {
+) -> Result<(&'a str, &'a ModuleMember<'a>), ConvertError> {
     let target = resolve_specifier(importer, specifier)?;
-    let module = set.get(&target).map_err(|_| {
+    let module = set.modules.get(&target).ok_or_else(|| {
         ConvertError::invalid(format!(
             "module {target:?} (imported by {importer:?} from {specifier:?}) is not in the module \
              set"
@@ -154,6 +247,10 @@ pub(crate) fn module_export_names(
     if !visiting.insert(path.to_string()) {
         return Ok(BTreeSet::new());
     }
+    // A Wasm member's surface is its export section (plan §3.2).
+    if let Some(plan) = set.get_wasm(path) {
+        return Ok(plan.exports.keys().cloned().collect());
+    }
     let module = set.get(path)?;
     let mut names = BTreeSet::new();
     for export in &module.exports {
@@ -175,7 +272,7 @@ pub(crate) fn module_export_names(
                 if let Some(ns_name) = ns {
                     names.insert(ns_name.to_string());
                 }
-                let (target, _) = resolve_specifier_target(set, path, &source.to_string())?;
+                let (target, _) = resolve_specifier_target(set, path, source.as_ref())?;
                 names.extend(module_export_names(set, target, visiting)?);
             }
         }
@@ -203,13 +300,19 @@ pub(crate) fn resolve_export<'a>(
             "circular re-export chain while resolving {name:?} from {path:?}"
         )));
     }
+    if set.get_wasm(path).is_some() {
+        return Err(ConvertError::invalid(format!(
+            "re-exporting Wasm module export {name:?} of {path:?} through JavaScript is not yet \
+             supported (wasm-esm phase 1; see docs/plan-wasm-esm-modules.md §5.2)"
+        )));
+    }
     let module = set.get(path)?;
     // 1. Explicit exports of this module.
     for export in &module.exports {
         match export {
             ExportSpec::Local {
                 local, exported, ..
-            } if exported.to_string() == name => {
+            } if exported == name => {
                 return match module.funcs.get(&local.0) {
                     Some(function) => Ok(Some(function)),
                     None => Err(ConvertError::invalid(format!(
@@ -234,19 +337,16 @@ pub(crate) fn resolve_export<'a>(
             }
             ExportSpec::ReexportAll {
                 ns: Some(ns_name), ..
-            } if ns_name.to_string() == name => {
+            } if ns_name == name => {
                 return Err(ConvertError::invalid(format!(
                     "namespace object export {name:?} (export * as ns) in {path:?} is not \
                      supported yet"
                 )));
             }
             ExportSpec::Reexport { source, names, .. } => {
-                if let Some((original, _)) = names
-                    .iter()
-                    .find(|(_, exported)| exported.to_string() == name)
-                {
-                    let (target, _) = resolve_specifier_target(set, path, &source.to_string())?;
-                    return resolve_export(set, target, &original.to_string(), visiting);
+                if let Some((original, _)) = names.iter().find(|(_, exported)| exported == name) {
+                    let (target, _) = resolve_specifier_target(set, path, source.as_ref())?;
+                    return resolve_export(set, target, original.as_ref(), visiting);
                 }
             }
             _ => {}
@@ -262,7 +362,7 @@ pub(crate) fn resolve_export<'a>(
                 source, ns: None, ..
             } = export
             {
-                let (target, _) = resolve_specifier_target(set, path, &source.to_string())?;
+                let (target, _) = resolve_specifier_target(set, path, source.as_ref())?;
                 if let Some(function) = resolve_export(set, target, name, visiting)? {
                     match found {
                         Some((previous, previous_path)) => {
@@ -302,10 +402,11 @@ pub(crate) enum ImportTarget<'a> {
     /// A compiler-recognized intrinsic module. Intrinsics are call-only:
     /// they do not have a runtime function object and are intercepted by the
     /// WasmGC lowering before ordinary call dispatch.
-    Intrinsic {
-        module: String,
-        name: String,
-    },
+    Intrinsic { module: String, name: String },
+    /// A named function import from a `.wasm` module-set member (wasm-esm,
+    /// portal-co/jsaw#14). The signature is derived from the binary's own
+    /// type section, not the FFI manifest.
+    WasmModule(WasmModuleImportSpec),
 }
 
 /// Build one module's import table: every referenced imported binding →
@@ -423,7 +524,49 @@ pub(crate) fn build_import_table<'a>(
             );
             continue;
         }
-        let (target_path, _) = resolve_specifier_target(set, path, &specifier)?;
+        let (target_path, member) = resolve_specifier_target(set, path, &specifier)?;
+        if let ModuleMember::Wasm(plan) = member {
+            // A `.wasm` member: the binary's export section is the import
+            // surface (plan §3.2). Named imports only; default/namespace
+            // imports fail closed (namespace objects: portal-co/jsaw#9).
+            let name = match kind {
+                ImportMap::Named { name } => name.to_string(),
+                ImportMap::Default => {
+                    return Err(ConvertError::invalid(format!(
+                        "Wasm module {target_path:?} has no default export (imported by {path:?} \
+                         from {specifier:?}); use a named import"
+                    )));
+                }
+                ImportMap::Star => {
+                    return Err(ConvertError::invalid(format!(
+                        "namespace imports of Wasm modules are not supported yet (imported by \
+                         {path:?} from {specifier:?}); see portal-co/jsaw#9"
+                    )));
+                }
+            };
+            let export = plan.exports.get(&name).ok_or_else(|| {
+                ConvertError::invalid(format!(
+                    "Wasm module {target_path:?} does not export {name:?} (imported by {path:?} \
+                     from {specifier:?})"
+                ))
+            })?;
+            let crate::wasm_esm::WasmExport::Func(signature) = export else {
+                return Err(ConvertError::invalid(format!(
+                    "Wasm module export {target_path:?}.{name:?} is not a function; importing \
+                     memories, globals, tables, or tags as JavaScript values is not supported \
+                     yet (portal-co/jsaw#10)"
+                )));
+            };
+            table.insert(
+                id,
+                ImportTarget::WasmModule(WasmModuleImportSpec {
+                    path: target_path.to_owned(),
+                    export: name,
+                    signature: signature.clone(),
+                }),
+            );
+            continue;
+        }
         let name = match kind {
             ImportMap::Named { name } => name.to_string(),
             ImportMap::Default => "default".to_owned(),
@@ -565,16 +708,16 @@ pub(crate) fn flatten_module_export_surface<'a>(
                 )));
             }
             ExportSpec::Reexport { source, names, .. } => {
-                let (target, _) = resolve_specifier_target(set, entry, &source.to_string())?;
+                let (target, _) = resolve_specifier_target(set, entry, source.as_ref())?;
                 for (original, exported_name) in names {
                     let function =
-                        resolve_export(set, target, &original.to_string(), &mut BTreeSet::new())?
+                        resolve_export(set, target, original.as_ref(), &mut BTreeSet::new())?
                             .ok_or_else(|| {
-                            ConvertError::invalid(format!(
-                                "module {target:?} does not export {original:?} (re-exported \
+                                ConvertError::invalid(format!(
+                                    "module {target:?} does not export {original:?} (re-exported \
                                      by {entry:?} as {exported_name:?})"
-                            ))
-                        })?;
+                                ))
+                            })?;
                     declared_names.insert(exported_name.to_string());
                     exported.push((exported_name.to_string(), function));
                 }
@@ -588,7 +731,7 @@ pub(crate) fn flatten_module_export_surface<'a>(
             ExportSpec::ReexportAll {
                 source, ns: None, ..
             } => {
-                let (target, _) = resolve_specifier_target(set, entry, &source.to_string())?;
+                let (target, _) = resolve_specifier_target(set, entry, source.as_ref())?;
                 star_sources.push(target.to_owned());
             }
         }
@@ -630,4 +773,141 @@ pub(crate) fn flatten_module_export_surface<'a>(
         }
     }
     Ok((exported, declared_names))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ingest::{parse_module_source, with_globals};
+    use crate::wasm_esm::WasmValType;
+    use crate::wasm_esm::tests as wasm_fixtures;
+
+    fn js_module(source: &str) -> &'static SModule {
+        Box::leak(Box::new(
+            parse_module_source("main.js", source).expect("JS fixture should lower"),
+        ))
+    }
+
+    #[test]
+    fn js_insert_rejects_wasm_keys() {
+        with_globals(|| {
+            let mut set = ModuleSet::new();
+            let error = set
+                .insert("sneaky.wasm", js_module("export function f() {}"))
+                .expect_err("a .wasm key must not accept JavaScript sources");
+            assert!(error.message.contains("insert_wasm"), "{error}");
+        });
+    }
+
+    #[test]
+    fn wasm_insert_requires_wasm_keys_and_rejects_duplicates() {
+        let mut set = ModuleSet::new();
+        let error = set
+            .insert_wasm("math.bin", &wasm_fixtures::add_module())
+            .expect_err("a Wasm member must use a .wasm key");
+        assert!(error.message.contains(".wasm"), "{error}");
+        set.insert_wasm("math.wasm", &wasm_fixtures::add_module())
+            .expect("valid Wasm member");
+        with_globals(|| {
+            let error = set
+                .insert("math.wasm", js_module("export function f() {}"))
+                .expect_err("a JS/wasm path collision is a duplicate");
+            assert!(error.message.contains(".wasm"), "{error}");
+        });
+        let error = set
+            .insert_wasm("math.wasm", &wasm_fixtures::add_module())
+            .expect_err("a duplicate Wasm path must be rejected");
+        assert!(error.message.contains("duplicate"), "{error}");
+    }
+
+    #[test]
+    fn get_distinguishes_wasm_members_from_js() {
+        let mut set = ModuleSet::new();
+        set.insert_wasm("math.wasm", &wasm_fixtures::add_module())
+            .expect("valid Wasm member");
+        let Err(error) = set.get("math.wasm") else {
+            panic!("get() is the JavaScript accessor");
+        };
+        assert!(error.message.contains("Wasm binary member"), "{error}");
+        assert!(set.get_wasm("math.wasm").is_some());
+        assert_eq!(set.js_modules().count(), 0);
+    }
+
+    #[test]
+    fn named_import_from_wasm_member_links_with_binary_signature() {
+        with_globals(|| {
+            let mut set = ModuleSet::new();
+            set.insert_wasm("lib/math.wasm", &wasm_fixtures::add_module())
+                .expect("valid Wasm member");
+            let main = js_module(
+                "import { add } from './lib/math.wasm'; \
+                 export function run(a, b) { return add(a, b); }",
+            );
+            set.insert("main.js", main).expect("JS member");
+            let table =
+                build_import_table(&set, "main.js", main, &crate::ffi::FfiManifest::default())
+                    .expect("the wasm import should link");
+            let target = table.values().next().expect("one import binding");
+            let ImportTarget::WasmModule(spec) = target else {
+                panic!("expected a WasmModule target");
+            };
+            assert_eq!(spec.path, "lib/math.wasm");
+            assert_eq!(spec.export, "add");
+            assert_eq!(
+                spec.signature.params,
+                vec![WasmValType::I32, WasmValType::I32]
+            );
+        });
+    }
+
+    #[test]
+    fn wasm_member_import_kinds_fail_closed() {
+        with_globals(|| {
+            let set_with = |source: &str| -> Result<(), ConvertError> {
+                let mut set = ModuleSet::new();
+                set.insert_wasm("lib/math.wasm", &wasm_fixtures::add_module())
+                    .expect("valid Wasm member");
+                let main = js_module(source);
+                set.insert("main.js", main).expect("JS member");
+                build_import_table(&set, "main.js", main, &crate::ffi::FfiManifest::default())?;
+                Ok(())
+            };
+            let fail = |source: &str| {
+                let Err(error) = set_with(source) else {
+                    panic!("import kind must be rejected")
+                };
+                error
+            };
+            let error = fail(
+                "import add from './lib/math.wasm'; \
+                 export function run(a, b) { return add(a, b); }",
+            );
+            assert!(error.message.contains("no default export"), "{error}");
+            let error = fail(
+                "import * as math from './lib/math.wasm'; \
+                 export function run(a, b) { return math.add(a, b); }",
+            );
+            assert!(error.message.contains("jsaw#9"), "{error}");
+            let error = fail(
+                "import { missing } from './lib/math.wasm'; \
+                 export function run() { return missing(); }",
+            );
+            assert!(error.message.contains("does not export"), "{error}");
+        });
+    }
+
+    #[test]
+    fn wasm_member_reexport_fails_closed_for_now() {
+        with_globals(|| {
+            let mut set = ModuleSet::new();
+            set.insert_wasm("lib/math.wasm", &wasm_fixtures::add_module())
+                .expect("valid Wasm member");
+            let main = js_module("export { add } from './lib/math.wasm';");
+            set.insert("main.js", main).expect("JS member");
+            let Err(error) = flatten_module_export_surface(&set, "main.js") else {
+                panic!("re-exporting Wasm exports is a named phase-1 error")
+            };
+            assert!(error.message.contains("not yet supported"), "{error}");
+        });
+    }
 }

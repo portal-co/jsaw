@@ -69,6 +69,14 @@ pub fn emit_coregc(
     // positions become i32 handles at this boundary.
     let raw_imports = declare_coregc_function_imports(source, &inventory, &mut module)?;
     let runtime = coregc_runtime::build(&mut module, options, &descriptors)?;
+    // Carry source linear memories (merged Wasm members, wasm-esm plan
+    // §5.5): they keep their data segments and memory64 flags, appended
+    // after the runtime memory so every runtime index is undisturbed. The
+    // lowering remaps source memory indices by this base.
+    let source_memory_base = module.memories.len();
+    for memory in source.memories.values() {
+        module.memories.push(memory.clone());
+    }
     let has_handle_boundary = source.funcs.entries().any(|(_, decl)| {
         let signature = match decl {
             FuncDecl::Import(signature, _) | FuncDecl::Body(signature, _, _) => *signature,
@@ -91,6 +99,7 @@ pub fn emit_coregc(
         &descriptors,
         &runtime,
         &raw_imports,
+        source_memory_base,
         &mut module,
     )?;
     for (name, func) in lowered.exports {

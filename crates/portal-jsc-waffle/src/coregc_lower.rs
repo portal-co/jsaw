@@ -1007,6 +1007,16 @@ fn is_scalar_passthrough(op: &Operator) -> bool {
         | O::F32Abs | O::F32Neg | O::F32Ceil | O::F32Floor | O::F32Trunc | O::F32Nearest
         | O::F32Sqrt | O::F32Add | O::F32Sub | O::F32Mul | O::F32Div | O::F32Min
         | O::F32Max | O::F32Copysign
+        // Linear-memory access (wasm-esm members, plan §5.5): scalar
+        // operands, memory index remapped by `source_memory_base` at codegen.
+        | O::I32Load { .. } | O::I64Load { .. } | O::F32Load { .. } | O::F64Load { .. }
+        | O::I32Load8S { .. } | O::I32Load8U { .. } | O::I32Load16S { .. } | O::I32Load16U { .. }
+        | O::I64Load8S { .. } | O::I64Load8U { .. } | O::I64Load16S { .. } | O::I64Load16U { .. }
+        | O::I64Load32S { .. } | O::I64Load32U { .. }
+        | O::I32Store { .. } | O::I64Store { .. } | O::F32Store { .. } | O::F64Store { .. }
+        | O::I32Store8 { .. } | O::I32Store16 { .. }
+        | O::I64Store8 { .. } | O::I64Store16 { .. } | O::I64Store32 { .. }
+        | O::MemorySize { .. } | O::MemoryGrow { .. }
         // f64 arithmetic
         | O::F64Abs | O::F64Neg | O::F64Ceil | O::F64Floor | O::F64Trunc | O::F64Nearest
         | O::F64Sqrt | O::F64Add | O::F64Sub | O::F64Mul | O::F64Div | O::F64Min
@@ -1361,6 +1371,10 @@ struct FunctionLowering<'a> {
     descriptors: &'a CoreGcDescriptorTable,
     runtime: &'a CoreGcRuntime,
     plan: &'a ModulePlan,
+    /// Output index of the first source linear memory: source memories are
+    /// appended after the runtime memory (wasm-esm plan §5.5), so source
+    /// memory indices in passthrough operators shift by this base.
+    source_memory_base: usize,
     source_body: &'a FunctionBody,
     value_plan: HashMap<Value, LowerValue>,
     value_map: HashMap<Value, Lowered>,
@@ -2731,21 +2745,70 @@ impl<'a> FunctionLowering<'a> {
             }
             _ => {
                 // Ordinary scalar arithmetic/comparison/conversion operator:
-                // arguments and result stay scalar, operator unchanged.
+                // arguments and result stay scalar, operator unchanged
+                // except for its memory index: source memories are appended
+                // after the runtime memory in the output (wasm-esm plan
+                // §5.5), so passthrough memory references shift by the base.
                 let scalar_args: Vec<Value> = args.iter().map(|&a| self.scalar(a)).collect();
+                let op = self.remap_passthrough_memory(*op);
                 let tys: Vec<Type> = match result_ty {
                     Some(ty) => vec![ty],
                     None => vec![],
                 };
                 if tys.is_empty() {
-                    emit.op(*op, &scalar_args, &[]);
+                    emit.op(op, &scalar_args, &[]);
                     Ok(None)
                 } else {
-                    let value = emit.op(*op, &scalar_args, &tys);
+                    let value = emit.op(op, &scalar_args, &tys);
                     Ok(Some(Lowered::Scalar(value)))
                 }
             }
         }
+    }
+
+    /// Shift a scalar-passthrough operator's memory reference by the
+    /// source-memory base (source memories are appended after the runtime
+    /// memory; wasm-esm plan §5.5). All other passthrough operators are
+    /// index-free with respect to the memory space.
+    fn remap_passthrough_memory(&self, op: Operator) -> Operator {
+        let base = self.source_memory_base;
+        if base == 0 {
+            return op;
+        }
+        let mut op = op;
+        let remap_arg = |memory: &mut MemoryArg| {
+            memory.memory = portal_pc_waffle::Memory::new(base + memory.memory.index());
+        };
+        match &mut op {
+            Operator::I32Load { memory }
+            | Operator::I64Load { memory }
+            | Operator::F32Load { memory }
+            | Operator::F64Load { memory }
+            | Operator::I32Load8S { memory }
+            | Operator::I32Load8U { memory }
+            | Operator::I32Load16S { memory }
+            | Operator::I32Load16U { memory }
+            | Operator::I64Load8S { memory }
+            | Operator::I64Load8U { memory }
+            | Operator::I64Load16S { memory }
+            | Operator::I64Load16U { memory }
+            | Operator::I64Load32S { memory }
+            | Operator::I64Load32U { memory }
+            | Operator::I32Store { memory }
+            | Operator::I64Store { memory }
+            | Operator::F32Store { memory }
+            | Operator::F64Store { memory }
+            | Operator::I32Store8 { memory }
+            | Operator::I32Store16 { memory }
+            | Operator::I64Store8 { memory }
+            | Operator::I64Store16 { memory }
+            | Operator::I64Store32 { memory } => remap_arg(memory),
+            Operator::MemorySize { mem } | Operator::MemoryGrow { mem } => {
+                *mem = portal_pc_waffle::Memory::new(base + mem.index());
+            }
+            _ => {}
+        }
+        op
     }
 
     /// The type-id operand for an `array_bounds` call: concrete receivers
@@ -2938,6 +3001,7 @@ fn lower_function(
     descriptors: &CoreGcDescriptorTable,
     runtime: &CoreGcRuntime,
     plan: &ModulePlan,
+    source_memory_base: usize,
     out: &mut Module<'static>,
     source_func: Func,
     source_body: &FunctionBody,
@@ -3063,6 +3127,7 @@ fn lower_function(
         descriptors,
         runtime,
         plan,
+        source_memory_base,
         source_body,
         value_plan,
         value_map,
@@ -3476,6 +3541,7 @@ pub(crate) fn lower(
         descriptors,
         runtime,
         &RawImports::new(),
+        0,
         out,
     )
 }
@@ -3608,6 +3674,7 @@ pub(crate) fn lower_with_imports(
     descriptors: &CoreGcDescriptorTable,
     runtime: &CoreGcRuntime,
     raw_imports: &RawImports,
+    source_memory_base: usize,
     out: &mut Module<'static>,
 ) -> Result<LoweredModule, CoreGcError> {
     let plan = preflight(source, inventory, raw_imports, out)?;
@@ -3619,6 +3686,7 @@ pub(crate) fn lower_with_imports(
                 descriptors,
                 runtime,
                 &plan,
+                source_memory_base,
                 out,
                 func,
                 body,

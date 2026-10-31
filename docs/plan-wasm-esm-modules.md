@@ -454,16 +454,27 @@ features on; host manifest records the requirement. **Done:**
 `tests/wasm_esm.rs` `multi_result_adapters_pack_into_a_js_array` and
 `memory64_members_merge_and_execute`.
 
-### Phase 4 — multi-memory
+### Phase 4 — multi-memory (Done)
 
-1. Multi-memory ingestion, index remapping, and adapters (memory is never
-   exposed to JS — only function behavior is observable).
-2. A fixture Wasm module with two memories (e.g. separate data/stack
-   regions) called from JS through both WasmGC and CoreGC outputs.
+1. Ingestion and merge remap were already in place from Phase 2
+   (`MemoryArg.memory` carried end-to-end; backend emits the full memory
+   section and per-memory data). `verify_core_only` needed no change:
+   multi-memory and memory64 are default-on in wasmparser 0.240.
+2. CoreGC carry-through: `emit_coregc` appends source memories after the
+   runtime memory (`source_memory_base`); `is_scalar_passthrough` now
+   accepts loads/stores/`memory.size`/`memory.grow`, and the passthrough
+   arm remaps memory indices by that base. The runtime memory layout is
+   undisturbed.
+3. Test: a two-memory member whose data segments land in distinct memories
+   (`mem0[4]='h'`, `mem1[1]='o'`) executes identically through native
+   WasmGC (Wasmtime + Node) and CoreGC (Wasmtime, core features). Encoding
+   lesson recorded in the test: a memarg with a memory index encodes
+   **memidx before offset** (bit 6 of the align flags).
 
 **Commit:** `wasm-esm: multi-memory modules`.
 **Gate:** CoreGC output validates with multi-memory on; memory contents do
-not alias across indices in differential tests.
+not alias across indices in differential tests. **Done:**
+`multi_memory_members_merge_and_execute_through_coregc`.
 
 ### Phase 5 — GC Wasm modules
 

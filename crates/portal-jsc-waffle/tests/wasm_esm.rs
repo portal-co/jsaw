@@ -520,3 +520,103 @@ fn wasm_member_is_reachable_through_relative_directories() {
     assert_eq!(node, 3.0);
 }
 
+/// `(module (memory 1) (memory 1)
+///   (data (memory 0) (i32.const 4) "hi!")
+///   (data (memory 1) (i32.const 0) "yo")
+///   (func (export "read") (param i32 i32) (result i32)
+///     local.get 0 i32.load8_u mem=0
+///     local.get 1 i32.load8_u mem=1
+///     i32.add))`
+///
+/// Non-aliasing is observable: mem0[4]='h' and mem1[1]='o' only when the
+/// two memories and their data segments stay distinct.
+fn dual_memory_module() -> Vec<u8> {
+    // Multi-memory memarg: align with bit 6 set, then the memory index,
+    // THEN the offset (wasmparser reads memidx before offset).
+    let memarg = |align: u8, offset: u8, mem: u8| {
+        if mem == 0 {
+            vec![align, offset]
+        } else {
+            vec![align | 0x40, mem, offset]
+        }
+    };
+    let data = |mem: u8, offset: u8, bytes: &[u8]| {
+        // flags 0x02: active with explicit memory index
+        let mut d = vec![0x02, mem, 0x41, offset, 0x0b];
+        d.extend(uleb(bytes.len() as u64));
+        d.extend(bytes);
+        d
+    };
+    let mut body = vec![0x00, 0x20, 0x00, 0x2d];
+    body.extend(memarg(0, 0, 0));
+    body.extend([0x20, 0x01, 0x2d]);
+    body.extend(memarg(0, 0, 1));
+    body.extend([0x6a, 0x0b]);
+    module(&[
+        section(1, vec_of(vec![func_type(&[I32, I32], &[I32])])),
+        section(3, vec_of(vec![uleb(0)])),
+        section(5, vec_of(vec![vec![0x00, 0x01], vec![0x00, 0x01]])),
+        section(7, vec_of(vec![export_entry("read", 0x00, 0)])),
+        section(10, vec_of(vec![code_body(&body)])),
+        section(11, vec_of(vec![data(0, 4, b"hi!"), data(1, 0, b"yo")])),
+    ])
+}
+
+/// Run a numeric export of a CoreGC artifact (pure core Wasm; multi-memory
+/// and memory64 enabled, GC off).
+fn execute_core(bytes: &[u8], name: &str, args: &[f64]) -> f64 {
+    let mut config = Config::new();
+    config.wasm_multi_memory(true);
+    config.wasm_memory64(true);
+    let engine = Engine::new(&config).expect("engine");
+    let module = wasmtime::Module::new(&engine, bytes).expect("core module compiles");
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).expect("core module instantiates");
+    let function = instance
+        .get_func(&mut store, name)
+        .unwrap_or_else(|| panic!("missing export {name:?}"));
+    let inputs: Vec<Val> = args
+        .iter()
+        .copied()
+        .map(|value| Val::F64(value.to_bits()))
+        .collect();
+    let mut outputs = [Val::F64(0)];
+    function
+        .call(&mut store, &inputs, &mut outputs)
+        .unwrap_or_else(|error| panic!("core call {name:?} failed: {error:#}"));
+    match outputs[0] {
+        Val::F64(bits) => f64::from_bits(bits),
+        ref value => panic!("export returned {value:?}, expected f64"),
+    }
+}
+
+#[test]
+fn multi_memory_members_merge_and_execute_through_coregc() {
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { read } from './dual.wasm'; export function run(a, b) { return read(a, b); }",
+    )])
+    .expect("sources");
+    set.insert_wasm_with_profile("dual.wasm", &dual_memory_module(), WasmProfile::MultiMemory)
+        .expect("multi-memory member at the right ceiling");
+    let module = convert("main.js", &set).expect("multi-memory member should merge");
+
+    // Native WasmGC: mem0[4]='h' + mem1[1]='o' = 215.
+    let bytes = wasm_bytes(&module);
+    let (wasmtime, node) = execute_numeric_in_all_runtimes(&bytes, "run", &[4.0, 1.0]);
+    assert_eq!(wasmtime, 215.0, "Wasmtime");
+    assert_eq!(node, 215.0, "Node");
+
+    // CoreGC: source memories are carried after the runtime memory.
+    let artifact = portal_jsc_waffle::emit_coregc(&module, &Default::default())
+        .expect("coregc lowering accepts member memories");
+    assert!(
+        artifact.module.memories.len() >= 3,
+        "coregc output should carry the runtime memory plus both member memories, got {}",
+        artifact.module.memories.len()
+    );
+    let core_bytes = portal_pc_waffle::to_wasm_bytes(&artifact.module).expect("core encodes");
+    let forced = execute_core(&core_bytes, "run", &[4.0, 1.0]);
+    assert_eq!(forced, 215.0, "coregc must match the native result");
+}
+

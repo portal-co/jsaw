@@ -2816,7 +2816,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     },
                 ),
                 WasmValType::F32 => {
-                    let number = body.add_op(block, Operator::F64PromoteF32, &[value], &[Type::F64]);
+                    let number =
+                        body.add_op(block, Operator::F64PromoteF32, &[value], &[Type::F64]);
                     self.box_value(
                         body,
                         block,

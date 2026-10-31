@@ -15,7 +15,7 @@ portal-jsc-swc-ssa.workspace = true
 portal-jsc-swc-tac.workspace = true
 portal-jsc-swc-util.workspace = true
 
-portal-pc-waffle = { workspace = true, features = ["backend"] }
+portal-pc-waffle = { workspace = true, features = ["backend", "frontend"] }
 sha3.workspace = true
 serde.workspace = true
 serde_json.workspace = true

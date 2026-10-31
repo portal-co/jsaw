@@ -7,19 +7,20 @@ use std::{
 use portal_jsc_swc_ssa::{SBlockId, SCatch, SFunc, SValue, SValueId, module::SModule};
 use portal_jsc_swc_tac::{Item, LId, PropKey, PropVal, TCallee, TTerm};
 use portal_pc_waffle::{
-    Block, BlockTarget, EntityRef, Export, ExportKind, Func, FuncDecl, FunctionBody, HeapType,
-    Import, ImportKind, Module, Operator, SignatureData, Table, TableData, Terminator, Type, Value,
-    WithNullable,
+    Block, BlockTarget, EntityRef, Export, ExportKind, Func, FuncDecl, FunctionBody, Global,
+    HeapType, Import, ImportKind, Memory, Module, Operator, Signature, SignatureData, Table,
+    TableData, Terminator, Type, Value, ValueDef, WithNullable,
 };
 use sha3::{Digest, Sha3_256};
 use swc_common::SyntaxContext;
 use swc_ecma_ast::{BinaryOp, Id as Ident, Lit, UnaryOp};
 
-use crate::linker::{ImportTarget, ModuleSet};
+use crate::linker::{ExportTarget, ImportTarget, ModuleSet};
 use crate::repr::{
     ConvertError, FUNCTION_FIELD_TAG, JS_NULL_SENTINEL, Repr, TypedArrayKind, field, ref_sig,
 };
 use crate::wasm_boundary::{WasmBoundarySignature, WasmBoundaryType, WasmImportSpec};
+use crate::wasm_esm::{WasmModuleImportSpec, WasmProfile, WasmValType};
 
 /// Convert jsaw-core SSA into a WasmGC module.
 ///
@@ -281,6 +282,19 @@ pub fn convert_modules<'a, 'wasm>(
                  function"
             )));
         }
+        // A boundary ABI wraps a JavaScript function; a Wasm re-export
+        // already carries the binary's own signature and is emitted raw.
+        if exported
+            .iter()
+            .any(|(exported_name, target)| {
+                exported_name == name && matches!(target, ExportTarget::Wasm { .. })
+            })
+        {
+            return Err(ConvertError::invalid(format!(
+                "FFI manifest declares export {name:?}, but that name is a raw Wasm member \
+                 re-export; boundary ABIs only wrap JavaScript functions"
+            )));
+        }
     }
     if let Some(suffix) = &options.gc_export_suffix {
         for export in &exported {
@@ -303,6 +317,10 @@ pub fn convert_modules<'a, 'wasm>(
     // sites, so they need a prescan to keep the import section first.
     let ffi_prescan = prescan_ffi(set, &import_tables)?;
     let ffi_host_imports = declare_ffi_host_imports(module, &ffi_prescan.thunks)?;
+    // Merge every Wasm member after all import declarations (merged members
+    // define functions) and before the converter creates any helper, so no
+    // jsaw entity observes a pre-merge index space (plan §5.1).
+    let wasm_module_functions = merge_wasm_members(module, set)?;
     let mut converter = Converter::new(module);
     converter.ffi_host_imports = ffi_host_imports;
     converter.semantic_cfg = options.semantic_cfg();
@@ -311,9 +329,17 @@ pub fn convert_modules<'a, 'wasm>(
     converter.ffi_thunks = ffi_prescan.thunks;
     converter.import_tables = import_tables;
     converter.wasm_host_imports = wasm_host_imports;
+    converter.wasm_module_functions = wasm_module_functions;
     converter.exceptions_enabled = exported
         .iter()
-        .any(|(_, function)| source_uses_exceptions(function, &mut BTreeSet::new()))
+        .any(|(_, target)| match target {
+            // Wasm members cannot participate in the JS exception protocol
+            // (plan §5.6): a throw into Wasm member code traps.
+            ExportTarget::Js(function) => {
+                source_uses_exceptions(function, &mut BTreeSet::new())
+            }
+            ExportTarget::Wasm { .. } => false,
+        })
         || set.keys().any(|path| {
             set.get(path)
                 .is_ok_and(|source| source_uses_exceptions(&source.body, &mut BTreeSet::new()))
@@ -363,18 +389,58 @@ pub fn convert_modules<'a, 'wasm>(
         let info = converter.ensure_function(&module.body, path)?;
         converter.module_init_bodies.push(info.adapter);
     }
+    /// One pending artifact export: either a lowered JavaScript function
+    /// (emitted through the numeric/`$gc`/FFI-boundary paths) or a Wasm
+    /// member function re-exported raw with its binary-declared signature
+    /// (plan §5.2).
+    enum PendingExport {
+        Js(FunctionInfo),
+        RawWasm(Func),
+    }
     let mut exports = Vec::with_capacity(exported.len());
-    for (name, function) in exported {
-        converter.collect_shapes(function)?;
-        converter.shadowed_names.clear();
-        converter.function_literal_locals.clear();
-        let mut visited = BTreeSet::new();
-        converter.collect_shadowed_names(function, &mut visited);
-        exports.push((name, converter.ensure_function(function, entry)?));
+    for (name, target) in exported {
+        match target {
+            ExportTarget::Js(function) => {
+                converter.collect_shapes(function)?;
+                converter.shadowed_names.clear();
+                converter.function_literal_locals.clear();
+                let mut visited = BTreeSet::new();
+                converter.collect_shadowed_names(function, &mut visited);
+                exports.push((
+                    name,
+                    PendingExport::Js(converter.ensure_function(function, entry)?),
+                ));
+            }
+            ExportTarget::Wasm { path, export } => {
+                let func = *converter
+                    .wasm_module_functions
+                    .get(&(path.to_string(), export.clone()))
+                    .ok_or_else(|| {
+                        ConvertError::invalid(format!(
+                            "Wasm module export {path:?}.{export:?} was not merged into the \
+                             output module"
+                        ))
+                    })?;
+                exports.push((name, PendingExport::RawWasm(func)));
+            }
+        }
     }
     converter.lower_all()?;
 
-    for (name, info) in exports {
+    for (name, emission) in exports {
+        let PendingExport::Js(info) = emission else {
+            // Raw passthrough: the merged function carries the binary's own
+            // signature; bypass the numeric/`$gc`/FFI-boundary wrappers.
+            // Export-name collisions were checked above.
+            let PendingExport::RawWasm(func) = emission else {
+                unreachable!("matched above")
+            };
+            converter.module.exports.push(Export {
+                name,
+                kind: ExportKind::Func(func),
+            });
+            continue;
+        };
         // A manifest-declared boundary export takes the plain name with its
         // raw host ABI; the generic numeric export is suppressed for it.
         let boundary = options.ffi.exports.get(&name).cloned();
@@ -450,6 +516,202 @@ fn wasm_boundary_type(ty: WasmBoundaryType) -> Type {
             nullable: true,
         }),
     }
+}
+
+/// One Wasm member value type as a Waffle IR type (adapter coercion table,
+/// plan §5.3).
+fn wasm_esm_val_type(ty: WasmValType) -> Type {
+    match ty {
+        WasmValType::I32 => Type::I32,
+        WasmValType::I64 => Type::I64,
+        WasmValType::F32 => Type::F32,
+        WasmValType::F64 => Type::F64,
+        // Reference and vector types are rejected by the adapter's profile
+        // gates before this is reachable.
+        WasmValType::Ref => Type::Heap(WithNullable {
+            value: HeapType::Any,
+            nullable: true,
+        }),
+        WasmValType::V128 => Type::V128,
+    }
+}
+
+/// Index-space bases for merging one Wasm member into the output module
+/// (plan §5.1: append entities, rewrite indices by these offsets).
+struct MergeBases {
+    signature: usize,
+    function: usize,
+    global: usize,
+    table: usize,
+    memory: usize,
+}
+
+impl MergeBases {
+    fn func(&self, index: Func) -> Func {
+        Func::new(self.function + index.index())
+    }
+    fn sig(&self, index: Signature) -> Signature {
+        Signature::new(self.signature + index.index())
+    }
+    fn global(&self, index: Global) -> Global {
+        Global::new(self.global + index.index())
+    }
+    fn table(&self, index: Table) -> Table {
+        Table::new(self.table + index.index())
+    }
+    fn memory(&self, index: Memory) -> Memory {
+        Memory::new(self.memory + index.index())
+    }
+}
+
+/// Rewrite every module-level index an MVP-reachable operator can carry
+/// (plan §5.1 item 2). Reference-types/bulk-memory/table ops are not
+/// reachable under the validated profiles this phase accepts; GC operators
+/// additionally carry type indices and are gated out at merge time.
+fn remap_wasm_member_op(op: &mut Operator, bases: &MergeBases) {
+    match op {
+        Operator::Call { function_index } => *function_index = bases.func(*function_index),
+        Operator::CallIndirect {
+            sig_index,
+            table_index,
+        } => {
+            *sig_index = bases.sig(*sig_index);
+            *table_index = bases.table(*table_index);
+        }
+        Operator::RefFunc { func_index } => *func_index = bases.func(*func_index),
+        Operator::GlobalGet { global_index } | Operator::GlobalSet { global_index } => {
+            *global_index = bases.global(*global_index);
+        }
+        Operator::I32Load { memory }
+        | Operator::I64Load { memory }
+        | Operator::F32Load { memory }
+        | Operator::F64Load { memory }
+        | Operator::I32Load8S { memory }
+        | Operator::I32Load8U { memory }
+        | Operator::I32Load16S { memory }
+        | Operator::I32Load16U { memory }
+        | Operator::I64Load8S { memory }
+        | Operator::I64Load8U { memory }
+        | Operator::I64Load16S { memory }
+        | Operator::I64Load16U { memory }
+        | Operator::I64Load32S { memory }
+        | Operator::I64Load32U { memory }
+        | Operator::I32Store { memory }
+        | Operator::I64Store { memory }
+        | Operator::F32Store { memory }
+        | Operator::F64Store { memory }
+        | Operator::I32Store8 { memory }
+        | Operator::I32Store16 { memory }
+        | Operator::I64Store8 { memory }
+        | Operator::I64Store16 { memory }
+        | Operator::I64Store32 { memory } => {
+            memory.memory = bases.memory(memory.memory);
+        }
+        Operator::MemorySize { mem } | Operator::MemoryGrow { mem } => {
+            *mem = bases.memory(*mem);
+        }
+        // Every other MVP operator is index-free with respect to the
+        // module's signature/function/global/table/memory spaces.
+        _ => {}
+    }
+}
+
+/// Merge every Wasm member's ingested Waffle IR into the output module
+/// (plan §5.1). Returns the member function-export map,
+/// `(member path, export name) -> merged Func`, in deterministic
+/// module-set key order.
+///
+/// Runs after all import declarations (merged members define functions,
+/// and Wasm requires the import section to precede them) and before the
+/// converter creates any helper, so no jsaw entity can observe a
+/// pre-merge index space.
+fn merge_wasm_members(
+    module: &mut Module<'_>,
+    set: &ModuleSet<'_>,
+) -> Result<BTreeMap<(String, String), Func>, ConvertError> {
+    let mut export_funcs: BTreeMap<(String, String), Func> = BTreeMap::new();
+    for (path, plan) in set.wasm_modules() {
+        if plan.profile >= WasmProfile::Gc {
+            return Err(ConvertError::invalid(format!(
+                "Wasm module {path:?} uses the gc profile; merging GC Wasm members is wasm-esm \
+                 phase 5 (docs/plan-wasm-esm-modules.md §5.5)"
+            )));
+        }
+        let member = &plan.module;
+        debug_assert!(
+            member.imports.is_empty(),
+            "wasm-esm ingestion rejects members with imports"
+        );
+        let bases = MergeBases {
+            signature: module.signatures.len(),
+            function: module.funcs.len(),
+            global: module.globals.len(),
+            table: module.tables.len(),
+            memory: module.memories.len(),
+        };
+        for signature in member.signatures.values() {
+            module.signatures.push(signature.clone());
+        }
+        for global in member.globals.values() {
+            module.globals.push(global.clone());
+        }
+        for table in member.tables.values() {
+            let mut table = table.clone();
+            // Element segments are already lowered into funcref tables;
+            // rebase their Func indices (plan §5.1 item 3).
+            if let Some(elements) = table.func_elements.as_mut() {
+                for element in elements.iter_mut() {
+                    if *element != Func::invalid() {
+                        *element = bases.func(*element);
+                    }
+                }
+            }
+            module.tables.push(table);
+        }
+        for memory in member.memories.values() {
+            // Data segments carry absolute offsets within their own memory,
+            // so they survive the rebase verbatim.
+            module.memories.push(memory.clone());
+        }
+        for decl in member.funcs.values() {
+            let decl = match decl {
+                FuncDecl::Body(sig, name, body) => {
+                    let mut body = body.clone();
+                    for (_value, def) in body.values.entries_mut() {
+                        if let ValueDef::Operator(op, _, _) = def {
+                            remap_wasm_member_op(op, &bases);
+                        }
+                    }
+                    // Keep WASM names: the binary's name section verbatim;
+                    // anonymous functions get a deterministic
+                    // `<path>:<index>` fallback (plan §5.1).
+                    let name = if name.is_empty() {
+                        format!("{path}:{}", module.funcs.len() - bases.function)
+                    } else {
+                        name.clone()
+                    };
+                    FuncDecl::Body(bases.sig(*sig), name, body)
+                }
+                other => {
+                    return Err(ConvertError::invalid(format!(
+                        "Wasm module {path:?} contains a non-body function declaration after \
+                         ingestion ({other:?}); members with imports are rejected and all bodies \
+                         are expanded"
+                    )));
+                }
+            };
+            module.funcs.push(decl);
+        }
+        for (name, export) in &plan.exports {
+            if let crate::wasm_esm::WasmExport::Func { index, .. } = export {
+                export_funcs.insert(
+                    (path.clone(), name.clone()),
+                    Func::new(bases.function + *index as usize),
+                );
+            }
+        }
+    }
+    Ok(export_funcs)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1259,6 +1521,11 @@ struct Converter<'a, 'module, 'wasm> {
     pit_ifaces: BTreeMap<[u8; 32], (String, Vec<FfiMethodSigRef>)>,
     /// Generated jsaw callable metadata for every raw host import.
     wasm_host_functions: BTreeMap<WasmImportSpec, FunctionInfo>,
+    /// Merged Wasm member function exports: `(member path, export name)` →
+    /// the merged function (plan §5.1).
+    wasm_module_functions: BTreeMap<(String, String), Func>,
+    /// Generated jsaw callable metadata per Wasm member import binding.
+    wasm_module_adapters: BTreeMap<WasmModuleImportSpec, FunctionInfo>,
     /// Per-module import tables for multi-module ingestion: resolved
     /// binding → linked target function. Keyed by module path; the single-
     /// module and bare-script paths use the same shape with an empty table
@@ -1346,6 +1613,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             pit_ifaces: BTreeMap::new(),
             ffi_struct_ctors: BTreeMap::new(),
             wasm_host_functions: BTreeMap::new(),
+            wasm_module_functions: BTreeMap::new(),
+            wasm_module_adapters: BTreeMap::new(),
             import_tables: BTreeMap::new(),
             module_of_function: BTreeMap::new(),
             current_module: String::new(),
@@ -2432,6 +2701,192 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             returns: ReturnKinds::default(),
         };
         self.wasm_host_functions.insert(spec.clone(), info);
+        Ok(info)
+    }
+
+    /// Build (or reuse) the boxed-JS callable adapter for a Wasm member's
+    /// function export (plan §5.3): read the ordinary JS formals, coerce each
+    /// argument to the binary's declared parameter type, call the merged
+    /// internal function directly (no host import, no FFI manifest), and box
+    /// the result as a JS value.
+    fn wasm_module_adapter(
+        &mut self,
+        spec: &WasmModuleImportSpec,
+    ) -> Result<FunctionInfo, ConvertError> {
+        if let Some(info) = self.wasm_module_adapters.get(spec) {
+            return Ok(*info);
+        }
+        // Profile gates: multi-result returns are phase 3 (JS array packing);
+        // reference types are phase 5 (GC); v128 is out of scope
+        // (portal-co/jsaw#7).
+        if spec.signature.results.len() > 1 {
+            return Err(ConvertError::invalid(format!(
+                "Wasm module export {:?}.{:?} has a multi-result signature; multi-value adapters \
+                 are wasm-esm phase 3 (plan §5.3)",
+                spec.path, spec.export
+            )));
+        }
+        for ty in spec
+            .signature
+            .params
+            .iter()
+            .chain(spec.signature.results.iter())
+        {
+            match ty {
+                WasmValType::Ref => {
+                    return Err(ConvertError::invalid(format!(
+                        "Wasm module export {:?}.{:?} has a reference-typed signature; GC adapters \
+                         are wasm-esm phase 5 (plan §5.3)",
+                        spec.path, spec.export
+                    )));
+                }
+                WasmValType::V128 => {
+                    return Err(ConvertError::invalid(format!(
+                        "Wasm module export {:?}.{:?} has a v128 (SIMD) signature; SIMD is out of \
+                         scope (portal-co/jsaw#7)",
+                        spec.path, spec.export
+                    )));
+                }
+                _ => {}
+            }
+        }
+        let func = *self
+            .wasm_module_functions
+            .get(&(spec.path.clone(), spec.export.clone()))
+            .ok_or_else(|| {
+                ConvertError::invalid(format!(
+                    "Wasm module export {:?}.{:?} was not merged into the output module",
+                    spec.path, spec.export
+                ))
+            })?;
+        let arity = spec.signature.params.len();
+        let native_sig = self.module.signatures.push(SignatureData::Func {
+            params: std::iter::once(self.repr.object_ty())
+                .chain(std::iter::once(self.repr.value))
+                .chain(std::iter::once(self.repr.arguments_ty()))
+                .chain(std::iter::repeat_n(self.repr.value, arity))
+                .collect(),
+            returns: vec![self.repr.value],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, native_sig);
+        let block = body.entry;
+        let formals = body.blocks[block].params[3..]
+            .iter()
+            .map(|(_, value)| *value)
+            .collect::<Vec<_>>();
+        let mut raw_args = Vec::with_capacity(arity);
+        for (value, ty) in formals
+            .into_iter()
+            .zip(spec.signature.params.iter().copied())
+        {
+            let value = LowerValue::Wasm {
+                value,
+                kind: ValueKind::Reference,
+            };
+            raw_args.push(match ty {
+                WasmValType::I32 => self.as_i32(&mut body, block, &value)?,
+                WasmValType::I64 => self.as_i64(&mut body, block, &value)?,
+                WasmValType::F32 => {
+                    let number = self.as_f64(&mut body, block, &value)?;
+                    body.add_op(block, Operator::F32DemoteF64, &[number], &[Type::F32])
+                }
+                WasmValType::F64 => self.as_f64(&mut body, block, &value)?,
+                WasmValType::Ref | WasmValType::V128 => unreachable!("gated above"),
+            });
+        }
+        let result_types = spec
+            .signature
+            .results
+            .iter()
+            .copied()
+            .map(wasm_esm_val_type)
+            .collect::<Vec<_>>();
+        let results: Vec<Value> = if result_types.is_empty() {
+            body.add_op(
+                block,
+                Operator::Call {
+                    function_index: func,
+                },
+                &raw_args,
+                &[],
+            );
+            vec![]
+        } else {
+            vec![body.add_op(
+                block,
+                Operator::Call {
+                    function_index: func,
+                },
+                &raw_args,
+                &result_types,
+            )]
+        };
+        let result = match spec.signature.results.first() {
+            None => self.undef(&mut body, block).wasm()?.0,
+            Some(WasmValType::I32) => self.box_value(
+                &mut body,
+                block,
+                &LowerValue::Wasm {
+                    value: results[0],
+                    kind: ValueKind::Integer,
+                },
+            )?,
+            Some(WasmValType::I64) => self.box_value(
+                &mut body,
+                block,
+                &LowerValue::Wasm {
+                    value: results[0],
+                    kind: ValueKind::BigInt,
+                },
+            )?,
+            Some(WasmValType::F32) => {
+                let number =
+                    body.add_op(block, Operator::F64PromoteF32, &[results[0]], &[Type::F64]);
+                self.box_value(
+                    &mut body,
+                    block,
+                    &LowerValue::Wasm {
+                        value: number,
+                        kind: ValueKind::Number,
+                    },
+                )?
+            }
+            Some(WasmValType::F64) => self.box_value(
+                &mut body,
+                block,
+                &LowerValue::Wasm {
+                    value: results[0],
+                    kind: ValueKind::Number,
+                },
+            )?,
+            Some(WasmValType::Ref | WasmValType::V128) => unreachable!("gated above"),
+        };
+        body.set_terminator(
+            block,
+            Terminator::Return {
+                values: vec![result],
+            },
+        );
+        let native = self.module.funcs.push(FuncDecl::Body(
+            native_sig,
+            format!("js_wasm_member_native_{}_{}", spec.path, spec.export),
+            body,
+        ));
+        let adapter = self.make_adapter(native, arity)?;
+        let tag = self.next_function_tag;
+        self.next_function_tag = self
+            .next_function_tag
+            .checked_add(1)
+            .ok_or_else(|| ConvertError::invalid("function tag space exhausted"))?;
+        let info = FunctionInfo {
+            native,
+            adapter,
+            arity,
+            tag,
+            returns: ReturnKinds::default(),
+        };
+        self.wasm_module_adapters.insert(spec.clone(), info);
         Ok(info)
     }
 
@@ -3869,12 +4324,17 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                             return Ok(vec![(block, value)]);
                         }
                         ImportTarget::WasmModule(spec) => {
-                            return Err(ConvertError::invalid(format!(
-                                "Wasm module import {:?} from {:?} is linked but calls into Wasm \
-                                 module-set members are not yet lowered (wasm-esm phase 1; see \
-                                 docs/plan-wasm-esm-modules.md)",
-                                spec.export, spec.path
-                            )));
+                            let info = self.wasm_module_adapter(&spec)?;
+                            let value = self.function_object_from_info(
+                                body,
+                                block,
+                                context,
+                                this.clone(),
+                                info,
+                                false,
+                                true,
+                            )?;
+                            return Ok(vec![(block, value)]);
                         }
                         ImportTarget::Intrinsic { module, name } => {
                             // The SSA builder materializes the callee's

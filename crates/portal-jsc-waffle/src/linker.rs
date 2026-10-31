@@ -165,6 +165,17 @@ impl<'s> ModuleSet<'s> {
             })
     }
 
+    /// Every Wasm binary member, in deterministic key order (the merge
+    /// order, plan §5.1).
+    pub(crate) fn wasm_modules(&self) -> impl Iterator<Item = (&String, &WasmModulePlan)> {
+        self.modules
+            .iter()
+            .filter_map(|(path, member)| match member {
+                ModuleMember::Wasm(plan) => Some((path, plan)),
+                ModuleMember::Js(_) => None,
+            })
+    }
+
     pub(crate) fn contains(&self, path: &str) -> bool {
         self.modules.contains_key(path)
     }
@@ -294,17 +305,31 @@ pub(crate) fn resolve_export<'a>(
     path: &str,
     name: &str,
     visiting: &mut BTreeSet<(String, String)>,
-) -> Result<Option<&'a SFunc>, ConvertError> {
+) -> Result<Option<ExportTarget<'a>>, ConvertError> {
     if !visiting.insert((path.to_string(), name.to_string())) {
         return Err(ConvertError::invalid(format!(
             "circular re-export chain while resolving {name:?} from {path:?}"
         )));
     }
-    if set.get_wasm(path).is_some() {
-        return Err(ConvertError::invalid(format!(
-            "re-exporting Wasm module export {name:?} of {path:?} through JavaScript is not yet \
-             supported (wasm-esm phase 1; see docs/plan-wasm-esm-modules.md §5.2)"
-        )));
+    // A Wasm member resolves its own export section directly (plan §5.2).
+    if let Some(plan) = set.get_wasm(path) {
+        return match plan.exports.get(name) {
+            None => Ok(None),
+            Some(crate::wasm_esm::WasmExport::Func { .. }) => Ok(Some(ExportTarget::Wasm {
+                // Re-key to the canonical module-set key so the identity is
+                // stable regardless of the spelling that resolved here.
+                path: set
+                    .keys()
+                    .find(|key| key.as_str() == path)
+                    .expect("verified present above")
+                    .as_str(),
+                export: name.to_string(),
+            })),
+            Some(_) => Err(ConvertError::invalid(format!(
+                "Wasm module export {path:?}.{name:?} is not a function; non-function exports \
+                 cannot be linked (portal-co/jsaw#10)"
+            ))),
+        };
     }
     let module = set.get(path)?;
     // 1. Explicit exports of this module.
@@ -314,7 +339,7 @@ pub(crate) fn resolve_export<'a>(
                 local, exported, ..
             } if exported == name => {
                 return match module.funcs.get(&local.0) {
-                    Some(function) => Ok(Some(function)),
+                    Some(function) => Ok(Some(ExportTarget::Js(function))),
                     None => Err(ConvertError::invalid(format!(
                         "export {name:?} of {path:?} is not a hoisted function declaration; only \
                          function exports can be linked across modules in this milestone"
@@ -323,7 +348,7 @@ pub(crate) fn resolve_export<'a>(
             }
             ExportSpec::DefaultFunc { func_name } if name == "default" => {
                 return match module.funcs.get(func_name) {
-                    Some(function) => Ok(Some(function)),
+                    Some(function) => Ok(Some(ExportTarget::Js(function))),
                     None => Err(ConvertError::invalid(format!(
                         "default export of {path:?} has no hoisted function body"
                     ))),
@@ -356,33 +381,64 @@ pub(crate) fn resolve_export<'a>(
     //    is ambiguous and rejected (a conservative subset of the spec's
     //    "unbound" rule); the same function through two paths is fine.
     if name != "default" {
-        let mut found: Option<(&'a SFunc, &str)> = None;
+        let mut found: Option<(ExportTarget<'a>, &str)> = None;
         for export in &module.exports {
             if let ExportSpec::ReexportAll {
                 source, ns: None, ..
             } = export
             {
                 let (target, _) = resolve_specifier_target(set, path, source.as_ref())?;
-                if let Some(function) = resolve_export(set, target, name, visiting)? {
-                    match found {
+                if let Some(resolved) = resolve_export(set, target, name, visiting)? {
+                    match &found {
                         Some((previous, previous_path)) => {
-                            if !std::ptr::eq(previous, function) {
+                            if !same_export_target(previous, &resolved) {
                                 return Err(ConvertError::invalid(format!(
                                     "ambiguous star export {name:?} from {path:?}: provided by \
                                      both {previous_path:?} and {target:?}"
                                 )));
                             }
                         }
-                        None => found = Some((function, target)),
+                        None => found = Some((resolved, target)),
                     }
                 }
             }
         }
-        if let Some((function, _)) = found {
-            return Ok(Some(function));
+        if let Some((resolved, _)) = found {
+            return Ok(Some(resolved));
         }
     }
     Ok(None)
+}
+
+/// Star-export identity: the same declaration reached through two star
+/// paths is not ambiguous (pointer identity for JS declarations; the
+/// canonical (path, export) pair for Wasm members).
+fn same_export_target(a: &ExportTarget<'_>, b: &ExportTarget<'_>) -> bool {
+    match (a, b) {
+        (ExportTarget::Js(a), ExportTarget::Js(b)) => std::ptr::eq(*a, *b),
+        (
+            ExportTarget::Wasm {
+                path: a_path,
+                export: a_export,
+            },
+            ExportTarget::Wasm {
+                path: b_path,
+                export: b_export,
+            },
+        ) => a_path == b_path && a_export == b_export,
+        _ => false,
+    }
+}
+
+/// A statically resolved export: either a JavaScript hoisted function or a
+/// Wasm member's function export (wasm-esm phase 2, plan §5.2).
+#[derive(Clone)]
+pub(crate) enum ExportTarget<'a> {
+    /// A JavaScript hoisted function declaration.
+    Js(&'a SFunc),
+    /// A function export of a `.wasm` module-set member. `path` is the
+    /// canonical module-set key; `export` is the binary's export name.
+    Wasm { path: &'a str, export: String },
 }
 
 /// A statically resolved imported binding.
@@ -550,7 +606,7 @@ pub(crate) fn build_import_table<'a>(
                      from {specifier:?})"
                 ))
             })?;
-            let crate::wasm_esm::WasmExport::Func(signature) = export else {
+            let crate::wasm_esm::WasmExport::Func { signature, .. } = export else {
                 return Err(ConvertError::invalid(format!(
                     "Wasm module export {target_path:?}.{name:?} is not a function; importing \
                      memories, globals, tables, or tags as JavaScript values is not supported \
@@ -577,20 +633,45 @@ pub(crate) fn build_import_table<'a>(
                 )));
             }
         };
-        let function =
+        let resolved =
             resolve_export(set, target_path, &name, &mut BTreeSet::new())?.ok_or_else(|| {
                 ConvertError::invalid(format!(
                     "module {target_path:?} does not export {name:?} (imported by {path:?} from \
                      {specifier:?})"
                 ))
             })?;
-        table.insert(
-            id,
-            ImportTarget::InternalFunction {
-                module: target_path.to_owned(),
-                function,
-            },
-        );
+        match resolved {
+            ExportTarget::Js(function) => {
+                table.insert(
+                    id,
+                    ImportTarget::InternalFunction {
+                        module: target_path.to_owned(),
+                        function,
+                    },
+                );
+            }
+            ExportTarget::Wasm {
+                path: wasm_path,
+                export,
+            } => {
+                // A JavaScript module re-exporting a Wasm member's function:
+                // the import links directly to the Wasm member (plan §5.2).
+                let plan = set.get_wasm(wasm_path).expect("resolved above");
+                let Some(crate::wasm_esm::WasmExport::Func { signature, .. }) =
+                    plan.exports.get(&export)
+                else {
+                    unreachable!("resolve_export only yields Wasm targets for function exports");
+                };
+                table.insert(
+                    id,
+                    ImportTarget::WasmModule(WasmModuleImportSpec {
+                        path: wasm_path.to_owned(),
+                        export,
+                        signature: signature.clone(),
+                    }),
+                );
+            }
+        }
     }
     Ok(table)
 }
@@ -670,9 +751,9 @@ fn validate_wasm_host_import_declarations(
 pub(crate) fn flatten_module_export_surface<'a>(
     set: &'a ModuleSet<'a>,
     entry: &str,
-) -> Result<(Vec<(String, &'a SFunc)>, BTreeSet<String>), ConvertError> {
+) -> Result<(Vec<(String, ExportTarget<'a>)>, BTreeSet<String>), ConvertError> {
     let module = set.get(entry)?;
-    let mut exported: Vec<(String, &'a SFunc)> = Vec::new();
+    let mut exported: Vec<(String, ExportTarget<'a>)> = Vec::new();
     // Every name the surface provides, including non-function exports that
     // keep their name reserved (no Wasm export) exactly like today's
     // function-only ABI.
@@ -689,7 +770,7 @@ pub(crate) fn flatten_module_export_surface<'a>(
                 // Non-function local exports skip silently: the existing
                 // function-only ABI never exported them either.
                 if let Some(function) = module.funcs.get(&local.0) {
-                    exported.push((name.to_string(), function));
+                    exported.push((name.to_string(), ExportTarget::Js(function)));
                 }
             }
             ExportSpec::DefaultFunc { func_name } => {
@@ -699,7 +780,7 @@ pub(crate) fn flatten_module_export_surface<'a>(
                     ))
                 })?;
                 declared_names.insert("default".to_owned());
-                exported.push(("default".to_owned(), function));
+                exported.push(("default".to_owned(), ExportTarget::Js(function)));
             }
             ExportSpec::DefaultExpr { .. } => {
                 return Err(ConvertError::invalid(format!(
@@ -710,7 +791,7 @@ pub(crate) fn flatten_module_export_surface<'a>(
             ExportSpec::Reexport { source, names, .. } => {
                 let (target, _) = resolve_specifier_target(set, entry, source.as_ref())?;
                 for (original, exported_name) in names {
-                    let function =
+                    let resolved =
                         resolve_export(set, target, original.as_ref(), &mut BTreeSet::new())?
                             .ok_or_else(|| {
                                 ConvertError::invalid(format!(
@@ -719,7 +800,7 @@ pub(crate) fn flatten_module_export_surface<'a>(
                                 ))
                             })?;
                     declared_names.insert(exported_name.to_string());
-                    exported.push((exported_name.to_string(), function));
+                    exported.push((exported_name.to_string(), resolved));
                 }
             }
             ExportSpec::ReexportAll { ns: Some(_), .. } => {
@@ -746,21 +827,38 @@ pub(crate) fn flatten_module_export_surface<'a>(
             local_names.insert(name.to_string());
         }
     }
-    let mut star_seen: BTreeMap<String, usize> = BTreeMap::new();
+    // Star-origin identity mirrors `same_export_target`: the same
+    // declaration through two star paths is not ambiguous.
+    #[derive(PartialEq, Eq)]
+    enum StarOrigin {
+        Js(usize),
+        Wasm(String, String),
+    }
+    let mut star_seen: BTreeMap<String, StarOrigin> = BTreeMap::new();
     for source in &star_sources {
         for name in module_export_names(set, source, &mut BTreeSet::new())? {
             if name == "default" || local_names.contains(&name) {
                 continue;
             }
-            let function =
+            let resolved =
                 resolve_export(set, source, &name, &mut BTreeSet::new())?.ok_or_else(|| {
                     ConvertError::invalid(format!(
                         "module {source:?} does not export {name:?} (star-exported by {entry:?})"
                     ))
                 })?;
-            let key = function as *const SFunc as usize;
+            let key = match &resolved {
+                ExportTarget::Js(function) => StarOrigin::Js(*function as *const SFunc as usize),
+                ExportTarget::Wasm { path, export } => {
+                    StarOrigin::Wasm(path.to_string(), export.clone())
+                }
+            };
             match star_seen.insert(name.clone(), key) {
-                Some(previous) if previous != key => {
+                Some(previous) if previous != match &resolved {
+                    ExportTarget::Js(function) => StarOrigin::Js(*function as *const SFunc as usize),
+                    ExportTarget::Wasm { path, export } => {
+                        StarOrigin::Wasm(path.to_string(), export.clone())
+                    }
+                } => {
                     return Err(ConvertError::invalid(format!(
                         "ambiguous star export {name:?} in {entry:?}: provided by more than one \
                          starred module"
@@ -769,7 +867,7 @@ pub(crate) fn flatten_module_export_surface<'a>(
                 _ => {}
             }
             declared_names.insert(name.clone());
-            exported.push((name, function));
+            exported.push((name, resolved));
         }
     }
     Ok((exported, declared_names))
@@ -897,17 +995,24 @@ mod tests {
     }
 
     #[test]
-    fn wasm_member_reexport_fails_closed_for_now() {
+    fn wasm_member_reexport_resolves_to_wasm_target() {
         with_globals(|| {
             let mut set = ModuleSet::new();
             set.insert_wasm("lib/math.wasm", &wasm_fixtures::add_module())
                 .expect("valid Wasm member");
             let main = js_module("export { add } from './lib/math.wasm';");
             set.insert("main.js", main).expect("JS member");
-            let Err(error) = flatten_module_export_surface(&set, "main.js") else {
-                panic!("re-exporting Wasm exports is a named phase-1 error")
+            let (exported, _) = flatten_module_export_surface(&set, "main.js")
+                .expect("re-exporting a Wasm function export resolves in phase 2");
+            let [(name, target)] = exported.as_slice() else {
+                panic!("expected exactly one export, got {}", exported.len());
             };
-            assert!(error.message.contains("not yet supported"), "{error}");
+            assert_eq!(name, "add");
+            let ExportTarget::Wasm { path, export } = target else {
+                panic!("expected a Wasm export target");
+            };
+            assert_eq!(*path, "lib/math.wasm");
+            assert_eq!(export, "add");
         });
     }
 }

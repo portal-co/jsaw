@@ -396,21 +396,36 @@ construction for a `.wasm` member. **Done:** 146 lib tests (incl. 8
 five profiles (multi-value, memory64, multi-memory, GC each gated and
 classified).
 
-### Phase 2 — JS↔Wasm adapters and native pass-through (MVP)
+### Phase 2 — JS↔Wasm adapters and native pass-through (Done)
 
 1. Merge the ingested Waffle module into the output module (entity remap,
-   segment rebase, deterministic order).
-2. Generate the boxed-JS call adapters per §5.3 (scalar types only).
-3. Raw re-export wrappers for `export { f } from "./m.wasm"` with the
-   binary's own signature; collision checks against numeric/`gc_export_suffix`
-   exports.
-4. Wasmtime + Node e2e: JS calls into Wasm, Wasm result values, re-export
-   passthrough, i64/BigInt and f32 rounding behavior.
+   segment rebase, deterministic order): ingestion (`from_wasm_bytes` +
+   `expand_all_funcs` + a safe field-by-field strip to `Module<'static>`)
+   happens at `insert_wasm` time; `merge_wasm_members` appends signatures,
+   globals, tables (funcref elements rebased), memories (segments
+   verbatim), and function bodies with all MVP-reachable operator indices
+   remapped. Binary name-section names are kept as Waffle debug names, with
+   `<path>:<index>` fallbacks. Members at GC profile fail closed at merge
+   until Phase 5.
+2. `wasm_module_adapter` generates the boxed-JS call adapters per §5.3
+   (scalar types only; multi-result, reference, and v128 signatures fail
+   closed with phase/SIMD-issue diagnostics). The callee is the merged
+   internal function — no host import, no FFI manifest entry.
+3. Re-export passthrough: `resolve_export` returns `ExportTarget::{Js, Wasm}`,
+   so `export { f } from "./m.wasm"` and shim/star re-exports resolve; the
+   artifact re-exports the merged function raw under the binary's own
+   signature, bypassing numeric/`$gc` wrappers, with collision checks; an
+   FFI boundary export naming a Wasm re-export fails closed.
+4. Wasmtime + Node e2e: JS calls into Wasm through the numeric ABI,
+   aliased imports reusing one adapter, no-arg/f32 rounding, memory +
+   data-segment pass-through, raw i32/i64 re-export signatures, and shim
+   re-exports — `crates/portal-jsc-waffle/tests/wasm_esm.rs` (10 tests).
 
 **Commit:** `wasm-esm: call MVP wasm modules from JS and re-export them`.
 **Gate:** differential fixtures (pure-JS implementation vs imported Wasm
 implementation of the same function) produce identical results through
-both the numeric and `$gc` export ABIs.
+both the numeric and `$gc` export ABIs. **Done:** all wasm_esm integration
+tests execute identically under Wasmtime and Node.
 
 ### Phase 3 — multi-value and memory64
 

@@ -25,7 +25,10 @@
 //!   frontend cannot rebase `global.get` bases.
 
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 
+use portal_pc_waffle::frontend::{FrontendOptions, expand_all_funcs, from_wasm_bytes};
+use portal_pc_waffle::{FuncDecl, Module};
 use wasmparser::{ExternalKind, Parser, Payload, TypeRef, ValType, Validator, WasmFeatures};
 
 use crate::repr::ConvertError;
@@ -126,8 +129,14 @@ pub(crate) struct WasmFuncSignature {
 
 /// One entry of a Wasm member's export surface.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum WasmExport {
-    Func(WasmFuncSignature),
+    Func {
+        /// The export's index in the member's own function index space
+        /// (imported functions first, then defined ones).
+        index: u32,
+        signature: WasmFuncSignature,
+    },
     Memory,
     Global,
     Table,
@@ -142,17 +151,20 @@ pub(crate) struct WasmImport {
     pub(crate) kind: &'static str,
 }
 
-/// A validated Wasm binary module-set member: the retained bytes (for the
-/// phase-2 Waffle ingestion and merge), its exact feature requirement, and
-/// its export/import surfaces.
-// `path`, `profile`, `bytes`, and `imports` are read by the phase-2 merge
-// (plan §5.1); until then only `exports` drives linking.
+/// A validated Wasm binary module-set member: the ingested Waffle IR (all
+/// bodies expanded, no borrows of the original bytes), its exact feature
+/// requirement, and its export/import surfaces.
+///
+/// The Waffle module keeps the binary's name section verbatim as debug
+/// names ("keep WASM names", plan §5.1).
+// `imports` is always empty today (phase 1 rejects Wasm-side imports) and
+// is read by the phase implementing plan §5.4.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub(crate) struct WasmModulePlan {
     pub(crate) path: String,
     pub(crate) profile: WasmProfile,
-    pub(crate) bytes: Vec<u8>,
+    pub(crate) module: Module<'static>,
     pub(crate) exports: BTreeMap<String, WasmExport>,
     pub(crate) imports: Vec<WasmImport>,
 }
@@ -326,15 +338,18 @@ pub(crate) fn parse_wasm_module(
                                         ))
                                     })?
                             };
-                            WasmExport::Func(func_types.get(ty as usize).cloned().ok_or_else(
-                                || {
-                                    ConvertError::invalid(format!(
-                                        "Wasm module {path:?} export {:?} references an \
+                            WasmExport::Func {
+                                index: export.index,
+                                signature: func_types.get(ty as usize).cloned().ok_or_else(
+                                    || {
+                                        ConvertError::invalid(format!(
+                                            "Wasm module {path:?} export {:?} references an \
                                              unknown type index {ty}",
-                                        export.name
-                                    ))
-                                },
-                            )?)
+                                            export.name
+                                        ))
+                                    },
+                                )?,
+                            }
                         }
                         ExternalKind::Memory => WasmExport::Memory,
                         ExternalKind::Global => WasmExport::Global,
@@ -408,13 +423,71 @@ pub(crate) fn parse_wasm_module(
         )));
     }
 
+    // Ingest into Waffle IR now, so ingestion errors surface at insertion
+    // time and phase-2 merging works on owned, fully-expanded IR.
+    let mut module = from_wasm_bytes(bytes, &FrontendOptions { debug: false }).map_err(|error| {
+        ConvertError::invalid(format!("Wasm module {path:?} failed Waffle ingestion: {error:#}"))
+    })?;
+    if module.start_func.is_some() {
+        return Err(ConvertError::invalid(format!(
+            "Wasm module {path:?} has a start function; the merged module's initialization order \
+             is owned by jsaw, so member start functions are rejected"
+        )));
+    }
+    expand_all_funcs(&mut module).map_err(|error| {
+        ConvertError::invalid(format!(
+            "Wasm module {path:?} failed Waffle body expansion: {error:#}"
+        ))
+    })?;
+    let module = strip_to_static(path, module)?;
+
     Ok(WasmModulePlan {
         path: path.to_string(),
         profile,
-        bytes: bytes.to_vec(),
+        module,
         exports,
         imports,
     })
+}
+
+/// Move a fully-expanded ingested module to `Module<'static>` without
+/// `unsafe`: after [`expand_all_funcs`], no `FuncDecl::Lazy` remains, so no
+/// value can still borrow the original bytes.
+fn strip_to_static(path: &str, module: Module<'_>) -> Result<Module<'static>, ConvertError> {
+    let mut stripped = Module::empty();
+    for decl in module.funcs.into_vec() {
+        let decl = match decl {
+            FuncDecl::Import(sig, name) => FuncDecl::Import(sig, name),
+            FuncDecl::Body(sig, name, body) => FuncDecl::Body(sig, name, body),
+            FuncDecl::Compiled(sig, name, bytes) => FuncDecl::Compiled(sig, name, bytes),
+            FuncDecl::None(_) => FuncDecl::None(PhantomData),
+            // `Lazy` is feature-gated and impossible after
+            // `expand_all_funcs`; the wildcard also covers it.
+            other => {
+                if matches!(other, FuncDecl::Lazy(..)) {
+                    return Err(ConvertError::invalid(format!(
+                        "Wasm module {path:?} retained a lazy body after expansion"
+                    )));
+                }
+                return Err(ConvertError::invalid(format!(
+                    "Wasm module {path:?} has an unhandled function declaration form"
+                )));
+            }
+        };
+        stripped.funcs.push(decl);
+    }
+    stripped.signatures = module.signatures;
+    stripped.globals = module.globals;
+    stripped.tables = module.tables;
+    stripped.imports = module.imports;
+    stripped.exports = module.exports;
+    stripped.memories = module.memories;
+    stripped.control_tags = module.control_tags;
+    stripped.start_func = None;
+    stripped.debug = module.debug;
+    stripped.debug_map = module.debug_map;
+    stripped.custom_sections = module.custom_sections;
+    Ok(stripped)
 }
 
 /// Active segment offsets must be plain constants: the Waffle frontend
@@ -539,7 +612,7 @@ pub(crate) mod tests {
             .expect("an MVP module should validate at the mvp ceiling");
         assert_eq!(plan.profile, WasmProfile::Mvp);
         assert!(plan.imports.is_empty());
-        let Some(WasmExport::Func(signature)) = plan.exports.get("add") else {
+        let Some(WasmExport::Func { signature, .. }) = plan.exports.get("add") else {
             panic!("expected the add function export, got {:?}", plan.exports);
         };
         assert_eq!(
@@ -589,7 +662,7 @@ pub(crate) mod tests {
         let plan = parse_wasm_module("pair.wasm", &bytes, WasmProfile::MultiValue)
             .expect("multi-value ceiling should accept the module");
         assert_eq!(plan.profile, WasmProfile::MultiValue);
-        let Some(WasmExport::Func(signature)) = plan.exports.get("pair") else {
+        let Some(WasmExport::Func { signature, .. }) = plan.exports.get("pair") else {
             panic!("expected the pair function export");
         };
         assert_eq!(signature.results, vec![WasmValType::I32, WasmValType::I64]);

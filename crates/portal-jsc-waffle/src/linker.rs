@@ -853,12 +853,17 @@ pub(crate) fn flatten_module_export_surface<'a>(
                 }
             };
             match star_seen.insert(name.clone(), key) {
-                Some(previous) if previous != match &resolved {
-                    ExportTarget::Js(function) => StarOrigin::Js(*function as *const SFunc as usize),
-                    ExportTarget::Wasm { path, export } => {
-                        StarOrigin::Wasm(path.to_string(), export.clone())
-                    }
-                } => {
+                Some(previous)
+                    if previous
+                        != match &resolved {
+                            ExportTarget::Js(function) => {
+                                StarOrigin::Js(*function as *const SFunc as usize)
+                            }
+                            ExportTarget::Wasm { path, export } => {
+                                StarOrigin::Wasm(path.to_string(), export.clone())
+                            }
+                        } =>
+                {
                     return Err(ConvertError::invalid(format!(
                         "ambiguous star export {name:?} in {entry:?}: provided by more than one \
                          starred module"

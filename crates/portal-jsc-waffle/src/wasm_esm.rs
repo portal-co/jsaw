@@ -425,9 +425,12 @@ pub(crate) fn parse_wasm_module(
 
     // Ingest into Waffle IR now, so ingestion errors surface at insertion
     // time and phase-2 merging works on owned, fully-expanded IR.
-    let mut module = from_wasm_bytes(bytes, &FrontendOptions { debug: false }).map_err(|error| {
-        ConvertError::invalid(format!("Wasm module {path:?} failed Waffle ingestion: {error:#}"))
-    })?;
+    let mut module =
+        from_wasm_bytes(bytes, &FrontendOptions { debug: false }).map_err(|error| {
+            ConvertError::invalid(format!(
+                "Wasm module {path:?} failed Waffle ingestion: {error:#}"
+            ))
+        })?;
     if module.start_func.is_some() {
         return Err(ConvertError::invalid(format!(
             "Wasm module {path:?} has a start function; the merged module's initialization order \

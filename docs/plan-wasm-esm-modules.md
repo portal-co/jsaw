@@ -364,6 +364,11 @@ Caveats recorded for later phases:
 - Table element ingestion assumes funcref tables
   (`func_elements.as_mut().unwrap()`); externref/typed tables panic.
   Reject non-funcref tables at validation until the GC phase fixes this.
+- ~~Backend data-segment offsets hardcode `i32.const`~~ — fixed in
+  `../waffle-` `1b55a86` during Phase 3 (memory64 requires `i64.const`).
+  Element-segment offsets have the same hardcode for 64-bit tables
+  (`table64`); funcref64 tables are out of profile scope for now and noted
+  here for the tail-calls/function-references work (portal-co/jsaw#7).
 
 Gate result: Phases 1–4 (MVP, multi-value, memory64, multi-memory) have no
 waffle-side blockers. Phase 5 (GC) is green on coverage but must add the
@@ -427,18 +432,27 @@ implementation of the same function) produce identical results through
 both the numeric and `$gc` export ABIs. **Done:** all wasm_esm integration
 tests execute identically under Wasmtime and Node.
 
-### Phase 3 — multi-value and memory64
+### Phase 3 — multi-value and memory64 (Done)
 
-1. Raise profile ceiling machinery to accept the two profiles; adapters for
-   multi-result (array packing) and memory64 memories (data segment rebase
-   with 64-bit offsets).
-2. Tests: multi-result round-trips; a memory64 module with >4GiB declared
-   maximum validates and its segments survive rebase (behavioral tests stay
-   in-bounds of CI memory).
+1. Multi-result adapters: `wasm_module_adapter` packs multiple Wasm results
+   into a fresh JS array via `ValueDef::PickOutput` extraction (each
+   PickOutput must be appended to the block — `add_value` alone leaves SSA
+   illegal) and `ArrayNewFixed` over `repr.arguments`, preserving order.
+2. memory64: merge already carried `memory64` flags and remapped `MemoryArg`
+   indices; the one real bug was in waffle-backend, which hardcoded
+   `i32.const` data-segment offsets — fixed in `../waffle-` commit
+   `1b55a86` (`i64.const` for memory64 memories). Recorded as a Phase 0
+   audit follow-up below.
+3. Tests: multi-result round-trip through JS array indexing and `.length`;
+   a memory64 module with a >4 GiB declared maximum (65537 pages) merges,
+   keeps its `memory64` flag in the artifact, and its data segment survives
+   the rebase — verified under Wasmtime and Node.
 
 **Commit:** `wasm-esm: multi-value returns and memory64 memories`.
 **Gate:** output artifacts validate with the corresponding wasmparser
-features on; host manifest records the requirement.
+features on; host manifest records the requirement. **Done:**
+`tests/wasm_esm.rs` `multi_result_adapters_pack_into_a_js_array` and
+`memory64_members_merge_and_execute`.
 
 ### Phase 4 — multi-memory
 

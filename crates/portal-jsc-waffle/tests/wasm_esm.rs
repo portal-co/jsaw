@@ -4,7 +4,7 @@
 //! boxed-JS adapters and raw re-export wrappers.
 
 use portal_jsc_waffle::{ModuleSet, WasmProfile, convert_modules, module_set_from_sources};
-use portal_pc_waffle::Module;
+use portal_pc_waffle::{EntityRef, Module};
 use wasmtime::{Config, Engine, Instance, Store, Val};
 
 // ---------------------------------------------------------------------------
@@ -138,9 +138,7 @@ fn memory_module() -> Vec<u8> {
         section(7, vec_of(vec![export_entry("read8", 0x00, 0)])),
         section(
             10,
-            vec_of(vec![code_body(&[
-                0x00, 0x20, 0x00, 0x2d, 0x00, 0x00, 0x0b,
-            ])]),
+            vec_of(vec![code_body(&[0x00, 0x20, 0x00, 0x2d, 0x00, 0x00, 0x0b])]),
         ),
         section(
             11,
@@ -189,6 +187,8 @@ fn execute_raw(bytes: &[u8], name: &str, args: &[Val], results: &mut [Val]) {
     let mut config = Config::new();
     config.wasm_gc(true);
     config.wasm_function_references(true);
+    config.wasm_memory64(true);
+    config.wasm_multi_memory(true);
     let engine = Engine::new(&config).expect("Wasmtime engine should support WasmGC");
     let module = wasmtime::Module::new(&engine, bytes).expect("Wasmtime should compile the module");
     let mut store = Store::new(&engine, ());
@@ -412,16 +412,84 @@ fn shim_module_reexport_links_through_to_the_wasm_member() {
 }
 
 #[test]
-fn multi_result_calls_fail_closed_until_phase_3() {
+fn multi_result_adapters_pack_into_a_js_array() {
     let mut set = module_set_from_sources([(
         "main.js",
-        "import { pair } from './pair.wasm'; export function run() { return pair(); }",
+        "import { pair } from './pair.wasm'; \
+         export function run() { const p = pair(); return p[0] + p[1] * 10; } \
+         export function len() { return pair().length; }",
     )])
     .expect("sources");
     set.insert_wasm_with_profile("pair.wasm", &pair_module(), WasmProfile::MultiValue)
         .expect("multi-value member at the right ceiling");
-    let error = convert("main.js", &set).expect_err("multi-result adapters are phase 3");
-    assert!(error.message.contains("multi-result"), "{error}");
+    let module = convert("main.js", &set).expect("multi-result adapter should lower");
+    let bytes = wasm_bytes(&module);
+    // pair() = [1, 2]; run() = 1 + 2 * 10 = 21.
+    let (wasmtime, node) = execute_numeric_in_all_runtimes(&bytes, "run", &[]);
+    assert_eq!(wasmtime, 21.0, "Wasmtime");
+    assert_eq!(node, 21.0, "Node");
+    let (wasmtime, node) = execute_numeric_in_all_runtimes(&bytes, "len", &[]);
+    assert_eq!(wasmtime, 2.0, "Wasmtime");
+    assert_eq!(node, 2.0, "Node");
+}
+
+/// `(module (memory i64 1 65537) (data (i64.const 4) "hi!")
+///   (func (export "read") (result i32) i64.const 4 i32.load8_u))`
+///
+/// The declared maximum is 65537 pages — just over 4 GiB, impossible for a
+/// 32-bit memory — while behavioral reads stay at offset 4.
+fn memory64_module() -> Vec<u8> {
+    module(&[
+        section(1, vec_of(vec![func_type(&[], &[I32])])),
+        section(3, vec_of(vec![uleb(0)])),
+        section(
+            5,
+            vec_of(vec![{
+                // limits: flags 0x05 (memory64, with maximum), min 1,
+                // max 65537.
+                let mut m = vec![0x05, 0x01];
+                m.extend(uleb(65537));
+                m
+            }]),
+        ),
+        section(7, vec_of(vec![export_entry("read", 0x00, 0)])),
+        section(
+            10,
+            vec_of(vec![code_body(&[0x00, 0x42, 0x04, 0x2d, 0x00, 0x00, 0x0b])]),
+        ),
+        section(
+            11,
+            vec_of(vec![{
+                // flags 0 (active, memory 0), offset i64.const 4, bytes "hi!"
+                let mut d = vec![0x00, 0x42, 0x04, 0x0b];
+                d.extend(uleb(3));
+                d.extend(b"hi!");
+                d
+            }]),
+        ),
+    ])
+}
+
+#[test]
+fn memory64_members_merge_and_execute() {
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { read } from './m64.wasm'; export function run() { return read(); }",
+    )])
+    .expect("sources");
+    set.insert_wasm_with_profile("m64.wasm", &memory64_module(), WasmProfile::Memory64)
+        .expect("memory64 member at the right ceiling");
+    let module = convert("main.js", &set).expect("memory64 member should merge");
+    // The member's memory must survive into the artifact as a 64-bit memory.
+    assert!(
+        module.memories.values().any(|memory| memory.memory64),
+        "the merged memory must keep its memory64 flag"
+    );
+    let bytes = wasm_bytes(&module);
+    // Data segments survive the rebase: offset 4 holds 'h'.
+    let (wasmtime, node) = execute_numeric_in_all_runtimes(&bytes, "run", &[]);
+    assert_eq!(wasmtime, b'h' as f64, "Wasmtime");
+    assert_eq!(node, b'h' as f64, "Node");
 }
 
 #[test]
@@ -451,3 +519,4 @@ fn wasm_member_is_reachable_through_relative_directories() {
     assert_eq!(wasmtime, 3.0);
     assert_eq!(node, 3.0);
 }
+

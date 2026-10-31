@@ -284,12 +284,9 @@ pub fn convert_modules<'a, 'wasm>(
         }
         // A boundary ABI wraps a JavaScript function; a Wasm re-export
         // already carries the binary's own signature and is emitted raw.
-        if exported
-            .iter()
-            .any(|(exported_name, target)| {
-                exported_name == name && matches!(target, ExportTarget::Wasm { .. })
-            })
-        {
+        if exported.iter().any(|(exported_name, target)| {
+            exported_name == name && matches!(target, ExportTarget::Wasm { .. })
+        }) {
             return Err(ConvertError::invalid(format!(
                 "FFI manifest declares export {name:?}, but that name is a raw Wasm member \
                  re-export; boundary ABIs only wrap JavaScript functions"
@@ -330,30 +327,24 @@ pub fn convert_modules<'a, 'wasm>(
     converter.import_tables = import_tables;
     converter.wasm_host_imports = wasm_host_imports;
     converter.wasm_module_functions = wasm_module_functions;
-    converter.exceptions_enabled = exported
-        .iter()
-        .any(|(_, target)| match target {
-            // Wasm members cannot participate in the JS exception protocol
-            // (plan §5.6): a throw into Wasm member code traps.
-            ExportTarget::Js(function) => {
+    converter.exceptions_enabled = exported.iter().any(|(_, target)| match target {
+        // Wasm members cannot participate in the JS exception protocol
+        // (plan §5.6): a throw into Wasm member code traps.
+        ExportTarget::Js(function) => source_uses_exceptions(function, &mut BTreeSet::new()),
+        ExportTarget::Wasm { .. } => false,
+    }) || set.keys().any(|path| {
+        set.get(path)
+            .is_ok_and(|source| source_uses_exceptions(&source.body, &mut BTreeSet::new()))
+    }) || converter.import_tables.values().any(|table| {
+        table.values().any(|target| match target {
+            ImportTarget::InternalFunction { function, .. } => {
                 source_uses_exceptions(function, &mut BTreeSet::new())
             }
-            ExportTarget::Wasm { .. } => false,
+            ImportTarget::WasmHost(_)
+            | ImportTarget::Intrinsic { .. }
+            | ImportTarget::WasmModule(_) => false,
         })
-        || set.keys().any(|path| {
-            set.get(path)
-                .is_ok_and(|source| source_uses_exceptions(&source.body, &mut BTreeSet::new()))
-        })
-        || converter.import_tables.values().any(|table| {
-            table.values().any(|target| match target {
-                ImportTarget::InternalFunction { function, .. } => {
-                    source_uses_exceptions(function, &mut BTreeSet::new())
-                }
-                ImportTarget::WasmHost(_)
-                | ImportTarget::Intrinsic { .. }
-                | ImportTarget::WasmModule(_) => false,
-            })
-        });
+    });
     if converter.exceptions_enabled {
         for (path, source) in set.js_modules() {
             converter.collect_module_function_locals(path, source);
@@ -2716,16 +2707,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         if let Some(info) = self.wasm_module_adapters.get(spec) {
             return Ok(*info);
         }
-        // Profile gates: multi-result returns are phase 3 (JS array packing);
-        // reference types are phase 5 (GC); v128 is out of scope
-        // (portal-co/jsaw#7).
-        if spec.signature.results.len() > 1 {
-            return Err(ConvertError::invalid(format!(
-                "Wasm module export {:?}.{:?} has a multi-result signature; multi-value adapters \
-                 are wasm-esm phase 3 (plan §5.3)",
-                spec.path, spec.export
-            )));
-        }
+        // Profile gates: reference types are phase 5 (GC); v128 is out of
+        // scope (portal-co/jsaw#7). Multi-result returns pack into a fresh
+        // JS array below (plan §5.3).
         for ty in spec
             .signature
             .params
@@ -2802,65 +2786,94 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             .copied()
             .map(wasm_esm_val_type)
             .collect::<Vec<_>>();
-        let results: Vec<Value> = if result_types.is_empty() {
-            body.add_op(
-                block,
-                Operator::Call {
-                    function_index: func,
-                },
-                &raw_args,
-                &[],
-            );
-            vec![]
-        } else {
-            vec![body.add_op(
-                block,
-                Operator::Call {
-                    function_index: func,
-                },
-                &raw_args,
-                &result_types,
-            )]
+        let call = body.add_op(
+            block,
+            Operator::Call {
+                function_index: func,
+            },
+            &raw_args,
+            &result_types,
+        );
+        let box_typed = |body: &mut FunctionBody,
+                         value: Value,
+                         ty: WasmValType|
+         -> Result<Value, ConvertError> {
+            match ty {
+                WasmValType::I32 => self.box_value(
+                    body,
+                    block,
+                    &LowerValue::Wasm {
+                        value,
+                        kind: ValueKind::Integer,
+                    },
+                ),
+                WasmValType::I64 => self.box_value(
+                    body,
+                    block,
+                    &LowerValue::Wasm {
+                        value,
+                        kind: ValueKind::BigInt,
+                    },
+                ),
+                WasmValType::F32 => {
+                    let number = body.add_op(block, Operator::F64PromoteF32, &[value], &[Type::F64]);
+                    self.box_value(
+                        body,
+                        block,
+                        &LowerValue::Wasm {
+                            value: number,
+                            kind: ValueKind::Number,
+                        },
+                    )
+                }
+                WasmValType::F64 => self.box_value(
+                    body,
+                    block,
+                    &LowerValue::Wasm {
+                        value,
+                        kind: ValueKind::Number,
+                    },
+                ),
+                WasmValType::Ref | WasmValType::V128 => unreachable!("gated above"),
+            }
         };
-        let result = match spec.signature.results.first() {
-            None => self.undef(&mut body, block).wasm()?.0,
-            Some(WasmValType::I32) => self.box_value(
-                &mut body,
-                block,
-                &LowerValue::Wasm {
-                    value: results[0],
-                    kind: ValueKind::Integer,
-                },
-            )?,
-            Some(WasmValType::I64) => self.box_value(
-                &mut body,
-                block,
-                &LowerValue::Wasm {
-                    value: results[0],
-                    kind: ValueKind::BigInt,
-                },
-            )?,
-            Some(WasmValType::F32) => {
-                let number =
-                    body.add_op(block, Operator::F64PromoteF32, &[results[0]], &[Type::F64]);
+        let result = match spec.signature.results.len() {
+            0 => self.undef(&mut body, block).wasm()?.0,
+            1 => box_typed(&mut body, call, spec.signature.results[0])?,
+            // Multi-value: pack the results into a fresh JS array, in order
+            // (plan §5.3).
+            count => {
+                let mut elements = Vec::with_capacity(count);
+                for (index, ty) in spec.signature.results.iter().copied().enumerate() {
+                    // `add_value` creates the PickOutput but does not append
+                    // it to the block (unlike `add_op`); SSA legality
+                    // requires the definition site.
+                    let picked = body.add_value(ValueDef::PickOutput(
+                        call,
+                        index as u32,
+                        result_types[index],
+                    ));
+                    body.append_to_block(block, picked);
+                    elements.push(box_typed(&mut body, picked, ty)?);
+                }
+                let array = body.add_op(
+                    block,
+                    Operator::ArrayNewFixed {
+                        sig: self.repr.arguments,
+                        num: count,
+                    },
+                    &elements,
+                    &[self.repr.arguments_ty()],
+                );
                 self.box_value(
                     &mut body,
                     block,
                     &LowerValue::Wasm {
-                        value: number,
-                        kind: ValueKind::Number,
+                        value: array,
+                        kind: ValueKind::Reference,
                     },
                 )?
             }
-            Some(WasmValType::F64) => self.box_value(
-                &mut body,
-                block,
-                &LowerValue::Wasm {
-                    value: results[0],
-                    kind: ValueKind::Number,
-                },
-            )?,
-            Some(WasmValType::Ref | WasmValType::V128) => unreachable!("gated above"),
         };
         body.set_terminator(
             block,

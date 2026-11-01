@@ -463,6 +463,13 @@ pub(crate) enum ImportTarget<'a> {
     /// portal-co/jsaw#14). The signature is derived from the binary's own
     /// type section, not the FFI manifest.
     WasmModule(WasmModuleImportSpec),
+    /// A namespace import (`import * as m`) from a `.wasm` module-set
+    /// member: a plain JS object of the member's function exports, bound to
+    /// the default instance for late-bound members (portal-co/jsaw#9).
+    WasmNamespace {
+        /// Module-set key of the `.wasm` member.
+        path: String,
+    },
 }
 
 /// Build one module's import table: every referenced imported binding →
@@ -621,10 +628,13 @@ pub(crate) fn build_import_table<'a>(
                     )));
                 }
                 ImportMap::Star => {
-                    return Err(ConvertError::invalid(format!(
-                        "namespace imports of Wasm modules are not supported yet (imported by \
-                         {path:?} from {specifier:?}); see portal-co/jsaw#9"
-                    )));
+                    table.insert(
+                        id,
+                        ImportTarget::WasmNamespace {
+                            path: target_path.to_owned(),
+                        },
+                    );
+                    continue;
                 }
             };
             let export = plan.exports.get(&name).ok_or_else(|| {
@@ -1013,11 +1023,23 @@ mod tests {
                  export function run(a, b) { return add(a, b); }",
             );
             assert!(error.message.contains("no default export"), "{error}");
-            let error = fail(
+            // Namespace imports of Wasm members link (portal-co/jsaw#9):
+            // they materialize as an object of the member's exports.
+            let mut ok_set = ModuleSet::new();
+            ok_set
+                .insert_wasm("lib/math.wasm", &wasm_fixtures::add_module())
+                .expect("valid Wasm member");
+            let main = js_module(
                 "import * as math from './lib/math.wasm'; \
                  export function run(a, b) { return math.add(a, b); }",
             );
-            assert!(error.message.contains("jsaw#9"), "{error}");
+            ok_set.insert("main.js", main).expect("JS member");
+            let table =
+                build_import_table(&ok_set, "main.js", main, &crate::ffi::FfiManifest::default())
+                    .expect("namespace import links");
+            assert!(table
+                .values()
+                .any(|target| matches!(target, ImportTarget::WasmNamespace { .. })));
             let error = fail(
                 "import { missing } from './lib/math.wasm'; \
                  export function run() { return missing(); }",

@@ -350,7 +350,8 @@ pub fn convert_modules<'a, 'wasm>(
             }
             ImportTarget::WasmHost(_)
             | ImportTarget::Intrinsic { .. }
-            | ImportTarget::WasmModule(_) => false,
+            | ImportTarget::WasmModule(_)
+            | ImportTarget::WasmNamespace { .. } => false,
         })
     });
     if converter.exceptions_enabled {
@@ -3294,6 +3295,65 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         )])
     }
 
+    /// A Wasm member's function exports as one plain JS object
+    /// (portal-co/jsaw#9): late-bound members bind the default instance;
+    /// static members bind nothing (their functions take no instance).
+    fn wasm_member_namespace(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        context: Value,
+        path: &str,
+    ) -> Result<(Block, LowerValue), ConvertError> {
+        let builder = self.wasm_instance_object_builder(path)?;
+        let (block, object) = if let Some(inst_sig) =
+            self.wasm_member_instance_ty.get(path).copied()
+        {
+            let (block, instance) =
+                self.wasm_default_instance(body, block, context, path, inst_sig)?;
+            // The builder takes the non-null instance type; the default
+            // instance is always initialized by module init.
+            let inst_non_null = Type::Heap(WithNullable {
+                value: HeapType::Sig {
+                    sig_index: inst_sig,
+                },
+                nullable: false,
+            });
+            let instance = body.add_op(
+                block,
+                Operator::RefCast { ty: inst_non_null },
+                &[instance],
+                &[inst_non_null],
+            );
+            let object = body.add_op(
+                block,
+                Operator::Call {
+                    function_index: builder,
+                },
+                &[instance],
+                &[self.repr.value],
+            );
+            (block, object)
+        } else {
+            let object = body.add_op(
+                block,
+                Operator::Call {
+                    function_index: builder,
+                },
+                &[],
+                &[self.repr.value],
+            );
+            (block, object)
+        };
+        Ok((
+            block,
+            LowerValue::Wasm {
+                value: object,
+                kind: ValueKind::Reference,
+            },
+        ))
+    }
+
     /// Synthesize (once per late-bound member) the object builder:
     /// `(instance) -> value`, a fresh JS object whose properties are the
     /// member's function exports bound to that instance (portal-co/jsaw#6).
@@ -3301,7 +3361,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         if let Some(func) = self.wasm_instance_object_builders.get(path) {
             return Ok(*func);
         }
-        let inst_sig = self.wasm_member_instance_ty[path];
+        // Static members build with no instance parameter and
+        // default-source adapters; late-bound members take the instance.
+        let static_member = !self.wasm_member_instance_ty.contains_key(path);
+        let inst_sig = self
+            .wasm_member_instance_ty
+            .get(path)
+            .copied()
+            .unwrap_or_default();
         let inst_ref = Type::Heap(WithNullable {
             value: HeapType::Sig {
                 sig_index: inst_sig,
@@ -3309,13 +3376,21 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             nullable: false,
         });
         let sig = self.module.signatures.push(SignatureData::Func {
-            params: vec![inst_ref],
+            params: if static_member {
+                vec![]
+            } else {
+                vec![inst_ref]
+            },
             returns: vec![self.repr.value],
             shared: false,
         });
         let mut body = FunctionBody::new(self.module, sig);
         let mut block = body.entry;
-        let instance = body.blocks[block].params[0].1;
+        let instance = if static_member {
+            None
+        } else {
+            Some(body.blocks[block].params[0].1)
+        };
         let module_init = self.ensure_module_init()?;
         let context = body.add_op(
             block,
@@ -3333,12 +3408,22 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             .cloned()
             .unwrap_or_default();
         for spec in specs {
-            let info = self.wasm_module_adapter_with_instance(&spec, WasmInstanceSource::This)?;
+            let (info, this) = if let Some(instance) = instance {
+                (
+                    self.wasm_module_adapter_with_instance(&spec, WasmInstanceSource::This)?,
+                    instance,
+                )
+            } else {
+                (
+                    self.wasm_module_adapter_with_instance(&spec, WasmInstanceSource::Default)?,
+                    self.undef(&mut body, block).wasm()?.0,
+                )
+            };
             let this = self.box_value(
                 &mut body,
                 block,
                 &LowerValue::Wasm {
-                    value: instance,
+                    value: this,
                     kind: ValueKind::Reference,
                 },
             )?;
@@ -5254,6 +5339,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                                 true,
                             )?;
                             return Ok(vec![(block, value)]);
+                        }
+                        ImportTarget::WasmNamespace { path } => {
+                            // Namespace object (portal-co/jsaw#9): the
+                            // member's function exports as a plain JS object.
+                            let (block, object) = self.wasm_member_namespace(
+                                body, block, context, &path,
+                            )?;
+                            return Ok(vec![(block, object)]);
                         }
                         ImportTarget::Intrinsic { module, name } => {
                             // The SSA builder materializes the callee's

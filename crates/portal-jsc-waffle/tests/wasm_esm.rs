@@ -1374,3 +1374,40 @@ fn v128_signatures_fail_closed_at_the_js_boundary() {
     let error = convert("main.js", &set).expect_err("v128 at the JS boundary fails closed");
     assert!(error.message.contains("v128"), "{error}");
 }
+
+#[test]
+fn namespace_imports_materialize_member_exports() {
+    // portal-co/jsaw#9: import * as m from "./m.wasm".
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import * as math from './math.wasm'; \
+         export function run(a, b) { return math.add(a, b); }",
+    )])
+    .expect("sources");
+    set.insert_wasm("math.wasm", &add_module()).expect("member");
+    let module = convert("main.js", &set).expect("namespace import converts");
+    let bytes = wasm_bytes(&module);
+    let (wasmtime, node) = execute_numeric_in_all_runtimes(&bytes, "run", &[19.0, 23.0]);
+    assert_eq!(wasmtime, 42.0, "Wasmtime");
+    assert_eq!(node, 42.0, "Node");
+}
+
+#[test]
+fn namespace_imports_bind_the_default_instance_for_late_bound_members() {
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import * as counter from './counter.wasm'; \
+         export function run() { \
+           counter.bump(); \
+           return counter.bump(); \
+         }",
+    )])
+    .expect("sources");
+    set.insert_wasm("counter.wasm", &counter_module())
+        .expect("member");
+    let module = convert("main.js", &set).expect("namespace import converts");
+    let bytes = wasm_bytes(&module);
+    let (wasmtime, node) = execute_numeric_in_all_runtimes(&bytes, "run", &[]);
+    assert_eq!(wasmtime, 2.0, "Wasmtime");
+    assert_eq!(node, 2.0, "Node");
+}

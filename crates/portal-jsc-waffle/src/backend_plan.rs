@@ -478,6 +478,13 @@ pub struct RuntimeRequirements {
     pub uses_simd: bool,
     pub uses_atomics: bool,
     pub may_trap: bool,
+    /// The plan carries more than one linear memory (merged Wasm members;
+    /// wasm-esm plan §5.5).
+    #[serde(default)]
+    pub uses_multi_memory: bool,
+    /// At least one linear memory is 64-bit.
+    #[serde(default)]
+    pub uses_memory64: bool,
 }
 
 /// Structured, fail-closed diagnostic kinds.
@@ -1184,6 +1191,12 @@ impl<'m> Builder<'m> {
                 shared: memory.shared,
             });
             self.runtime.needs_linear_memory = true;
+            if memory.memory64 {
+                self.runtime.uses_memory64 = true;
+            }
+        }
+        if memories.len() > 1 {
+            self.runtime.uses_multi_memory = true;
         }
 
         // Import module/name lookup for function imports.

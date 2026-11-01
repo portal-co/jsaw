@@ -37,7 +37,7 @@ pub use coregc::{
 };
 pub use coregc_emit::{
     CoreGcArtifact, CoreGcHandleAbi, CoreGcHandleDirection, CoreGcHandleKind, CoreGcOptions,
-    emit_coregc,
+    WasmFeatureRequirements, emit_coregc,
 };
 pub use coregc_layout::{
     COREGC_DESCRIPTOR_MAGIC, COREGC_DESCRIPTOR_VERSION, CoreGcDescriptorTable, CoreGcPayloadLayout,

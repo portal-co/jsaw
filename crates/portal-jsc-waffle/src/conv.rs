@@ -15,16 +15,15 @@ use sha3::{Digest, Sha3_256};
 use swc_common::SyntaxContext;
 use swc_ecma_ast::{BinaryOp, Id as Ident, Lit, UnaryOp};
 
+use crate::ffi::FfiManifest;
+use crate::ffi::{FfiBoundarySignature, FfiType};
 use crate::linker::{ExportTarget, ImportTarget, ModuleSet};
 use crate::repr::{
     ConvertError, FUNCTION_FIELD_TAG, JS_NULL_SENTINEL, Repr, TypedArrayKind, field, ref_sig,
 };
 use crate::wasm_boundary::{WasmBoundarySignature, WasmBoundaryType, WasmImportSpec};
-use crate::ffi::{FfiBoundarySignature, FfiType};
-use crate::ffi::FfiManifest;
 use crate::wasm_esm::{
-    WasmAbstractHeap, WasmFuncSignature, WasmModuleImportSpec, WasmRefType,
-    WasmValType,
+    WasmAbstractHeap, WasmFuncSignature, WasmModuleImportSpec, WasmRefType, WasmValType,
 };
 
 /// Convert jsaw-core SSA into a WasmGC module.
@@ -549,13 +548,11 @@ fn member_types_get<'a>(
     path: &str,
     index: u32,
 ) -> Result<&'a Signature, ConvertError> {
-    member_types
-        .get(&(path.to_string(), index))
-        .ok_or_else(|| {
-            ConvertError::invalid(format!(
-                "Wasm module {path:?} type index {index} was not merged into the output module"
-            ))
-        })
+    member_types.get(&(path.to_string(), index)).ok_or_else(|| {
+        ConvertError::invalid(format!(
+            "Wasm module {path:?} type index {index} was not merged into the output module"
+        ))
+    })
 }
 
 fn wasm_esm_abstract_heap(heap: WasmAbstractHeap) -> HeapType {
@@ -753,16 +750,18 @@ fn signature_references(data: &SignatureData, mut visit: impl FnMut(u32)) {
         SignatureData::Struct { fields, .. } => {
             for field in fields {
                 if let StorageType::Val(t) = &field.value
-                    && let Type::Heap(h) = t {
-                        visit_heap(&h.value, &mut visit);
-                    }
+                    && let Type::Heap(h) = t
+                {
+                    visit_heap(&h.value, &mut visit);
+                }
             }
         }
         SignatureData::Array { ty: element, .. } => {
             if let StorageType::Val(t) = &element.value
-                && let Type::Heap(h) = t {
-                    visit_heap(&h.value, &mut visit);
-                }
+                && let Type::Heap(h) = t
+            {
+                visit_heap(&h.value, &mut visit);
+            }
         }
         SignatureData::Import { like, .. } => visit_heap(like, &mut visit),
         _ => {}
@@ -879,10 +878,7 @@ struct WasmMemberMerge {
 
 /// Compare a binary-declared member import signature with the FFI manifest
 /// declaration (plan §5.4 rule 1).
-fn ffi_signature_matches(
-    ffi: &FfiBoundarySignature,
-    wasm: &WasmFuncSignature,
-) -> bool {
+fn ffi_signature_matches(ffi: &FfiBoundarySignature, wasm: &WasmFuncSignature) -> bool {
     let ffi_type_matches = |ffi: &FfiType, wasm: &WasmValType| {
         matches!(
             (ffi, wasm),
@@ -3185,10 +3181,18 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     // declared type. Concrete types use the interned
                     // signature, so a value produced by another member of
                     // the same shape casts successfully (plan §5.3).
-                    let target =
-                        wasm_esm_val_type(WasmValType::Ref(reference), &self.wasm_module_types, &spec.path)?;
+                    let target = wasm_esm_val_type(
+                        WasmValType::Ref(reference),
+                        &self.wasm_module_types,
+                        &spec.path,
+                    )?;
                     let anyref = value.wasm()?.0;
-                    body.add_op(block, Operator::RefCast { ty: target }, &[anyref], &[target])
+                    body.add_op(
+                        block,
+                        Operator::RefCast { ty: target },
+                        &[anyref],
+                        &[target],
+                    )
                 }
                 WasmValType::V128 => unreachable!("gated above"),
             });

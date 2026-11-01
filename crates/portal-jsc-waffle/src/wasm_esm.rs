@@ -385,17 +385,18 @@ pub(crate) fn parse_wasm_module(
                         )));
                     };
                     imported_func_types.push(ty);
-                    let signature = func_types
-                        .get(ty as usize)
-                        .cloned()
-                        .flatten()
-                        .ok_or_else(|| {
-                            ConvertError::invalid(format!(
-                                "Wasm module {path:?} import {}.{:?} references unknown or \
+                    let signature =
+                        func_types
+                            .get(ty as usize)
+                            .cloned()
+                            .flatten()
+                            .ok_or_else(|| {
+                                ConvertError::invalid(format!(
+                                    "Wasm module {path:?} import {}.{:?} references unknown or \
                                  non-function type index {ty}",
-                                import.module, import.name,
-                            ))
-                        })?;
+                                    import.module, import.name,
+                                ))
+                            })?;
                     imports.push(WasmImport {
                         module: import.module.to_string(),
                         field: import.name.to_string(),

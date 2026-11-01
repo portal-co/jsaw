@@ -28,6 +28,21 @@ pub struct CoreGcArtifact {
     pub descriptors: CoreGcDescriptorTable,
     /// Deterministic public handle-boundary contract for embeds.
     pub handle_abi: Vec<CoreGcHandleAbi>,
+    /// Wasm features beyond the core default set that the artifact requires
+    /// of its host (carried Wasm members; wasm-esm plan §5.5). GC and
+    /// reference types never appear here: the artifact is core-only by
+    /// construction (`verify_core_only`).
+    pub wasm_features: WasmFeatureRequirements,
+}
+
+/// Wasm features a CoreGC artifact requires beyond the core default set.
+/// Both multi-memory and memory64 are part of the core default validation
+/// set in wasmparser 0.240, but hosts (and older engines) may still need
+/// to opt in, so they are recorded explicitly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WasmFeatureRequirements {
+    pub multi_memory: bool,
+    pub memory64: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -223,11 +238,16 @@ pub fn emit_coregc(
     handle_abi.sort_by(|a, b| {
         (a.direction as u8, &a.module, &a.name).cmp(&(b.direction as u8, &b.module, &b.name))
     });
+    let wasm_features = WasmFeatureRequirements {
+        multi_memory: module.memories.len() > 1,
+        memory64: module.memories.values().any(|memory| memory.memory64),
+    };
     Ok(CoreGcArtifact {
         module,
         inventory,
         descriptors,
         handle_abi,
+        wasm_features,
     })
 }
 

@@ -512,19 +512,30 @@ not alias across indices in differential tests. **Done:**
 combination~~ CoreGC executes GC members correctly; mobile audit accepts
 (recorded, not silent).
 
-### Phase 6 — CoreGC / nano_mvp / low_emit pass-through and manifests
+### Phase 6 — CoreGC / nano_mvp / low_emit pass-through and manifests (Done)
 
-1. CoreGC lowering of imported Wasm funcs (scalar-only) with the §5.5
-  matrix enforced; `wasm_features` in `CoreGcArtifact` and the backend-plan
-   manifest.
-2. `nano_mvp` acceptance of MVP+multi-value imported modules behind its
-   capability audit.
-3. Mobile emitter audit: explicit rejection diagnostics per profile (no
-   translation yet).
+1. CoreGC lowering of member funcs landed in Phase 4 (scalar passthrough +
+   memory carry-through) and Phase 5 (GC types measured working).
+   `CoreGcArtifact.wasm_features: WasmFeatureRequirements` now records
+   multi-memory/memory64 requirements; `RuntimeRequirements` (backend-plan
+   manifest) gained `uses_multi_memory` / `uses_memory64`
+   (serde-defaulted, wire-compatible with `jsaw.backend-plan.v1`).
+2. nano_mvp: MVP members with pure scalar functions lower and execute
+   (`nano_mvp_executes_mvp_member_calls`); member memory ops fail closed
+   with a named `unsupported_operator` diagnostic
+   (`nano_mvp_rejects_member_memory_ops_loudly`) — the plan payloads record
+   the memory index (`PlanMemArg`), so lowering them later is additive.
+   low_emit is the nano lane's arena ABI and is untouched by member code.
+3. Mobile audit: rejects memory-bearing members with a named diagnostic
+   (`mobile_audit_rejects_memory_bearing_members_loudly`); GC members pass
+   as ordinary struct/array IR (measured in Phase 5; value-level interop
+   remains portal-co/jsaw#13).
 
 **Commit:** `wasm-esm: pass imported wasm through coregc and nano targets`.
 **Gate:** the full cross-target suite runs a mixed JS+Wasm program to
 identical results on WasmGC, CoreGC, and nano_mvp where the matrix allows.
+**Done:** WasmGC (Wasmtime+Node), CoreGC (multi-memory, memory64, GC),
+nano_mvp (MVP members) all execute the same programs identically.
 
 ### Phase 7 — documentation and consumer surface
 

@@ -517,7 +517,10 @@ fn point_module() -> Vec<u8> {
         section(3, vec_of(vec![uleb(1), uleb(2)])),
         section(
             7,
-            vec_of(vec![export_entry("make", 0x00, 0), export_entry("sum", 0x00, 1)]),
+            vec_of(vec![
+                export_entry("make", 0x00, 0),
+                export_entry("sum", 0x00, 1),
+            ]),
         ),
         section(
             10,
@@ -542,7 +545,9 @@ fn point_maker_module() -> Vec<u8> {
         section(7, vec_of(vec![export_entry("make", 0x00, 0)])),
         section(
             10,
-            vec_of(vec![code_body(&[0x00, 0x20, 0x00, 0x20, 0x01, 0xfb, 0x00, 0x00, 0x0b])]),
+            vec_of(vec![code_body(&[
+                0x00, 0x20, 0x00, 0x20, 0x01, 0xfb, 0x00, 0x00, 0x0b,
+            ])]),
         ),
     ])
 }
@@ -778,7 +783,6 @@ fn multi_memory_members_merge_and_execute_through_coregc() {
     assert_eq!(forced, 215.0, "coregc must match the native result");
 }
 
-
 // ---------------------------------------------------------------------------
 // Wasm-member import satisfaction via the FFI manifest (plan §5.4).
 
@@ -803,7 +807,9 @@ fn importing_module() -> Vec<u8> {
         section(7, vec_of(vec![export_entry("quad", 0x00, 1)])),
         section(
             10,
-            vec_of(vec![code_body(&[0x00, 0x20, 0x00, 0x10, 0x00, 0x10, 0x00, 0x0b])]),
+            vec_of(vec![code_body(&[
+                0x00, 0x20, 0x00, 0x10, 0x00, 0x10, 0x00, 0x0b,
+            ])]),
         ),
     ])
 }
@@ -939,4 +945,128 @@ fn gc_member_passes_through_coregc_and_mobile_audit() {
     let core_bytes = portal_pc_waffle::to_wasm_bytes(&artifact.module).expect("core encodes");
     let result = execute_core(&core_bytes, "run", &[19.0, 23.0]);
     assert_eq!(result, 42.0, "coregc matches the native result");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: backend-plan manifests, nano_mvp, mobile audit.
+
+#[test]
+fn nano_mvp_executes_mvp_member_calls() {
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { add } from './math.wasm'; export function run(a, b) { return add(a, b); }",
+    )])
+    .expect("sources");
+    set.insert_wasm("math.wasm", &add_module()).expect("member");
+    let module = convert("main.js", &set).expect("converts");
+    let plan = portal_jsc_waffle::BackendPlan::from_module(&module)
+        .unwrap_or_else(|d| panic!("plan: {d:?}"));
+    let bytes = portal_jsc_waffle::emit_nano_mvp(&plan).unwrap_or_else(|d| panic!("emit: {d:?}"));
+
+    // The nano output is pure core Wasm (no GC), with multi-value and tail
+    // calls as the nano baseline.
+    let mut features = wasmparser::WasmFeatures::default();
+    features.remove(wasmparser::WasmFeatures::GC);
+    features.insert(wasmparser::WasmFeatures::TAIL_CALL);
+    features.insert(wasmparser::WasmFeatures::MULTI_VALUE);
+    wasmparser::Validator::new_with_features(features)
+        .validate_all(&bytes)
+        .expect("nano module must validate as core Wasm");
+
+    let mut config = Config::new();
+    config.wasm_tail_call(true);
+    let engine = Engine::new(&config).expect("engine");
+    let compiled = wasmtime::Module::new(&engine, &bytes).expect("parse");
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &compiled, &[]).expect("instantiate");
+    let run = instance.get_func(&mut store, "run").expect("export");
+    let inputs = [Val::F64(19.0f64.to_bits()), Val::F64(23.0f64.to_bits())];
+    let mut outputs = [Val::F64(0)];
+    run.call(&mut store, &inputs, &mut outputs).expect("call");
+    match outputs[0] {
+        Val::F64(bits) => assert_eq!(f64::from_bits(bits), 42.0),
+        ref other => panic!("expected f64, got {other:?}"),
+    }
+}
+
+#[test]
+fn nano_mvp_rejects_member_memory_ops_loudly() {
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { read8 } from './mem.wasm'; export function run(i) { return read8(i); }",
+    )])
+    .expect("sources");
+    set.insert_wasm("mem.wasm", &memory_module()).expect("member");
+    let module = convert("main.js", &set).expect("converts");
+    let plan = portal_jsc_waffle::BackendPlan::from_module(&module)
+        .unwrap_or_else(|d| panic!("plan: {d:?}"));
+    // The plan records the member memory and its ops; nano_mvp's capability
+    // audit must reject memory instructions with a named diagnostic rather
+    // than miscompiling them against the arena memory.
+    assert!(plan.runtime.needs_linear_memory);
+    let errors = portal_jsc_waffle::emit_nano_mvp(&plan)
+        .expect_err("nano_mvp must reject member memory ops until it lowers them");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == "unsupported_operator" && format!("{e:?}").contains("Load")),
+        "expected a named unsupported-operator diagnostic, got {errors:?}"
+    );
+}
+
+#[test]
+fn artifacts_record_wasm_feature_requirements() {
+    // Multi-memory member.
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { read } from './dual.wasm'; export function run(a, b) { return read(a, b); }",
+    )])
+    .expect("sources");
+    set.insert_wasm_with_profile("dual.wasm", &dual_memory_module(), WasmProfile::MultiMemory)
+        .expect("member");
+    let module = convert("main.js", &set).expect("converts");
+    let plan = portal_jsc_waffle::BackendPlan::from_module(&module)
+        .unwrap_or_else(|d| panic!("plan: {d:?}"));
+    assert!(plan.runtime.uses_multi_memory, "backend plan records multi-memory");
+    assert!(!plan.runtime.uses_memory64);
+    let artifact = portal_jsc_waffle::emit_coregc(&module, &Default::default())
+        .expect("coregc lowers");
+    assert!(
+        artifact.wasm_features.multi_memory,
+        "coregc artifact records multi-memory"
+    );
+    assert!(!artifact.wasm_features.memory64);
+
+    // memory64 member.
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { read } from './m64.wasm'; export function run() { return read(); }",
+    )])
+    .expect("sources");
+    set.insert_wasm_with_profile("m64.wasm", &memory64_module(), WasmProfile::Memory64)
+        .expect("member");
+    let module = convert("main.js", &set).expect("converts");
+    let plan = portal_jsc_waffle::BackendPlan::from_module(&module)
+        .unwrap_or_else(|d| panic!("plan: {d:?}"));
+    assert!(plan.runtime.uses_memory64, "backend plan records memory64");
+    let artifact = portal_jsc_waffle::emit_coregc(&module, &Default::default())
+        .expect("coregc lowers");
+    assert!(artifact.wasm_features.memory64);
+}
+
+#[test]
+fn mobile_audit_rejects_memory_bearing_members_loudly() {
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { read8 } from './mem.wasm'; export function run(i) { return read8(i); }",
+    )])
+    .expect("sources");
+    set.insert_wasm("mem.wasm", &memory_module()).expect("member");
+    let module = convert("main.js", &set).expect("converts");
+    let error = portal_jsc_mob_emit::audit::audit_module(&module)
+        .expect_err("the mobile audit must reject linear memories loudly");
+    assert!(
+        format!("{error:?}").contains("linear memories"),
+        "expected a named linear-memory rejection, got {error:?}"
+    );
 }

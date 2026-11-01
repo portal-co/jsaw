@@ -1549,3 +1549,136 @@ fn wasi_p1_passthrough_is_opt_in() {
         ref other => panic!("unexpected {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Mobile translation of late-bound members (portal-co/jsaw#13).
+
+#[test]
+fn late_bound_members_execute_on_jvm_and_swift() {
+    // portal-co/jsaw#13: late-bound members lower to ordinary GC-array IR,
+    // which the mobile emitters already cover.
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { bump } from './counter.wasm'; \
+         import { read8 } from './mem.wasm'; \
+         export function run(i) { bump(); return bump() * 100 + read8(i); }",
+    )])
+    .expect("sources");
+    set.insert_wasm("counter.wasm", &counter_module())
+        .expect("counter member");
+    set.insert_wasm("mem.wasm", &memory_module())
+        .expect("memory member");
+    let module = convert("main.js", &set).expect("converts");
+
+    // JVM: run(4) = bump()=2 * 100 + read8(4)='h' = 304.
+    let jvm = {
+        let sources = portal_jsc_jvm_emit::emit_java(&module).expect("Java emission");
+        let dir = std::env::temp_dir().join(format!("jsaw-wasm-esm-jvm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut files = vec![];
+        for (path, content) in &sources.files {
+            let full = dir.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).expect("mkdirs");
+            std::fs::write(&full, content).expect("write");
+            files.push(full);
+        }
+        let ename = portal_jsc_mob_emit::names::java("run");
+        let main = format!(
+            "package pc.portal.mob;\n\
+             public class Main {{\n\
+             \x20   public static void main(String[] a) {{\n\
+             \x20       double r = Mod.{ename}(Double.parseDouble(a[0]));\n\
+             \x20       System.out.println(Double.doubleToRawLongBits(r));\n\
+             \x20   }}\n\
+             }}\n"
+        );
+        let main_path = dir.join("pc/portal/mob/Main.java");
+        std::fs::write(&main_path, &main).expect("Main.java");
+        files.push(main_path);
+        let compile = std::process::Command::new("javac")
+            .arg("-proc:none")
+            .arg("-nowarn")
+            .arg("-g:none")
+            .arg("-d")
+            .arg(&dir)
+            .args(&files)
+            .output()
+            .expect("javac runs");
+        assert!(
+            compile.status.success(),
+            "javac: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = std::process::Command::new("java")
+            .arg("-Xss8m")
+            .arg("-cp")
+            .arg(&dir)
+            .arg("pc.portal.mob.Main")
+            .arg("4")
+            .output()
+            .expect("java runs");
+        assert!(run.status.success(), "java: {}", String::from_utf8_lossy(&run.stderr));
+        let bits: i64 = String::from_utf8_lossy(&run.stdout)
+            .trim()
+            .parse()
+            .expect("raw f64 bits");
+        f64::from_bits(bits as u64)
+    };
+    assert_eq!(jvm, 304.0, "JVM");
+
+    // Swift, if a toolchain is available.
+    if swiftc_available().is_some() {
+        let sources = portal_jsc_swift_emit::emit_swift(&module).expect("Swift emission");
+        let dir = std::env::temp_dir().join(format!("jsaw-wasm-esm-swift-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut wrote = vec![];
+        for (path, content) in &sources.files {
+            let full = dir.join(path);
+            std::fs::write(&full, content).expect("write");
+            wrote.push(full);
+        }
+        let ename = portal_jsc_mob_emit::names::swift("run");
+        let main = format!("import Foundation\nlet a = CommandLine.arguments\nprint(Mod.{ename}(Double(a[1])!).bitPattern)\n");
+        let main_path = dir.join("main.swift");
+        std::fs::write(&main_path, &main).expect("main.swift");
+        wrote.push(main_path);
+        let exe = dir.join("fixture");
+        let compile = std::process::Command::new("swiftc")
+            .arg("-O")
+            .arg("-o")
+            .arg(&exe)
+            .args(&wrote)
+            .output()
+            .expect("swiftc runs");
+        assert!(
+            compile.status.success(),
+            "swiftc: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = std::process::Command::new(&exe)
+            .arg("4")
+            .output()
+            .expect("swift runs");
+        assert!(run.status.success(), "swift: {}", String::from_utf8_lossy(&run.stderr));
+        let bits: u64 = String::from_utf8_lossy(&run.stdout)
+            .trim()
+            .parse()
+            .expect("raw f64 bits");
+        assert_eq!(f64::from_bits(bits), 304.0, "Swift");
+    }
+}
+
+fn full_parent(path: &std::path::Path) -> std::path::PathBuf {
+    path.parent().expect("parent").to_path_buf()
+}
+
+fn swiftc_available() -> Option<std::path::PathBuf> {
+    std::process::Command::new("swiftc")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|_| std::path::PathBuf::from("swiftc"))
+}

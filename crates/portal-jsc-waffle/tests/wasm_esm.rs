@@ -189,6 +189,7 @@ fn execute_raw(bytes: &[u8], name: &str, args: &[Val], results: &mut [Val]) {
     config.wasm_function_references(true);
     config.wasm_memory64(true);
     config.wasm_multi_memory(true);
+    config.wasm_tail_call(true);
     let engine = Engine::new(&config).expect("Wasmtime engine should support WasmGC");
     let module = wasmtime::Module::new(&engine, bytes).expect("Wasmtime should compile the module");
     let mut store = Store::new(&engine, ());
@@ -1243,3 +1244,133 @@ fn instantiate_rejects_static_members() {
 
 
 
+
+// ---------------------------------------------------------------------------
+// Additional proposals (portal-co/jsaw#7): tail calls, SIMD.
+
+/// `(module
+///   (func $count (export "count") (param i32) (result i32)
+///     local.get 0 i32.const 0 return_call 1)
+///   (func $tail (param i32 i32) (result i32)
+///     local.get 0 i32.eqz
+///     if (result i32)
+///       local.get 1
+///     else
+///       local.get 0 i32.const 1 i32.sub
+///       local.get 1 local.get 0 i32.add
+///       return_call 1
+///     end))`
+fn tail_call_module() -> Vec<u8> {
+    module(&[
+        section(
+            1,
+            vec_of(vec![func_type(&[I32], &[I32]), func_type(&[I32, I32], &[I32])]),
+        ),
+        section(3, vec_of(vec![uleb(0), uleb(1)])),
+        section(7, vec_of(vec![export_entry("count", 0x00, 0)])),
+        section(
+            10,
+            vec_of(vec![
+                // func 0: local.get 0; i32.const 0; return_call 1
+                code_body(&[0x00, 0x20, 0x00, 0x41, 0x00, 0x12, 0x01, 0x0b]),
+                // func 1
+                code_body(&[
+                    0x00, // locals
+                    0x20, 0x00, // local.get 0
+                    0x45, // i32.eqz
+                    0x04, 0x7f, // if (result i32)
+                    0x20, 0x01, //   local.get 1
+                    0x05, // else
+                    0x20, 0x00, //   local.get 0
+                    0x41, 0x01, //   i32.const 1
+                    0x6b, //   i32.sub
+                    0x20, 0x01, //   local.get 1
+                    0x20, 0x00, //   local.get 0
+                    0x6a, //   i32.add
+                    0x12, 0x01, //   return_call 1
+                    0x0b, // end
+                    0x0b, // func end
+                ]),
+            ]),
+        ),
+    ])
+}
+
+/// `(module (func (export "lanes") (param i32 i32) (result i32)
+///   local.get 0 i32x4.splat local.get 1 i32x4.splat i32x4.add
+///   i32x4.extract_lane 0))`
+fn simd_module() -> Vec<u8> {
+    module(&[
+        section(1, vec_of(vec![func_type(&[I32, I32], &[I32])])),
+        section(3, vec_of(vec![uleb(0)])),
+        section(7, vec_of(vec![export_entry("lanes", 0x00, 0)])),
+        section(
+            10,
+            vec_of(vec![code_body(&[
+                0x00, // locals
+                0x20, 0x00, // local.get 0
+                0xfd, 0x11, // i32x4.splat
+                0x20, 0x01, // local.get 1
+                0xfd, 0x11, // i32x4.splat
+                0xfd, 0xae, 0x01, // i32x4.add
+                0xfd, 0x1b, 0x00, // i32x4.extract_lane 0
+                0x0b,
+            ])]),
+        ),
+    ])
+}
+
+#[test]
+fn tail_call_members_execute_via_static_merge() {
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { count } from './tail.wasm'; export function run(n) { return count(n); }",
+    )])
+    .expect("sources");
+    set.insert_wasm_with_profile("tail.wasm", &tail_call_module(), WasmProfile::TailCall)
+        .expect("tail-call member at the right ceiling");
+    let module = convert("main.js", &set).expect("tail-call member merges");
+    let bytes = wasm_bytes(&module);
+    // count(3) = 3+2+1 = 6, through the static path's tail-call terminator
+    // remap.
+    let (wasmtime, node) = execute_numeric_in_all_runtimes(&bytes, "run", &[3.0]);
+    assert_eq!(wasmtime, 6.0, "Wasmtime");
+    assert_eq!(node, 6.0, "Node");
+}
+
+#[test]
+fn simd_members_execute_with_scalar_exports() {
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { lanes } from './simd.wasm'; export function run(a, b) { return lanes(a, b); }",
+    )])
+    .expect("sources");
+    set.insert_wasm_with_profile("simd.wasm", &simd_module(), WasmProfile::Simd)
+        .expect("simd member at the right ceiling");
+    let module = convert("main.js", &set).expect("simd member merges");
+    let bytes = wasm_bytes(&module);
+    let (wasmtime, node) = execute_numeric_in_all_runtimes(&bytes, "run", &[19.0, 23.0]);
+    assert_eq!(wasmtime, 42.0, "Wasmtime");
+    assert_eq!(node, 42.0, "Node");
+}
+
+#[test]
+fn v128_signatures_fail_closed_at_the_js_boundary() {
+    // (func (export "id") (param v128) (result v128) local.get 0)
+    let v128 = 0x7b;
+    let bytes = module(&[
+        section(1, vec_of(vec![func_type(&[v128], &[v128])])),
+        section(3, vec_of(vec![uleb(0)])),
+        section(7, vec_of(vec![export_entry("id", 0x00, 0)])),
+        section(10, vec_of(vec![code_body(&[0x00, 0x20, 0x00, 0x0b])])),
+    ]);
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { id } from './v128.wasm'; export function run(x) { return id(x); }",
+    )])
+    .expect("sources");
+    set.insert_wasm_with_profile("v128.wasm", &bytes, WasmProfile::Simd)
+        .expect("valid simd member");
+    let error = convert("main.js", &set).expect_err("v128 at the JS boundary fails closed");
+    assert!(error.message.contains("v128"), "{error}");
+}

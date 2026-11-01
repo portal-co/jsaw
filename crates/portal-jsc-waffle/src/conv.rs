@@ -761,6 +761,18 @@ fn remap_wasm_body_types(body: &mut FunctionBody, remap: &MemberRemap) {
     for (_local, ty) in body.locals.entries_mut() {
         remap.ty(ty);
     }
+    // Tail-call terminators carry func/sig/table indices too.
+    for (_block, def) in body.blocks.entries_mut() {
+        match &mut def.terminator.terminator {
+            Terminator::ReturnCall { func, .. } => *func = remap.func(*func),
+            Terminator::ReturnCallIndirect { sig, table, .. } => {
+                *sig = remap.sig(*sig);
+                *table = remap.table(*table);
+            }
+            Terminator::ReturnCallRef { sig, .. } => *sig = remap.sig(*sig),
+            _ => {}
+        }
+    }
     for (_block, def) in body.blocks.entries_mut() {
         for (ty, _param) in def.params.iter_mut() {
             remap.ty(ty);
@@ -3210,8 +3222,8 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
     fn try_wasm_instantiate_call(
         &mut self,
         body: &mut FunctionBody,
-        mut block: Block,
-        context: Value,
+        block: Block,
+        _context: Value,
         _values: &ContinuationValues,
         args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
     ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {

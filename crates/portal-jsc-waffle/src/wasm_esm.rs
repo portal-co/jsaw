@@ -47,16 +47,25 @@ pub enum WasmProfile {
     MultiMemory,
     /// + WasmGC types and operators (with function-references).
     Gc,
+    /// + fixed-width SIMD (`v128`). v128 never crosses the JS boundary —
+    /// exports with v128 signatures fail closed at the adapter
+    /// (portal-co/jsaw#7).
+    Simd,
+    /// + tail calls. Tail-calling members are ineligible for late binding
+    /// and take the static merge path.
+    TailCall,
 }
 
 impl WasmProfile {
     /// All profiles in cumulative order, lowest first.
-    pub(crate) const ALL: [WasmProfile; 5] = [
+    pub(crate) const ALL: [WasmProfile; 7] = [
         WasmProfile::Mvp,
         WasmProfile::MultiValue,
         WasmProfile::Memory64,
         WasmProfile::MultiMemory,
         WasmProfile::Gc,
+        WasmProfile::Simd,
+        WasmProfile::TailCall,
     ];
 
     fn features(self) -> WasmFeatures {
@@ -77,6 +86,12 @@ impl WasmProfile {
             // reference-types is the subsumed base proposal.
             features.insert(WasmFeatures::REFERENCE_TYPES);
         }
+        if self >= WasmProfile::Simd {
+            features.insert(WasmFeatures::SIMD);
+        }
+        if self >= WasmProfile::TailCall {
+            features.insert(WasmFeatures::TAIL_CALL);
+        }
         features
     }
 
@@ -87,6 +102,8 @@ impl WasmProfile {
             WasmProfile::Memory64 => "memory64",
             WasmProfile::MultiMemory => "multi-memory",
             WasmProfile::Gc => "gc",
+            WasmProfile::Simd => "simd",
+            WasmProfile::TailCall => "tail-call",
         }
     }
 }
@@ -739,6 +756,12 @@ pub(crate) mod tests {
     }
 
     pub(crate) const I32: u8 = 0x7f;
+
+    pub(crate) fn code_body(body: &[u8]) -> Vec<u8> {
+        let mut b = uleb(body.len() as u64);
+        b.extend_from_slice(body);
+        b
+    }
     pub(crate) const I64: u8 = 0x7e;
 
     /// `(module (func (export "add") (param i32 i32) (result i32)
@@ -948,6 +971,41 @@ pub(crate) mod tests {
         assert_eq!(plan.imports[0].module, "env");
         assert_eq!(plan.imports[0].field, "f");
         assert_eq!(plan.imports[0].signature.params, vec![WasmValType::I32]);
+    }
+
+    #[test]
+    fn classifies_simd_and_tail_call_modules() {
+        // (func (local i32) drop) with a v128.const: needs SIMD.
+        let simd = module(&[
+            section(1, vec_of(vec![func_type(&[], &[])])),
+            section(3, vec_of(vec![uleb(0)])),
+            section(
+                10,
+                vec_of(vec![code_body(&[
+                    0x00, 0xfd, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1a, 0x0b,
+                ])]),
+            ),
+        ]);
+        let error = parse_wasm_module("s.wasm", &simd, WasmProfile::Gc)
+            .expect_err("simd must fail below the simd ceiling");
+        assert!(error.message.contains("simd"), "{error}");
+        let plan = parse_wasm_module("s.wasm", &simd, WasmProfile::Simd)
+            .expect("simd ceiling accepts");
+        assert_eq!(plan.profile, WasmProfile::Simd);
+
+        // return_call: needs tail-call.
+        let tc = module(&[
+            section(1, vec_of(vec![func_type(&[], &[])])),
+            section(3, vec_of(vec![uleb(0)])),
+            section(10, vec_of(vec![code_body(&[0x00, 0x12, 0x00, 0x0b])])),
+        ]);
+        let error = parse_wasm_module("t.wasm", &tc, WasmProfile::Simd)
+            .expect_err("tail-call must fail below the tail-call ceiling");
+        assert!(error.message.contains("tail-call"), "{error}");
+        let plan = parse_wasm_module("t.wasm", &tc, WasmProfile::TailCall)
+            .expect("tail-call ceiling accepts");
+        assert_eq!(plan.profile, WasmProfile::TailCall);
     }
 
     #[test]

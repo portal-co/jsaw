@@ -83,6 +83,26 @@ wins:
 - The numeric export boundary is `f64`-only, so generated Java/Swift
   functions take and return `double`/`Double` — no string marshalling.
 
+### Wasm members (wasm-esm, portal-co/jsaw#14)
+
+The compiler binary's manifest also accepts Wasm binary members:
+
+```json
+{
+  "version": 1,
+  "entry": "index.js",
+  "modules": ["index.js"],
+  "wasm": [{ "path": "lib/math.wasm", "base64": "AGFzbQEAAAA…" }]
+}
+```
+
+`wasm` entries join the closed module set under their `.wasm` keys (base64
+because the manifest is JSON); `import { add } from "./lib/math.wasm"`
+then links to the binary's function exports. See the "Wasm module-set
+members" section of the README for profiles, adapter coercions, and
+fail-closed rules. The Gradle task does not yet collect `.wasm` files from
+`sourceDir` into the manifest; that wiring is a follow-up.
+
 ## Outputs
 
 | Target | Path | Consumer |

@@ -1,6 +1,11 @@
 # Plan: Wasm ES modules as first-class module-set members
 
-**Status:** accepted; tracked as portal-co/jsaw#14. Builds on the
+**Status:** implemented through Phase 7 (MVP, multi-value, memory64,
+multi-memory, GC); tracked as portal-co/jsaw#14. Remaining follow-ups live
+in their own issues (portal-co/jsaw#5–#13): Component Model, dynamic
+linking, additional proposals, JS reflection API, namespace imports,
+shared-memory interop, WASI p1 provider, structural GC interop, and mobile
+translation. Builds on the
 closed-world [`ModuleSet`] linker (`crates/portal-jsc-waffle/src/linker.rs`),
 the FFI manifest boundary (DreamComp #37, `crates/portal-jsc-waffle/src/ffi.rs`),
 and the host-import machinery of
@@ -537,15 +542,21 @@ identical results on WasmGC, CoreGC, and nano_mvp where the matrix allows.
 **Done:** WasmGC (Wasmtime+Node), CoreGC (multi-memory, memory64, GC),
 nano_mvp (MVP members) all execute the same programs identically.
 
-### Phase 7 — documentation and consumer surface
+### Phase 7 — documentation and consumer surface (Done)
 
-1. README / embedding docs: `.wasm` module-set members, profiles, the
-   adapter coercions, multi-value array results, GC cast rule, and the
-   fail-closed import-resolution order.
-2. `jsaw-wasi-bin` and Gradle plugin manifest docs for the `wasm` array.
+1. README "Wasm module-set members (wasm-esm)": `.wasm` keys, profiles and
+   ceilings, the full adapter coercion table (incl. multi-value array
+   packing and the GC `ref.cast` rule), interning semantics, FFI-manifest
+   import satisfaction, and artifact feature manifests.
+2. `docs/gradle-plugin.md`: the manifest `wasm: [{path, base64}]` array,
+   with a note that Gradle-side `.wasm` collection is a follow-up.
 
 **Commit:** `docs: wasm esm module consumer guide`.
-**Gate:** docs examples are executable fixtures in the test suite.
+**Gate:** docs examples are executable fixtures in the test suite — the
+README example is `js_calls_wasm_member_through_boxed_adapter`, the raw
+re-export example is
+`raw_reexport_passthrough_keeps_the_binary_signature`, and every fail-closed
+rule cited has a named test.
 
 ## 7. Test matrix
 

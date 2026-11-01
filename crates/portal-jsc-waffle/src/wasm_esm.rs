@@ -91,6 +91,49 @@ impl WasmProfile {
     }
 }
 
+/// The internal-hierarchy abstract heap types jsaw adapters can cast to and
+/// from (`anyref` family; plan §5.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum WasmAbstractHeap {
+    Any,
+    None,
+    Eq,
+    I31,
+    Struct,
+    Array,
+}
+
+/// A reference-typed value position (plan §5.2: the signature carries the
+/// actual heap type when the gc profile is on).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum WasmRefType {
+    /// `(ref (null) $t)` — `index` is the member-local type index.
+    Concrete { nullable: bool, index: u32 },
+    /// An abstract internal-hierarchy reference (`any`, `none`, `eq`,
+    /// `i31`, `struct`, `array`).
+    Abstract {
+        nullable: bool,
+        heap: WasmAbstractHeap,
+    },
+    /// `funcref`/`nofunc` — JS function objects are GC structs, not
+    /// funcrefs, so this fails closed at the adapter.
+    OpaqueFunc { nullable: bool },
+    /// `externref`/`noextern` — the external hierarchy is disjoint from
+    /// jsaw values; fails closed at the adapter.
+    OpaqueExtern { nullable: bool },
+}
+
+impl WasmRefType {
+    pub(crate) fn nullable(&self) -> bool {
+        match self {
+            WasmRefType::Concrete { nullable, .. }
+            | WasmRefType::Abstract { nullable, .. }
+            | WasmRefType::OpaqueFunc { nullable }
+            | WasmRefType::OpaqueExtern { nullable } => *nullable,
+        }
+    }
+}
+
 /// One value position in a Wasm function signature, as declared by the
 /// binary's type section.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -100,9 +143,7 @@ pub(crate) enum WasmValType {
     F32,
     F64,
     V128,
-    /// Any reference type. The concrete heap type is recorded in the GC
-    /// phase (plan §5.2); until then this stays an opaque boundary token.
-    Ref,
+    Ref(WasmRefType),
 }
 
 impl WasmValType {
@@ -113,7 +154,52 @@ impl WasmValType {
             ValType::F32 => WasmValType::F32,
             ValType::F64 => WasmValType::F64,
             ValType::V128 => WasmValType::V128,
-            ValType::Ref(_) => WasmValType::Ref,
+            ValType::Ref(reference) => {
+                let nullable = reference.is_nullable();
+                WasmValType::Ref(match reference.heap_type() {
+                    wasmparser::HeapType::Concrete(index) => WasmRefType::Concrete {
+                        nullable,
+                        index: index.as_module_index().unwrap_or(u32::MAX),
+                    },
+                    wasmparser::HeapType::Abstract { ty, .. } => match ty {
+                        wasmparser::AbstractHeapType::Any => WasmRefType::Abstract {
+                            nullable,
+                            heap: WasmAbstractHeap::Any,
+                        },
+                        wasmparser::AbstractHeapType::None => WasmRefType::Abstract {
+                            nullable,
+                            heap: WasmAbstractHeap::None,
+                        },
+                        wasmparser::AbstractHeapType::Eq => WasmRefType::Abstract {
+                            nullable,
+                            heap: WasmAbstractHeap::Eq,
+                        },
+                        wasmparser::AbstractHeapType::I31 => WasmRefType::Abstract {
+                            nullable,
+                            heap: WasmAbstractHeap::I31,
+                        },
+                        wasmparser::AbstractHeapType::Struct => WasmRefType::Abstract {
+                            nullable,
+                            heap: WasmAbstractHeap::Struct,
+                        },
+                        wasmparser::AbstractHeapType::Array => WasmRefType::Abstract {
+                            nullable,
+                            heap: WasmAbstractHeap::Array,
+                        },
+                        wasmparser::AbstractHeapType::Func
+                        | wasmparser::AbstractHeapType::NoFunc => {
+                            WasmRefType::OpaqueFunc { nullable }
+                        }
+                        wasmparser::AbstractHeapType::Extern
+                        | wasmparser::AbstractHeapType::NoExtern => {
+                            WasmRefType::OpaqueExtern { nullable }
+                        }
+                        // exn/noexn (exception handling) and continuations
+                        // are out of scope (portal-co/jsaw#7).
+                        _ => WasmRefType::OpaqueExtern { nullable },
+                    },
+                })
+            }
         }
     }
 }
@@ -143,12 +229,14 @@ pub(crate) enum WasmExport {
     Tag,
 }
 
-/// One entry of a Wasm module's import section.
+/// One entry of a Wasm module's import section. Only function imports are
+/// accepted (plan §5.4); every other kind is rejected at ingestion.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WasmImport {
     pub(crate) module: String,
     pub(crate) field: String,
-    pub(crate) kind: &'static str,
+    /// The binary's declared import signature (function imports only).
+    pub(crate) signature: WasmFuncSignature,
 }
 
 /// A validated Wasm binary module-set member: the ingested Waffle IR (all
@@ -223,7 +311,9 @@ pub(crate) fn parse_wasm_module(
         )));
     }
 
-    let mut func_types: Vec<WasmFuncSignature> = Vec::new();
+    // Indexed by the module's full type index space; non-function types
+    // (GC struct/array) hold None so type indices stay aligned.
+    let mut func_types: Vec<Option<WasmFuncSignature>> = Vec::new();
     let mut exports: BTreeMap<String, WasmExport> = BTreeMap::new();
     let mut imports: Vec<WasmImport> = Vec::new();
     // Type indices of imported functions come before defined ones; the
@@ -243,14 +333,25 @@ pub(crate) fn parse_wasm_module(
                         ))
                     })?;
                     for sub in rec_group.into_types() {
+                        // waffle's `SignatureData` drops subtyping
+                        // (`is_final: true, supertype_idx: None` always, see
+                        // waffle-ir module.rs), so a subtyped member would
+                        // silently mis-encode: fail closed.
+                        if !sub.is_final || sub.supertype_idx.is_some() {
+                            return Err(ConvertError::invalid(format!(
+                                "Wasm module {path:?} declares a subtype (sub/extends); Waffle \
+                                 does not preserve subtyping, so such members are rejected \
+                                 until that is fixed"
+                            )));
+                        }
                         let wasmparser::CompositeInnerType::Func(func) = &sub.composite_type.inner
                         else {
-                            // GC struct/array types: validated already; only
-                            // function types are referenced by exports in
-                            // this phase.
+                            // GC struct/array types: validated already; the
+                            // None keeps the type index space aligned.
+                            func_types.push(None);
                             continue;
                         };
-                        func_types.push(WasmFuncSignature {
+                        func_types.push(Some(WasmFuncSignature {
                             params: func
                                 .params()
                                 .iter()
@@ -261,7 +362,7 @@ pub(crate) fn parse_wasm_module(
                                 .iter()
                                 .map(|ty| WasmValType::from_wasmparser(*ty))
                                 .collect(),
-                        });
+                        }));
                     }
                 }
             }
@@ -272,19 +373,33 @@ pub(crate) fn parse_wasm_module(
                             "Wasm module {path:?} has an unreadable import section: {error}"
                         ))
                     })?;
-                    if let TypeRef::Func(ty) = import.ty {
-                        imported_func_types.push(ty);
-                    }
+                    let TypeRef::Func(ty) = import.ty else {
+                        // Memory/global/table/tag imports of a Wasm member
+                        // interact with multi-memory identity and CoreGC's
+                        // static layout (plan §5.4): fail closed.
+                        return Err(ConvertError::invalid(format!(
+                            "Wasm module {path:?} imports {}.{:?} which is not a function; \
+                             non-function imports of Wasm members are not supported \
+                             (portal-co/jsaw#10)",
+                            import.module, import.name,
+                        )));
+                    };
+                    imported_func_types.push(ty);
+                    let signature = func_types
+                        .get(ty as usize)
+                        .cloned()
+                        .flatten()
+                        .ok_or_else(|| {
+                            ConvertError::invalid(format!(
+                                "Wasm module {path:?} import {}.{:?} references unknown or \
+                                 non-function type index {ty}",
+                                import.module, import.name,
+                            ))
+                        })?;
                     imports.push(WasmImport {
                         module: import.module.to_string(),
                         field: import.name.to_string(),
-                        kind: match import.ty {
-                            TypeRef::Func(_) => "function",
-                            TypeRef::Table(_) => "table",
-                            TypeRef::Memory(_) => "memory",
-                            TypeRef::Global(_) => "global",
-                            TypeRef::Tag(_) => "tag",
-                        },
+                        signature,
                     });
                 }
             }
@@ -338,17 +453,20 @@ pub(crate) fn parse_wasm_module(
                                         ))
                                     })?
                             };
+                            let signature = func_types
+                                .get(ty as usize)
+                                .cloned()
+                                .flatten()
+                                .ok_or_else(|| {
+                                    ConvertError::invalid(format!(
+                                        "Wasm module {path:?} export {:?} references unknown or \
+                                         non-function type index {ty}",
+                                        export.name
+                                    ))
+                                })?;
                             WasmExport::Func {
                                 index: export.index,
-                                signature: func_types.get(ty as usize).cloned().ok_or_else(
-                                    || {
-                                        ConvertError::invalid(format!(
-                                            "Wasm module {path:?} export {:?} references an \
-                                             unknown type index {ty}",
-                                            export.name
-                                        ))
-                                    },
-                                )?,
+                                signature,
                             }
                         }
                         ExternalKind::Memory => WasmExport::Memory,
@@ -410,18 +528,8 @@ pub(crate) fn parse_wasm_module(
         }
     }
 
-    if !imports.is_empty() {
-        let summary: Vec<String> = imports
-            .iter()
-            .map(|import| format!("{}.{:?} ({})", import.module, import.field, import.kind))
-            .collect();
-        return Err(ConvertError::invalid(format!(
-            "Wasm module {path:?} declares imports ({}) which cannot be resolved yet; import \
-             satisfaction via the FFI manifest or intra-set edges is a later wasm-esm phase \
-             (plan §5.4)",
-            summary.join(", "),
-        )));
-    }
+    // Function imports are recorded and satisfied at merge time from the
+    // FFI manifest (plan §5.4); nothing to reject here anymore.
 
     // Ingest into Waffle IR now, so ingestion errors surface at insertion
     // time and phase-2 merging works on owned, fully-expanded IR.
@@ -442,6 +550,31 @@ pub(crate) fn parse_wasm_module(
             "Wasm module {path:?} failed Waffle body expansion: {error:#}"
         ))
     })?;
+    // The frontend cannot represent data/element segment index spaces, so
+    // `array.new_data`/`array.new_elem`/`array.init_*` would silently
+    // reference garbage (plan Phase 0 audit): reject members using them.
+    for (_, decl) in module.funcs.entries() {
+        if let FuncDecl::Body(_, _, body) = decl {
+            for (_value, def) in body.values.entries() {
+                if let portal_pc_waffle::ValueDef::Operator(op, _, _) = def {
+                    use portal_pc_waffle::Operator as O;
+                    if matches!(
+                        op,
+                        O::ArrayNewData { .. }
+                            | O::ArrayNewElem { .. }
+                            | O::ArrayInitData { .. }
+                            | O::ArrayInitElem { .. }
+                    ) {
+                        return Err(ConvertError::invalid(format!(
+                            "Wasm module {path:?} uses {op:?}, which references a data/element \
+                             segment index space the Waffle frontend does not preserve (plan \
+                             Phase 0 audit)"
+                        )));
+                    }
+                }
+            }
+        }
+    }
     let module = strip_to_static(path, module)?;
 
     Ok(WasmModulePlan {
@@ -708,26 +841,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn rejects_modules_with_imports_for_now() {
-        // (import "env" "f" (func)) — plan §5.4 import resolution is a
-        // later phase.
-        let bytes = module(&[
-            section(1, vec_of(vec![func_type(&[], &[])])),
-            section(
-                2,
-                vec_of(vec![{
-                    let mut i = name("env");
-                    i.extend(name("f"));
-                    i.push(0x00); // func
-                    i.extend(uleb(0));
-                    i
-                }]),
-            ),
-        ]);
+    fn rejects_non_function_imports() {
+        // (import "env" "mem" (memory 1)) — memory imports of a Wasm member
+        // are fail-closed (plan §5.4, portal-co/jsaw#10).
+        let bytes = module(&[section(
+            2,
+            vec_of(vec![{
+                let mut i = name("env");
+                i.extend(name("mem"));
+                i.push(0x02); // memory
+                i.extend([0x00, 0x01]); // limits: min 1
+                i
+            }]),
+        )]);
         let error = parse_wasm_module("imp.wasm", &bytes, WasmProfile::Mvp)
-            .expect_err("imports are not resolvable yet");
-        assert!(error.message.contains("env"), "{error}");
-        assert!(error.message.contains("cannot be resolved"), "{error}");
+            .expect_err("non-function imports are rejected");
+        assert!(error.message.contains("not a function"), "{error}");
     }
 
     #[test]
@@ -745,6 +874,41 @@ pub(crate) mod tests {
         let error = parse_wasm_module("tbl.wasm", &bytes, WasmProfile::Gc)
             .expect_err("non-funcref tables are rejected per the Phase 0 audit");
         assert!(error.message.contains("non-funcref table"), "{error}");
+    }
+
+    #[test]
+    fn rejects_subtyped_gc_types() {
+        // (type (sub (struct))) — non-final sub. Waffle drops subtyping
+        // (is_final: true always), so this must fail closed.
+        let bytes = module(&[section(1, vec_of(vec![vec![0x50, 0x00, 0x5f, 0x00]]))]);
+        let error = parse_wasm_module("sub.wasm", &bytes, WasmProfile::Gc)
+            .expect_err("subtyped members are rejected until waffle preserves subtyping");
+        assert!(error.message.contains("subtype"), "{error}");
+    }
+
+    #[test]
+    fn accepts_function_imports_with_signatures() {
+        // (import "env" "f" (func (param i32) (result i32)))
+        let sig = || vec![0x60, 0x01, 0x7f, 0x01, 0x7f];
+        let bytes = module(&[
+            section(1, vec_of(vec![sig()])),
+            section(
+                2,
+                vec_of(vec![{
+                    let mut i = name("env");
+                    i.extend(name("f"));
+                    i.push(0x00);
+                    i.extend(uleb(0));
+                    i
+                }]),
+            ),
+        ]);
+        let plan = parse_wasm_module("imp.wasm", &bytes, WasmProfile::Mvp)
+            .expect("function imports are recorded for merge-time FFI satisfaction");
+        assert_eq!(plan.imports.len(), 1);
+        assert_eq!(plan.imports[0].module, "env");
+        assert_eq!(plan.imports[0].field, "f");
+        assert_eq!(plan.imports[0].signature.params, vec![WasmValType::I32]);
     }
 
     #[test]

@@ -337,13 +337,12 @@ mod tests {
     }
 
     #[test]
-    fn manifest_wasm_calls_fail_closed_in_phase_1() {
+    fn manifest_wasm_calls_compile_since_phase_2() {
         let (manifest, sources) = manifest(
             "import { add } from './math.wasm'; export function run(a, b) { return add(a, b); }",
         );
-        let error = compile_to_outputs(&manifest, &sources)
-            .expect_err("calls into wasm members are phase-2 work");
-        assert!(format!("{error}").contains("not yet lowered"), "{error}");
+        compile_to_outputs(&manifest, &sources)
+            .expect("calls into wasm members lower since phase 2");
     }
 
     #[test]

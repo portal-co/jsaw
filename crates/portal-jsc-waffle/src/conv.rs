@@ -8,8 +8,8 @@ use portal_jsc_swc_ssa::{SBlockId, SCatch, SFunc, SValue, SValueId, module::SMod
 use portal_jsc_swc_tac::{Item, LId, PropKey, PropVal, TCallee, TTerm};
 use portal_pc_waffle::{
     Block, BlockTarget, EntityRef, Export, ExportKind, Func, FuncDecl, FunctionBody, Global,
-    HeapType, Import, ImportKind, Memory, Module, Operator, Signature, SignatureData, Table,
-    TableData, Terminator, Type, Value, ValueDef, WithNullable,
+    HeapType, Import, ImportKind, Memory, Module, Operator, Signature, SignatureData, StorageType,
+    Table, TableData, Terminator, Type, Value, ValueDef, WithNullable,
 };
 use sha3::{Digest, Sha3_256};
 use swc_common::SyntaxContext;
@@ -20,7 +20,12 @@ use crate::repr::{
     ConvertError, FUNCTION_FIELD_TAG, JS_NULL_SENTINEL, Repr, TypedArrayKind, field, ref_sig,
 };
 use crate::wasm_boundary::{WasmBoundarySignature, WasmBoundaryType, WasmImportSpec};
-use crate::wasm_esm::{WasmModuleImportSpec, WasmProfile, WasmValType};
+use crate::ffi::{FfiBoundarySignature, FfiType};
+use crate::ffi::FfiManifest;
+use crate::wasm_esm::{
+    WasmAbstractHeap, WasmFuncSignature, WasmModuleImportSpec, WasmRefType,
+    WasmValType,
+};
 
 /// Convert jsaw-core SSA into a WasmGC module.
 ///
@@ -317,7 +322,7 @@ pub fn convert_modules<'a, 'wasm>(
     // Merge every Wasm member after all import declarations (merged members
     // define functions) and before the converter creates any helper, so no
     // jsaw entity observes a pre-merge index space (plan §5.1).
-    let wasm_module_functions = merge_wasm_members(module, set)?;
+    let wasm_member_merge = merge_wasm_members(module, set, &options.ffi)?;
     let mut converter = Converter::new(module);
     converter.ffi_host_imports = ffi_host_imports;
     converter.semantic_cfg = options.semantic_cfg();
@@ -326,7 +331,8 @@ pub fn convert_modules<'a, 'wasm>(
     converter.ffi_thunks = ffi_prescan.thunks;
     converter.import_tables = import_tables;
     converter.wasm_host_imports = wasm_host_imports;
-    converter.wasm_module_functions = wasm_module_functions;
+    converter.wasm_module_functions = wasm_member_merge.export_funcs;
+    converter.wasm_module_types = wasm_member_merge.types;
     converter.exceptions_enabled = exported.iter().any(|(_, target)| match target {
         // Wasm members cannot participate in the JS exception protocol
         // (plan §5.6): a throw into Wasm member code traps.
@@ -509,70 +515,172 @@ fn wasm_boundary_type(ty: WasmBoundaryType) -> Type {
     }
 }
 
-/// One Wasm member value type as a Waffle IR type (adapter coercion table,
-/// plan §5.3).
-fn wasm_esm_val_type(ty: WasmValType) -> Type {
-    match ty {
+/// One Wasm member value type as a Waffle IR type, given the member's
+/// interned type map (adapter coercion table, plan §5.3). Reference types
+/// map to their exact interned target; abstract internal-hierarchy types to
+/// the corresponding abstract Waffle heap type.
+fn wasm_esm_val_type(
+    ty: WasmValType,
+    member_types: &BTreeMap<(String, u32), Signature>,
+    path: &str,
+) -> Result<Type, ConvertError> {
+    Ok(match ty {
         WasmValType::I32 => Type::I32,
         WasmValType::I64 => Type::I64,
         WasmValType::F32 => Type::F32,
         WasmValType::F64 => Type::F64,
-        // Reference and vector types are rejected by the adapter's profile
-        // gates before this is reachable.
-        WasmValType::Ref => Type::Heap(WithNullable {
-            value: HeapType::Any,
-            nullable: true,
-        }),
         WasmValType::V128 => Type::V128,
+        WasmValType::Ref(reference) => Type::Heap(WithNullable {
+            nullable: reference.nullable(),
+            value: match reference {
+                WasmRefType::Concrete { index, .. } => HeapType::Sig {
+                    sig_index: *member_types_get(member_types, path, index)?,
+                },
+                WasmRefType::Abstract { heap, .. } => wasm_esm_abstract_heap(heap),
+                WasmRefType::OpaqueFunc { .. } => HeapType::FuncRef,
+                WasmRefType::OpaqueExtern { .. } => HeapType::ExternRef,
+            },
+        }),
+    })
+}
+
+fn member_types_get<'a>(
+    member_types: &'a BTreeMap<(String, u32), Signature>,
+    path: &str,
+    index: u32,
+) -> Result<&'a Signature, ConvertError> {
+    member_types
+        .get(&(path.to_string(), index))
+        .ok_or_else(|| {
+            ConvertError::invalid(format!(
+                "Wasm module {path:?} type index {index} was not merged into the output module"
+            ))
+        })
+}
+
+fn wasm_esm_abstract_heap(heap: WasmAbstractHeap) -> HeapType {
+    match heap {
+        WasmAbstractHeap::Any => HeapType::Any,
+        WasmAbstractHeap::None => HeapType::None,
+        WasmAbstractHeap::Eq => HeapType::Eq,
+        WasmAbstractHeap::I31 => HeapType::I31,
+        WasmAbstractHeap::Struct => HeapType::Struct,
+        WasmAbstractHeap::Array => HeapType::Array,
     }
 }
 
-/// Index-space bases for merging one Wasm member into the output module
-/// (plan §5.1: append entities, rewrite indices by these offsets).
-struct MergeBases {
-    signature: usize,
-    function: usize,
-    global: usize,
-    table: usize,
-    memory: usize,
+/// Per-member index remap (plan §5.1): member-local indices → output
+/// indices. Signatures go through the interning map so structurally
+/// identical types share output identity across members.
+struct MemberRemap {
+    /// Member-local type index → output `Signature` (interned).
+    sigs: Vec<Signature>,
+    /// Member-local func index → output `Func` (imports first, then bodies).
+    funcs: Vec<Func>,
+    global_base: usize,
+    table_base: usize,
+    memory_base: usize,
 }
 
-impl MergeBases {
-    fn func(&self, index: Func) -> Func {
-        Func::new(self.function + index.index())
-    }
+impl MemberRemap {
     fn sig(&self, index: Signature) -> Signature {
-        Signature::new(self.signature + index.index())
+        self.sigs[index.index()]
+    }
+    fn func(&self, index: Func) -> Func {
+        self.funcs[index.index()]
     }
     fn global(&self, index: Global) -> Global {
-        Global::new(self.global + index.index())
+        Global::new(self.global_base + index.index())
     }
     fn table(&self, index: Table) -> Table {
-        Table::new(self.table + index.index())
+        Table::new(self.table_base + index.index())
     }
     fn memory(&self, index: Memory) -> Memory {
-        Memory::new(self.memory + index.index())
+        Memory::new(self.memory_base + index.index())
+    }
+    fn heap_type(&self, heap: &mut HeapType) {
+        if let HeapType::Sig { sig_index } = heap {
+            *sig_index = self.sig(*sig_index);
+        }
+    }
+    fn ty(&self, ty: &mut Type) {
+        if let Type::Heap(heap) = ty {
+            self.heap_type(&mut heap.value);
+        }
+    }
+    fn storage_type(&self, storage: &mut StorageType) {
+        if let StorageType::Val(ty) = storage {
+            self.ty(ty);
+        }
+    }
+    fn signature_data(&self, data: &mut SignatureData) {
+        match data {
+            SignatureData::Func {
+                params, returns, ..
+            } => {
+                for ty in params.iter_mut().chain(returns.iter_mut()) {
+                    self.ty(ty);
+                }
+            }
+            SignatureData::Struct { fields, .. } => {
+                for field in fields.iter_mut() {
+                    self.storage_type(&mut field.value);
+                }
+            }
+            SignatureData::Array { ty, .. } => self.storage_type(&mut ty.value),
+            SignatureData::Import { like, .. } => self.heap_type(like),
+            _ => {}
+        }
     }
 }
 
-/// Rewrite every module-level index an MVP-reachable operator can carry
-/// (plan §5.1 item 2). Reference-types/bulk-memory/table ops are not
-/// reachable under the validated profiles this phase accepts; GC operators
-/// additionally carry type indices and are gated out at merge time.
-fn remap_wasm_member_op(op: &mut Operator, bases: &MergeBases) {
+/// Rewrite every module-level index an operator of an accepted profile can
+/// carry (plan §5.1 item 2). Bulk-memory segment-space operators are
+/// rejected at ingestion; everything else listed here is reachable under
+/// MVP..GC.
+fn remap_wasm_member_op(op: &mut Operator, remap: &MemberRemap) {
     match op {
-        Operator::Call { function_index } => *function_index = bases.func(*function_index),
+        Operator::Call { function_index } => *function_index = remap.func(*function_index),
         Operator::CallIndirect {
             sig_index,
             table_index,
         } => {
-            *sig_index = bases.sig(*sig_index);
-            *table_index = bases.table(*table_index);
+            *sig_index = remap.sig(*sig_index);
+            *table_index = remap.table(*table_index);
         }
-        Operator::RefFunc { func_index } => *func_index = bases.func(*func_index),
+        Operator::CallRef { sig_index } => *sig_index = remap.sig(*sig_index),
+        Operator::RefFunc { func_index } => *func_index = remap.func(*func_index),
         Operator::GlobalGet { global_index } | Operator::GlobalSet { global_index } => {
-            *global_index = bases.global(*global_index);
+            *global_index = remap.global(*global_index);
         }
+        Operator::TableGet { table_index }
+        | Operator::TableSet { table_index }
+        | Operator::TableGrow { table_index }
+        | Operator::TableSize { table_index } => {
+            *table_index = remap.table(*table_index);
+        }
+        Operator::StructNew { sig }
+        | Operator::StructNewDefault { sig }
+        | Operator::StructGet { sig, .. }
+        | Operator::StructGetS { sig, .. }
+        | Operator::StructGetU { sig, .. }
+        | Operator::StructSet { sig, .. }
+        | Operator::ArrayNew { sig }
+        | Operator::ArrayNewDefault { sig }
+        | Operator::ArrayNewFixed { sig, .. }
+        | Operator::ArrayGet { sig }
+        | Operator::ArrayGetS { sig }
+        | Operator::ArrayGetU { sig }
+        | Operator::ArraySet { sig }
+        | Operator::ArrayFill { sig } => *sig = remap.sig(*sig),
+        Operator::ArrayCopy { dest, src } => {
+            *dest = remap.sig(*dest);
+            *src = remap.sig(*src);
+        }
+        Operator::RefTest { ty } | Operator::RefCast { ty } | Operator::RefNull { ty } => {
+            remap.ty(ty);
+        }
+        Operator::TypedSelect { ty } => remap.ty(ty),
         Operator::I32Load { memory }
         | Operator::I64Load { memory }
         | Operator::F32Load { memory }
@@ -596,113 +704,402 @@ fn remap_wasm_member_op(op: &mut Operator, bases: &MergeBases) {
         | Operator::I64Store8 { memory }
         | Operator::I64Store16 { memory }
         | Operator::I64Store32 { memory } => {
-            memory.memory = bases.memory(memory.memory);
+            memory.memory = remap.memory(memory.memory);
         }
         Operator::MemorySize { mem } | Operator::MemoryGrow { mem } => {
-            *mem = bases.memory(*mem);
+            *mem = remap.memory(*mem);
         }
-        // Every other MVP operator is index-free with respect to the
+        // Every other accepted operator is index-free with respect to the
         // module's signature/function/global/table/memory spaces.
         _ => {}
     }
 }
 
-/// Merge every Wasm member's ingested Waffle IR into the output module
-/// (plan §5.1). Returns the member function-export map,
-/// `(member path, export name) -> merged Func`, in deterministic
-/// module-set key order.
+/// Remap the type references a function body can hold outside its
+/// operators: locals, results, and block parameters.
+fn remap_wasm_body_types(body: &mut FunctionBody, remap: &MemberRemap) {
+    for ty in body.rets.iter_mut() {
+        remap.ty(ty);
+    }
+    for (_local, ty) in body.locals.entries_mut() {
+        remap.ty(ty);
+    }
+    for (_block, def) in body.blocks.entries_mut() {
+        for (ty, _param) in def.params.iter_mut() {
+            remap.ty(ty);
+        }
+    }
+}
+
+/// Does this signature reference type index `at_or_after` (or itself)?
+/// Forward/self references mark a recursive group, which structural
+/// interning must not split (plan §5.1 item 1).
+fn signature_references(data: &SignatureData, mut visit: impl FnMut(u32)) {
+    let visit_heap = |heap: &HeapType, visit: &mut dyn FnMut(u32)| {
+        if let HeapType::Sig { sig_index } = heap {
+            visit(sig_index.index() as u32);
+        }
+    };
+    match data {
+        SignatureData::Func {
+            params, returns, ..
+        } => {
+            for t in params.iter().chain(returns.iter()) {
+                if let Type::Heap(h) = t {
+                    visit_heap(&h.value, &mut visit);
+                }
+            }
+        }
+        SignatureData::Struct { fields, .. } => {
+            for field in fields {
+                if let StorageType::Val(t) = &field.value
+                    && let Type::Heap(h) = t {
+                        visit_heap(&h.value, &mut visit);
+                    }
+            }
+        }
+        SignatureData::Array { ty: element, .. } => {
+            if let StorageType::Val(t) = &element.value
+                && let Type::Heap(h) = t {
+                    visit_heap(&h.value, &mut visit);
+                }
+        }
+        SignatureData::Import { like, .. } => visit_heap(like, &mut visit),
+        _ => {}
+    }
+}
+
+/// Intern one member's type section into the output module (plan §5.1 item
+/// 1): structurally identical, non-recursive signatures share output
+/// identity, so a value produced by one member passes another member's
+/// `ref.cast`. jsaw's own types never enter the interning table, so member
+/// types stay nominally distinct from `Repr` types (plan §5.3).
 ///
-/// Runs after all import declarations (merged members define functions,
-/// and Wasm requires the import section to precede them) and before the
-/// converter creates any helper, so no jsaw entity can observe a
-/// pre-merge index space.
+/// A member whose signatures form a recursive group (any forward or self
+/// reference) is appended without sharing: correct, just not interned.
+fn intern_member_signatures(
+    module: &mut Module<'_>,
+    path: &str,
+    member: &Module<'_>,
+    interned: &mut BTreeMap<SignatureData, Signature>,
+) -> Result<Vec<Signature>, ConvertError> {
+    let count = member.signatures.len();
+    let mut has_recursive_group = false;
+    for (index, data) in member.signatures.entries() {
+        let mut forward = false;
+        signature_references(data, |referenced| {
+            if referenced as usize >= index.index() {
+                forward = true;
+            }
+        });
+        if forward {
+            has_recursive_group = true;
+            break;
+        }
+    }
+    let base = module.signatures.len();
+    let mut map = Vec::with_capacity(count);
+    for (_index, data) in member.signatures.entries() {
+        if has_recursive_group {
+            let mut data = data.clone();
+            // Recursive group: remap by plain offset (no sharing).
+            let offset_remap = |heap: &mut HeapType| {
+                if let HeapType::Sig { sig_index } = heap {
+                    *sig_index = Signature::new(base + sig_index.index());
+                }
+            };
+            let data_ref = &mut data;
+            remap_signature_data_heap_types(data_ref, &offset_remap);
+            map.push(module.signatures.push(data));
+            continue;
+        }
+        let mut normalized = data.clone();
+        {
+            let map_ref = &map;
+            let intern_remap = |heap: &mut HeapType| {
+                if let HeapType::Sig { sig_index } = heap {
+                    *sig_index = map_ref[sig_index.index()];
+                }
+            };
+            let data_ref = &mut normalized;
+            remap_signature_data_heap_types(data_ref, &intern_remap);
+        }
+        if let Some(existing) = interned.get(&normalized) {
+            map.push(*existing);
+        } else {
+            let pushed = module.signatures.push(normalized.clone());
+            interned.insert(normalized, pushed);
+            map.push(pushed);
+        }
+    }
+    let _ = path;
+    Ok(map)
+}
+
+/// Apply a heap-type rewrite throughout a `SignatureData`.
+fn remap_signature_data_heap_types(data: &mut SignatureData, remap: &dyn Fn(&mut HeapType)) {
+    let ty = |ty: &mut Type| {
+        if let Type::Heap(heap) = ty {
+            remap(&mut heap.value);
+        }
+    };
+    match data {
+        SignatureData::Func {
+            params, returns, ..
+        } => {
+            for t in params.iter_mut().chain(returns.iter_mut()) {
+                ty(t);
+            }
+        }
+        SignatureData::Struct { fields, .. } => {
+            for field in fields.iter_mut() {
+                if let StorageType::Val(t) = &mut field.value {
+                    ty(t);
+                }
+            }
+        }
+        SignatureData::Array { ty: element, .. } => {
+            if let StorageType::Val(t) = &mut element.value {
+                ty(t);
+            }
+        }
+        SignatureData::Import { like, .. } => remap(like),
+        _ => {}
+    }
+}
+
+/// The merge result: member function exports and member type indices, both
+/// in output index space.
+struct WasmMemberMerge {
+    /// `(member path, export name) -> merged function`.
+    export_funcs: BTreeMap<(String, String), Func>,
+    /// `(member path, member-local type index) -> merged (interned) type`.
+    types: BTreeMap<(String, u32), Signature>,
+}
+
+/// Compare a binary-declared member import signature with the FFI manifest
+/// declaration (plan §5.4 rule 1).
+fn ffi_signature_matches(
+    ffi: &FfiBoundarySignature,
+    wasm: &WasmFuncSignature,
+) -> bool {
+    let ffi_type_matches = |ffi: &FfiType, wasm: &WasmValType| {
+        matches!(
+            (ffi, wasm),
+            (FfiType::I32, WasmValType::I32)
+                | (FfiType::I64, WasmValType::I64)
+                | (FfiType::F32, WasmValType::F32)
+                | (FfiType::F64, WasmValType::F64)
+                | (FfiType::Ref, WasmValType::Ref(_))
+        )
+    };
+    ffi.params.len() == wasm.params.len()
+        && ffi.params.len() <= wasm.params.len()
+        && ffi
+            .params
+            .iter()
+            .zip(wasm.params.iter())
+            .all(|(f, w)| ffi_type_matches(f, w))
+        && match (&ffi.result, wasm.results.as_slice()) {
+            (None, []) => true,
+            (Some(f), [w]) => ffi_type_matches(f, w),
+            _ => false,
+        }
+}
+
+/// Merge every Wasm member's ingested Waffle IR into the output module
+/// (plan §5.1). Three phases keep Wasm index-space rules: types, globals,
+/// and memories first; then all members' function imports (Wasm requires
+/// imports to precede defined functions); then bodies, tables, and the
+/// export map. Deterministic module-set key order throughout.
+///
+/// Member function imports are satisfied from the FFI manifest with a
+/// signature check (plan §5.4 rule 1); anything else fails closed.
 fn merge_wasm_members(
     module: &mut Module<'_>,
     set: &ModuleSet<'_>,
-) -> Result<BTreeMap<(String, String), Func>, ConvertError> {
+    ffi: &FfiManifest,
+) -> Result<WasmMemberMerge, ConvertError> {
+    struct MemberState {
+        path: String,
+        sigs: Vec<Signature>,
+        funcs: Vec<Func>,
+        global_base: usize,
+        table_base: usize,
+        memory_base: usize,
+    }
+
+    let mut interned: BTreeMap<SignatureData, Signature> = BTreeMap::new();
+    let mut states: Vec<MemberState> = Vec::new();
     let mut export_funcs: BTreeMap<(String, String), Func> = BTreeMap::new();
+    let mut types: BTreeMap<(String, u32), Signature> = BTreeMap::new();
+
+    // Phase A: signatures (interned), globals, memories per member.
     for (path, plan) in set.wasm_modules() {
-        if plan.profile >= WasmProfile::Gc {
-            return Err(ConvertError::invalid(format!(
-                "Wasm module {path:?} uses the gc profile; merging GC Wasm members is wasm-esm \
-                 phase 5 (docs/plan-wasm-esm-modules.md §5.5)"
-            )));
-        }
         let member = &plan.module;
-        debug_assert!(
-            member.imports.is_empty(),
-            "wasm-esm ingestion rejects members with imports"
-        );
-        let bases = MergeBases {
-            signature: module.signatures.len(),
-            function: module.funcs.len(),
-            global: module.globals.len(),
-            table: module.tables.len(),
-            memory: module.memories.len(),
-        };
-        for signature in member.signatures.values() {
-            module.signatures.push(signature.clone());
+        let sigs = intern_member_signatures(module, path, member, &mut interned)?;
+        for (index, sig) in sigs.iter().enumerate() {
+            types.insert((path.clone(), index as u32), *sig);
         }
+        let global_base = module.globals.len();
         for global in member.globals.values() {
-            module.globals.push(global.clone());
+            let mut global = global.clone();
+            let remap = MemberRemap {
+                sigs: sigs.clone(),
+                funcs: vec![],
+                global_base,
+                table_base: module.tables.len(),
+                memory_base: module.memories.len(),
+            };
+            remap.ty(&mut global.ty);
+            module.globals.push(global);
         }
-        for table in member.tables.values() {
-            let mut table = table.clone();
-            // Element segments are already lowered into funcref tables;
-            // rebase their Func indices (plan §5.1 item 3).
-            if let Some(elements) = table.func_elements.as_mut() {
-                for element in elements.iter_mut() {
-                    if *element != Func::invalid() {
-                        *element = bases.func(*element);
-                    }
-                }
-            }
-            module.tables.push(table);
-        }
+        let memory_base = module.memories.len();
         for memory in member.memories.values() {
             // Data segments carry absolute offsets within their own memory,
             // so they survive the rebase verbatim.
             module.memories.push(memory.clone());
         }
-        for decl in member.funcs.values() {
+        states.push(MemberState {
+            path: path.clone(),
+            sigs,
+            funcs: Vec::new(),
+            global_base,
+            table_base: module.tables.len(),
+            memory_base,
+        });
+    }
+
+    // Phase B: every member's function imports, satisfied from the FFI
+    // manifest, before any defined function of any member.
+    let mut import_dedup: BTreeMap<(String, String, Signature), Func> = BTreeMap::new();
+    for state in &mut states {
+        let Some(plan) = set.get_wasm(&state.path) else {
+            unreachable!("state paths come from wasm_modules");
+        };
+        for (member_index, import) in plan.imports.iter().enumerate() {
+            let declared = ffi.import(&import.module, &import.field).ok_or_else(|| {
+                ConvertError::invalid(format!(
+                    "Wasm module {:?} imports {}.{:?}, which has no FFI declaration; declare it \
+                     in the FFI manifest (`ConvertOptions::ffi`) (plan §5.4)",
+                    state.path, import.module, import.field
+                ))
+            })?;
+            if !ffi_signature_matches(declared, &import.signature) {
+                return Err(ConvertError::invalid(format!(
+                    "Wasm module {:?} imports {}.{:?} with a signature that does not match the \
+                     FFI manifest declaration {declared:?} (plan §5.4)",
+                    state.path, import.module, import.field
+                )));
+            }
+            let key = (import.module.clone(), import.field.clone(), {
+                let FuncDecl::Import(sig, _) = &plan.module.funcs[Func::new(member_index)] else {
+                    return Err(ConvertError::invalid(format!(
+                        "Wasm module {:?} import {} is not a function declaration",
+                        state.path, member_index
+                    )));
+                };
+                state.sigs[sig.index()]
+            });
+            let func = if let Some(func) = import_dedup.get(&key) {
+                *func
+            } else {
+                let FuncDecl::Import(sig, name) = &plan.module.funcs[Func::new(member_index)]
+                else {
+                    unreachable!("checked above");
+                };
+                let mapped = state.sigs[sig.index()];
+                let func = module.funcs.push(FuncDecl::Import(mapped, name.clone()));
+                module.imports.push(Import {
+                    module: import.module.clone(),
+                    name: import.field.clone(),
+                    kind: ImportKind::Func(func),
+                });
+                import_dedup.insert(key, func);
+                func
+            };
+            state.funcs.push(func);
+        }
+    }
+
+    // Phase C: bodies, tables, and the export map per member.
+    for state in &mut states {
+        let Some(plan) = set.get_wasm(&state.path) else {
+            unreachable!("state paths come from wasm_modules");
+        };
+        let member = &plan.module;
+        let import_count = state.funcs.len();
+        let body_count = member.funcs.len() - import_count;
+        let body_base = module.funcs.len();
+        // Reserve every body index before remapping so forward calls
+        // resolve.
+        state
+            .funcs
+            .extend((0..body_count).map(|i| Func::new(body_base + i)));
+        let remap = MemberRemap {
+            sigs: state.sigs.clone(),
+            funcs: state.funcs.clone(),
+            global_base: state.global_base,
+            table_base: state.table_base,
+            memory_base: state.memory_base,
+        };
+        for (member_func, decl) in member.funcs.entries().skip(import_count) {
             let decl = match decl {
                 FuncDecl::Body(sig, name, body) => {
                     let mut body = body.clone();
+                    remap_wasm_body_types(&mut body, &remap);
                     for (_value, def) in body.values.entries_mut() {
                         if let ValueDef::Operator(op, _, _) = def {
-                            remap_wasm_member_op(op, &bases);
+                            remap_wasm_member_op(op, &remap);
                         }
                     }
                     // Keep WASM names: the binary's name section verbatim;
                     // anonymous functions get a deterministic
                     // `<path>:<index>` fallback (plan §5.1).
                     let name = if name.is_empty() {
-                        format!("{path}:{}", module.funcs.len() - bases.function)
+                        format!("{}:{}", state.path, member_func.index() - import_count)
                     } else {
                         name.clone()
                     };
-                    FuncDecl::Body(bases.sig(*sig), name, body)
+                    FuncDecl::Body(remap.sig(*sig), name, body)
                 }
                 other => {
                     return Err(ConvertError::invalid(format!(
-                        "Wasm module {path:?} contains a non-body function declaration after \
-                         ingestion ({other:?}); members with imports are rejected and all bodies \
-                         are expanded"
+                        "Wasm module {:?} contains a non-body, non-import function declaration \
+                         after ingestion ({other:?})",
+                        state.path
                     )));
                 }
             };
             module.funcs.push(decl);
         }
+        // Tables carry funcref element lists (validated funcref-only at
+        // ingestion); rebase their Func indices (plan §5.1 item 3).
+        for table in member.tables.values() {
+            let mut table = table.clone();
+            remap.ty(&mut table.ty);
+            if let Some(elements) = table.func_elements.as_mut() {
+                for element in elements.iter_mut() {
+                    if *element != Func::invalid() {
+                        *element = remap.func(*element);
+                    }
+                }
+            }
+            module.tables.push(table);
+        }
         for (name, export) in &plan.exports {
             if let crate::wasm_esm::WasmExport::Func { index, .. } = export {
                 export_funcs.insert(
-                    (path.clone(), name.clone()),
-                    Func::new(bases.function + *index as usize),
+                    (state.path.clone(), name.clone()),
+                    remap.func(Func::new(*index as usize)),
                 );
             }
         }
     }
-    Ok(export_funcs)
+    Ok(WasmMemberMerge {
+        export_funcs,
+        types,
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1515,6 +1912,9 @@ struct Converter<'a, 'module, 'wasm> {
     /// Merged Wasm member function exports: `(member path, export name)` →
     /// the merged function (plan §5.1).
     wasm_module_functions: BTreeMap<(String, String), Func>,
+    /// Merged Wasm member types: `(member path, member-local type index)` →
+    /// the merged (interned) signature (plan §5.1 item 1).
+    wasm_module_types: BTreeMap<(String, u32), Signature>,
     /// Generated jsaw callable metadata per Wasm member import binding.
     wasm_module_adapters: BTreeMap<WasmModuleImportSpec, FunctionInfo>,
     /// Per-module import tables for multi-module ingestion: resolved
@@ -1605,6 +2005,7 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             ffi_struct_ctors: BTreeMap::new(),
             wasm_host_functions: BTreeMap::new(),
             wasm_module_functions: BTreeMap::new(),
+            wasm_module_types: BTreeMap::new(),
             wasm_module_adapters: BTreeMap::new(),
             import_tables: BTreeMap::new(),
             module_of_function: BTreeMap::new(),
@@ -2707,9 +3108,10 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         if let Some(info) = self.wasm_module_adapters.get(spec) {
             return Ok(*info);
         }
-        // Profile gates: reference types are phase 5 (GC); v128 is out of
-        // scope (portal-co/jsaw#7). Multi-result returns pack into a fresh
-        // JS array below (plan §5.3).
+        // Profile gates (plan §5.3): the funcref/externref hierarchies are
+        // disjoint from jsaw values and fail closed; v128 is out of scope
+        // (portal-co/jsaw#7). Multi-result returns pack into a fresh JS
+        // array below.
         for ty in spec
             .signature
             .params
@@ -2717,10 +3119,12 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             .chain(spec.signature.results.iter())
         {
             match ty {
-                WasmValType::Ref => {
+                WasmValType::Ref(
+                    WasmRefType::OpaqueFunc { .. } | WasmRefType::OpaqueExtern { .. },
+                ) => {
                     return Err(ConvertError::invalid(format!(
-                        "Wasm module export {:?}.{:?} has a reference-typed signature; GC adapters \
-                         are wasm-esm phase 5 (plan §5.3)",
+                        "Wasm module export {:?}.{:?} has a funcref/externref in its signature; \
+                         those hierarchies are disjoint from JS values (plan §5.3)",
                         spec.path, spec.export
                     )));
                 }
@@ -2776,16 +3180,31 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                     body.add_op(block, Operator::F32DemoteF64, &[number], &[Type::F32])
                 }
                 WasmValType::F64 => self.as_f64(&mut body, block, &value)?,
-                WasmValType::Ref | WasmValType::V128 => unreachable!("gated above"),
+                WasmValType::Ref(reference) => {
+                    // The JS value is an `anyref`; cast it to the exact
+                    // declared type. Concrete types use the interned
+                    // signature, so a value produced by another member of
+                    // the same shape casts successfully (plan §5.3).
+                    let target =
+                        wasm_esm_val_type(WasmValType::Ref(reference), &self.wasm_module_types, &spec.path)?;
+                    let anyref = value.wasm()?.0;
+                    body.add_op(block, Operator::RefCast { ty: target }, &[anyref], &[target])
+                }
+                WasmValType::V128 => unreachable!("gated above"),
             });
         }
-        let result_types = spec
-            .signature
-            .results
-            .iter()
-            .copied()
-            .map(wasm_esm_val_type)
-            .collect::<Vec<_>>();
+        // The call's result types are the merged callee's exact signature
+        // types (interned), so the value stream type-checks exactly.
+        let callee_sig = self.module.funcs[func].sig();
+        let result_types = match &self.module.signatures[callee_sig] {
+            SignatureData::Func { returns, .. } => returns.clone(),
+            other => {
+                return Err(ConvertError::invalid(format!(
+                    "Wasm module export {:?}.{:?} merged to a non-function signature {other:?}",
+                    spec.path, spec.export
+                )));
+            }
+        };
         let call = body.add_op(
             block,
             Operator::Call {
@@ -2835,7 +3254,15 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         kind: ValueKind::Number,
                     },
                 ),
-                WasmValType::Ref | WasmValType::V128 => unreachable!("gated above"),
+                WasmValType::Ref(_) => self.box_value(
+                    body,
+                    block,
+                    &LowerValue::Wasm {
+                        value,
+                        kind: ValueKind::Reference,
+                    },
+                ),
+                WasmValType::V128 => unreachable!("gated above"),
             }
         };
         let result = match spec.signature.results.len() {

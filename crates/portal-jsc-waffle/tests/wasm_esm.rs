@@ -492,16 +492,174 @@ fn memory64_members_merge_and_execute() {
     assert_eq!(node, b'h' as f64, "Node");
 }
 
+// ---------------------------------------------------------------------------
+// GC fixtures (phase 5).
+
+/// A struct type `(struct (field i32 mut) (field i32 mut))`.
+fn point_type() -> Vec<u8> {
+    vec![0x5f, 0x02, 0x7f, 0x01, 0x7f, 0x01]
+}
+
+const ANYREF: u8 = 0x6e;
+
+/// `(module (type $point (struct i32 i32))
+///   (func (export "make") (param i32 i32) (result (ref 0))
+///     local.get 0 local.get 1 struct.new 0)
+///   (func (export "sum") (param (ref null 0)) (result i32)
+///     local.get 0 struct.get 0 0 local.get 0 struct.get 0 1 i32.add))`
+fn point_module() -> Vec<u8> {
+    // (i32, i32) -> (ref 0)
+    let make_sig = vec![0x60, 0x02, 0x7f, 0x7f, 0x01, 0x64, 0x00];
+    // (ref null 0) -> i32
+    let sum_sig = vec![0x60, 0x01, 0x63, 0x00, 0x01, 0x7f];
+    module(&[
+        section(1, vec_of(vec![point_type(), make_sig, sum_sig])),
+        section(3, vec_of(vec![uleb(1), uleb(2)])),
+        section(
+            7,
+            vec_of(vec![export_entry("make", 0x00, 0), export_entry("sum", 0x00, 1)]),
+        ),
+        section(
+            10,
+            vec_of(vec![
+                code_body(&[0x00, 0x20, 0x00, 0x20, 0x01, 0xfb, 0x00, 0x00, 0x0b]),
+                code_body(&[
+                    0x00, 0x20, 0x00, 0xfb, 0x02, 0x00, 0x00, 0x20, 0x00, 0xfb, 0x02, 0x00, 0x01,
+                    0x6a, 0x0b,
+                ]),
+            ]),
+        ),
+    ])
+}
+
+/// Just the maker half of `point_module` — a structurally identical
+/// `$point` type that interning must share with the reader's (plan §5.1).
+fn point_maker_module() -> Vec<u8> {
+    let make_sig = vec![0x60, 0x02, 0x7f, 0x7f, 0x01, 0x64, 0x00];
+    module(&[
+        section(1, vec_of(vec![point_type(), make_sig])),
+        section(3, vec_of(vec![uleb(1)])),
+        section(7, vec_of(vec![export_entry("make", 0x00, 0)])),
+        section(
+            10,
+            vec_of(vec![code_body(&[0x00, 0x20, 0x00, 0x20, 0x01, 0xfb, 0x00, 0x00, 0x0b])]),
+        ),
+    ])
+}
+
+/// `(module (type $point (struct i32 i32))
+///   (func (export "get_x") (param anyref) (result i32)
+///     local.get 0 ref.cast (ref 0) struct.get 0 0))`
+///
+/// The `ref.cast` only accepts the other member's value if `$point` was
+/// interned into one output type (plan §5.1 item 1).
+fn point_reader_module() -> Vec<u8> {
+    let get_sig = vec![0x60, 0x01, ANYREF, 0x01, 0x7f];
+    module(&[
+        section(1, vec_of(vec![point_type(), get_sig])),
+        section(3, vec_of(vec![uleb(1)])),
+        section(7, vec_of(vec![export_entry("get_x", 0x00, 0)])),
+        section(
+            10,
+            vec_of(vec![code_body(&[
+                // local.get 0; ref.cast (ref 0); struct.get 0 0
+                0x00, 0x20, 0x00, 0xfb, 0x16, 0x00, 0xfb, 0x02, 0x00, 0x00, 0x0b,
+            ])]),
+        ),
+    ])
+}
+
+/// `(module (func (export "echo") (param anyref) (result anyref)
+///   local.get 0))`
+fn echo_module() -> Vec<u8> {
+    module(&[
+        section(1, vec_of(vec![vec![0x60, 0x01, ANYREF, 0x01, ANYREF]])),
+        section(3, vec_of(vec![uleb(0)])),
+        section(7, vec_of(vec![export_entry("echo", 0x00, 0)])),
+        section(10, vec_of(vec![code_body(&[0x00, 0x20, 0x00, 0x0b])])),
+    ])
+}
+
 #[test]
-fn gc_members_fail_closed_at_merge() {
-    // (type (struct)) — a GC type section entry with no functions.
-    let gc = module(&[section(1, vec_of(vec![vec![0x5f, 0x00]]))]);
-    let mut set = module_set_from_sources([("main.js", "export function run() { return 1; }")])
-        .expect("sources");
-    set.insert_wasm_with_profile("g.wasm", &gc, WasmProfile::Gc)
+fn gc_members_merge_and_roundtrip_struct_values() {
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { make, sum } from './point.wasm'; \
+         export function run(a, b) { return sum(make(a, b)); }",
+    )])
+    .expect("sources");
+    set.insert_wasm_with_profile("point.wasm", &point_module(), WasmProfile::Gc)
         .expect("gc member at the gc ceiling");
-    let error = convert("main.js", &set).expect_err("GC merge is phase 5");
-    assert!(error.message.contains("phase 5"), "{error}");
+    let module = convert("main.js", &set).expect("gc member should merge");
+    let bytes = wasm_bytes(&module);
+    let (wasmtime, node) = execute_numeric_in_all_runtimes(&bytes, "run", &[19.0, 23.0]);
+    assert_eq!(wasmtime, 42.0, "Wasmtime");
+    assert_eq!(node, 42.0, "Node");
+}
+
+#[test]
+fn gc_concrete_type_mismatch_traps() {
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { sum } from './point.wasm'; \
+         export function run() { return sum({}); }",
+    )])
+    .expect("sources");
+    set.insert_wasm_with_profile("point.wasm", &point_module(), WasmProfile::Gc)
+        .expect("gc member");
+    let module = convert("main.js", &set).expect("converts");
+    let bytes = wasm_bytes(&module);
+    // Passing a JS object where `(ref null $point)` is required must trap
+    // at the adapter's ref.cast (plan §5.3), never silently coerce.
+    let mut config = Config::new();
+    config.wasm_gc(true);
+    config.wasm_function_references(true);
+    let engine = Engine::new(&config).expect("engine");
+    let compiled = wasmtime::Module::new(&engine, &bytes).expect("compiles");
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &compiled, &[]).expect("instantiates");
+    let function = instance.get_func(&mut store, "run").expect("export");
+    let mut outputs = [Val::F64(0)];
+    function
+        .call(&mut store, &[], &mut outputs)
+        .expect_err("a non-$point value must trap at the ref.cast boundary");
+}
+
+#[test]
+fn interned_gc_types_cast_across_members() {
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { make } from './maker.wasm'; import { get_x } from './reader.wasm'; \
+         export function run(a, b) { return get_x(make(a, b)); }",
+    )])
+    .expect("sources");
+    set.insert_wasm_with_profile("maker.wasm", &point_maker_module(), WasmProfile::Gc)
+        .expect("maker");
+    set.insert_wasm_with_profile("reader.wasm", &point_reader_module(), WasmProfile::Gc)
+        .expect("reader");
+    let module = convert("main.js", &set).expect("interned members merge");
+    let bytes = wasm_bytes(&module);
+    // The reader's ref.cast accepts the maker's value only because the two
+    // members' structurally identical $point types were interned into one.
+    let (wasmtime, node) = execute_numeric_in_all_runtimes(&bytes, "run", &[40.0, 2.0]);
+    assert_eq!(wasmtime, 40.0, "Wasmtime");
+    assert_eq!(node, 40.0, "Node");
+}
+
+#[test]
+fn anyref_identity_roundtrip_through_gc_member() {
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { echo } from './echo.wasm'; export function run(x) { return echo(x); }",
+    )])
+    .expect("sources");
+    set.insert_wasm_with_profile("echo.wasm", &echo_module(), WasmProfile::Gc)
+        .expect("echo member");
+    let module = convert("main.js", &set).expect("converts");
+    let bytes = wasm_bytes(&module);
+    let (wasmtime, node) = execute_numeric_in_all_runtimes(&bytes, "run", &[42.5]);
+    assert_eq!(wasmtime, 42.5, "Wasmtime");
+    assert_eq!(node, 42.5, "Node");
 }
 
 #[test]
@@ -620,3 +778,165 @@ fn multi_memory_members_merge_and_execute_through_coregc() {
     assert_eq!(forced, 215.0, "coregc must match the native result");
 }
 
+
+// ---------------------------------------------------------------------------
+// Wasm-member import satisfaction via the FFI manifest (plan §5.4).
+
+/// `(module (type $t (func (param i32) (result i32)))
+///   (import "env" "double" (func 0))
+///   (func (export "quad") (type 1) local.get 0 call 0 call 0))`
+fn importing_module() -> Vec<u8> {
+    let sig = || vec![0x60, 0x01, 0x7f, 0x01, 0x7f];
+    module(&[
+        section(1, vec_of(vec![sig(), sig()])),
+        section(
+            2,
+            vec_of(vec![{
+                let mut i = name("env");
+                i.extend(name("double"));
+                i.push(0x00); // func
+                i.extend(uleb(0));
+                i
+            }]),
+        ),
+        section(3, vec_of(vec![uleb(1)])),
+        section(7, vec_of(vec![export_entry("quad", 0x00, 1)])),
+        section(
+            10,
+            vec_of(vec![code_body(&[0x00, 0x20, 0x00, 0x10, 0x00, 0x10, 0x00, 0x0b])]),
+        ),
+    ])
+}
+
+fn ffi_with_double(
+    params: portal_jsc_waffle::FfiType,
+    result: portal_jsc_waffle::FfiType,
+) -> portal_jsc_waffle::FfiManifest {
+    let mut functions = std::collections::BTreeMap::new();
+    functions.insert(
+        "double".to_string(),
+        portal_jsc_waffle::FfiBoundarySignature {
+            params: vec![params],
+            result: Some(result),
+        },
+    );
+    let mut modules = std::collections::BTreeMap::new();
+    modules.insert(
+        "env".to_string(),
+        portal_jsc_waffle::FfiModule { functions },
+    );
+    portal_jsc_waffle::FfiManifest {
+        modules,
+        exports: Default::default(),
+    }
+}
+
+fn convert_with(
+    entry: &str,
+    set: &ModuleSet<'_>,
+    options: &portal_jsc_waffle::ConvertOptions,
+) -> Result<Module<'static>, portal_jsc_waffle::ConvertError> {
+    let mut module = portal_pc_waffle::Module::empty();
+    convert_modules(entry, set, &mut module, options)?;
+    Ok(module)
+}
+
+#[test]
+fn member_imports_are_satisfied_by_the_ffi_manifest() {
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { quad } from './ffi.wasm'; export function run(x) { return quad(x); }",
+    )])
+    .expect("sources");
+    set.insert_wasm("ffi.wasm", &importing_module())
+        .expect("importing member");
+    let options = portal_jsc_waffle::ConvertOptions {
+        ffi: ffi_with_double(
+            portal_jsc_waffle::FfiType::I32,
+            portal_jsc_waffle::FfiType::I32,
+        ),
+        ..Default::default()
+    };
+    let module = convert_with("main.js", &set, &options).expect("FFI-satisfied import merges");
+    let bytes = wasm_bytes(&module);
+
+    // Instantiate with the host `double` and run the numeric export.
+    let mut config = Config::new();
+    config.wasm_gc(true);
+    config.wasm_function_references(true);
+    let engine = Engine::new(&config).expect("engine");
+    let compiled = wasmtime::Module::new(&engine, &bytes).expect("compiles");
+    let mut store = Store::new(&engine, ());
+    let double = wasmtime::Func::wrap(&mut store, |x: i32| x * 2);
+    let instance = Instance::new(&mut store, &compiled, &[double.into()]).expect("instantiates");
+    let run = instance.get_func(&mut store, "run").expect("export");
+    let mut outputs = [Val::F64(0)];
+    run.call(&mut store, &[Val::F64(5.0f64.to_bits())], &mut outputs)
+        .expect("call");
+    match outputs[0] {
+        Val::F64(bits) => assert_eq!(f64::from_bits(bits), 20.0, "quad(5) = double(double(5))"),
+        ref other => panic!("unexpected result {other:?}"),
+    }
+}
+
+#[test]
+fn member_import_signature_mismatch_fails_closed() {
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { quad } from './ffi.wasm'; export function run(x) { return quad(x); }",
+    )])
+    .expect("sources");
+    set.insert_wasm("ffi.wasm", &importing_module())
+        .expect("importing member");
+    let options = portal_jsc_waffle::ConvertOptions {
+        ffi: ffi_with_double(
+            portal_jsc_waffle::FfiType::I64,
+            portal_jsc_waffle::FfiType::I64,
+        ),
+        ..Default::default()
+    };
+    let error = convert_with("main.js", &set, &options)
+        .expect_err("an i64 manifest declaration must not satisfy an i32 import");
+    assert!(error.message.contains("does not match"), "{error}");
+}
+
+#[test]
+fn member_imports_without_ffi_declaration_fail_closed() {
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { quad } from './ffi.wasm'; export function run(x) { return quad(x); }",
+    )])
+    .expect("sources");
+    set.insert_wasm("ffi.wasm", &importing_module())
+        .expect("importing member");
+    let error = convert("main.js", &set).expect_err("undeclared imports fail closed");
+    assert!(error.message.contains("no FFI declaration"), "{error}");
+}
+
+#[test]
+fn gc_member_passes_through_coregc_and_mobile_audit() {
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { make, sum } from './point.wasm'; \
+         export function run(a, b) { return sum(make(a, b)); }",
+    )])
+    .expect("sources");
+    set.insert_wasm_with_profile("point.wasm", &point_module(), WasmProfile::Gc)
+        .expect("gc member");
+    let module = convert("main.js", &set).expect("converts");
+
+    // The mobile audit is the JVM/Swift feature-closure contract: merged GC
+    // member code is ordinary struct/array IR, which the closure already
+    // covers for jsaw's own lowering, so it passes (see portal-co/jsaw#13
+    // for the value-level interop question this does NOT settle).
+    portal_jsc_mob_emit::audit::audit_module(&module)
+        .expect("mobile audit accepts merged GC member code");
+
+    // CoreGC lowers the member's GC types like jsaw's own (plan §5.5's
+    // "reject" row was wrong: GC-in/core-out works; the matrix is updated).
+    let artifact = portal_jsc_waffle::emit_coregc(&module, &Default::default())
+        .expect("coregc lowers GC member types");
+    let core_bytes = portal_pc_waffle::to_wasm_bytes(&artifact.module).expect("core encodes");
+    let result = execute_core(&core_bytes, "run", &[19.0, 23.0]);
+    assert_eq!(result, 42.0, "coregc matches the native result");
+}

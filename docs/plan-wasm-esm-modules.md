@@ -303,10 +303,10 @@ half-supported.
 | Target | MVP | multi-value | memory64 | multi-memory | GC |
 | --- | --- | --- | --- | --- | --- |
 | Native WasmGC encode | ✅ direct | ✅ direct | ✅ direct (encoder feature) | ✅ direct (encoder feature) | ✅ direct |
-| CoreGC core-Wasm | scalar-only funcs; ref params/results fail closed (the JS-facing handle ABI does not apply — these are internal calls) | ✅ (core feature) | ✅ emit memory64 output | ✅ emit multi-memory output | fail closed: GC module in, core out is a contradiction — reject the combination at `emit_coregc` |
+| CoreGC core-Wasm | scalar-only funcs; ref params/results fail closed (the JS-facing handle ABI does not apply — these are internal calls) | ✅ (core feature) | ✅ emit memory64 output | ✅ emit multi-memory output | ✅ measured working: member GC types lower like jsaw's own (Phase 5 test `gc_member_passes_through_coregc_and_mobile_audit`) |
 | `nano_mvp` | ✅ (its whole purpose) | ✅ (`MULTI_VALUE` already enabled in its validator) | audit | audit | reject |
 | `low_emit` | audit per profile | audit | audit | audit | reject |
-| Mobile JVM/Swift | audit stays fail-closed this plan; translation of the MVP subset (i32/i64/f32/f64, one memory → `ByteBuffer`) is portal-co/jsaw#13 | reject | reject | reject | reject |
+| Mobile JVM/Swift | audit stays fail-closed this plan; translation of the MVP subset (i32/i64/f32/f64, one memory → `ByteBuffer`) is portal-co/jsaw#13 | reject | reject | reject | audit accepts merged GC members as ordinary struct/array IR (measured Phase 5); #13 owns value-level interop |
 
 The audit pattern is the one the host-import plan established for mobile:
 an unsupported feature is a loud rejection naming the profile and the
@@ -476,19 +476,41 @@ features on; host manifest records the requirement. **Done:**
 not alias across indices in differential tests. **Done:**
 `multi_memory_members_merge_and_execute_through_coregc`.
 
-### Phase 5 — GC Wasm modules
+### Phase 5 — GC Wasm modules (Done)
 
-1. `gc` profile: type-section interning into the output rec groups,
-   abstract-ref adapters, concrete-ref `ref.cast` boundary rule.
-2. FFI-manifest satisfaction of the GC module's own imports (§5.4) with
-   signature checking.
-3. Tests: a GC Wasm module exporting struct constructors/accessors called
-   from JS; abstract `anyref` identity round-trips; concrete-type mismatch
-   traps; two GC modules sharing an interned type.
+1. `gc` profile merge: structural **interning** of member signatures into
+   the output type section (a value from one member passes another's
+   `ref.cast` when shapes match); recursive groups disable sharing per
+   member (correct, not shared). Subtyped members (`sub`/`extends`) are
+   rejected at ingestion because Waffle drops subtyping
+   (`is_final: true` always). Members using `array.new_data`/`new_elem`/
+   `init_*` are rejected (segment index spaces the frontend cannot
+   represent).
+2. Adapters: concrete refs cast with `ref.cast` to the interned type
+   (mismatch traps; no structural coercion — portal-co/jsaw#12); abstract
+   internal-hierarchy refs cast to the abstract target; funcref/externref
+   positions fail closed. Call result types come from the merged callee's
+   exact signature.
+3. Member imports: only function imports are accepted at ingestion (others
+   fail closed, portal-co/jsaw#10); each is satisfied from the FFI manifest
+   with a signature check, deduplicated, and emitted before all member
+   bodies (two-phase merge). Intra-set Wasm→Wasm edges (rule 2) remain
+   future work.
+4. Waffle fork fixes this phase required (all committed in `../waffle-`):
+   GC operators routed through the frontend's generic `emit`;
+   `op_inputs`/`op_outputs` for `struct.new` no longer mark the result
+   nullable; the frontend's stack pop accepts non-null where nullable is
+   expected (subtyping); data-segment offsets encode as `i64.const` on
+   memory64 (phase 3).
+5. **Measured correction to the §5.5 matrix:** CoreGC lowers GC member
+   types like jsaw's own (GC-in/core-out *works*, verified executing), and
+   the mobile audit accepts merged GC members (ordinary struct/array IR).
+   The matrix rows are updated below.
 
 **Commit:** `wasm-esm: ingest and link wasmgc modules`.
-**Gate:** merged module validates with GC on; `emit_coregc` rejects the
-combination loudly; mobile audit rejects GC-bearing sets.
+**Gate:** merged module validates with GC on; ~~`emit_coregc` rejects the
+combination~~ CoreGC executes GC members correctly; mobile audit accepts
+(recorded, not silent).
 
 ### Phase 6 — CoreGC / nano_mvp / low_emit pass-through and manifests
 

@@ -141,6 +141,11 @@ pub struct Options {
     /// default, which preserves the legacy no-assumptions behavior.
     #[serde(default)]
     pub assumptions: Vec<AssumptionInput>,
+    /// Opt-in WASI p1 passthrough for Wasm members (portal-co/jsaw#11):
+    /// member function imports from `wasi_snapshot_preview1` become runtime
+    /// imports without FFI manifest entries.
+    #[serde(default)]
+    pub wasm_wasi_p1_passthrough: bool,
 }
 
 impl Default for Options {
@@ -149,6 +154,7 @@ impl Default for Options {
             numeric_exports: true,
             gc_export_suffix: None,
             assumptions: Vec::new(),
+            wasm_wasi_p1_passthrough: false,
         }
     }
 }

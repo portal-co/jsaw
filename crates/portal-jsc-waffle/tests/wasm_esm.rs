@@ -1477,3 +1477,75 @@ fn global_exports_read_live_from_the_default_instance() {
     assert_eq!(wasmtime, 4201.0, "Wasmtime");
     assert_eq!(node, 4201.0, "Node");
 }
+
+/// `(module
+///   (import "wasi_snapshot_preview1" "random_get" (func (param i32 i32) (result i32)))
+///   (func (export "rand") (param i32) (result i32)
+///     local.get 0 i32.const 0 call 0))` — calls random_get(x, 0).
+fn wasi_import_module() -> Vec<u8> {
+    module(&[
+        section(
+            1,
+            vec_of(vec![func_type(&[I32, I32], &[I32]), func_type(&[I32], &[I32])]),
+        ),
+        section(
+            2,
+            vec_of(vec![{
+                let mut i = name("wasi_snapshot_preview1");
+                i.extend(name("random_get"));
+                i.push(0x00);
+                i.extend(uleb(0));
+                i
+            }]),
+        ),
+        section(3, vec_of(vec![uleb(1)])),
+        section(7, vec_of(vec![export_entry("rand", 0x00, 1)])),
+        section(
+            10,
+            vec_of(vec![code_body(&[
+                0x00, 0x20, 0x00, 0x41, 0x00, 0x10, 0x00, 0x0b,
+            ])]),
+        ),
+    ])
+}
+
+#[test]
+fn wasi_p1_passthrough_is_opt_in() {
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { rand } from './w.wasm'; export function run(x) { return rand(x); }",
+    )])
+    .expect("sources");
+    set.insert_wasm("w.wasm", &wasi_import_module())
+        .expect("wasi member");
+
+    // Off by default: no implicit environment.
+    let error = convert("main.js", &set).expect_err("default fails closed");
+    assert!(error.message.contains("no FFI declaration"), "{error}");
+
+    // portal-co/jsaw#11: opt-in passthrough leaves WASI imports for the host.
+    let options = portal_jsc_waffle::ConvertOptions {
+        wasm_wasi_p1_passthrough: true,
+        ..Default::default()
+    };
+    let module = convert_with("main.js", &set, &options).expect("passthrough converts");
+    let bytes = wasm_bytes(&module);
+    let mut config = Config::new();
+    config.wasm_gc(true);
+    config.wasm_function_references(true);
+    config.wasm_tail_call(true);
+    let engine = Engine::new(&config).expect("engine");
+    let compiled = wasmtime::Module::new(&engine, &bytes).expect("compiles");
+    let mut store = Store::new(&engine, ());
+    let random_get = wasmtime::Func::wrap(&mut store, |_buf: i32, _len: i32| 0i32);
+    let instance =
+        Instance::new(&mut store, &compiled, &[random_get.into()]).expect("instantiates");
+    let run = instance.get_func(&mut store, "run").expect("export");
+    let mut outputs = [Val::F64(0)];
+    run.call(&mut store, &[Val::F64(7.0f64.to_bits())], &mut outputs)
+        .expect("call");
+    match outputs[0] {
+        Val::F64(bits) => assert_eq!(f64::from_bits(bits), 0.0),
+        ref other => panic!("unexpected {other:?}"),
+    }
+}

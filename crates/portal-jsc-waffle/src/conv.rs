@@ -84,6 +84,12 @@ pub struct ConvertOptions {
     /// import and every host-ABI export must be declared here. The default is
     /// empty, so any `wasm:` import fails closed.
     pub ffi: crate::ffi::FfiManifest,
+    /// When true, Wasm members' function imports from
+    /// `wasi_snapshot_preview1` pass through as runtime imports with their
+    /// binary-declared signatures, without an FFI manifest entry
+    /// (portal-co/jsaw#11). The host must provide WASI at instantiation.
+    /// Off by default: no implicit environment.
+    pub wasm_wasi_p1_passthrough: bool,
 }
 
 impl Default for ConvertOptions {
@@ -93,6 +99,7 @@ impl Default for ConvertOptions {
             gc_export_suffix: None,
             assumptions: portal_jsc_common::assumptions::AssumptionSet::empty(),
             ffi: crate::ffi::FfiManifest::default(),
+            wasm_wasi_p1_passthrough: false,
         }
     }
 }
@@ -321,7 +328,12 @@ pub fn convert_modules<'a, 'wasm>(
     // Merge every Wasm member after all import declarations (merged members
     // define functions) and before the converter creates any helper, so no
     // jsaw entity observes a pre-merge index space (plan §5.1).
-    let wasm_member_merge = merge_wasm_members(module, set, &options.ffi)?;
+    let wasm_member_merge = merge_wasm_members(
+        module,
+        set,
+        &options.ffi,
+        options.wasm_wasi_p1_passthrough,
+    )?;
     let mut converter = Converter::new(module);
     converter.ffi_host_imports = ffi_host_imports;
     converter.semantic_cfg = options.semantic_cfg();
@@ -977,6 +989,7 @@ fn merge_wasm_members(
     module: &mut Module<'_>,
     set: &ModuleSet<'_>,
     ffi: &FfiManifest,
+    wasi_p1_passthrough: bool,
 ) -> Result<WasmMemberMerge, ConvertError> {
     struct MemberState {
         path: String,
@@ -1039,19 +1052,25 @@ fn merge_wasm_members(
             unreachable!("state paths come from wasm_modules");
         };
         for (member_index, import) in plan.imports.iter().enumerate() {
-            let declared = ffi.import(&import.module, &import.field).ok_or_else(|| {
-                ConvertError::invalid(format!(
-                    "Wasm module {:?} imports {}.{:?}, which has no FFI declaration; declare it \
-                     in the FFI manifest (`ConvertOptions::ffi`) (plan §5.4)",
-                    state.path, import.module, import.field
-                ))
-            })?;
-            if !ffi_signature_matches(declared, &import.signature) {
-                return Err(ConvertError::invalid(format!(
-                    "Wasm module {:?} imports {}.{:?} with a signature that does not match the \
-                     FFI manifest declaration {declared:?} (plan §5.4)",
-                    state.path, import.module, import.field
-                )));
+            // portal-co/jsaw#11: with the opt-in passthrough, WASI p1
+            // imports skip the manifest and keep their binary signature.
+            let wasi_passthrough =
+                wasi_p1_passthrough && import.module == "wasi_snapshot_preview1";
+            if !wasi_passthrough {
+                let declared = ffi.import(&import.module, &import.field).ok_or_else(|| {
+                    ConvertError::invalid(format!(
+                        "Wasm module {:?} imports {}.{:?}, which has no FFI declaration; declare \
+                         it in the FFI manifest (`ConvertOptions::ffi`) (plan §5.4)",
+                        state.path, import.module, import.field
+                    ))
+                })?;
+                if !ffi_signature_matches(declared, &import.signature) {
+                    return Err(ConvertError::invalid(format!(
+                        "Wasm module {:?} imports {}.{:?} with a signature that does not match \
+                         the FFI manifest declaration {declared:?} (plan §5.4)",
+                        state.path, import.module, import.field
+                    )));
+                }
             }
             let key = (import.module.clone(), import.field.clone(), {
                 let FuncDecl::Import(sig, _) = &plan.module.funcs[Func::new(member_index)] else {

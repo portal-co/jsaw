@@ -203,6 +203,7 @@ pub fn compile_to_outputs(
         gc_export_suffix: manifest.options.gc_export_suffix.clone(),
         assumptions,
         ffi: manifest.ffi.clone(),
+        wasm_wasi_p1_passthrough: manifest.options.wasm_wasi_p1_passthrough,
     };
     let mut module = portal_pc_waffle::Module::empty();
     convert_modules(&manifest.entry, &set, &mut module, &options)

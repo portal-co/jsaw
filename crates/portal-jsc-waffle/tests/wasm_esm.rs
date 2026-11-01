@@ -1411,3 +1411,69 @@ fn namespace_imports_bind_the_default_instance_for_late_bound_members() {
     assert_eq!(wasmtime, 2.0, "Wasmtime");
     assert_eq!(node, 2.0, "Node");
 }
+
+/// `(module
+///   (global $answer i32 (i32.const 42))
+///   (global $count (mut i32) (i32.const 0))
+///   (func (export "bump") (result i32) ...)
+///   (export "answer" (global 0)) (export "count" (global 1)))`
+fn globals_module() -> Vec<u8> {
+    module(&[
+        section(1, vec_of(vec![func_type(&[], &[I32])])),
+        section(3, vec_of(vec![uleb(0)])),
+        section(
+            6,
+            vec_of(vec![
+                // immutable i32 = 42
+                {
+                    let mut g = vec![0x7f, 0x00];
+                    g.extend([0x41, 42, 0x0b]);
+                    g
+                },
+                // mutable i32 = 0
+                {
+                    let mut g = vec![0x7f, 0x01];
+                    g.extend([0x41, 0x00, 0x0b]);
+                    g
+                },
+            ]),
+        ),
+        section(
+            7,
+            vec_of(vec![
+                export_entry("bump", 0x00, 0),
+                export_entry("answer", 0x03, 0), // global
+                export_entry("count", 0x03, 1),
+            ]),
+        ),
+        section(
+            10,
+            vec_of(vec![code_body(&[
+                0x00, 0x23, 0x01, 0x41, 0x01, 0x6a, 0x24, 0x01, 0x23, 0x01, 0x0b,
+            ])]),
+        ),
+    ])
+}
+
+#[test]
+fn global_exports_read_live_from_the_default_instance() {
+    // portal-co/jsaw#10: global exports as live read-only JS values.
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { answer, count, bump } from './g.wasm'; \
+         export function run() { \
+           const a = answer; \
+           const c1 = count; \
+           bump(); \
+           return a * 100 + c1 * 10 + count; \
+         }",
+    )])
+    .expect("sources");
+    set.insert_wasm("g.wasm", &globals_module()).expect("member");
+    let module = convert("main.js", &set).expect("converts");
+    let bytes = wasm_bytes(&module);
+    // a=42, c1=0 (read before bump), count=1 (live read after bump).
+    let (wasmtime, node) = execute_numeric_in_all_runtimes(&bytes, "run", &[]);
+    assert_eq!(wasmtime, 4201.0, "Wasmtime");
+    assert_eq!(node, 4201.0, "Node");
+}

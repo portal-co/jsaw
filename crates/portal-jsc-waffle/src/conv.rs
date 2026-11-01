@@ -351,7 +351,8 @@ pub fn convert_modules<'a, 'wasm>(
             ImportTarget::WasmHost(_)
             | ImportTarget::Intrinsic { .. }
             | ImportTarget::WasmModule(_)
-            | ImportTarget::WasmNamespace { .. } => false,
+            | ImportTarget::WasmNamespace { .. }
+            | ImportTarget::WasmGlobal { .. } => false,
         })
     });
     if converter.exceptions_enabled {
@@ -5347,6 +5348,93 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                                 body, block, context, &path,
                             )?;
                             return Ok(vec![(block, object)]);
+                        }
+                        ImportTarget::WasmGlobal {
+                            path,
+                            index,
+                            ty,
+                        } => {
+                            // A late-bound member's global export, read live
+                            // from the default instance's field
+                            // (portal-co/jsaw#10).
+                            let inst_sig = self.wasm_member_instance_ty[&path];
+                            let (block, instance) = self.wasm_default_instance(
+                                body, block, context, &path, inst_sig,
+                            )?;
+                            let field_ty =
+                                wasm_esm_val_type(ty, &self.wasm_module_types, &path)?;
+                            let raw = body.add_op(
+                                block,
+                                Operator::StructGet {
+                                    sig: inst_sig,
+                                    idx: index as usize,
+                                },
+                                &[instance],
+                                &[field_ty],
+                            );
+                            let boxed = match ty {
+                                WasmValType::I32 => self.box_value(
+                                    body,
+                                    block,
+                                    &LowerValue::Wasm {
+                                        value: raw,
+                                        kind: ValueKind::Integer,
+                                    },
+                                )?,
+                                WasmValType::I64 => self.box_value(
+                                    body,
+                                    block,
+                                    &LowerValue::Wasm {
+                                        value: raw,
+                                        kind: ValueKind::BigInt,
+                                    },
+                                )?,
+                                WasmValType::F32 => {
+                                    let number = body.add_op(
+                                        block,
+                                        Operator::F64PromoteF32,
+                                        &[raw],
+                                        &[Type::F64],
+                                    );
+                                    self.box_value(
+                                        body,
+                                        block,
+                                        &LowerValue::Wasm {
+                                            value: number,
+                                            kind: ValueKind::Number,
+                                        },
+                                    )?
+                                }
+                                WasmValType::F64 => self.box_value(
+                                    body,
+                                    block,
+                                    &LowerValue::Wasm {
+                                        value: raw,
+                                        kind: ValueKind::Number,
+                                    },
+                                )?,
+                                WasmValType::Ref(_) => self.box_value(
+                                    body,
+                                    block,
+                                    &LowerValue::Wasm {
+                                        value: raw,
+                                        kind: ValueKind::Reference,
+                                    },
+                                )?,
+                                WasmValType::V128 => {
+                                    return Err(ConvertError::invalid(format!(
+                                        "Wasm module export {path:?}.{index} is a v128 global; \
+                                         SIMD has no JS representation (portal-co/jsaw#7)"
+                                    )));
+                                }
+                            };
+                            return Ok(vec![(
+                                block,
+                                LowerValue::Wasm {
+                                    value: boxed,
+                                    kind: ValueKind::Reference,
+                                },
+                            )]);
                         }
                         ImportTarget::Intrinsic { module, name } => {
                             // The SSA builder materializes the callee's

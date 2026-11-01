@@ -470,6 +470,18 @@ pub(crate) enum ImportTarget<'a> {
         /// Module-set key of the `.wasm` member.
         path: String,
     },
+    /// A global export of a late-bound `.wasm` member, read live from the
+    /// default instance's field (portal-co/jsaw#10). Read-only: import
+    /// bindings are never assigned in ES modules.
+    WasmGlobal {
+        /// Module-set key of the `.wasm` member.
+        path: String,
+        /// Member-local global index (== instance field index, globals
+        /// come first in the instance layout).
+        index: u32,
+        /// The global's value type.
+        ty: crate::wasm_esm::WasmValType,
+    },
 }
 
 /// Build one module's import table: every referenced imported binding →
@@ -643,10 +655,29 @@ pub(crate) fn build_import_table<'a>(
                      from {specifier:?})"
                 ))
             })?;
+            let export = export.clone();
+            if let crate::wasm_esm::WasmExport::Global { index, ty } = export {
+                if plan.instance.is_none() {
+                    return Err(ConvertError::invalid(format!(
+                        "Wasm module export {target_path:?}.{name:?} is a global of a static \
+                         member (tables/indirect calls); global reads need the late-bound \
+                         instance form (portal-co/jsaw#10)"
+                    )));
+                }
+                table.insert(
+                    id,
+                    ImportTarget::WasmGlobal {
+                        path: target_path.to_owned(),
+                        index,
+                        ty,
+                    },
+                );
+                continue;
+            }
             let crate::wasm_esm::WasmExport::Func { signature, .. } = export else {
                 return Err(ConvertError::invalid(format!(
-                    "Wasm module export {target_path:?}.{name:?} is not a function; importing \
-                     memories, globals, tables, or tags as JavaScript values is not supported \
+                    "Wasm module export {target_path:?}.{name:?} is not a function or global; \
+                     importing memories, tables, or tags as JavaScript values is not supported \
                      yet (portal-co/jsaw#10)"
                 )));
             };

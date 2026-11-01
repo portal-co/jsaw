@@ -241,7 +241,9 @@ pub(crate) enum WasmExport {
         signature: WasmFuncSignature,
     },
     Memory,
-    Global,
+    /// A global export, read live as a JS value (portal-co/jsaw#10):
+    /// `index` is the member-local global index, `ty` its value type.
+    Global { index: u32, ty: WasmValType },
     Table,
     Tag,
 }
@@ -354,6 +356,7 @@ pub(crate) fn parse_wasm_module(
     // export section references the combined function index space.
     let mut imported_func_types: Vec<u32> = Vec::new();
     let mut defined_func_types: Vec<u32> = Vec::new();
+    let mut global_types: Vec<WasmValType> = Vec::new();
     for payload in Parser::new(0).parse_all(bytes) {
         let payload = payload.map_err(|error| {
             ConvertError::invalid(format!("Wasm module {path:?} could not be parsed: {error}"))
@@ -505,7 +508,20 @@ pub(crate) fn parse_wasm_module(
                             }
                         }
                         ExternalKind::Memory => WasmExport::Memory,
-                        ExternalKind::Global => WasmExport::Global,
+                        ExternalKind::Global => {
+                            let gty = global_types.get(export.index as usize).copied()
+                                .ok_or_else(|| {
+                                    ConvertError::invalid(format!(
+                                        "Wasm module {path:?} export {:?} references an unknown \
+                                         global index {}",
+                                        export.name, export.index
+                                    ))
+                                })?;
+                            WasmExport::Global {
+                                index: export.index,
+                                ty: gty,
+                            }
+                        }
                         ExternalKind::Table => WasmExport::Table,
                         ExternalKind::Tag => WasmExport::Tag,
                     };
@@ -515,6 +531,16 @@ pub(crate) fn parse_wasm_module(
                             export.name
                         )));
                     }
+                }
+            }
+            Payload::GlobalSection(reader) => {
+                for global in reader {
+                    let global = global.map_err(|error| {
+                        ConvertError::invalid(format!(
+                            "Wasm module {path:?} has an unreadable global section: {error}"
+                        ))
+                    })?;
+                    global_types.push(WasmValType::from_wasmparser(global.ty.content_type));
                 }
             }
             Payload::DataSection(reader) => {

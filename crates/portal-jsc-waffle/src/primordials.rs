@@ -249,6 +249,40 @@ fn ensure_module_init(&mut self) -> Result<Func, ConvertError> {
             block = normal;
         }
     }
+    // Instantiate every late-bound Wasm member's default instance and
+    // store it on the context (portal-co/jsaw#6); adapters read it back
+    // via `wasm_default_instance`.
+    for (path, instantiate) in self.wasm_member_instantiate.clone() {
+        let inst_sig = self.wasm_member_instance_ty[&path];
+        let inst_ref = Type::Heap(WithNullable {
+            value: HeapType::Sig {
+                sig_index: inst_sig,
+            },
+            nullable: false,
+        });
+        let instance = body.add_op(
+            block,
+            Operator::Call {
+                function_index: instantiate,
+            },
+            &[],
+            &[inst_ref],
+        );
+        let boxed = self.box_value(
+            &mut body,
+            block,
+            &LowerValue::Wasm {
+                value: instance,
+                kind: ValueKind::Reference,
+            },
+        )?;
+        let key = format!("__wasm_inst_{path}");
+        let blocks = self.set_property(&mut body, block, context, &key, &LowerValue::Wasm {
+            value: boxed,
+            kind: ValueKind::Reference,
+        })?;
+        block = *blocks.last().expect("set_property yields a continuation");
+    }
     body.set_terminator(
         block,
         Terminator::Return {

@@ -570,6 +570,29 @@ rule cited has a named test.
 | Backends | WasmGC encode validates per profile; CoreGC scalar-only acceptance and GC rejection; nano_mvp MVP acceptance; mobile audit rejects each profile loudly. |
 | Regression | All existing e2e/coregc-cross suites unchanged; no `wasm:`/`~ffi` behavior change; artifacts without Wasm members are byte-identical to before. |
 
+## 7b. Late binding: GC-native instances (portal-co/jsaw#6)
+
+Implemented after Phase 7 (superseding parts of §5.1 for eligible members):
+members without tables, `ref.func`, or indirect/reference calls are
+converted at ingestion to a GC-native instance form — globals become
+instance struct fields, each linear memory becomes a GC `(array (mut i8))`
+field (loads/stores lower to little-endian byte assembly with i64
+effective-address bounds traps; `memory.size`/`grow` map to array length
+and realloc-copy), and every member function gains a trailing instance
+parameter. A synthesized `__instantiate` allocates the struct and applies
+data segments as byte stores. The default instance is created by
+`ensure_module_init` and stored as a context property
+(`__wasm_inst_<path>`); adapters and raw re-export wrappers thread it.
+
+Multi-instance: `import { instantiate } from "~wasm"` returns a fresh
+instance as a JS object of instance-bound functions (arrow-captured
+`this`). Members with tables/indirect calls keep the static merge.
+
+Consequences: member memories never appear as linear memories in any
+artifact (the §5.5 multi-memory/memory64 manifest flags now describe only
+static-path members); memory-bearing members now lower through CoreGC,
+nano_mvp, and the mobile audit as ordinary GC array code.
+
 ## 8. Open questions
 
 - **Namespace objects** (`import * as m from "./m.wasm"`): worth a frozen

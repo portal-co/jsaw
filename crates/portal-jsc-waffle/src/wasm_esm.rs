@@ -255,6 +255,10 @@ pub(crate) struct WasmModulePlan {
     pub(crate) module: Module<'static>,
     pub(crate) exports: BTreeMap<String, WasmExport>,
     pub(crate) imports: Vec<WasmImport>,
+    /// Late binding (portal-co/jsaw#6): when the member was converted to
+    /// its GC-native instance form, the layout. `None` means the static
+    /// single-instance merge path (members with tables/indirect calls).
+    pub(crate) instance: Option<InstanceLayout>,
 }
 
 /// A statically resolved import of a Wasm member's function export.
@@ -278,6 +282,19 @@ pub(crate) fn parse_wasm_module(
     bytes: &[u8],
     ceiling: WasmProfile,
 ) -> Result<WasmModulePlan, ConvertError> {
+    // Component binaries share the `\0asm` magic but carry a layer field in
+    // the version word (low 16 bits: 0 = core module, 1 = component). Name
+    // the Component Model non-goal rather than surfacing a bare validation
+    // error (portal-co/jsaw#5).
+    if bytes.len() >= 8 && &bytes[0..4] == b"\0asm" {
+        let layer = u16::from_le_bytes([bytes[6], bytes[7]]);
+        if layer != 0 {
+            return Err(ConvertError::invalid(format!(
+                "Wasm member {path:?} is a Component Model binary (layer {layer}), not a core \
+                 module; component ingestion is deferred (portal-co/jsaw#5)"
+            )));
+        }
+    }
     // Determine the exact profile requirement: validate against each
     // profile from the lowest up; the first that accepts the module is its
     // requirement. Validating at the ceiling alone would accept but not
@@ -576,7 +593,14 @@ pub(crate) fn parse_wasm_module(
             }
         }
     }
-    let module = strip_to_static(path, module)?;
+    let mut module = strip_to_static(path, module)?;
+
+    // Late binding: convert eligible members to GC-native instance form.
+    let instance = if eligible_for_late_binding(&module) {
+        Some(instancify(path, &mut module)?)
+    } else {
+        None
+    };
 
     Ok(WasmModulePlan {
         path: path.to_string(),
@@ -584,6 +608,7 @@ pub(crate) fn parse_wasm_module(
         module,
         exports,
         imports,
+        instance,
     })
 }
 
@@ -762,6 +787,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn component_binaries_get_a_named_diagnostic() {
+        // Component Model header: \0asm, version 0x0d, layer 1.
+        let bytes = b"\0asm\x0d\x00\x01\x00";
+        let error = parse_wasm_module("comp.wasm", bytes, WasmProfile::Mvp)
+            .expect_err("components are not core modules");
+        assert!(error.message.contains("Component Model"), "{error}");
+        assert!(error.message.contains("jsaw#5"), "{error}");
+        // A core module header (layer 0) still parses normally.
+        parse_wasm_module("math.wasm", &add_module(), WasmProfile::Mvp)
+            .expect("core modules are unaffected");
+    }
+
+    #[test]
     fn rejects_corrupt_bytes() {
         let error = parse_wasm_module("bad.wasm", b"\0asm\x01\0\0", WasmProfile::Mvp)
             .expect_err("truncated bytes must be rejected");
@@ -926,4 +964,1087 @@ pub(crate) mod tests {
             .expect("the gc ceiling should accept a GC type section");
         assert_eq!(plan.profile, WasmProfile::Gc);
     }
+}
+
+// ---------------------------------------------------------------------
+// Late binding: GC-native instance representation (portal-co/jsaw#6).
+//
+// A Wasm member without tables, `ref.func`, or indirect/reference calls is
+// converted to a GC-native instance form: its globals become fields of an
+// instance struct, each linear memory becomes a GC `(array (mut i8))`
+// field, and every member function gains a trailing instance parameter.
+// Instantiation is a synthesised function that allocates the struct and
+// applies data segments as byte stores, so member state is late-bound
+// (created at module init, or per `~wasm` `instantiate`) and multiple
+// instances have disjoint state. Ineligible members keep the static merge
+// path with exactly one implicit instance (today's behavior).
+
+use portal_pc_waffle::{
+    Block, BlockTarget, EntityRef, EntityVec, Func, FunctionBody, HeapType, Memory,
+    MemoryArg, Operator, Signature, SignatureData, StorageType, Terminator, Type, Value,
+    ValueDef, WithMutablility, WithNullable,
+};
+
+/// Layout of a late-bound member's instance representation.
+#[derive(Clone, Debug)]
+pub(crate) struct InstanceLayout {
+    /// Member-local type index of the instance struct.
+    pub(crate) ty: u32,
+    /// Member-local func index of the synthesised instantiation function,
+    /// `() -> (ref inst)`.
+    pub(crate) instantiate: u32,
+}
+
+/// A member ineligible for late binding keeps the static single-instance
+/// merge. Tables, `ref.func`, and call_ref/call_indirect signatures change
+/// under the instance transform, so those members fail over to static.
+fn eligible_for_late_binding(module: &Module<'_>) -> bool {
+    if module.tables.len() != 0 {
+        return false;
+    }
+    for (_, decl) in module.funcs.entries() {
+        let FuncDecl::Body(_, _, body) = decl else {
+            continue;
+        };
+        for (_value, def) in body.values.entries() {
+            if let ValueDef::Operator(op, _, _) = def
+                && matches!(
+                    op,
+                    Operator::RefFunc { .. }
+                        | Operator::CallRef { .. }
+                        | Operator::CallIndirect { .. }
+                ) {
+                    return false;
+                }
+        }
+        for (_block, def) in body.blocks.entries() {
+            if matches!(
+                &def.terminator.terminator,
+                Terminator::ReturnCall { .. }
+                    | Terminator::ReturnCallIndirect { .. }
+                    | Terminator::ReturnCallRef { .. }
+            ) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Everything the body transform needs to resolve member state.
+#[derive(Clone)]
+struct InstanceCtx {
+    inst_ty: Signature,
+    inst_ref_null: Type,
+    i8_array: Signature,
+    /// Member global index → instance field index.
+    global_field: Vec<usize>,
+    /// Member memory index → instance field index.
+    memory_field: Vec<usize>,
+    /// Per memory: (memory64, max bytes).
+    memory_limits: Vec<(bool, u64)>,
+    /// Calls to indices below this are host imports: no instance argument.
+    import_count: usize,
+    inst_value: Value,
+}
+
+impl InstanceCtx {
+    fn memory_field(&self, memory: Memory) -> usize {
+        self.memory_field[memory.index()]
+    }
+}
+
+/// Convert a member module to its GC-native instance form. Returns the
+/// layout; the module is rewritten in place (globals and memories are
+/// emptied — they live in instances now).
+fn instancify(path: &str, module: &mut Module<'static>) -> Result<InstanceLayout, ConvertError> {
+    let i8_array = module.signatures.push(SignatureData::Array {
+        ty: WithMutablility {
+            value: StorageType::I8,
+            mutable: true,
+        },
+        shared: false,
+    });
+    let i8_array_null = Type::Heap(WithNullable {
+        value: HeapType::Sig {
+            sig_index: i8_array,
+        },
+        nullable: true,
+    });
+    let mut fields: Vec<WithMutablility<StorageType>> = vec![];
+    let mut global_field = vec![];
+    for global in module.globals.values() {
+        global_field.push(fields.len());
+        fields.push(WithMutablility {
+            value: StorageType::Val(global.ty),
+            mutable: global.mutable,
+        });
+    }
+    let mut memory_field = vec![];
+    let mut memory_limits = vec![];
+    for memory in module.memories.values() {
+        memory_field.push(fields.len());
+        fields.push(WithMutablility {
+            value: StorageType::Val(i8_array_null),
+            mutable: true,
+        });
+        let max_pages = memory.maximum_pages.unwrap_or(if memory.memory64 {
+            1 << 48
+        } else {
+            65536
+        }) as u64;
+        memory_limits.push((memory.memory64, max_pages.saturating_mul(65536)));
+    }
+    let inst_ty = module.signatures.push(SignatureData::Struct {
+        fields,
+        shared: false,
+    });
+    let inst_ref = Type::Heap(WithNullable {
+        value: HeapType::Sig {
+            sig_index: inst_ty,
+        },
+        nullable: false,
+    });
+    let inst_ref_null = Type::Heap(WithNullable {
+        value: HeapType::Sig {
+            sig_index: inst_ty,
+        },
+        nullable: true,
+    });
+    let import_count = module
+        .funcs
+        .values()
+        .take_while(|decl| matches!(decl, FuncDecl::Import(..)))
+        .count();
+
+    // Every defined member function gains a trailing instance parameter.
+    let func_ids: Vec<Func> = module.funcs.entries().map(|(f, _)| f).collect();
+    let mut rewrites: Vec<(Func, Signature)> = vec![];
+    for func in &func_ids {
+        let FuncDecl::Body(sig, _, _) = &module.funcs[*func] else {
+            continue;
+        };
+        let SignatureData::Func {
+            params, returns, ..
+        } = &module.signatures[*sig]
+        else {
+            return Err(ConvertError::invalid(format!(
+                "Wasm module {path:?} function has a non-function signature"
+            )));
+        };
+        let mut params = params.clone();
+        params.push(inst_ref_null);
+        let new_sig = module.signatures.push(SignatureData::Func {
+            params,
+            returns: returns.clone(),
+            shared: false,
+        });
+        rewrites.push((*func, new_sig));
+    }
+    for (func, new_sig) in rewrites.drain(..) {
+        let decl = std::mem::replace(&mut module.funcs[func], FuncDecl::None(PhantomData));
+        let FuncDecl::Body(_, name, body) = decl else {
+            unreachable!("filtered above");
+        };
+        let ctx = InstanceCtx {
+            inst_ty,
+            inst_ref_null,
+            i8_array,
+            global_field: global_field.clone(),
+            memory_field: memory_field.clone(),
+            memory_limits: memory_limits.clone(),
+            import_count,
+            inst_value: Value::invalid(),
+        };
+        let (new_body, _) = instancify_body(path, module, &body, new_sig, &ctx)?;
+        module.funcs[func] = FuncDecl::Body(new_sig, name, new_body);
+    }
+
+    // The instantiation function: allocate the struct, initialise globals
+    // from their constant inits, allocate memory arrays, apply data
+    // segments as byte stores.
+    let instantiate_sig = module.signatures.push(SignatureData::Func {
+        params: vec![],
+        returns: vec![inst_ref],
+        shared: false,
+    });
+    let global_inits: Vec<(Type, Option<u64>)> = module
+        .globals
+        .values()
+        .map(|global| (global.ty, global.value))
+        .collect();
+    let memory_inits: Vec<(u64, Vec<(usize, Vec<u8>)>)> = module
+        .memories
+        .values()
+        .map(|memory| {
+            (
+                memory.initial_pages as u64 * 65536,
+                memory
+                    .segments
+                    .iter()
+                    .map(|segment| (segment.offset, segment.data.clone()))
+                    .collect(),
+            )
+        })
+        .collect();
+    let mut body = FunctionBody::new(module, instantiate_sig);
+    let block = body.entry;
+    let mut field_values = vec![];
+    for (ty, init) in global_inits {
+        field_values.push(match ty {
+            Type::I32 => body.add_op(
+                block,
+                Operator::I32Const {
+                    value: init.unwrap_or(0) as u32,
+                },
+                &[],
+                &[Type::I32],
+            ),
+            Type::I64 => body.add_op(
+                block,
+                Operator::I64Const {
+                    value: init.unwrap_or(0),
+                },
+                &[],
+                &[Type::I64],
+            ),
+            Type::F32 => body.add_op(
+                block,
+                Operator::F32Const {
+                    value: init.unwrap_or(0) as u32,
+                },
+                &[],
+                &[Type::F32],
+            ),
+            Type::F64 => body.add_op(
+                block,
+                Operator::F64Const {
+                    value: init.unwrap_or(0),
+                },
+                &[],
+                &[Type::F64],
+            ),
+            Type::Heap(heap) => body.add_op(
+                block,
+                Operator::RefNull { ty: Type::Heap(heap) },
+                &[],
+                &[Type::Heap(heap)],
+            ),
+            other => {
+                return Err(ConvertError::invalid(format!(
+                    "Wasm module {path:?} has a global of type {other:?} that cannot be                      initialised in an instance"
+                )));
+            }
+        });
+    }
+    for (initial_bytes, segments) in &memory_inits {
+        if *initial_bytes > i32::MAX as u64 {
+            return Err(ConvertError::invalid(format!(
+                "Wasm module {path:?} memory is too large for the GC-native representation                  ({initial_bytes} bytes > i32::MAX)"
+            )));
+        }
+        let len = body.add_op(
+            block,
+            Operator::I32Const {
+                value: *initial_bytes as u32,
+            },
+            &[],
+            &[Type::I32],
+        );
+        let array = body.add_op(
+            block,
+            Operator::ArrayNewDefault { sig: i8_array },
+            &[len],
+            &[Type::Heap(WithNullable {
+                value: HeapType::Sig {
+                    sig_index: i8_array,
+                },
+                nullable: false,
+            })],
+        );
+        for (offset, data) in segments {
+            for (index, byte) in data.iter().enumerate() {
+                let address = body.add_op(
+                    block,
+                    Operator::I32Const {
+                        value: (offset + index) as u32,
+                    },
+                    &[],
+                    &[Type::I32],
+                );
+                let value = body.add_op(
+                    block,
+                    Operator::I32Const {
+                        value: *byte as u32,
+                    },
+                    &[],
+                    &[Type::I32],
+                );
+                body.add_op(
+                    block,
+                    Operator::ArraySet { sig: i8_array },
+                    &[array, address, value],
+                    &[],
+                );
+            }
+        }
+        field_values.push(array);
+    }
+    let instance = body.add_op(
+        block,
+        Operator::StructNew { sig: inst_ty },
+        &field_values,
+        &[inst_ref],
+    );
+    body.set_terminator(block, Terminator::Return {
+        values: vec![instance],
+    });
+    let instantiate = module.funcs.push(FuncDecl::Body(
+        instantiate_sig,
+        format!("{path}:__instantiate"),
+        body,
+    ));
+
+    // Globals and memories live in instances now.
+    module.memories = EntityVec::default();
+    module.globals = EntityVec::default();
+
+    Ok(InstanceLayout {
+        ty: inst_ty.index() as u32,
+        instantiate: instantiate.index() as u32,
+    })
+}
+
+/// Rewrite one member body as a fresh function: global accesses become
+/// instance field accesses, memory ops become byte-wise GC array accesses,
+/// and internal calls thread the instance. The instance parameter is the
+/// trailing parameter. A full rebuild (rather than in-place edits) keeps
+/// CFG succ/pred bookkeeping trivially consistent across trap splits.
+fn instancify_body(
+    _path: &str,
+    module: &Module<'static>,
+    old: &FunctionBody,
+    new_sig: Signature,
+    ctx: &InstanceCtx,
+) -> Result<(FunctionBody, Value), ConvertError> {
+    let mut body = FunctionBody::new(module, new_sig);
+    let mut values: std::collections::HashMap<Value, Value> = std::collections::HashMap::new();
+    let mut block_map: std::collections::HashMap<Block, Block> = std::collections::HashMap::new();
+
+    // Entry block params: the original params, then the instance.
+    let new_entry: Vec<Value> = body.blocks[body.entry]
+        .params
+        .iter()
+        .map(|(_, value)| *value)
+        .collect();
+    let inst_value = new_entry[old.n_params];
+    for (index, (_, old_value)) in old.blocks[old.entry].params.iter().enumerate() {
+        values.insert(*old_value, new_entry[index]);
+    }
+    block_map.insert(old.entry, body.entry);
+    let ctx = InstanceCtx {
+        inst_value,
+        ..ctx.clone()
+    };
+
+    // Create the remaining blocks and their params.
+    for (b, def) in old.blocks.entries() {
+        if b == old.entry {
+            continue;
+        }
+        let nb = body.add_block();
+        block_map.insert(b, nb);
+        for (ty, old_value) in &def.params {
+            let nv = body.add_blockparam(nb, *ty);
+            values.insert(*old_value, nv);
+        }
+    }
+
+    // Fill each block.
+    for (b, def) in old.blocks.entries() {
+        let mut cur = block_map[&b];
+        for record in &def.insts {
+            let v = record.value;
+            match &old.values[v] {
+                ValueDef::BlockParam(..) | ValueDef::None | ValueDef::Placeholder(_) => {}
+                ValueDef::PickOutput(from, index, ty) => {
+                    let nv = body.add_value(ValueDef::PickOutput(values[from], *index, *ty));
+                    body.append_to_block(cur, nv);
+                    values.insert(v, nv);
+                }
+                ValueDef::Alias(to) => {
+                    values.insert(v, values[to]);
+                }
+                ValueDef::Operator(op, args, tys) => {
+                    let arg_vec: Vec<Value> = old.arg_pool[*args]
+                        .iter()
+                        .map(|a| values[a])
+                        .collect();
+                    let ty_vec: Vec<Type> = old.type_pool[*tys].to_vec();
+                    match op {
+                        Operator::GlobalGet { global_index } => {
+                            let nv = body.add_op(
+                                cur,
+                                Operator::StructGet {
+                                    sig: ctx.inst_ty,
+                                    idx: ctx.global_field[global_index.index()],
+                                },
+                                &[ctx.inst_value],
+                                &ty_vec,
+                            );
+                            values.insert(v, nv);
+                        }
+                        Operator::GlobalSet { global_index } => {
+                            let nv = body.add_op(
+                                cur,
+                                Operator::StructSet {
+                                    sig: ctx.inst_ty,
+                                    idx: ctx.global_field[global_index.index()],
+                                },
+                                &[ctx.inst_value, arg_vec[0]],
+                                &[],
+                            );
+                            values.insert(v, nv);
+                        }
+                        Operator::Call { function_index } => {
+                            let mut a = arg_vec.clone();
+                            if function_index.index() >= ctx.import_count {
+                                a.push(ctx.inst_value);
+                            }
+                            let nv = body.add_op(
+                                cur,
+                                Operator::Call {
+                                    function_index: *function_index,
+                                },
+                                &a,
+                                &ty_vec,
+                            );
+                            values.insert(v, nv);
+                        }
+                        op if memory_load(op).is_some() => {
+                            let (width, signed, result_ty) = memory_load(op).expect("matched");
+                            let memarg = match op {
+                                Operator::I32Load { memory }
+                                | Operator::I64Load { memory }
+                                | Operator::F32Load { memory }
+                                | Operator::F64Load { memory }
+                                | Operator::I32Load8S { memory }
+                                | Operator::I32Load8U { memory }
+                                | Operator::I32Load16S { memory }
+                                | Operator::I32Load16U { memory }
+                                | Operator::I64Load8S { memory }
+                                | Operator::I64Load8U { memory }
+                                | Operator::I64Load16S { memory }
+                                | Operator::I64Load16U { memory }
+                                | Operator::I64Load32S { memory }
+                                | Operator::I64Load32U { memory } => *memory,
+                                _ => unreachable!(),
+                            };
+                            let (nb, nv) = expand_memory_load(
+                                &mut body, cur, arg_vec[0], memarg, width, signed,
+                                result_ty, &ctx,
+                            )?;
+                            cur = nb;
+                            values.insert(v, nv);
+                        }
+                        op if memory_store(op).is_some() => {
+                            let (width, value_ty) = memory_store(op).expect("matched");
+                            let memarg = match op {
+                                Operator::I32Store { memory }
+                                | Operator::I64Store { memory }
+                                | Operator::F32Store { memory }
+                                | Operator::F64Store { memory }
+                                | Operator::I32Store8 { memory }
+                                | Operator::I32Store16 { memory }
+                                | Operator::I64Store8 { memory }
+                                | Operator::I64Store16 { memory }
+                                | Operator::I64Store32 { memory } => *memory,
+                                _ => unreachable!(),
+                            };
+                            cur = expand_memory_store(
+                                &mut body, cur, arg_vec[0], arg_vec[1], memarg, width, value_ty,
+                                &ctx,
+                            );
+                            // Stores produce no result; nothing to map.
+                        }
+                        Operator::MemorySize { mem } => {
+                            let nv = expand_memory_size(&mut body, cur, *mem, &ctx);
+                            values.insert(v, nv);
+                        }
+                        Operator::MemoryGrow { mem } => {
+                            let (nb, nv) =
+                                expand_memory_grow(&mut body, cur, arg_vec[0], *mem, &ctx)?;
+                            cur = nb;
+                            values.insert(v, nv);
+                        }
+                        _ => {
+                            let nv = body.add_op(cur, *op, &arg_vec, &ty_vec);
+                            values.insert(v, nv);
+                        }
+                    }
+                }
+            }
+        }
+        let terminator = map_terminator(&def.terminator.terminator, &values, &block_map);
+        body.set_terminator(cur, terminator);
+    }
+    Ok((body, inst_value))
+}
+
+/// Map a terminator's block targets and values into the rebuilt body.
+fn map_terminator(
+    term: &Terminator,
+    values: &std::collections::HashMap<Value, Value>,
+    block_map: &std::collections::HashMap<Block, Block>,
+) -> Terminator {
+    let target = |t: &BlockTarget| BlockTarget {
+        block: block_map[&t.block],
+        args: t.args.iter().map(|a| values[a]).collect(),
+    };
+    match term {
+        Terminator::Br { target: t } => Terminator::Br { target: target(t) },
+        Terminator::CondBr {
+            cond,
+            if_true,
+            if_false,
+        } => Terminator::CondBr {
+            cond: values[cond],
+            if_true: target(if_true),
+            if_false: target(if_false),
+        },
+        Terminator::Select {
+            value,
+            targets,
+            default,
+        } => Terminator::Select {
+            value: values[value],
+            targets: targets.iter().map(&target).collect(),
+            default: target(default),
+        },
+        Terminator::Return { values: vals } => Terminator::Return {
+            values: vals.iter().map(|v| values[v]).collect(),
+        },
+        // Rejected by the eligibility check.
+        Terminator::ReturnCall { .. }
+        | Terminator::ReturnCallIndirect { .. }
+        | Terminator::ReturnCallRef { .. } => {
+            unreachable!("tail/reference calls are ineligible for late binding")
+        }
+        Terminator::Unreachable => Terminator::Unreachable,
+        Terminator::UB => Terminator::UB,
+        Terminator::None => Terminator::None,
+        _ => unreachable!("non-exhaustive terminator"),
+    }
+}
+/// Load/store op metadata: (access width in bytes, sign extension, value
+/// type).
+fn memory_load(op: &Operator) -> Option<(u32, Option<bool>, Type)> {
+    use Operator as O;
+    Some(match op {
+        O::I32Load { .. } => (4, None, Type::I32),
+        O::I64Load { .. } => (8, None, Type::I64),
+        O::F32Load { .. } => (4, None, Type::F32),
+        O::F64Load { .. } => (8, None, Type::F64),
+        O::I32Load8S { .. } => (1, Some(true), Type::I32),
+        O::I32Load8U { .. } => (1, Some(false), Type::I32),
+        O::I32Load16S { .. } => (2, Some(true), Type::I32),
+        O::I32Load16U { .. } => (2, Some(false), Type::I32),
+        O::I64Load8S { .. } => (1, Some(true), Type::I64),
+        O::I64Load8U { .. } => (1, Some(false), Type::I64),
+        O::I64Load16S { .. } => (2, Some(true), Type::I64),
+        O::I64Load16U { .. } => (2, Some(false), Type::I64),
+        O::I64Load32S { .. } => (4, Some(true), Type::I64),
+        O::I64Load32U { .. } => (4, Some(false), Type::I64),
+        _ => return None,
+    })
+}
+
+/// Store op metadata: (access width in bytes, value type).
+fn memory_store(op: &Operator) -> Option<(u32, Type)> {
+    use Operator as O;
+    Some(match op {
+        O::I32Store { .. } => (4, Type::I32),
+        O::I64Store { .. } => (8, Type::I64),
+        O::F32Store { .. } => (4, Type::F32),
+        O::F64Store { .. } => (8, Type::F64),
+        O::I32Store8 { .. } => (1, Type::I32),
+        O::I32Store16 { .. } => (2, Type::I32),
+        O::I64Store8 { .. } => (1, Type::I64),
+        O::I64Store16 { .. } => (2, Type::I64),
+        O::I64Store32 { .. } => (4, Type::I64),
+        _ => return None,
+    })
+}
+
+/// The instance's byte array for `memory`.
+fn instance_memory_array(
+    body: &mut FunctionBody,
+    block: Block,
+    memory: Memory,
+    ctx: &InstanceCtx,
+) -> Value {
+    body.add_op(
+        block,
+        Operator::StructGet {
+            sig: ctx.inst_ty,
+            idx: ctx.memory_field(memory),
+        },
+        &[ctx.inst_value],
+        &[Type::Heap(WithNullable {
+            value: HeapType::Sig {
+                sig_index: ctx.i8_array,
+            },
+            nullable: true,
+        })],
+    )
+}
+
+/// Effective address (i64) = address + immediate offset, plus a bounds
+/// check that traps out of bounds (splitting the block). Returns the
+/// continuation block and the i64 effective address.
+fn effective_address(
+    body: &mut FunctionBody,
+    block: Block,
+    addr: Value,
+    memarg: &MemoryArg,
+    width: u32,
+    array: Value,
+    memory64: bool,
+) -> (Block, Value) {
+    let wide_addr = if memory64 {
+        addr
+    } else {
+        body.add_op(block, Operator::I64ExtendI32U, &[addr], &[Type::I64])
+    };
+    let offset = body.add_op(
+        block,
+        Operator::I64Const { value: memarg.offset },
+        &[],
+        &[Type::I64],
+    );
+    let ea = body.add_op(block, Operator::I64Add, &[wide_addr, offset], &[Type::I64]);
+    let width_value = body.add_op(
+        block,
+        Operator::I64Const {
+            value: width as u64,
+        },
+        &[],
+        &[Type::I64],
+    );
+    let limit = body.add_op(block, Operator::I64Add, &[ea, width_value], &[Type::I64]);
+    let len = body.add_op(block, Operator::ArrayLen, &[array], &[Type::I32]);
+    let wide_len = body.add_op(block, Operator::I64ExtendI32U, &[len], &[Type::I64]);
+    let out_of_bounds = body.add_op(block, Operator::I64GtU, &[limit, wide_len], &[Type::I32]);
+    let trap = body.add_block();
+    let cont = body.add_block();
+    body.set_terminator(
+        block,
+        Terminator::CondBr {
+            cond: out_of_bounds,
+            if_true: BlockTarget {
+                block: trap,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: cont,
+                args: vec![],
+            },
+        },
+    );
+    body.set_terminator(trap, Terminator::Unreachable);
+    (cont, ea)
+}
+
+/// One byte read from the instance memory array at `ea + index`.
+fn read_byte(
+    body: &mut FunctionBody,
+    block: Block,
+    array: Value,
+    ea: Value,
+    index: u32,
+    ctx: &InstanceCtx,
+) -> Value {
+    let address = if index == 0 {
+        body.add_op(block, Operator::I32WrapI64, &[ea], &[Type::I32])
+    } else {
+        let offset = body.add_op(
+            block,
+            Operator::I64Const {
+                value: index as u64,
+            },
+            &[],
+            &[Type::I64],
+        );
+        let wide = body.add_op(block, Operator::I64Add, &[ea, offset], &[Type::I64]);
+        body.add_op(block, Operator::I32WrapI64, &[wide], &[Type::I32])
+    };
+    body.add_op(
+        block,
+        Operator::ArrayGetU {
+            sig: ctx.i8_array,
+        },
+        &[array, address],
+        &[Type::I32],
+    )
+}
+
+/// Assemble bytes little-endian into an i32.
+fn assemble_i32(body: &mut FunctionBody, block: Block, bytes: &[Value]) -> Value {
+    let mut acc = bytes[0];
+    for (i, byte) in bytes.iter().enumerate().skip(1) {
+        let shift = body.add_op(
+            block,
+            Operator::I32Const {
+                value: (i * 8) as u32,
+            },
+            &[],
+            &[Type::I32],
+        );
+        let shifted = body.add_op(block, Operator::I32Shl, &[*byte, shift], &[Type::I32]);
+        acc = body.add_op(block, Operator::I32Or, &[acc, shifted], &[Type::I32]);
+    }
+    acc
+}
+
+/// Assemble `bytes` little-endian into an i64.
+fn assemble_i64(body: &mut FunctionBody, block: Block, bytes: &[Value]) -> Value {
+    let mut acc: Option<Value> = None;
+    for (i, byte) in bytes.iter().enumerate() {
+        let wide = body.add_op(block, Operator::I64ExtendI32U, &[*byte], &[Type::I64]);
+        let shifted = if i == 0 {
+            wide
+        } else {
+            let shift = body.add_op(
+                block,
+                Operator::I64Const {
+                    value: (i * 8) as u64,
+                },
+                &[],
+                &[Type::I64],
+            );
+            body.add_op(block, Operator::I64Shl, &[wide, shift], &[Type::I64])
+        };
+        acc = Some(match acc {
+            None => shifted,
+            Some(acc) => body.add_op(block, Operator::I64Or, &[acc, shifted], &[Type::I64]),
+        });
+    }
+    acc.expect("at least one byte")
+}
+
+/// Sign-extend an i32 of `width` bytes to full width.
+fn sign_extend_i32(body: &mut FunctionBody, block: Block, value: Value, width: u32) -> Value {
+    let shift = body.add_op(
+        block,
+        Operator::I32Const {
+            value: (32 - width * 8),
+        },
+        &[],
+        &[Type::I32],
+    );
+    let shifted = body.add_op(block, Operator::I32Shl, &[value, shift], &[Type::I32]);
+    body.add_op(block, Operator::I32ShrS, &[shifted, shift], &[Type::I32])
+}
+
+/// Sign-extend an i64 of `width` bytes to full width.
+fn sign_extend_i64(body: &mut FunctionBody, block: Block, value: Value, width: u32) -> Value {
+    let shift = body.add_op(
+        block,
+        Operator::I64Const {
+            value: (64 - width * 8) as u64,
+        },
+        &[],
+        &[Type::I64],
+    );
+    let shifted = body.add_op(block, Operator::I64Shl, &[value, shift], &[Type::I64]);
+    body.add_op(block, Operator::I64ShrS, &[shifted, shift], &[Type::I64])
+}
+
+/// Expand a memory load into instance-array byte reads (little-endian).
+/// Returns the continuation block (bounds-check split) and the result.
+fn expand_memory_load(
+    body: &mut FunctionBody,
+    block: Block,
+    addr: Value,
+    memarg: MemoryArg,
+    width: u32,
+    signed: Option<bool>,
+    result_ty: Type,
+    ctx: &InstanceCtx,
+) -> Result<(Block, Value), ConvertError> {
+    let memory64 = ctx.memory_limits[memarg.memory.index()].0;
+    let array = instance_memory_array(body, block, memarg.memory, ctx);
+    let (cur, ea) = effective_address(body, block, addr, &memarg, width, array, memory64);
+    let bytes: Vec<Value> = (0..width)
+        .map(|i| read_byte(body, cur, array, ea, i, ctx))
+        .collect();
+    let result = match (result_ty, signed) {
+        (Type::I32, None) | (Type::I32, Some(false)) => assemble_i32(body, cur, &bytes),
+        (Type::I32, Some(true)) => {
+            let raw = assemble_i32(body, cur, &bytes);
+            sign_extend_i32(body, cur, raw, width)
+        }
+        (Type::I64, None) | (Type::I64, Some(false)) => assemble_i64(body, cur, &bytes),
+        (Type::I64, Some(true)) => {
+            let raw = assemble_i64(body, cur, &bytes);
+            sign_extend_i64(body, cur, raw, width)
+        }
+        (Type::F32, None) => {
+            let raw = assemble_i32(body, cur, &bytes);
+            body.add_op(cur, Operator::F32ReinterpretI32, &[raw], &[Type::F32])
+        }
+        (Type::F64, None) => {
+            let raw = assemble_i64(body, cur, &bytes);
+            body.add_op(cur, Operator::F64ReinterpretI64, &[raw], &[Type::F64])
+        }
+        _ => unreachable!(),
+    };
+    Ok((cur, result))
+}
+
+/// Expand a memory store into instance-array byte writes (little-endian).
+/// Returns the continuation block.
+fn expand_memory_store(
+    body: &mut FunctionBody,
+    block: Block,
+    addr: Value,
+    stored: Value,
+    memarg: MemoryArg,
+    width: u32,
+    value_ty: Type,
+    ctx: &InstanceCtx,
+) -> Block {
+    let memory64 = ctx.memory_limits[memarg.memory.index()].0;
+    let array = instance_memory_array(body, block, memarg.memory, ctx);
+    let (cur, ea) = effective_address(body, block, addr, &memarg, width, array, memory64);
+    // Normalise the stored value to raw bits.
+    let bits = match value_ty {
+        Type::I32 | Type::I64 => stored,
+        Type::F32 => body.add_op(cur, Operator::I32ReinterpretF32, &[stored], &[Type::I32]),
+        Type::F64 => body.add_op(cur, Operator::I64ReinterpretF64, &[stored], &[Type::I64]),
+        _ => unreachable!(),
+    };
+    for i in 0..width {
+        let byte = if value_ty == Type::I32 {
+            let shifted = if i == 0 {
+                bits
+            } else {
+                let shift = body.add_op(
+                    cur,
+                    Operator::I32Const {
+                        value: (i * 8),
+                    },
+                    &[],
+                    &[Type::I32],
+                );
+                body.add_op(cur, Operator::I32ShrU, &[bits, shift], &[Type::I32])
+            };
+            let mask = body.add_op(cur, Operator::I32Const { value: 0xff }, &[], &[Type::I32]);
+            body.add_op(cur, Operator::I32And, &[shifted, mask], &[Type::I32])
+        } else {
+            let shifted = if i == 0 {
+                bits
+            } else {
+                let shift = body.add_op(
+                    cur,
+                    Operator::I64Const {
+                        value: (i * 8) as u64,
+                    },
+                    &[],
+                    &[Type::I64],
+                );
+                body.add_op(cur, Operator::I64ShrU, &[bits, shift], &[Type::I64])
+            };
+            let mask = body.add_op(cur, Operator::I64Const { value: 0xff }, &[], &[Type::I64]);
+            let masked = body.add_op(cur, Operator::I64And, &[shifted, mask], &[Type::I64]);
+            body.add_op(cur, Operator::I32WrapI64, &[masked], &[Type::I32])
+        };
+        write_byte(body, cur, array, ea, i, byte, ctx);
+    }
+    cur
+}
+
+/// One byte written to the instance memory array at `ea + index`.
+fn write_byte(
+    body: &mut FunctionBody,
+    block: Block,
+    array: Value,
+    ea: Value,
+    index: u32,
+    byte: Value,
+    ctx: &InstanceCtx,
+) {
+    let address = if index == 0 {
+        body.add_op(block, Operator::I32WrapI64, &[ea], &[Type::I32])
+    } else {
+        let offset = body.add_op(
+            block,
+            Operator::I64Const {
+                value: index as u64,
+            },
+            &[],
+            &[Type::I64],
+        );
+        let wide = body.add_op(block, Operator::I64Add, &[ea, offset], &[Type::I64]);
+        body.add_op(block, Operator::I32WrapI64, &[wide], &[Type::I32])
+    };
+    body.add_op(
+        block,
+        Operator::ArraySet {
+            sig: ctx.i8_array,
+        },
+        &[array, address, byte],
+        &[],
+    );
+}
+
+/// Expand `memory.size` against the instance array (current pages).
+fn expand_memory_size(
+    body: &mut FunctionBody,
+    block: Block,
+    memory: Memory,
+    ctx: &InstanceCtx,
+) -> Value {
+    let array = instance_memory_array(body, block, memory, ctx);
+    let len = body.add_op(block, Operator::ArrayLen, &[array], &[Type::I32]);
+    let shift = body.add_op(block, Operator::I32Const { value: 16 }, &[], &[Type::I32]);
+    let pages32 = body.add_op(block, Operator::I32ShrU, &[len, shift], &[Type::I32]);
+    if ctx.memory_limits[memory.index()].0 {
+        body.add_op(block, Operator::I64ExtendI32U, &[pages32], &[Type::I64])
+    } else {
+        pages32
+    }
+}
+
+/// Expand `memory.grow`: allocate a bigger array, copy, store back.
+/// Returns the continuation block and the previous size in pages (or -1).
+fn expand_memory_grow(
+    body: &mut FunctionBody,
+    block: Block,
+    delta: Value,
+    memory: Memory,
+    ctx: &InstanceCtx,
+) -> Result<(Block, Value), ConvertError> {
+    let (memory64, max_bytes) = ctx.memory_limits[memory.index()];
+    let array = instance_memory_array(body, block, memory, ctx);
+    let old_bytes = body.add_op(block, Operator::ArrayLen, &[array], &[Type::I32]);
+    let wide_old = body.add_op(block, Operator::I64ExtendI32U, &[old_bytes], &[Type::I64]);
+    let wide_delta = if memory64 {
+        delta
+    } else {
+        body.add_op(block, Operator::I64ExtendI32U, &[delta], &[Type::I64])
+    };
+    let page_const = body.add_op(
+        block,
+        Operator::I64Const { value: 65536 },
+        &[],
+        &[Type::I64],
+    );
+    let delta_bytes = body.add_op(
+        block,
+        Operator::I64Mul,
+        &[wide_delta, page_const],
+        &[Type::I64],
+    );
+    let new_bytes = body.add_op(
+        block,
+        Operator::I64Add,
+        &[wide_old, delta_bytes],
+        &[Type::I64],
+    );
+    // Failure also covers arrays larger than i32::MAX (GC array length is
+    // an i32), whichever limit is smaller.
+    let cap = max_bytes.min(i32::MAX as u64);
+    let max_value = body.add_op(block, Operator::I64Const { value: cap }, &[], &[Type::I64]);
+    let too_big = body.add_op(block, Operator::I64GtU, &[new_bytes, max_value], &[Type::I32]);
+    let fail = body.add_block();
+    let ok = body.add_block();
+    let join = body.add_block();
+    body.set_terminator(
+        block,
+        Terminator::CondBr {
+            cond: too_big,
+            if_true: BlockTarget {
+                block: fail,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: ok,
+                args: vec![],
+            },
+        },
+    );
+    // Success: new array, copy, store back, return old pages.
+    let narrow_new = body.add_op(ok, Operator::I32WrapI64, &[new_bytes], &[Type::I32]);
+    let new_array = body.add_op(
+        ok,
+        Operator::ArrayNewDefault {
+            sig: ctx.i8_array,
+        },
+        &[narrow_new],
+        &[Type::Heap(WithNullable {
+            value: HeapType::Sig {
+                sig_index: ctx.i8_array,
+            },
+            nullable: false,
+        })],
+    );
+    let zero = body.add_op(ok, Operator::I32Const { value: 0 }, &[], &[Type::I32]);
+    body.add_op(
+        ok,
+        Operator::ArrayCopy {
+            dest: ctx.i8_array,
+            src: ctx.i8_array,
+        },
+        &[new_array, zero, array, zero, old_bytes],
+        &[],
+    );
+    body.add_op(
+        ok,
+        Operator::StructSet {
+            sig: ctx.inst_ty,
+            idx: ctx.memory_field(memory),
+        },
+        &[ctx.inst_value, new_array],
+        &[],
+    );
+    let shift64 = body.add_op(ok, Operator::I64Const { value: 16 }, &[], &[Type::I64]);
+    let old_pages_wide = body.add_op(ok, Operator::I64ShrU, &[wide_old, shift64], &[Type::I64]);
+    let ok_result = if memory64 {
+        old_pages_wide
+    } else {
+        body.add_op(ok, Operator::I32WrapI64, &[old_pages_wide], &[Type::I32])
+    };
+    body.set_terminator(
+        ok,
+        Terminator::Br {
+            target: BlockTarget {
+                block: join,
+                args: vec![ok_result],
+            },
+        },
+    );
+    // Failure: -1.
+    let fail_result = if memory64 {
+        body.add_op(fail, Operator::I64Const { value: u64::MAX }, &[], &[Type::I64])
+    } else {
+        body.add_op(
+            fail,
+            Operator::I32Const { value: u32::MAX },
+            &[],
+            &[Type::I32],
+        )
+    };
+    body.set_terminator(
+        fail,
+        Terminator::Br {
+            target: BlockTarget {
+                block: join,
+                args: vec![fail_result],
+            },
+        },
+    );
+    let result_ty = if memory64 { Type::I64 } else { Type::I32 };
+    let join_param = body.add_blockparam(join, result_ty);
+    Ok((join, join_param))
 }

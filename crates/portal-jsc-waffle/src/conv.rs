@@ -332,6 +332,9 @@ pub fn convert_modules<'a, 'wasm>(
     converter.wasm_host_imports = wasm_host_imports;
     converter.wasm_module_functions = wasm_member_merge.export_funcs;
     converter.wasm_module_types = wasm_member_merge.types;
+    converter.wasm_member_instantiate = wasm_member_merge.instantiate;
+    converter.wasm_member_instance_ty = wasm_member_merge.instance_ty;
+    converter.wasm_member_export_specs = wasm_member_merge.export_specs;
     converter.exceptions_enabled = exported.iter().any(|(_, target)| match target {
         // Wasm members cannot participate in the JS exception protocol
         // (plan §5.6): a throw into Wasm member code traps.
@@ -391,7 +394,14 @@ pub fn convert_modules<'a, 'wasm>(
     /// (plan §5.2).
     enum PendingExport {
         Js(FunctionInfo),
-        RawWasm(Func),
+        /// A Wasm member re-export: the merged function plus everything a
+        /// late-binding wrapper needs (portal-co/jsaw#6).
+        RawWasm {
+            path: String,
+            export: String,
+            func: Func,
+            signature: WasmFuncSignature,
+        },
     }
     let mut exports = Vec::with_capacity(exported.len());
     for (name, target) in exported {
@@ -417,7 +427,22 @@ pub fn convert_modules<'a, 'wasm>(
                              output module"
                         ))
                     })?;
-                exports.push((name, PendingExport::RawWasm(func)));
+                let Some(crate::wasm_esm::WasmExport::Func { signature, .. }) =
+                    set.get_wasm(path).and_then(|plan| plan.exports.get(&export))
+                else {
+                    return Err(ConvertError::invalid(format!(
+                        "Wasm module export {path:?}.{export:?} is not a function"
+                    )));
+                };
+                exports.push((
+                    name,
+                    PendingExport::RawWasm {
+                        path: path.to_string(),
+                        export,
+                        func,
+                        signature: signature.clone(),
+                    },
+                ));
             }
         }
     }
@@ -427,14 +452,19 @@ pub fn convert_modules<'a, 'wasm>(
         let PendingExport::Js(info) = emission else {
             // Raw passthrough: the merged function carries the binary's own
             // signature; bypass the numeric/`$gc`/FFI-boundary wrappers.
-            // Export-name collisions were checked above.
-            let PendingExport::RawWasm(func) = emission else {
+            // Export-name collisions were checked above. Late-bound members
+            // get a wrapper that threads the default instance
+            // (portal-co/jsaw#6).
+            let PendingExport::RawWasm {
+                path,
+                export,
+                func,
+                signature,
+            } = emission
+            else {
                 unreachable!("matched above")
             };
-            converter.module.exports.push(Export {
-                name,
-                kind: ExportKind::Func(func),
-            });
+            converter.export_wasm_member_reexport(&name, &path, &export, func, &signature)?;
             continue;
         };
         // A manifest-declared boundary export takes the plain name with its
@@ -564,6 +594,16 @@ fn wasm_esm_abstract_heap(heap: WasmAbstractHeap) -> HeapType {
         WasmAbstractHeap::Struct => HeapType::Struct,
         WasmAbstractHeap::Array => HeapType::Array,
     }
+}
+
+/// Where a late-bound member adapter gets its instance
+/// (portal-co/jsaw#6).
+#[derive(Clone, Copy)]
+enum WasmInstanceSource {
+    /// The default instance, a context property set at module init.
+    Default,
+    /// The captured `this` of an instance-bound function object.
+    This,
 }
 
 /// Per-member index remap (plan §5.1): member-local indices → output
@@ -874,6 +914,14 @@ struct WasmMemberMerge {
     export_funcs: BTreeMap<(String, String), Func>,
     /// `(member path, member-local type index) -> merged (interned) type`.
     types: BTreeMap<(String, u32), Signature>,
+    /// Late-bound members (portal-co/jsaw#6): member path → synthesised
+    /// instantiation function `() -> (ref inst)`.
+    instantiate: BTreeMap<String, Func>,
+    /// Late-bound members: member path → merged instance struct type.
+    instance_ty: BTreeMap<String, Signature>,
+    /// Late-bound members: member path → the member's function exports as
+    /// import specs (for `~wasm` `instantiate` bound adapters).
+    export_specs: BTreeMap<String, Vec<WasmModuleImportSpec>>,
 }
 
 /// Compare a binary-declared member import signature with the FFI manifest
@@ -929,6 +977,9 @@ fn merge_wasm_members(
     let mut states: Vec<MemberState> = Vec::new();
     let mut export_funcs: BTreeMap<(String, String), Func> = BTreeMap::new();
     let mut types: BTreeMap<(String, u32), Signature> = BTreeMap::new();
+    let mut instantiate: BTreeMap<String, Func> = BTreeMap::new();
+    let mut instance_ty: BTreeMap<String, Signature> = BTreeMap::new();
+    let mut export_specs: BTreeMap<String, Vec<WasmModuleImportSpec>> = BTreeMap::new();
 
     // Phase A: signatures (interned), globals, memories per member.
     for (path, plan) in set.wasm_modules() {
@@ -1045,8 +1096,23 @@ fn merge_wasm_members(
                     let mut body = body.clone();
                     remap_wasm_body_types(&mut body, &remap);
                     for (_value, def) in body.values.entries_mut() {
-                        if let ValueDef::Operator(op, _, _) = def {
-                            remap_wasm_member_op(op, &remap);
+                        match def {
+                            ValueDef::Operator(op, _, tys) => {
+                                remap_wasm_member_op(op, &remap);
+                                // The op's result-type list is as much a
+                                // type-index carrier as its fields.
+                                let mapped: Vec<Type> = body.type_pool[*tys]
+                                    .iter()
+                                    .map(|ty| {
+                                        let mut ty = *ty;
+                                        remap.ty(&mut ty);
+                                        ty
+                                    })
+                                    .collect();
+                                *tys = body.type_pool.from_iter(mapped.into_iter());
+                            }
+                            ValueDef::PickOutput(_, _, ty) => remap.ty(ty),
+                            _ => {}
                         }
                     }
                     // Keep WASM names: the binary's name section verbatim;
@@ -1091,10 +1157,35 @@ fn merge_wasm_members(
                 );
             }
         }
+        if let Some(layout) = &plan.instance {
+            instantiate.insert(
+                state.path.clone(),
+                remap.func(Func::new(layout.instantiate as usize)),
+            );
+            instance_ty.insert(state.path.clone(), remap.sig(Signature::new(layout.ty as usize)));
+            let specs = plan
+                .exports
+                .iter()
+                .filter_map(|(name, export)| match export {
+                    crate::wasm_esm::WasmExport::Func { signature, .. } => {
+                        Some(WasmModuleImportSpec {
+                            path: state.path.clone(),
+                            export: name.clone(),
+                            signature: signature.clone(),
+                        })
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            export_specs.insert(state.path.clone(), specs);
+        }
     }
     Ok(WasmMemberMerge {
         export_funcs,
         types,
+        instantiate,
+        instance_ty,
+        export_specs,
     })
 }
 
@@ -1911,6 +2002,20 @@ struct Converter<'a, 'module, 'wasm> {
     /// Merged Wasm member types: `(member path, member-local type index)` →
     /// the merged (interned) signature (plan §5.1 item 1).
     wasm_module_types: BTreeMap<(String, u32), Signature>,
+    /// Late-bound members (portal-co/jsaw#6): member path → instantiation
+    /// function. The default instance is a context property
+    /// (`__wasm_inst_<path>`) initialized by `ensure_module_init`.
+    wasm_member_instantiate: BTreeMap<String, Func>,
+    /// Late-bound members: member path → merged instance struct type.
+    wasm_member_instance_ty: BTreeMap<String, Signature>,
+    /// Late-bound members: member path → function exports as import specs,
+    /// for `~wasm` `instantiate` (portal-co/jsaw#6).
+    wasm_member_export_specs: BTreeMap<String, Vec<WasmModuleImportSpec>>,
+    /// Instance-bound (`this`-carried) adapters for late-bound members.
+    wasm_module_bound_adapters: BTreeMap<WasmModuleImportSpec, FunctionInfo>,
+    /// Per late-bound member, the synthesized `(instance) -> object`
+    /// builder for `~wasm` `instantiate` (portal-co/jsaw#6).
+    wasm_instance_object_builders: BTreeMap<String, Func>,
     /// Generated jsaw callable metadata per Wasm member import binding.
     wasm_module_adapters: BTreeMap<WasmModuleImportSpec, FunctionInfo>,
     /// Per-module import tables for multi-module ingestion: resolved
@@ -2002,6 +2107,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             wasm_host_functions: BTreeMap::new(),
             wasm_module_functions: BTreeMap::new(),
             wasm_module_types: BTreeMap::new(),
+            wasm_member_instantiate: BTreeMap::new(),
+            wasm_member_instance_ty: BTreeMap::new(),
+            wasm_member_export_specs: BTreeMap::new(),
+            wasm_module_bound_adapters: BTreeMap::new(),
+            wasm_instance_object_builders: BTreeMap::new(),
             wasm_module_adapters: BTreeMap::new(),
             import_tables: BTreeMap::new(),
             module_of_function: BTreeMap::new(),
@@ -3092,6 +3202,295 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         Ok(info)
     }
 
+    /// `~wasm` `instantiate("./path.wasm")` (portal-co/jsaw#6): allocate a
+    /// fresh GC-native instance of a late-bound member and return a JS
+    /// object whose properties are the member's function exports, each
+    /// bound to that instance (arrow-style captured `this`, so the binding
+    /// wins over any call-site receiver).
+    fn try_wasm_instantiate_call(
+        &mut self,
+        body: &mut FunctionBody,
+        mut block: Block,
+        context: Value,
+        _values: &ContinuationValues,
+        args: &[portal_jsc_swc_tac::SpreadOr<SValueId>],
+    ) -> Result<Vec<(Block, LowerValue)>, ConvertError> {
+        let [arg] = args else {
+            return Err(ConvertError::invalid(
+                "~wasm instantiate takes exactly one string-literal module path",
+            ));
+        };
+        if arg.is_spread {
+            return Err(ConvertError::invalid(
+                "~wasm instantiate does not take a spread argument",
+            ));
+        }
+        let source = self.lowering_function.ok_or_else(|| {
+            ConvertError::invalid("~wasm instantiate outside a lowered function")
+        })?;
+        let Some(svalue) = source.cfg.values.get(arg.value) else {
+            return Err(ConvertError::invalid(
+                "~wasm instantiate's argument is not a value in the current function",
+            ));
+        };
+        let SValue::Item {
+            item: Item::Lit { lit: Lit::Str(path_lit) },
+            ..
+        } = &svalue.value
+        else {
+            return Err(ConvertError::invalid(
+                "~wasm instantiate's argument must be a string literal naming a Wasm member",
+            ));
+        };
+        let specifier = path_lit.value.to_string_lossy().into_owned();
+        let path = crate::linker::resolve_specifier(&self.current_module, &specifier)?;
+        let Some(inst_sig) = self.wasm_member_instance_ty.get(&path).copied() else {
+            return Err(ConvertError::invalid(format!(
+                "~wasm instantiate: {path:?} is not a late-bound Wasm member (static members                  with tables or indirect calls cannot be instantiated)"
+            )));
+        };
+        let instantiate = self.wasm_member_instantiate[&path];
+        let inst_ref = Type::Heap(WithNullable {
+            value: HeapType::Sig {
+                sig_index: inst_sig,
+            },
+            nullable: false,
+        });
+        let instance = body.add_op(
+            block,
+            Operator::Call {
+                function_index: instantiate,
+            },
+            &[],
+            &[inst_ref],
+        );
+        let object_fn = self.wasm_instance_object_builder(&path)?;
+        let object = body.add_op(
+            block,
+            Operator::Call {
+                function_index: object_fn,
+            },
+            &[instance],
+            &[self.repr.value],
+        );
+        Ok(vec![(
+            block,
+            LowerValue::Wasm {
+                value: object,
+                kind: ValueKind::Reference,
+            },
+        )])
+    }
+
+    /// Synthesize (once per late-bound member) the object builder:
+    /// `(instance) -> value`, a fresh JS object whose properties are the
+    /// member's function exports bound to that instance (portal-co/jsaw#6).
+    fn wasm_instance_object_builder(&mut self, path: &str) -> Result<Func, ConvertError> {
+        if let Some(func) = self.wasm_instance_object_builders.get(path) {
+            return Ok(*func);
+        }
+        let inst_sig = self.wasm_member_instance_ty[path];
+        let inst_ref = Type::Heap(WithNullable {
+            value: HeapType::Sig {
+                sig_index: inst_sig,
+            },
+            nullable: false,
+        });
+        let sig = self.module.signatures.push(SignatureData::Func {
+            params: vec![inst_ref],
+            returns: vec![self.repr.value],
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, sig);
+        let mut block = body.entry;
+        let instance = body.blocks[block].params[0].1;
+        let module_init = self.ensure_module_init()?;
+        let context = body.add_op(
+            block,
+            Operator::Call {
+                function_index: module_init,
+            },
+            &[],
+            &[self.repr.object_ty()],
+        );
+        let object = self.new_object(&mut body, block)?;
+        let object_value = object.wasm()?.0;
+        let specs = self
+            .wasm_member_export_specs
+            .get(path)
+            .cloned()
+            .unwrap_or_default();
+        for spec in specs {
+            let info = self.wasm_module_adapter_with_instance(&spec, WasmInstanceSource::This)?;
+            let this = self.box_value(
+                &mut body,
+                block,
+                &LowerValue::Wasm {
+                    value: instance,
+                    kind: ValueKind::Reference,
+                },
+            )?;
+            let function = self.function_object_from_info(
+                &mut body,
+                block,
+                context,
+                LowerValue::Wasm {
+                    value: this,
+                    kind: ValueKind::Reference,
+                },
+                info,
+                true, // arrow: the captured instance wins over any receiver
+                true,
+            )?;
+            // Fresh plain object with statically known keys: the raw static
+            // store path keeps one continuation block (the proxy-dispatch
+            // path would return parallel branches).
+            block = self.set_static_property_value_raw(
+                &mut body,
+                block,
+                &LowerValue::Wasm {
+                    value: object_value,
+                    kind: ValueKind::Reference,
+                },
+                &spec.export,
+                &function,
+            )?;
+        }
+        let result = object.wasm()?.0;
+        body.set_terminator(
+            block,
+            Terminator::Return {
+                values: vec![result],
+            },
+        );
+        let func = self.module.funcs.push(FuncDecl::Body(
+            sig,
+            format!("wasm_instance_object_{path}"),
+            body,
+        ));
+        self.wasm_instance_object_builders.insert(path.to_string(), func);
+        Ok(func)
+    }
+
+    /// Read a late-bound member's default instance from the context
+    /// property `__wasm_inst_<path>` (set by `ensure_module_init`) and cast
+    /// it back to the instance type (portal-co/jsaw#6).
+    fn wasm_default_instance(
+        &mut self,
+        body: &mut FunctionBody,
+        block: Block,
+        context: Value,
+        path: &str,
+        inst_sig: Signature,
+    ) -> Result<(Block, Value), ConvertError> {
+        let key = format!("__wasm_inst_{path}");
+        let (block, value) = self.get_property_raw(body, block, context, &key)?;
+        let inst_ty = Type::Heap(WithNullable {
+            value: HeapType::Sig {
+                sig_index: inst_sig,
+            },
+            nullable: true,
+        });
+        let value = value.wasm()?.0;
+        let instance = body.add_op(block, Operator::RefCast { ty: inst_ty }, &[value], &[inst_ty]);
+        Ok((block, instance))
+    }
+
+    /// Re-export a Wasm member function under `name` with the binary's own
+    /// signature. Static members export the merged function directly;
+    /// late-bound members (portal-co/jsaw#6) get a wrapper that appends the
+    /// default instance.
+    fn export_wasm_member_reexport(
+        &mut self,
+        name: &str,
+        path: &str,
+        export: &str,
+        func: Func,
+        signature: &WasmFuncSignature,
+    ) -> Result<(), ConvertError> {
+        let Some(inst_sig) = self.wasm_member_instance_ty.get(path).copied() else {
+            // Static path: the merged function already has the binary's
+            // signature.
+            self.module.exports.push(Export {
+                name: name.to_string(),
+                kind: ExportKind::Func(func),
+            });
+            return Ok(());
+        };
+        let params = signature
+            .params
+            .iter()
+            .copied()
+            .map(|ty| wasm_esm_val_type(ty, &self.wasm_module_types, path))
+            .collect::<Result<Vec<_>, _>>()?;
+        let results = signature
+            .results
+            .iter()
+            .copied()
+            .map(|ty| wasm_esm_val_type(ty, &self.wasm_module_types, path))
+            .collect::<Result<Vec<_>, _>>()?;
+        let wrapper_sig = self.module.signatures.push(SignatureData::Func {
+            params,
+            returns: results.clone(),
+            shared: false,
+        });
+        let mut body = FunctionBody::new(self.module, wrapper_sig);
+        let mut block = body.entry;
+        let mut args: Vec<Value> = body.blocks[block]
+            .params
+            .iter()
+            .map(|(_, value)| *value)
+            .collect();
+        // The default instance lives in the module context; initialize it
+        // exactly like a numeric export wrapper would.
+        let module_init = self.ensure_module_init()?;
+        let context = body.add_op(
+            block,
+            Operator::Call {
+                function_index: module_init,
+            },
+            &[],
+            &[self.repr.object_ty()],
+        );
+        let (new_block, instance) =
+            self.wasm_default_instance(&mut body, block, context, path, inst_sig)?;
+        block = new_block;
+        args.push(instance);
+        let result = body.add_op(
+            block,
+            Operator::Call {
+                function_index: func,
+            },
+            &args,
+            &results,
+        );
+        let values = if results.len() <= 1 {
+            if results.is_empty() { vec![] } else { vec![result] }
+        } else {
+            results
+                .iter()
+                .enumerate()
+                .map(|(index, ty)| {
+                    let picked =
+                        body.add_value(ValueDef::PickOutput(result, index as u32, *ty));
+                    body.append_to_block(block, picked);
+                    picked
+                })
+                .collect()
+        };
+        body.set_terminator(block, Terminator::Return { values });
+        let wrapper = self.module.funcs.push(FuncDecl::Body(
+            wrapper_sig,
+            format!("wasm_reexport_{path}_{export}"),
+            body,
+        ));
+        self.module.exports.push(Export {
+            name: name.to_string(),
+            kind: ExportKind::Func(wrapper),
+        });
+        Ok(())
+    }
+
     /// Build (or reuse) the boxed-JS callable adapter for a Wasm member's
     /// function export (plan §5.3): read the ordinary JS formals, coerce each
     /// argument to the binary's declared parameter type, call the merged
@@ -3101,7 +3500,22 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
         &mut self,
         spec: &WasmModuleImportSpec,
     ) -> Result<FunctionInfo, ConvertError> {
-        if let Some(info) = self.wasm_module_adapters.get(spec) {
+        self.wasm_module_adapter_with_instance(spec, WasmInstanceSource::Default)
+    }
+
+    /// `wasm_module_adapter` with an explicit instance source: the default
+    /// instance (context property), or `this` for instance-bound function
+    /// objects (`~wasm` `instantiate`, portal-co/jsaw#6).
+    fn wasm_module_adapter_with_instance(
+        &mut self,
+        spec: &WasmModuleImportSpec,
+        source: WasmInstanceSource,
+    ) -> Result<FunctionInfo, ConvertError> {
+        let cache = match source {
+            WasmInstanceSource::Default => &mut self.wasm_module_adapters,
+            WasmInstanceSource::This => &mut self.wasm_module_bound_adapters,
+        };
+        if let Some(info) = cache.get(spec) {
             return Ok(*info);
         }
         // Profile gates (plan §5.3): the funcref/externref hierarchies are
@@ -3154,12 +3568,53 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             shared: false,
         });
         let mut body = FunctionBody::new(self.module, native_sig);
-        let block = body.entry;
-        let formals = body.blocks[block].params[3..]
+        let mut block = body.entry;
+        let context_value = body.blocks[block].params[0].1;
+        // Late-bound members (portal-co/jsaw#6) take the default instance
+        // as the trailing argument; it lives in a context property set by
+        // `ensure_module_init`.
+        let mut raw_args = Vec::with_capacity(arity + 1);
+        // Read the default instance first (the property read may split the
+        // block), but append it last: it is the trailing parameter.
+        let mut instance_arg = None;
+        if let Some(inst_sig) = self.wasm_member_instance_ty.get(&spec.path).copied() {
+            let instance = match source {
+                WasmInstanceSource::Default => {
+                    let (new_block, instance) = self.wasm_default_instance(
+                        &mut body,
+                        block,
+                        context_value,
+                        &spec.path,
+                        inst_sig,
+                    )?;
+                    block = new_block;
+                    instance
+                }
+                // Instance-bound function objects carry the instance as the
+                // captured `this` (created with arrow semantics so it wins
+                // over any receiver at the call site).
+                WasmInstanceSource::This => {
+                    let this_value = body.blocks[body.entry].params[1].1;
+                    let inst_ty = Type::Heap(WithNullable {
+                        value: HeapType::Sig {
+                            sig_index: inst_sig,
+                        },
+                        nullable: true,
+                    });
+                    body.add_op(
+                        block,
+                        Operator::RefCast { ty: inst_ty },
+                        &[this_value],
+                        &[inst_ty],
+                    )
+                }
+            };
+            instance_arg = Some(instance);
+        }
+        let formals = body.blocks[body.entry].params[3..]
             .iter()
             .map(|(_, value)| *value)
             .collect::<Vec<_>>();
-        let mut raw_args = Vec::with_capacity(arity);
         for (value, ty) in formals
             .into_iter()
             .zip(spec.signature.params.iter().copied())
@@ -3209,6 +3664,9 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                 )));
             }
         };
+        if let Some(instance) = instance_arg {
+            raw_args.push(instance);
+        }
         let call = body.add_op(
             block,
             Operator::Call {
@@ -3331,7 +3789,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
             tag,
             returns: ReturnKinds::default(),
         };
-        self.wasm_module_adapters.insert(spec.clone(), info);
+        match source {
+            WasmInstanceSource::Default => &mut self.wasm_module_adapters,
+            WasmInstanceSource::This => &mut self.wasm_module_bound_adapters,
+        }
+        .insert(spec.clone(), info);
         Ok(info)
     }
 
@@ -5030,6 +5492,11 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         _ => None,
                     });
                 if let Some((module, name)) = intrinsic {
+                    if module == "~wasm" {
+                        let result =
+                            self.try_wasm_instantiate_call(body, block, context, values, args)?;
+                        return Ok(result);
+                    }
                     if module == "~weakmap" {
                         let result = self
                             .try_weakmap_intrinsic_call(
@@ -15031,6 +15498,14 @@ impl<'a, 'module, 'wasm> Converter<'a, 'module, 'wasm> {
                         this.clone(),
                         values,
                         &name,
+                        args,
+                    )?)
+                } else if module == "~wasm" {
+                    Some(self.try_wasm_instantiate_call(
+                        body,
+                        block,
+                        context,
+                        values,
                         args,
                     )?)
                 } else if module == "~weakmap" {

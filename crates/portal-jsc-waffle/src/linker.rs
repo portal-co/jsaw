@@ -559,6 +559,33 @@ pub(crate) fn build_import_table<'a>(
             );
             continue;
         }
+        // `~wasm` is the Wasm-member intrinsic namespace
+        // (portal-co/jsaw#6): `instantiate` creates a fresh GC-native
+        // instance object of a late-bound member. Call-only, like the
+        // other intrinsic namespaces.
+        if specifier == "~wasm" {
+            let name = match kind {
+                ImportMap::Named { name } => name.to_string(),
+                ImportMap::Default | ImportMap::Star => {
+                    return Err(ConvertError::invalid(format!(
+                        "intrinsic import from {specifier:?} in module {path:?} must be named"
+                    )));
+                }
+            };
+            if name != "instantiate" {
+                return Err(ConvertError::invalid(format!(
+                    "unknown ~wasm intrinsic {name:?} (expected instantiate)"
+                )));
+            }
+            table.insert(
+                id,
+                ImportTarget::Intrinsic {
+                    module: specifier.clone(),
+                    name,
+                },
+            );
+            continue;
+        }
         // `~weakmap` is a compiler intrinsic namespace, not an ES module in
         // the closed module set. Preserve the lexical binding so call
         // lowering can intercept it before the normal function path.

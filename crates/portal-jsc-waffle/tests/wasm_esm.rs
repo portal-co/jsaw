@@ -480,11 +480,10 @@ fn memory64_members_merge_and_execute() {
     set.insert_wasm_with_profile("m64.wasm", &memory64_module(), WasmProfile::Memory64)
         .expect("memory64 member at the right ceiling");
     let module = convert("main.js", &set).expect("memory64 member should merge");
-    // The member's memory must survive into the artifact as a 64-bit memory.
-    assert!(
-        module.memories.values().any(|memory| memory.memory64),
-        "the merged memory must keep its memory64 flag"
-    );
+    // Late binding (portal-co/jsaw#6): the member's memory64 memory becomes
+    // a GC byte array in the instance struct — no linear memory survives
+    // into the artifact, and i64 addressing is preserved by the transform.
+    assert_eq!(module.memories.len(), 0, "late-bound members carry no linear memory");
     let bytes = wasm_bytes(&module);
     // Data segments survive the rebase: offset 4 holds 'h'.
     let (wasmtime, node) = execute_numeric_in_all_runtimes(&bytes, "run", &[]);
@@ -770,13 +769,14 @@ fn multi_memory_members_merge_and_execute_through_coregc() {
     assert_eq!(wasmtime, 215.0, "Wasmtime");
     assert_eq!(node, 215.0, "Node");
 
-    // CoreGC: source memories are carried after the runtime memory.
+    // CoreGC: late-bound member memories are GC byte arrays, lowered like
+    // any GC array (portal-co/jsaw#6); the runtime memory stands alone.
     let artifact = portal_jsc_waffle::emit_coregc(&module, &Default::default())
-        .expect("coregc lowering accepts member memories");
-    assert!(
-        artifact.module.memories.len() >= 3,
-        "coregc output should carry the runtime memory plus both member memories, got {}",
-        artifact.module.memories.len()
+        .expect("coregc lowering accepts late-bound member memories");
+    assert_eq!(
+        artifact.module.memories.len(),
+        1,
+        "only the coregc runtime memory remains"
     );
     let core_bytes = portal_pc_waffle::to_wasm_bytes(&artifact.module).expect("core encodes");
     let forced = execute_core(&core_bytes, "run", &[4.0, 1.0]);
@@ -990,7 +990,7 @@ fn nano_mvp_executes_mvp_member_calls() {
 }
 
 #[test]
-fn nano_mvp_rejects_member_memory_ops_loudly() {
+fn nano_mvp_executes_late_bound_member_memory() {
     let mut set = module_set_from_sources([(
         "main.js",
         "import { read8 } from './mem.wasm'; export function run(i) { return read8(i); }",
@@ -1000,18 +1000,25 @@ fn nano_mvp_rejects_member_memory_ops_loudly() {
     let module = convert("main.js", &set).expect("converts");
     let plan = portal_jsc_waffle::BackendPlan::from_module(&module)
         .unwrap_or_else(|d| panic!("plan: {d:?}"));
-    // The plan records the member memory and its ops; nano_mvp's capability
-    // audit must reject memory instructions with a named diagnostic rather
-    // than miscompiling them against the arena memory.
-    assert!(plan.runtime.needs_linear_memory);
-    let errors = portal_jsc_waffle::emit_nano_mvp(&plan)
-        .expect_err("nano_mvp must reject member memory ops until it lowers them");
-    assert!(
-        errors
-            .iter()
-            .any(|e| e.kind == "unsupported_operator" && format!("{e:?}").contains("Load")),
-        "expected a named unsupported-operator diagnostic, got {errors:?}"
-    );
+    // Late binding (portal-co/jsaw#6): member memory ops are GC array ops,
+    // which nano_mvp lowers through its arena like jsaw's own arrays.
+    assert!(!plan.runtime.needs_linear_memory);
+    let bytes = portal_jsc_waffle::emit_nano_mvp(&plan)
+        .unwrap_or_else(|d| panic!("nano_mvp lowers late-bound member memory ops: {d:?}"));
+    let mut config = Config::new();
+    config.wasm_tail_call(true);
+    let engine = Engine::new(&config).expect("engine");
+    let compiled = wasmtime::Module::new(&engine, &bytes).expect("parse");
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &compiled, &[]).expect("instantiate");
+    let run = instance.get_func(&mut store, "run").expect("export");
+    let mut outputs = [Val::F64(0)];
+    run.call(&mut store, &[Val::F64(4.0f64.to_bits())], &mut outputs)
+        .expect("call");
+    match outputs[0] {
+        Val::F64(bits) => assert_eq!(f64::from_bits(bits), b'h' as f64),
+        ref other => panic!("expected f64, got {other:?}"),
+    }
 }
 
 #[test]
@@ -1027,14 +1034,14 @@ fn artifacts_record_wasm_feature_requirements() {
     let module = convert("main.js", &set).expect("converts");
     let plan = portal_jsc_waffle::BackendPlan::from_module(&module)
         .unwrap_or_else(|d| panic!("plan: {d:?}"));
-    assert!(plan.runtime.uses_multi_memory, "backend plan records multi-memory");
+    // Late binding (portal-co/jsaw#6): member memories are GC byte arrays,
+    // so neither manifest reports linear-memory features for them. The
+    // flags still describe static-path members (tables/indirect calls).
+    assert!(!plan.runtime.uses_multi_memory);
     assert!(!plan.runtime.uses_memory64);
     let artifact = portal_jsc_waffle::emit_coregc(&module, &Default::default())
         .expect("coregc lowers");
-    assert!(
-        artifact.wasm_features.multi_memory,
-        "coregc artifact records multi-memory"
-    );
+    assert!(!artifact.wasm_features.multi_memory);
     assert!(!artifact.wasm_features.memory64);
 
     // memory64 member.
@@ -1048,14 +1055,14 @@ fn artifacts_record_wasm_feature_requirements() {
     let module = convert("main.js", &set).expect("converts");
     let plan = portal_jsc_waffle::BackendPlan::from_module(&module)
         .unwrap_or_else(|d| panic!("plan: {d:?}"));
-    assert!(plan.runtime.uses_memory64, "backend plan records memory64");
+    assert!(!plan.runtime.uses_memory64, "late-bound memory64 is a GC array");
     let artifact = portal_jsc_waffle::emit_coregc(&module, &Default::default())
         .expect("coregc lowers");
-    assert!(artifact.wasm_features.memory64);
+    assert!(!artifact.wasm_features.memory64);
 }
 
 #[test]
-fn mobile_audit_rejects_memory_bearing_members_loudly() {
+fn mobile_audit_accepts_late_bound_memory_members() {
     let mut set = module_set_from_sources([(
         "main.js",
         "import { read8 } from './mem.wasm'; export function run(i) { return read8(i); }",
@@ -1063,10 +1070,176 @@ fn mobile_audit_rejects_memory_bearing_members_loudly() {
     .expect("sources");
     set.insert_wasm("mem.wasm", &memory_module()).expect("member");
     let module = convert("main.js", &set).expect("converts");
-    let error = portal_jsc_mob_emit::audit::audit_module(&module)
-        .expect_err("the mobile audit must reject linear memories loudly");
-    assert!(
-        format!("{error:?}").contains("linear memories"),
-        "expected a named linear-memory rejection, got {error:?}"
-    );
+    // Late binding (portal-co/jsaw#6) turned the member's linear memory
+    // into GC byte arrays, which the mobile feature closure already covers
+    // — the audit accepts, and the JVM/Swift emitters lower the array code
+    // like jsaw's own (see portal-co/jsaw#13 for the remaining surface).
+    portal_jsc_mob_emit::audit::audit_module(&module)
+        .expect("the mobile audit accepts late-bound member memories as GC arrays");
 }
+
+
+// ---------------------------------------------------------------------------
+// Late binding / multi-instance (portal-co/jsaw#6).
+
+/// `(module (global (mut i32) (i32.const 0))
+///   (func (export "bump") (result i32)
+///     global.get 0 i32.const 1 i32.add global.set 0 global.get 0))`
+fn counter_module() -> Vec<u8> {
+    module(&[
+        section(1, vec_of(vec![func_type(&[], &[I32])])),
+        section(3, vec_of(vec![uleb(0)])),
+        // global section: one mutable i32, init 0
+        section(
+            6,
+            vec_of(vec![{
+                let mut g = vec![0x7f, 0x01]; // i32, mutable
+                g.extend([0x41, 0x00, 0x0b]); // i32.const 0
+                g
+            }]),
+        ),
+        section(7, vec_of(vec![export_entry("bump", 0x00, 0)])),
+        section(
+            10,
+            vec_of(vec![code_body(&[
+                0x00, // no locals
+                0x23, 0x00, // global.get 0
+                0x41, 0x01, // i32.const 1
+                0x6a, // i32.add
+                0x24, 0x00, // global.set 0
+                0x23, 0x00, // global.get 0
+                0x0b,
+            ])]),
+        ),
+    ])
+}
+
+/// `(module (memory 1)
+///   (func (export "store") (param i32 i32) local.get 0 local.get 1 i32.store)
+///   (func (export "load") (param i32) (result i32) local.get 0 i32.load))`
+fn mem_rw_module() -> Vec<u8> {
+    module(&[
+        section(
+            1,
+            vec_of(vec![func_type(&[I32, I32], &[]), func_type(&[I32], &[I32])]),
+        ),
+        section(3, vec_of(vec![uleb(0), uleb(1)])),
+        section(5, vec_of(vec![vec![0x00, 0x01]])),
+        section(
+            7,
+            vec_of(vec![export_entry("store", 0x00, 0), export_entry("load", 0x00, 1)]),
+        ),
+        section(
+            10,
+            vec_of(vec![
+                code_body(&[0x00, 0x20, 0x00, 0x20, 0x01, 0x36, 0x00, 0x00, 0x0b]),
+                code_body(&[0x00, 0x20, 0x00, 0x28, 0x00, 0x00, 0x0b]),
+            ]),
+        ),
+    ])
+}
+
+#[test]
+fn late_bound_member_state_persists_across_calls() {
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { bump } from './counter.wasm'; \
+         export function run() { \
+           const x = bump(); const y = bump(); const z = bump(); \
+           return x * 100 + y * 10 + z; \
+         }",
+    )])
+    .expect("sources");
+    set.insert_wasm("counter.wasm", &counter_module())
+        .expect("counter member");
+    let module = convert("main.js", &set).expect("converts");
+    let bytes = wasm_bytes(&module);
+    // The default instance's global persists across adapter calls.
+    let (wasmtime, node) = execute_numeric_in_all_runtimes(&bytes, "run", &[]);
+    assert_eq!(wasmtime, 123.0, "Wasmtime");
+    assert_eq!(node, 123.0, "Node");
+}
+
+#[test]
+fn multi_instance_state_is_disjoint() {
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { instantiate } from '~wasm'; \
+         import { bump } from './counter.wasm'; \
+         export function run() { \
+           const a = instantiate('./counter.wasm'); \
+           const b = instantiate('./counter.wasm'); \
+           a.bump(); a.bump(); a.bump(); \
+           b.bump(); \
+           const d = bump(); \
+           return a.bump() * 1000 + b.bump() * 100 + d * 10 + bump(); \
+         }",
+    )])
+    .expect("sources");
+    set.insert_wasm("counter.wasm", &counter_module())
+        .expect("counter member");
+    let module = convert("main.js", &set).expect("converts");
+    let bytes = wasm_bytes(&module);
+    // a: 4, b: 2, default: 2 → 4000 + 200 + 10 + 2 = 4212.
+    let (wasmtime, node) = execute_numeric_in_all_runtimes(&bytes, "run", &[]);
+    assert_eq!(wasmtime, 4212.0, "Wasmtime");
+    assert_eq!(node, 4212.0, "Node");
+}
+
+#[test]
+fn multi_instance_memory_is_disjoint() {
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { instantiate } from '~wasm'; \
+         export function run() { \
+           const a = instantiate('./mem.wasm'); \
+           const b = instantiate('./mem.wasm'); \
+           a.store(0, 42); \
+           b.store(0, 7); \
+           return a.load(0) * 100 + b.load(0); \
+         }",
+    )])
+    .expect("sources");
+    set.insert_wasm("mem.wasm", &mem_rw_module())
+        .expect("memory member");
+    let module = convert("main.js", &set).expect("converts");
+    let bytes = wasm_bytes(&module);
+    let (wasmtime, node) = execute_numeric_in_all_runtimes(&bytes, "run", &[]);
+    assert_eq!(wasmtime, 4207.0, "Wasmtime");
+    assert_eq!(node, 4207.0, "Node");
+}
+
+#[test]
+fn instantiate_rejects_static_members() {
+    // A member with a table stays on the static single-instance path and
+    // cannot be instantiated.
+    // The add module plus one funcref table (min 1), in section order.
+    let table_member = module(&[
+        section(1, vec_of(vec![func_type(&[I32, I32], &[I32])])),
+        section(3, vec_of(vec![uleb(0)])),
+        section(4, vec_of(vec![{
+            let mut t = vec![0x70]; // funcref
+            t.extend([0x00, 0x01]); // limits: min 1
+            t
+        }])),
+        section(7, vec_of(vec![export_entry("add", 0x00, 0)])),
+        section(
+            10,
+            vec_of(vec![code_body(&[0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b])]),
+        ),
+    ]);
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { instantiate } from '~wasm'; \
+         export function run() { return instantiate('./math.wasm').add(1, 2); }",
+    )])
+    .expect("sources");
+    set.insert_wasm("math.wasm", &table_member)
+        .expect("table member is valid, just static");
+    let error = convert("main.js", &set)
+        .expect_err("static members cannot be instantiated");
+    assert!(error.message.contains("not a late-bound"), "{error}");
+}
+
+
+

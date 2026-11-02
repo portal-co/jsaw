@@ -484,7 +484,11 @@ fn memory64_members_merge_and_execute() {
     // Late binding (portal-co/jsaw#6): the member's memory64 memory becomes
     // a GC byte array in the instance struct — no linear memory survives
     // into the artifact, and i64 addressing is preserved by the transform.
-    assert_eq!(module.memories.len(), 0, "late-bound members carry no linear memory");
+    assert_eq!(
+        module.memories.len(),
+        0,
+        "late-bound members carry no linear memory"
+    );
     let bytes = wasm_bytes(&module);
     // Data segments survive the rebase: offset 4 holds 'h'.
     let (wasmtime, node) = execute_numeric_in_all_runtimes(&bytes, "run", &[]);
@@ -997,7 +1001,8 @@ fn nano_mvp_executes_late_bound_member_memory() {
         "import { read8 } from './mem.wasm'; export function run(i) { return read8(i); }",
     )])
     .expect("sources");
-    set.insert_wasm("mem.wasm", &memory_module()).expect("member");
+    set.insert_wasm("mem.wasm", &memory_module())
+        .expect("member");
     let module = convert("main.js", &set).expect("converts");
     let plan = portal_jsc_waffle::BackendPlan::from_module(&module)
         .unwrap_or_else(|d| panic!("plan: {d:?}"));
@@ -1040,8 +1045,8 @@ fn artifacts_record_wasm_feature_requirements() {
     // flags still describe static-path members (tables/indirect calls).
     assert!(!plan.runtime.uses_multi_memory);
     assert!(!plan.runtime.uses_memory64);
-    let artifact = portal_jsc_waffle::emit_coregc(&module, &Default::default())
-        .expect("coregc lowers");
+    let artifact =
+        portal_jsc_waffle::emit_coregc(&module, &Default::default()).expect("coregc lowers");
     assert!(!artifact.wasm_features.multi_memory);
     assert!(!artifact.wasm_features.memory64);
 
@@ -1056,9 +1061,12 @@ fn artifacts_record_wasm_feature_requirements() {
     let module = convert("main.js", &set).expect("converts");
     let plan = portal_jsc_waffle::BackendPlan::from_module(&module)
         .unwrap_or_else(|d| panic!("plan: {d:?}"));
-    assert!(!plan.runtime.uses_memory64, "late-bound memory64 is a GC array");
-    let artifact = portal_jsc_waffle::emit_coregc(&module, &Default::default())
-        .expect("coregc lowers");
+    assert!(
+        !plan.runtime.uses_memory64,
+        "late-bound memory64 is a GC array"
+    );
+    let artifact =
+        portal_jsc_waffle::emit_coregc(&module, &Default::default()).expect("coregc lowers");
     assert!(!artifact.wasm_features.memory64);
 }
 
@@ -1069,7 +1077,8 @@ fn mobile_audit_accepts_late_bound_memory_members() {
         "import { read8 } from './mem.wasm'; export function run(i) { return read8(i); }",
     )])
     .expect("sources");
-    set.insert_wasm("mem.wasm", &memory_module()).expect("member");
+    set.insert_wasm("mem.wasm", &memory_module())
+        .expect("member");
     let module = convert("main.js", &set).expect("converts");
     // Late binding (portal-co/jsaw#6) turned the member's linear memory
     // into GC byte arrays, which the mobile feature closure already covers
@@ -1078,7 +1087,6 @@ fn mobile_audit_accepts_late_bound_memory_members() {
     portal_jsc_mob_emit::audit::audit_module(&module)
         .expect("the mobile audit accepts late-bound member memories as GC arrays");
 }
-
 
 // ---------------------------------------------------------------------------
 // Late binding / multi-instance (portal-co/jsaw#6).
@@ -1128,7 +1136,10 @@ fn mem_rw_module() -> Vec<u8> {
         section(5, vec_of(vec![vec![0x00, 0x01]])),
         section(
             7,
-            vec_of(vec![export_entry("store", 0x00, 0), export_entry("load", 0x00, 1)]),
+            vec_of(vec![
+                export_entry("store", 0x00, 0),
+                export_entry("load", 0x00, 1),
+            ]),
         ),
         section(
             10,
@@ -1218,11 +1229,14 @@ fn instantiate_rejects_static_members() {
     let table_member = module(&[
         section(1, vec_of(vec![func_type(&[I32, I32], &[I32])])),
         section(3, vec_of(vec![uleb(0)])),
-        section(4, vec_of(vec![{
-            let mut t = vec![0x70]; // funcref
-            t.extend([0x00, 0x01]); // limits: min 1
-            t
-        }])),
+        section(
+            4,
+            vec_of(vec![{
+                let mut t = vec![0x70]; // funcref
+                t.extend([0x00, 0x01]); // limits: min 1
+                t
+            }]),
+        ),
         section(7, vec_of(vec![export_entry("add", 0x00, 0)])),
         section(
             10,
@@ -1237,13 +1251,9 @@ fn instantiate_rejects_static_members() {
     .expect("sources");
     set.insert_wasm("math.wasm", &table_member)
         .expect("table member is valid, just static");
-    let error = convert("main.js", &set)
-        .expect_err("static members cannot be instantiated");
+    let error = convert("main.js", &set).expect_err("static members cannot be instantiated");
     assert!(error.message.contains("not a late-bound"), "{error}");
 }
-
-
-
 
 // ---------------------------------------------------------------------------
 // Additional proposals (portal-co/jsaw#7): tail calls, SIMD.
@@ -1264,7 +1274,10 @@ fn tail_call_module() -> Vec<u8> {
     module(&[
         section(
             1,
-            vec_of(vec![func_type(&[I32], &[I32]), func_type(&[I32, I32], &[I32])]),
+            vec_of(vec![
+                func_type(&[I32], &[I32]),
+                func_type(&[I32, I32], &[I32]),
+            ]),
         ),
         section(3, vec_of(vec![uleb(0), uleb(1)])),
         section(7, vec_of(vec![export_entry("count", 0x00, 0)])),
@@ -1469,7 +1482,8 @@ fn global_exports_read_live_from_the_default_instance() {
          }",
     )])
     .expect("sources");
-    set.insert_wasm("g.wasm", &globals_module()).expect("member");
+    set.insert_wasm("g.wasm", &globals_module())
+        .expect("member");
     let module = convert("main.js", &set).expect("converts");
     let bytes = wasm_bytes(&module);
     // a=42, c1=0 (read before bump), count=1 (live read after bump).
@@ -1486,7 +1500,10 @@ fn wasi_import_module() -> Vec<u8> {
     module(&[
         section(
             1,
-            vec_of(vec![func_type(&[I32, I32], &[I32]), func_type(&[I32], &[I32])]),
+            vec_of(vec![
+                func_type(&[I32, I32], &[I32]),
+                func_type(&[I32], &[I32]),
+            ]),
         ),
         section(
             2,
@@ -1618,7 +1635,11 @@ fn late_bound_members_execute_on_jvm_and_swift() {
             .arg("4")
             .output()
             .expect("java runs");
-        assert!(run.status.success(), "java: {}", String::from_utf8_lossy(&run.stderr));
+        assert!(
+            run.status.success(),
+            "java: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
         let bits: i64 = String::from_utf8_lossy(&run.stdout)
             .trim()
             .parse()
@@ -1640,7 +1661,9 @@ fn late_bound_members_execute_on_jvm_and_swift() {
             wrote.push(full);
         }
         let ename = portal_jsc_mob_emit::names::swift("run");
-        let main = format!("import Foundation\nlet a = CommandLine.arguments\nprint(Mod.{ename}(Double(a[1])!).bitPattern)\n");
+        let main = format!(
+            "import Foundation\nlet a = CommandLine.arguments\nprint(Mod.{ename}(Double(a[1])!).bitPattern)\n"
+        );
         let main_path = dir.join("main.swift");
         std::fs::write(&main_path, &main).expect("main.swift");
         wrote.push(main_path);
@@ -1661,7 +1684,11 @@ fn late_bound_members_execute_on_jvm_and_swift() {
             .arg("4")
             .output()
             .expect("swift runs");
-        assert!(run.status.success(), "swift: {}", String::from_utf8_lossy(&run.stderr));
+        assert!(
+            run.status.success(),
+            "swift: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
         let bits: u64 = String::from_utf8_lossy(&run.stdout)
             .trim()
             .parse()
@@ -1681,4 +1708,24 @@ fn swiftc_available() -> Option<std::path::PathBuf> {
         .ok()
         .filter(|out| out.status.success())
         .map(|_| std::path::PathBuf::from("swiftc"))
+}
+
+#[test]
+fn imported_calls_evaluate_in_source_order() {
+    // portal-co/jsaw#16: calls to imported functions in a compound
+    // expression must evaluate left to right (the waffle treeifier moved a
+    // pure op's subtree containing a call past a later call).
+    let mut set = module_set_from_sources([(
+        "main.js",
+        "import { bump } from './counter.wasm'; \
+         export function run() { return bump()*100 + bump()*10 + bump(); }",
+    )])
+    .expect("sources");
+    set.insert_wasm("counter.wasm", &counter_module())
+        .expect("member");
+    let module = convert("main.js", &set).expect("converts");
+    let bytes = wasm_bytes(&module);
+    let (wasmtime, node) = execute_numeric_in_all_runtimes(&bytes, "run", &[]);
+    assert_eq!(wasmtime, 123.0, "Wasmtime");
+    assert_eq!(node, 123.0, "Node");
 }
